@@ -81,7 +81,11 @@ game/
 
 The engine renders three scene *types* driven entirely by the content file:
 `animation`, `scenario`, `quiz`. Adding chapter 2 later means writing a new
-`content/ch02.js` — no engine changes required. This is the only piece of
+`content/ch02.js` — no engine changes required. (This holds fully for
+`scenario` and `quiz` scenes. An `animation` scene still needs a hand-written
+renderer function registered in `scene-player.js`'s `ANIMATION_RENDERERS`
+map, keyed by scene id — future chapters must use scene ids that don't
+collide with existing animation-renderer keys.) This is the only piece of
 speculative design in this spec, and it's justified because "become an expert
 along the way" requires a shared progress model to exist from the start, even
 though only one chapter is built now.

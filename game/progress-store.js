@@ -82,7 +82,12 @@ export function createProgressStore(storageLike) {
 
     awardSceneXp(chapterId, sceneId, xp) {
       if (!progress.chapters[chapterId]) progress.chapters[chapterId] = {};
-      if (progress.chapters[chapterId][sceneId] !== undefined) {
+      const existing = progress.chapters[chapterId][sceneId];
+      if (existing !== undefined) {
+        if (xp <= existing) return this.getProgress();
+        progress.chapters[chapterId][sceneId] = xp;
+        progress.xp += xp - existing;
+        persist();
         return this.getProgress();
       }
       progress.chapters[chapterId][sceneId] = xp;

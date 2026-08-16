@@ -54,6 +54,15 @@ test('awardSceneXp adds xp once and is idempotent for the same scene', () => {
   assert.equal(store.isSceneComplete('ch01', 'acid-test'), true);
 });
 
+test('awardSceneXp keeps the higher score on replay and ignores a lower one', () => {
+  const store = createProgressStore(makeFakeStorage());
+  store.awardSceneXp('ch01', 'mindset-check', 5);
+  store.awardSceneXp('ch01', 'mindset-check', 20);
+  assert.equal(store.getTotalXp(), 20);
+  store.awardSceneXp('ch01', 'mindset-check', 10);
+  assert.equal(store.getTotalXp(), 20);
+});
+
 test('getChapterStats reports mastery once all scenes for a chapter are complete', () => {
   const store = createProgressStore(makeFakeStorage());
   store.awardSceneXp('ch01', 'acid-test', 20);

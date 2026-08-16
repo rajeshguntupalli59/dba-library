@@ -1138,7 +1138,7 @@ git commit -m "feat(game): link the interactive Chapter 1 game from the books pa
 
 - [ ] **Step 1: Run the full automated test suite**
 
-Run: `node --test tests/`
+Run: `node --test`
 Expected: PASS — all tests from Tasks 1 and 2 green (13 tests total).
 
 - [ ] **Step 2: Manual smoke test in a private/incognito window**

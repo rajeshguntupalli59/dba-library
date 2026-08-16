@@ -318,7 +318,8 @@ export function mountChapterGame(root, { chapterId, scenes, store }) {
 
   function selectScene(scene) {
     Array.from(nav.children).forEach((btn) => {
-      btn.className = navButtonClass(scene, btn.dataset.sceneId === scene.id);
+      const btnScene = scenes.find((s) => s.id === btn.dataset.sceneId);
+      btn.className = navButtonClass(btnScene, btn.dataset.sceneId === scene.id);
     });
     renderScene(sceneContainer, scene, (xp) => {
       store.awardSceneXp(chapterId, scene.id, xp);
