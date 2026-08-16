@@ -282,6 +282,8 @@ git commit -m "feat(game): add localStorage-backed progress store with unit test
 
 ### Task 2: Chapter 1 content data
 
+**Fact-fidelity note (ruling, added post-review):** The `acid-test` scene dramatizes the chapter's one-sentence, abstract bank-transfer example with specific dollar figures and a crash/rollback demo, neither of which is literally stated in the chapter text. A task review flagged this against the spec's "every fact traces back to the chapter" constraint. The human ruled: keep the dramatization (it's a reasonable illustration of the chapter's own example, and the interactivity depends on having concrete numbers to animate), but label it clearly as a simulation via the `simulationNote` field below, rendered in Task 3. No other scene in this chapter needed this treatment — the `two-paths` timeline and `day-in-production` vignettes are sourced near-verbatim from the chapter and require no disclaimer.
+
 **Files:**
 - Create: `game/content/ch01.js`
 - Test: `tests/game/ch01-content.test.js`
@@ -292,7 +294,7 @@ git commit -m "feat(game): add localStorage-backed progress store with unit test
   - `chapterId: 'ch01'`
   - `chapterTitle: string`
   - `scenes: Array<AnimationScene | ScenarioScene | QuizScene>` — exactly 4 entries, ids `'acid-test'`, `'two-paths'`, `'day-in-production'`, `'mindset-check'`, each with `id`, `type`, `title`.
-    - `AnimationScene` (ids `acid-test`, `two-paths`) additionally has `xp: number` and scene-specific fields consumed by the matching renderer in Task 3.
+    - `AnimationScene` (ids `acid-test`, `two-paths`) additionally has `xp: number` and scene-specific fields consumed by the matching renderer in Task 3. `acid-test` also has `simulationNote: string` — a disclaimer, rendered by Task 3, that the scene's dollar figures and crash/rollback moment are an illustrative simulation built on the chapter's abstract example, not a literal chapter detail (see "Fact-fidelity note" below).
     - `ScenarioScene` (`day-in-production`) has `vignettes: Array<{id, category, prompt, options: Array<{text, correct: boolean, feedback}>}>`, exactly one `correct: true` per vignette.
     - `QuizScene` (`mindset-check`) has `xpPerCorrect: number` and `questions: Array<{id, prompt, choices: string[], correctIndex: number, explanation}>`.
 
@@ -311,9 +313,10 @@ test('chapter 1 has exactly 4 scenes with unique ids', () => {
   assert.equal(new Set(ids).size, 4);
 });
 
-test('acid-test scene has a valid crash step index and step balances', () => {
+test('acid-test scene has a valid crash step index, step balances, and a simulation-note disclaimer', () => {
   const scene = scenes.find((s) => s.id === 'acid-test');
   assert.ok(scene.crashStep >= 0 && scene.crashStep < scene.steps.length);
+  assert.ok(typeof scene.simulationNote === 'string' && scene.simulationNote.length > 0);
   scene.steps.forEach((step) => {
     assert.equal(typeof step.balances.a, 'number');
     assert.equal(typeof step.balances.b, 'number');
@@ -375,6 +378,7 @@ export const scenes = [
     title: 'The ACID Test',
     xp: 20,
     intro: "The chapter opens with an example: when a bank transfers money between accounts, the database must guarantee the operation either fully completes or does not happen at all. Walk through it step by step.",
+    simulationNote: "The dollar figures and the crash/rollback moment below are an illustrative simulation built on the chapter's own example — the chapter itself describes the guarantee abstractly, without specific numbers or a step-by-step rollback.",
     crashStep: 1,
     crashNarration: "Crash simulated after debiting A but before crediting B. Atomicity guarantees this can never be left half-done — on restart, the database rolls back: Account A returns to $500, Account B stays at $200, exactly as if the transfer never happened.",
     steps: [
@@ -558,7 +562,10 @@ function el(tag, className, text) {
 
 function renderAcidTestScene(container, scene, onComplete) {
   container.innerHTML = '';
-  container.appendChild(el('p', 'text-gray-300 leading-relaxed mb-6', scene.intro));
+  container.appendChild(el('p', 'text-gray-300 leading-relaxed mb-4', scene.intro));
+  if (scene.simulationNote) {
+    container.appendChild(el('p', 'text-xs text-gray-500 italic mb-6', scene.simulationNote));
+  }
 
   const badgeRow = el('div', 'flex gap-2 mb-6');
   const letters = ['A', 'C', 'I', 'D'];
@@ -958,7 +965,7 @@ git commit -m "feat(game): add scene player rendering animation, scenario, and q
 
 Serve the repo root with any static file server (e.g. `npx serve .` or `python -m http.server`) and open `/game/ch01.html`:
 - All 4 scene tabs are visible and clickable.
-- "The ACID Test": clicking Next steps through all 6 steps with balances/narration updating; clicking "Simulate a crash here" only works on the debit step and shows the rollback narration; either path ends with a "Finish scene (+20 XP)" button that updates the XP counter in the header and turns that scene's tab green.
+- "The ACID Test": the `simulationNote` disclaimer is visible below the intro before any steps are taken; clicking Next steps through all 6 steps with balances/narration updating; clicking "Simulate a crash here" only works on the debit step and shows the rollback narration; either path ends with a "Finish scene (+20 XP)" button that updates the XP counter in the header and turns that scene's tab green.
 - "Two Paths, One Discipline": clicking all 10 markers reveals their detail text; after all are viewed, "Continue" appears and finishing awards +15 XP.
 - "A Day in Production": each of the 4 vignettes shows feedback after a choice is picked, and the scene finishes with a total XP summary.
 - "The Mindset Check": each of the 4 questions shows the correct answer highlighted plus an explanation, and finishes with a score summary.
