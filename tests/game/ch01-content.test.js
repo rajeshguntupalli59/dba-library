@@ -8,9 +8,10 @@ test('chapter 1 has exactly 4 scenes with unique ids', () => {
   assert.equal(new Set(ids).size, 4);
 });
 
-test('acid-test scene has a valid crash step index and step balances', () => {
+test('acid-test scene has a valid crash step index, step balances, and a simulation-note disclaimer', () => {
   const scene = scenes.find((s) => s.id === 'acid-test');
   assert.ok(scene.crashStep >= 0 && scene.crashStep < scene.steps.length);
+  assert.ok(typeof scene.simulationNote === 'string' && scene.simulationNote.length > 0);
   scene.steps.forEach((step) => {
     assert.equal(typeof step.balances.a, 'number');
     assert.equal(typeof step.balances.b, 'number');

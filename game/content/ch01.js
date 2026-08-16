@@ -11,6 +11,7 @@ export const scenes = [
     title: 'The ACID Test',
     xp: 20,
     intro: "The chapter opens with an example: when a bank transfers money between accounts, the database must guarantee the operation either fully completes or does not happen at all. Walk through it step by step.",
+    simulationNote: "The dollar figures and the crash/rollback moment below are an illustrative simulation built on the chapter's own example — the chapter itself describes the guarantee abstractly, without specific numbers or a step-by-step rollback.",
     crashStep: 1,
     crashNarration: "Crash simulated after debiting A but before crediting B. Atomicity guarantees this can never be left half-done — on restart, the database rolls back: Account A returns to $500, Account B stays at $200, exactly as if the transfer never happened.",
     steps: [
