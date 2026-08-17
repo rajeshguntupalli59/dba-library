@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AI-assisted incident response: from alert to root cause in under 5 minutes — Rajesh Guntupalli</title>
+  <meta name="description" content="A concrete, repeatable playbook for using AI to compress database incident triage — the snapshot script, the prompt structure, and where a human still has to take over." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-blue-500 to-blue-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-blue-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"    class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"     class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Book</a>
+        <a href="index.html"       class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Blog</a>
+        <a href="../about.html"    class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
+           class="ml-2 px-4 py-1.5 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded-lg transition">Get Free Tools</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="flex gap-2 mb-5"><span class="px-2 py-0.5 bg-blue-900/40 border border-blue-800/40 text-blue-300 text-xs rounded-full">AI + Databases</span><span class="px-2 py-0.5 bg-blue-900/40 border border-blue-800/40 text-blue-300 text-xs rounded-full">DBA</span></div>
+    <h1 class="text-4xl font-extrabold mb-4 leading-tight">AI-assisted incident response: from alert to root cause in under 5 minutes</h1>
+    <div class="flex items-center gap-3 text-xs text-gray-500 mb-10 pb-8 border-b border-gray-800/60">
+      <span>Rajesh Guntupalli</span><span>·</span><span>August 2026</span><span>·</span><span>5 min read</span>
+    </div>
+    <div class="space-y-4 text-sm">
+
+<p class="text-gray-300 leading-relaxed">"AI helps with incidents" is true but vague enough to be useless as advice. Here's the specific, repeatable playbook I run when a database alert fires — the snapshot I capture, the exact prompt structure, and the point at which I stop trusting the model's judgment and start trusting my own.</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Minute one: capture state before it changes</h2>
+
+<p class="text-gray-300 leading-relaxed">The most common mistake in incident response, AI-assisted or not, is investigating live instead of capturing a snapshot first. Locks clear, queries finish, and the exact state that caused the page often looks completely different two minutes later when you finally start looking. My incident script runs first, before I do anything else, and captures everything in one shot:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/bin/bash
+# incident_snapshot.sh — run this before touching anything else
+OUT=/tmp/incident_$(date +%s).txt
+
+psql -h $DB_HOST -U $DB_USER -d $DB_NAME <<SQL >> $OUT
+\echo '=== Active queries (>5s) ==='
+SELECT pid, now() - query_start AS duration, wait_event_type, wait_event,
+       left(query, 200) AS query
+FROM pg_stat_activity
+WHERE state != 'idle' AND query_start < now() - interval '5 seconds'
+ORDER BY duration DESC;
+
+\echo '=== Lock waits ==='
+SELECT blocked.pid AS blocked_pid, blocking.pid AS blocking_pid,
+       blocked.query AS blocked_query, blocking.query AS blocking_query
+FROM pg_locks blocked
+JOIN pg_locks blocking ON blocking.locktype = blocked.locktype
+  AND blocking.database IS NOT DISTINCT FROM blocked.database
+  AND blocking.relation IS NOT DISTINCT FROM blocked.relation
+  AND blocking.pid != blocked.pid
+JOIN pg_stat_activity blocked ON blocked.pid = blocked.pid
+WHERE NOT blocked.granted;
+
+\echo '=== Recent errors ==='
+SELECT * FROM pg_stat_database WHERE datname = current_database();
+SQL
+
+echo "Snapshot saved to $OUT"</code></pre>
+
+<p class="text-gray-300 leading-relaxed">This takes under ten seconds to run and gives you a frozen record of exactly what the database was doing when the alert fired — which matters twice: once for diagnosis, and again afterward when you write the postmortem and can't remember exactly what you saw.</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Minute two: structure the prompt like you'd brief a colleague</h2>
+
+<p class="text-gray-300 leading-relaxed">The quality of AI-assisted triage lives almost entirely in how much relevant context you give it, not in the model. A raw snapshot dump gets a generic answer. A snapshot plus what changed recently gets a specific, testable hypothesis:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>Alert: p99 latency on orders_service jumped from 40ms to 4s starting 14:32 UTC.
+Deploys in the last 2 hours: none.
+Recent schema changes: none in the last 7 days.
+Traffic: normal, matches yesterday's pattern at this time.
+
+Here is a pg_stat_activity + lock snapshot taken 90 seconds after the alert:
+[paste snapshot]
+
+What's the most likely root cause, ranked by probability, and what
+single query would confirm or rule out the top hypothesis?</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The "no deploys, no schema changes, normal traffic" framing does real work — it tells the model to rule out the most common explanations up front, so it doesn't waste your first response cycle suggesting "check if you just deployed something." Asking for a ranked list with a specific confirming query, rather than a paragraph of prose, is what makes the output actionable in the next sixty seconds instead of requiring another round of back-and-forth.</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Minute three: confirm, don't trust</h2>
+
+<p class="text-gray-300 leading-relaxed">Whatever the model returns is a hypothesis, and I run the confirming query before touching anything. In the incident this playbook is built from, the model's top hypothesis was a long-running analytics query holding a row lock that was blocking the order-update path — and the lock-wait snapshot confirmed it in about fifteen seconds. Total time from alert to confirmed root cause: three minutes and change, most of it spent on the snapshot capture and the read, not on waiting for the model.</p>
+
+<p class="text-gray-300 leading-relaxed">The model does not get to decide the fix. Once the cause is confirmed, that's a human decision — kill the blocking query, or let it finish if it's close to done and killing it would waste more time than it saves. This is the same principle as AI-assisted index advice: the model compresses time-to-hypothesis dramatically, and a person who understands the actual system makes the call on what to do about it.</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Where this breaks down</h2>
+
+<p class="text-gray-300 leading-relaxed">This playbook is built for the class of incident where the database itself has clear, queryable state to reason about — locks, long queries, connection saturation. It's much weaker for incidents where the cause is outside the database entirely (a bad deploy in a service three hops away, a network partition, a downstream API degrading), because the snapshot won't contain the signal. Know which kind of incident you're in before trusting the triage speed this playbook promises — a fast wrong hypothesis costs more time than a slower correct one.</p>
+
+<p class="text-gray-300 leading-relaxed">I keep the full snapshot script, prompt templates for six common incident categories, and the decision tree for when to escalate past AI-assisted triage in <a href="../book2/index.html" class="text-blue-400 hover:text-blue-300 transition">The AI-Powered DBA</a>, free to read online.</p>
+
+    </div>
+    <div class="mt-14 bg-blue-950/40 border border-blue-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">DB Hub — All-in-One DBA Command Center</p>
+        <p class="text-xs text-gray-400">Health monitor · Query optimizer · Schema docs · AI assistant (BYOK) · Self-hosted, no cloud</p>
+      </div>
+      <a href="../products.html"
+         class="shrink-0 px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded-xl text-sm transition">
+        Explore DB Hub
+      </a>
+    </div>
+    <div class="mt-8"><a href="index.html" class="text-xs text-gray-500 hover:text-gray-300 transition">← Back to all articles</a></div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli</div>
+  </footer>
+</body>
+</html>

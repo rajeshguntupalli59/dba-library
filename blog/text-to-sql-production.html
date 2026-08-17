@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Text-to-SQL in production: what actually works in 2026 — Rajesh Guntupalli</title>
+  <meta name="description" content="An honest assessment of text-to-SQL reliability in production — where it works well, where it silently fails, and the guardrails that make it safe to ship." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-blue-500 to-blue-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-blue-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"    class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"     class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Book</a>
+        <a href="index.html"       class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Blog</a>
+        <a href="../about.html"    class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
+           class="ml-2 px-4 py-1.5 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded-lg transition">Get Free Tools</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="flex gap-2 mb-5"><span class="px-2 py-0.5 bg-blue-900/40 border border-blue-800/40 text-blue-300 text-xs rounded-full">AI + Databases</span><span class="px-2 py-0.5 bg-blue-900/40 border border-blue-800/40 text-blue-300 text-xs rounded-full">DBA</span></div>
+    <h1 class="text-4xl font-extrabold mb-4 leading-tight">Text-to-SQL in production: what actually works in 2026</h1>
+    <div class="flex items-center gap-3 text-xs text-gray-500 mb-10 pb-8 border-b border-gray-800/60">
+      <span>Rajesh Guntupalli</span><span>·</span><span>August 2026</span><span>·</span><span>5 min read</span>
+    </div>
+    <div class="space-y-4 text-sm">
+
+<p class="text-gray-300 leading-relaxed">"Let the business team ask the database questions in plain English" has been the demo everyone builds and almost nobody ships correctly. I've now put text-to-SQL in front of real users at two companies, and the gap between the demo and the production system is entirely about what happens when the model is wrong — not how often it's right.</p>
+
+<p class="text-gray-300 leading-relaxed">Model quality stopped being the bottleneck a while ago. Claude and GPT-class models write syntactically correct, schema-aware SQL from natural language with genuinely impressive accuracy against a well-documented schema. The problem is that "impressive accuracy" still means wrong often enough that an unguarded system will eventually tell someone the wrong revenue number with complete confidence, and that one incident costs you more trust than a hundred correct answers earned.</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Where it works well</h2>
+
+<p class="text-gray-300 leading-relaxed">Ad hoc exploration against a well-modeled, well-documented schema is the sweet spot. If your table and column names are self-explanatory, foreign keys are declared (not just implied), and you feed the model a current schema description rather than trusting its memory of your codebase from a training cutoff, you get genuinely useful queries for the kind of question that used to mean pinging a data analyst and waiting a day.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- "How many orders over $500 did we get last week, by state?"
+SELECT s.state, COUNT(*) AS order_count, SUM(o.total) AS revenue
+FROM orders o
+JOIN shipping_addresses s ON s.order_id = o.id
+WHERE o.total > 500
+  AND o.created_at >= NOW() - INTERVAL '7 days'
+GROUP BY s.state
+ORDER BY revenue DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">That query is correct, idiomatic, and exactly what a competent analyst would write. Feeding the model your actual <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">information_schema</code> output, real column comments, and a handful of example query/answer pairs for your specific schema's quirks (which column actually holds "active" status, which of your three <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">created_at</code>-looking columns is the one that matters) makes a bigger accuracy difference than switching models.</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Where it quietly fails</h2>
+
+<p class="text-gray-300 leading-relaxed">The failures that matter aren't syntax errors — those are obvious and get caught immediately. The dangerous ones are queries that run successfully and return a plausible, wrong number. Ambiguous business logic is the biggest source: "active customers" might mean <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">status = 'active'</code>, or it might mean "placed an order in the last 90 days," and the model will confidently pick one without flagging the ambiguity unless you've told it the definition explicitly.</p>
+
+<p class="text-gray-300 leading-relaxed">Joins across tables with similar-looking columns are the second big source. A schema with both <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">orders.customer_id</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">orders.billed_customer_id</code> (one for the account, one for who actually paid, because of a gift-purchase edge case someone added two years ago) is exactly the kind of tribal knowledge a model has no way to know unless it's documented somewhere the model can read.</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">The guardrails that make it shippable</h2>
+
+<p class="text-gray-300 leading-relaxed">Run generated SQL through a read-only role with a strict statement timeout and row cap, the same way I'd configure any AI agent's database access — never let generated SQL touch a write path. Beyond that, three things separated the systems that stayed trustworthy from the ones that quietly eroded user confidence:</p>
+
+<p class="text-gray-300 leading-relaxed">First, show the generated SQL, always, not just the result. Users who can see <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WHERE status = 'active'</code> and know that's not what they meant will say so. Users who only see a number have no way to catch the error, and neither do you until someone makes a decision based on it.</p>
+
+<p class="text-gray-300 leading-relaxed">Second, maintain a small library of verified query patterns for your genuinely ambiguous business terms, and inject the relevant ones into context based on keyword matching before generation. This is unglamorous and it's the single highest-leverage thing I've done to cut wrong-answer rate — it turns "the model guessed" into "the model looked up the answer your team already agreed on."</p>
+
+<p class="text-gray-300 leading-relaxed">Third, log every generated query alongside the natural-language question that produced it. Review that log weekly, early on. The patterns of what confuses the model are specific to your schema and your users' phrasing, and you'll find them faster by reading real queries than by theorizing.</p>
+
+<p class="text-gray-300 leading-relaxed">Text-to-SQL earned its place in my toolkit this year — not as a replacement for a data team, but as a genuinely good first draft that a human glances at instead of writing from scratch. Ship it that way — visible SQL, bounded permissions, documented ambiguity — and it holds up. Ship it as a black box that just answers questions, and it will eventually answer one wrong at the worst possible moment.</p>
+
+<p class="text-gray-300 leading-relaxed">I walk through a complete text-to-SQL implementation, including the schema-context injection pattern above, in <a href="../book2/index.html" class="text-blue-400 hover:text-blue-300 transition">The AI-Powered DBA</a>, free to read online.</p>
+
+    </div>
+    <div class="mt-14 bg-blue-950/40 border border-blue-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">DB Documenter — Self-Hosted Schema Docs</p>
+        <p class="text-xs text-gray-400">Auto-generated, always-current schema documentation — exactly the context a text-to-SQL system needs</p>
+      </div>
+      <a href="../products.html"
+         class="shrink-0 px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded-xl text-sm transition">
+        Explore DB Documenter
+      </a>
+    </div>
+    <div class="mt-8"><a href="index.html" class="text-xs text-gray-500 hover:text-gray-300 transition">← Back to all articles</a></div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli</div>
+  </footer>
+</body>
+</html>

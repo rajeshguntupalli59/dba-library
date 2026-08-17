@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>How AI-assisted index advisors actually decide what to recommend — Rajesh Guntupalli</title>
+  <meta name="description" content="Inside the decision process of an AI-assisted index advisor — what signals it weighs, where it gets it wrong, and why a human should still approve every DDL change." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-blue-500 to-blue-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-blue-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"    class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"     class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Book</a>
+        <a href="index.html"       class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Blog</a>
+        <a href="../about.html"    class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
+           class="ml-2 px-4 py-1.5 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded-lg transition">Get Free Tools</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="flex gap-2 mb-5"><span class="px-2 py-0.5 bg-blue-900/40 border border-blue-800/40 text-blue-300 text-xs rounded-full">AI + Databases</span><span class="px-2 py-0.5 bg-blue-900/40 border border-blue-800/40 text-blue-300 text-xs rounded-full">Performance</span></div>
+    <h1 class="text-4xl font-extrabold mb-4 leading-tight">How AI-assisted index advisors actually decide what to recommend</h1>
+    <div class="flex items-center gap-3 text-xs text-gray-500 mb-10 pb-8 border-b border-gray-800/60">
+      <span>Rajesh Guntupalli</span><span>·</span><span>August 2026</span><span>·</span><span>5 min read</span>
+    </div>
+    <div class="space-y-4 text-sm">
+
+<p class="text-gray-300 leading-relaxed">I built the index advisor in QueryOptimizer to give a recommendation and a reason, not just a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE INDEX</code> statement to copy-paste. That distinction turned out to matter more than I expected, because the moment DBAs started asking the tool "why," I had to be honest with myself about what the underlying model was actually weighing — and where that reasoning breaks down.</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">The signals that actually drive a good recommendation</h2>
+
+<p class="text-gray-300 leading-relaxed">Selectivity and access pattern do most of the work, and neither requires AI — they're the same signals a skilled human DBA reads from an execution plan. What AI genuinely adds is correlating those signals across a query workload instead of one query at a time. Feed a model a week of <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> output, and it can spot that fourteen different queries all filter on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">(tenant_id, status, created_at)</code> in slightly different orders — a pattern a human reviewing queries one at a time is unlikely to notice, but that points clearly at one well-chosen composite index instead of four narrow ones.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Workload signal: 14 queries share this filter shape
+SELECT * FROM invoices
+WHERE tenant_id = $1 AND status = 'pending' AND created_at > $2;
+
+SELECT COUNT(*) FROM invoices
+WHERE tenant_id = $1 AND created_at > $2 AND status != 'void';
+
+-- Recommendation: one composite index serves both access patterns
+CREATE INDEX idx_invoices_tenant_status_created
+  ON invoices (tenant_id, status, created_at);</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Write amplification is the second real signal, and it's the one naive advisors skip. Every index speeds up the reads it serves and slows down every write to that table. A workload-aware advisor needs write frequency and write latency budget as inputs, not just query frequency — otherwise you get "correct" recommendations that quietly regress your busiest write path.</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Where the reasoning breaks down</h2>
+
+<p class="text-gray-300 leading-relaxed">The advisor has no idea what your deployment actually looks like unless you tell it. It doesn't know your table gets a nightly bulk load that would make index maintenance during that window expensive, that you're two weeks from a migration that drops the column it wants to index, or that your team has an unwritten rule against indexes over three columns because of a past incident. This is the same gap I hit with text-to-SQL and with MCP-connected agents generally — the model is reasoning from what's in front of it, and a huge amount of what actually matters for a production decision isn't in front of it unless someone puts it there.</p>
+
+<p class="text-gray-300 leading-relaxed">The second failure mode is subtler: an advisor optimizing for the queries it can see will happily recommend an index that helps a slow reporting query at the cost of a hot-path write it either can't see clearly or doesn't weight heavily enough. I've caught recommendations that would have shaved 200ms off a once-a-day dashboard query while adding measurable write latency to a table taking thousands of inserts per second. The math wasn't wrong given the inputs — the inputs were incomplete.</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">The workflow that actually works</h2>
+
+<p class="text-gray-300 leading-relaxed">Treat every recommendation as a hypothesis, not a directive. The advisor's real job is compressing the time to a good hypothesis — same as AI-assisted query tuning generally — not replacing the validation step. Before I apply anything, I check three things it can't fully see on its own: current write volume on the target table, whether an existing index already covers most of the same ground (index consolidation opportunities get missed more often than you'd think), and whether the workload sample it reasoned from is actually representative or just captured a quiet Tuesday.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Before applying: check write volume on the target table
+SELECT relname, n_tup_ins, n_tup_upd, n_tup_del
+FROM pg_stat_user_tables
+WHERE relname = 'invoices';
+
+-- And check for existing overlapping indexes
+SELECT indexname, indexdef
+FROM pg_indexes
+WHERE tablename = 'invoices';</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Autonomous index management — where the system applies its own recommendations without a human in the loop — is a real and growing capability, and I cover the guardrails that make it safe (staged rollout, automatic rollback on regression, blast-radius limits) separately, because it deserves more than a paragraph here. For now, the honest state of the art: AI-assisted index advice is genuinely good at surfacing the hypothesis. It is not yet good enough to skip the DBA who knows what the model can't see.</p>
+
+<p class="text-gray-300 leading-relaxed">I cover the full autonomous tuning pipeline — including staged rollout and automatic rollback design — in <a href="../book3/index.html" class="text-blue-400 hover:text-blue-300 transition">The ADE Handbook</a>, free to read online.</p>
+
+    </div>
+    <div class="mt-14 bg-blue-950/40 border border-blue-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">Index advisor · EXPLAIN visualizer · Slow query dashboard · PostgreSQL + SQL Server</p>
+      </div>
+      <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
+         class="shrink-0 px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded-xl text-sm transition">
+        Download Free
+      </a>
+    </div>
+    <div class="mt-8"><a href="index.html" class="text-xs text-gray-500 hover:text-gray-300 transition">← Back to all articles</a></div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli</div>
+  </footer>
+</body>
+</html>

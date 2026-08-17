@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Cutting your AI-inference database costs: connection pooling for LLM workloads — Rajesh Guntupalli</title>
+  <meta name="description" content="AI agents and RAG pipelines open database connections in patterns nothing else does. Here's why that quietly drives up your bill, and the pooling setup that fixes it." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-blue-500 to-blue-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-blue-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"    class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"     class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Book</a>
+        <a href="index.html"       class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Blog</a>
+        <a href="../about.html"    class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
+           class="ml-2 px-4 py-1.5 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded-lg transition">Get Free Tools</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="flex gap-2 mb-5"><span class="px-2 py-0.5 bg-blue-900/40 border border-blue-800/40 text-blue-300 text-xs rounded-full">AI + Databases</span><span class="px-2 py-0.5 bg-blue-900/40 border border-blue-800/40 text-blue-300 text-xs rounded-full">Cost Optimization</span></div>
+    <h1 class="text-4xl font-extrabold mb-4 leading-tight">Cutting your AI-inference database costs: connection pooling for LLM workloads</h1>
+    <div class="flex items-center gap-3 text-xs text-gray-500 mb-10 pb-8 border-b border-gray-800/60">
+      <span>Rajesh Guntupalli</span><span>·</span><span>August 2026</span><span>·</span><span>5 min read</span>
+    </div>
+    <div class="space-y-4 text-sm">
+
+<p class="text-gray-300 leading-relaxed">A client asked me to look at their RDS bill after it grew 3x in two months with no corresponding growth in user traffic. The culprit wasn't storage, wasn't compute — it was connection count, driven entirely by an AI agent framework that opened a fresh database connection per tool call and let the pool grow until they'd upsized the instance twice just to stop hitting <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_connections</code>. This is a pattern I now see constantly, and it's specific to how AI workloads talk to databases.</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Why AI workloads break normal connection assumptions</h2>
+
+<p class="text-gray-300 leading-relaxed">Traditional web application connection patterns are predictable: a request comes in, does a handful of queries, releases the connection, all within tens of milliseconds. Standard pool sizing assumes this shape. AI agent workloads violate it in two specific ways.</p>
+
+<p class="text-gray-300 leading-relaxed">First, a single agent "turn" often spans a model inference call — anywhere from 500ms to several seconds — sandwiched between two database queries, and a naive integration holds the connection open across that entire span, including the part where nothing is happening on the database side at all. Second, agent frameworks tend to spin up a new connection per tool invocation rather than reusing one across a session, because the tool-calling abstraction doesn't naturally carry connection state the way a request handler does.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- What this looks like in pg_stat_activity during an incident
+SELECT state, count(*),
+       round(avg(extract(epoch from (now() - state_change)))::numeric, 1) AS avg_idle_seconds
+FROM pg_stat_activity
+WHERE application_name = 'ai-agent-worker'
+GROUP BY state;
+
+--   state              | count | avg_idle_seconds
+-- idle                 |   340 |             4.2
+-- idle in transaction  |    28 |            11.7</code></pre>
+
+<p class="text-gray-300 leading-relaxed">340 idle connections, each one reserving memory on the database server whether or not it's doing anything, is what forces the instance upsize — not query volume, not data volume. The bill goes up because of connection *count*, and connection count went up because of an integration pattern nobody was watching.</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">The fix: pool at the transaction level, not the session level</h2>
+
+<p class="text-gray-300 leading-relaxed">PgBouncer in transaction pooling mode is the single highest-leverage change here. Instead of one database connection per agent session, you get a small pool of real connections shared across every agent worker, checked out only for the duration of an actual transaction — not held across the model inference call in between.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># pgbouncer.ini
+[databases]
+app_production = host=db.internal port=5432 dbname=app_production
+
+[pgbouncer]
+pool_mode = transaction
+max_client_conn = 2000
+default_pool_size = 25
+reserve_pool_size = 5
+server_idle_timeout = 30</code></pre>
+
+<p class="text-gray-300 leading-relaxed">2,000 agent workers can now share 25 real backend connections, because each one only holds a connection for the milliseconds it's actually running a query — not for the seconds it's waiting on the model. This is the same pattern serverless applications have used for years; AI agent frameworks just haven't caught up to it yet, so most teams are shipping the naive version by default.</p>
+
+<p class="text-gray-300 leading-relaxed">One real constraint: transaction pooling mode doesn't support session-level features like <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SET</code> statements that need to persist, prepared statements outside a single transaction, or advisory locks held across transactions. If your agent tooling relies on any of these, audit that before flipping the switch — it's a config change, but it's not a zero-risk one.</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Measure the actual saving, not the theoretical one</h2>
+
+<p class="text-gray-300 leading-relaxed">For the client above: instance size went from db.r6g.2xlarge back to db.r6g.xlarge once connection pressure stopped forcing the upsize — roughly 45% of the monthly RDS bill for that database, with no change to query patterns, data volume, or user-facing latency. The saving wasn't from making anything faster. It was from stopping the database from paying, in memory and instance size, for idle time that belonged to the model, not the database.</p>
+
+<p class="text-gray-300 leading-relaxed">Before and after any pooling change, watch <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_activity</code> connection counts by state over a full day, not a snapshot — idle-in-transaction spikes during specific agent workflows are common and easy to miss with a point-in-time check. The goal isn't zero idle connections; it's making sure the ones you're paying for are actually doing something close to what you're paying for.</p>
+
+<p class="text-gray-300 leading-relaxed">I cover connection architecture for AI workloads in more depth — including patterns for read replicas and multi-region agent deployments — in <a href="../book7/index.html" class="text-blue-400 hover:text-blue-300 transition">Database FinOps</a>, free to read online.</p>
+
+    </div>
+    <div class="mt-14 bg-blue-950/40 border border-blue-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">DB Hub — All-in-One DBA Command Center</p>
+        <p class="text-xs text-gray-400">Health monitor · Query optimizer · Schema docs · AI assistant (BYOK) · Self-hosted, no cloud</p>
+      </div>
+      <a href="../products.html"
+         class="shrink-0 px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded-xl text-sm transition">
+        Explore DB Hub
+      </a>
+    </div>
+    <div class="mt-8"><a href="index.html" class="text-xs text-gray-500 hover:text-gray-300 transition">← Back to all articles</a></div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli</div>
+  </footer>
+</body>
+</html>
