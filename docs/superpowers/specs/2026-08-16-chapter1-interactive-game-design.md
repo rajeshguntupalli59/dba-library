@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-16
 **Status:** Approved by user, pending spec review
-**Repo:** rajeshguntupalli59/https-rajeshguntupalli59.github.io
+**Repo:** rajeshguntupalli59/dba-library
 
 ## Goal
 
