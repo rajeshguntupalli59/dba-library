@@ -62,7 +62,7 @@
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Building Workload-Aware Maintenance Scheduling</h3>
 
-<p class="text-gray-300 leading-relaxed">The first place intelligent automation pays off for most shops is maintenance scheduling. Instead of running <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VACUUM ANALYZE</code> or index rebuilds on a fixed nightly schedule, you build a system that predicts when maintenance is needed and when the database has capacity to absorb it.</p>
+<p class="text-gray-300 leading-relaxed">The first place intelligent automation pays off for most shops is maintenance scheduling. Instead of running <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">index maintenance</code> or statistics updates on a fixed nightly schedule, you build a system that predicts when maintenance is needed and when the database has capacity to absorb it.</p>
 
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify indexes needing maintenance weighted by fragmentation and usage
@@ -213,7 +213,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class MaintenanceAction:
-    action_type: str        # 'vacuum', 'analyze', 'reindex', 'rebuild_stats'
+    action_type: str        # 'rebuild_index', 'reorganize_index', 'reindex', 'update_stats'
     target_schema: str
     target_table: str
     target_index: Optional[str]
@@ -231,7 +231,7 @@ Your job is to produce a prioritized maintenance plan as a JSON array.
 
 Each item must conform to this schema:
 {
-  "action_type": "vacuum|analyze|reindex|update_statistics",
+  "action_type": "rebuild_index|reorganize_index|reindex|update_statistics",
   "target_schema": "&lt;schema&gt;",
   "target_table": "&lt;table&gt;",
   "target_index": "&lt;index_name or null&gt;",
@@ -241,8 +241,8 @@ Each item must conform to this schema:
 }
 
 Rules:
-- REINDEX requires an ACCESS EXCLUSIVE lock. Never recommend it during business hours.
-- VACUUM ANALYZE can run concurrently. Prefer it for tables with high dead tuple ratios.
+- Blocking index REBUILDs require a lock. Never recommend them during business hours.
+- Index REORGANIZE is an online operation. Prefer it for fragmented indexes in narrow maintenance windows.
 - Sort by urgency but deprioritize locking operations if maintenance_window_minutes &lt; 30.
 - Return ONLY valid JSON. No prose outside the JSON array.
 """
@@ -701,7 +701,7 @@ ACTION_GATE_MAP = {
     'KILL_IDLE_TRANSACTIONS': ActionGate.AUTO_EXECUTE,
     'CANCEL_LONG_QUERIES': ActionGate.AUTO_EXECUTE,
     'CHECKPOINT_IMMEDIATE': ActionGate.AUTO_EXECUTE,
-    'VACUUM_TABLE': ActionGate.AUTO_EXECUTE,
+    'REORGANIZE_INDEX': ActionGate.AUTO_EXECUTE,
     'NO_ACTION': ActionGate.AUTO_EXECUTE,
     'REINDEX_TABLE': ActionGate.APPROVAL_REQUIRED,
     'ALTER_CONFIGURATION': ActionGate.APPROVAL_REQUIRED,
@@ -1038,7 +1038,7 @@ def record_remediation_outcome(
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Phase 2 — Auto-Execute Low-Risk Actions (Weeks 5–12)</strong></p>
 
-<p class="text-gray-300 leading-relaxed">Enable autonomous execution for the lowest-risk, fully reversible action categories: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">NO_ACTION</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CANCEL_LONG_QUERIES</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VACUUM_TABLE</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CHECKPOINT_IMMEDIATE</code>. Keep <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">KILL_IDLE_TRANSACTIONS</code> on approval-required until you've validated the idle threshold configuration against your workload. Monitor false positive rates and resolution rates weekly. Retrain anomaly detection models on the feedback data from phase 1.</p>
+<p class="text-gray-300 leading-relaxed">Enable autonomous execution for the lowest-risk, fully reversible action categories: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">NO_ACTION</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CANCEL_LONG_QUERIES</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">REORGANIZE_INDEX</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CHECKPOINT_IMMEDIATE</code>. Keep <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">KILL_IDLE_TRANSACTIONS</code> on approval-required until you've validated the idle threshold configuration against your workload. Monitor false positive rates and resolution rates weekly. Retrain anomaly detection models on the feedback data from phase 1.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Phase 3 — Expand Coverage and Tune (Months 4+)</strong></p>
 

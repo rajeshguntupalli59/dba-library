@@ -43,16 +43,16 @@
 
 <p class="text-gray-300 leading-relaxed">First, a single agent "turn" often spans a model inference call — anywhere from 500ms to several seconds — sandwiched between two database queries, and a naive integration holds the connection open across that entire span, including the part where nothing is happening on the database side at all. Second, agent frameworks tend to spin up a new connection per tool invocation rather than reusing one across a session, because the tool-calling abstraction doesn't naturally carry connection state the way a request handler does.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- What this looks like in pg_stat_activity during an incident
-SELECT state, count(*),
-       round(avg(extract(epoch from (now() - state_change)))::numeric, 1) AS avg_idle_seconds
-FROM pg_stat_activity
-WHERE application_name = 'ai-agent-worker'
-GROUP BY state;
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- What this looks like in sys.dm_exec_sessions during an incident
+SELECT status, COUNT(*) AS session_count,
+       CAST(AVG(DATEDIFF(SECOND, last_request_end_time, GETUTCDATE())) AS DECIMAL(10,1)) AS avg_idle_seconds
+FROM sys.dm_exec_sessions
+WHERE program_name = 'ai-agent-worker'
+GROUP BY status;
 
---   state              | count | avg_idle_seconds
--- idle                 |   340 |             4.2
--- idle in transaction  |    28 |            11.7</code></pre>
+--   status    | session_count | avg_idle_seconds
+-- sleeping    |         340 |             4.2
+-- running     |          28 |            11.7</code></pre>
 
 <p class="text-gray-300 leading-relaxed">340 idle connections, each one reserving memory on the database server whether or not it's doing anything, is what forces the instance upsize — not query volume, not data volume. The bill goes up because of connection *count*, and connection count went up because of an integration pattern nobody was watching.</p>
 
@@ -79,7 +79,7 @@ server_idle_timeout = 30</code></pre>
 
 <p class="text-gray-300 leading-relaxed">For the client above: instance size went from db.r6g.2xlarge back to db.r6g.xlarge once connection pressure stopped forcing the upsize — roughly 45% of the monthly RDS bill for that database, with no change to query patterns, data volume, or user-facing latency. The saving wasn't from making anything faster. It was from stopping the database from paying, in memory and instance size, for idle time that belonged to the model, not the database.</p>
 
-<p class="text-gray-300 leading-relaxed">Before and after any pooling change, watch <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_activity</code> connection counts by state over a full day, not a snapshot — idle-in-transaction spikes during specific agent workflows are common and easy to miss with a point-in-time check. The goal isn't zero idle connections; it's making sure the ones you're paying for are actually doing something close to what you're paying for.</p>
+<p class="text-gray-300 leading-relaxed">Before and after any pooling change, watch <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_sessions</code> connection counts by status over a full day, not a snapshot — idle-in-transaction spikes during specific agent workflows are common and easy to miss with a point-in-time check. The goal isn't zero idle connections; it's making sure the ones you're paying for are actually doing something close to what you're paying for.</p>
 
 <p class="text-gray-300 leading-relaxed">I cover connection architecture for AI workloads in more depth — including patterns for read replicas and multi-region agent deployments — in <a href="../book7/index.html" class="text-blue-400 hover:text-blue-300 transition">Database FinOps</a>, free to read online.</p>
 

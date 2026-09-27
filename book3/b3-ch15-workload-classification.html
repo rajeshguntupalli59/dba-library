@@ -112,7 +112,7 @@ ORDER BY SUM(qsrs.avg_duration * qsrs.count_executions) DESC;</code></pre>
 <p class="text-gray-300 leading-relaxed">| Feature | Formula | Interpretation |</p>
 <p class="text-gray-300 leading-relaxed">|---|---|---|</p>
 <p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">scan_dominance</code> | <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">seq_scan_rows / total_rows_examined</code> | High = analytical |</p>
-<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">write_amplification</code> | <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">wal_bytes / (rows_modified + 1)</code> | High = batch/ETL |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">write_amplification</code> | <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">log_bytes / (rows_modified + 1)</code> | High = batch/ETL |</p>
 <p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">result_compression</code> | <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">rows_returned / rows_examined</code> | Low = aggregation-heavy |</p>
 <p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">temporal_burst_coef</code> | <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">calls_p99 / calls_median</code> over 5-min windows | High = bursty OLTP |</p>
 <p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">plan_instability</code> | <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">distinct_plans / total_calls</code> | High = parameter sensitivity |</p>
@@ -137,7 +137,7 @@ class WorkloadFeatureVector:
     buffer_hit_ratio: float
     avg_physical_reads: float
     avg_temp_writes: float
-    avg_wal_bytes: float
+    avg_log_bytes: float
     calls_per_hour: float
     avg_parallelism: float
     # Derived features
@@ -163,7 +163,7 @@ def compute_derived_features(raw: dict, burst_history: list[float]) -&gt; dict:
     else:
         burst_coef = 1.0
 
-    write_amplification = raw['avg_wal_bytes'] / max(raw['avg_rows_returned'], 1)
+    write_amplification = raw['avg_log_bytes'] / max(raw['avg_rows_returned'], 1)
 
     return {
         'result_compression': result_compression,
@@ -222,7 +222,7 @@ class FeatureCollector:
                 'avg_rows_returned': row.avg_rows or 0,
                 'buffer_hit_ratio': (row.avg_logical - (row.avg_physical or 0)) /
                                     max(row.avg_logical or 1, 1),
-                'avg_wal_bytes': row.avg_log or 0,
+                'avg_log_bytes': row.avg_log or 0,
             }, history)
             fv = WorkloadFeatureVector(
                 query_id=row.query_id,
@@ -234,7 +234,7 @@ class FeatureCollector:
                                   max(row.avg_logical or 1, 1),
                 avg_physical_reads=row.avg_physical or 0,
                 avg_temp_writes=row.avg_temp or 0,
-                avg_wal_bytes=row.avg_log or 0,
+                avg_log_bytes=row.avg_log or 0,
                 calls_per_hour=row.calls_per_hour or 0,
                 avg_parallelism=row.avg_dop or 1,
                 plan_instability=row.plan_instability or 0,
@@ -253,7 +253,7 @@ class FeatureCollector:
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">OLTP_MODERATE</strong>: Slightly wider queries — small range scans, multi-table joins, under 100ms. Action: standard SLA tier.</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">ANALYTICAL</strong>: Long-running, high-row-count aggregations, sequential scans, parallel execution. Action: route to read replica, assign lower CPU priority, allow longer lock waits.</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">BATCH_ETL</strong>: High write amplification, sequential access, predictable schedule, large tempdb usage. Action: schedule during maintenance window, pre-warm buffers, expand the index maintenance budget post-run.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">MAINTENANCE</strong>: VACUUM, ANALYZE, index builds, statistics updates, DBCC operations. Action: track separately, do not apply SLA enforcement, use as calibration signal.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">MAINTENANCE</strong>: index rebuilds and reorganizations, statistics updates, DBCC operations. Action: track separately, do not apply SLA enforcement, use as calibration signal.</li>
 
 <p class="text-gray-300 leading-relaxed">The classifier itself is a gradient-boosted tree model (XGBoost or LightGBM) trained on labeled historical data from Query Store. The labeling phase is the only place human judgment enters: a DBA manually labels 500–1000 representative query patterns once, and the model generalizes from there. Semi-supervised bootstrapping can extend coverage to new query patterns by treating high-confidence predictions as pseudo-labels for retraining.</p>
 
@@ -277,7 +277,7 @@ class WorkloadClass(str, Enum):
 FEATURE_COLUMNS = [
     'avg_exec_ms', 'exec_time_cv', 'avg_rows_returned',
     'buffer_hit_ratio', 'avg_physical_reads', 'avg_temp_writes',
-    'avg_wal_bytes', 'calls_per_hour', 'avg_parallelism',
+    'avg_log_bytes', 'calls_per_hour', 'avg_parallelism',
     'result_compression', 'temporal_burst_coef',
     'plan_instability', 'write_amplification'
 ]
@@ -961,7 +961,7 @@ LEFT JOIN dbo.classification_explanations ce_new
     <div class="mt-14 bg-emerald-950/40 border border-emerald-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">DB Hub — Self-Hosted Database Platform</p>
-        <p class="text-xs text-gray-400">8 modules · Schema browser · AI assistant · Query optimizer · PostgreSQL, SQL Server, MySQL</p>
+        <p class="text-xs text-gray-400">9 modules · Schema browser · AI assistant · Query optimizer · SQL Server</p>
       </div>
       <a href="../products.html"
          class="shrink-0 px-6 py-3 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-xl text-sm transition">

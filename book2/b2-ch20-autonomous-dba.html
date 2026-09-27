@@ -54,7 +54,7 @@
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">First: a unified perception layer.</strong> An autonomous system cannot act on information it cannot see. Metrics from Prometheus, query telemetry from Query Store, log streams from SQL Server, schema change history from DDL audit tables, cost data from your cloud provider—all of this must flow into a single, queryable state representation. Historically, DBAs did this synthesis in their heads. An autonomous system needs it externalized into data structures an LLM or ML pipeline can consume.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Second: a reasoning engine that connects perception to action.</strong> Raw metrics do not suggest actions. The jump from "replication lag is 4,200 seconds and rising" to "the subscriber is falling behind because a bulk delete on the publisher is generating excessive WAL volume; the remediation is to batch the delete and throttle it" requires reasoning across multiple signals. This is exactly the kind of multi-step inference that large language models handle well when given the right context.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Second: a reasoning engine that connects perception to action.</strong> Raw metrics do not suggest actions. The jump from "replication lag is 4,200 seconds and rising" to "the subscriber is falling behind because a bulk delete on the publisher is generating excessive transaction log volume; the remediation is to batch the delete and throttle it" requires reasoning across multiple signals. This is exactly the kind of multi-step inference that large language models handle well when given the right context.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Third: a closed-loop execution framework.</strong> The system must be able to act, not just recommend. That means it needs APIs or command interfaces into your databases, guardrails that prevent catastrophic actions, an audit trail of every decision, and a feedback mechanism that tells it whether the action worked.</p>
 
@@ -83,7 +83,7 @@ DBA_TOOLS = [
     },
     {
         "name": "analyze_query_plan",
-        "description": "Run EXPLAIN ANALYZE on a query and return the plan",
+        "description": "Return the actual execution plan for a query with runtime statistics",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -193,7 +193,7 @@ def run_agent_loop(system_prompt: str, initial_observation: str) -&gt; dict:
 
 <p class="text-gray-300 leading-relaxed">An autonomous agent is only as intelligent as the state representation it operates on. A sparse or stale view of database health leads to confident but wrong decisions. The perception layer must be designed with the same care as any production data pipeline.</p>
 
-<p class="text-gray-300 leading-relaxed">The state object that gets injected into every agent invocation should be a structured snapshot covering five domains: performance (current query latency percentiles, wait event distribution, cache hit ratios), resource utilization (CPU, memory, disk I/O, connection pool saturation), replication health (lag in bytes and seconds per replica), schema inventory (table sizes, index bloat estimates, last vacuum/analyze timestamps), and recent anomalies (any ML-flagged deviations from baseline in the preceding 30 minutes).</p>
+<p class="text-gray-300 leading-relaxed">The state object that gets injected into every agent invocation should be a structured snapshot covering five domains: performance (current query latency percentiles, wait event distribution, cache hit ratios), resource utilization (CPU, memory, disk I/O, connection pool saturation), replication health (lag in bytes and seconds per replica), schema inventory (table sizes, index fragmentation estimates, last statistics-update timestamps), and recent anomalies (any ML-flagged deviations from baseline in the preceding 30 minutes).</p>
 
 <p class="text-gray-300 leading-relaxed">Building this snapshot requires pulling from several sources simultaneously. Here is the state collector for SQL Server, which runs on a 60-second interval and writes to a Redis key the agent reads before each reasoning cycle:</p>
 
@@ -299,9 +299,9 @@ FOR JSON PATH, WITHOUT_ARRAY_WRAPPER;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">*The risk-tiered dispatch loop: the LLM only ever proposes an action — whether it runs immediately, waits for a human, or never runs at all is decided by code in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dispatch_tool</code>, not by the model's own judgment.*</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Tier 1 — Autonomous execution.</strong> The agent acts immediately and logs the action. These are operations with bounded blast radius, easy reversibility, and well-understood side effects. Examples: creating an index <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CONCURRENTLY</code>, updating a statistics target, calling <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_cancel_backend()</code> (cancel, not terminate) on a query that has been running more than a configurable threshold, running <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ANALYZE</code> on a table with stale statistics, adjusting <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">work_mem</code> for a specific session.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Tier 1 — Autonomous execution.</strong> The agent acts immediately and logs the action. These are operations with bounded blast radius, easy reversibility, and well-understood side effects. Examples: creating an index <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WITH (ONLINE = ON)</code>, updating a statistics target, calling <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">KILL</code> on a session whose query has been running more than a configurable threshold, running <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ANALYZE</code> on a table with stale statistics, adjusting <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">work_mem</code> for a specific session.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Tier 2 — Propose and await approval.</strong> The agent writes a structured proposal to a Slack channel or ticketing system, including its reasoning and the exact command it would run. A human approves or rejects within a configurable window (typically 15 minutes). If no response arrives, the agent escalates to the on-call escalation path. Examples: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VACUUM FULL</code> on a bloated table during a low-traffic window, adding a column with a default value (lock implications), killing a session with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_terminate_backend()</code>, changing a GUC parameter that requires reload, enabling query parallelism for a specific user.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Tier 2 — Propose and await approval.</strong> The agent writes a structured proposal to a Slack channel or ticketing system, including its reasoning and the exact command it would run. A human approves or rejects within a configurable window (typically 15 minutes). If no response arrives, the agent escalates to the on-call escalation path. Examples: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">a blocking index REBUILD</code> on a fragmented table during a low-traffic window, adding a column with a default value (lock implications), killing a session with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">KILL</code>, changing a server configuration that requires a reconfigure, enabling query parallelism for a specific workload.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Tier 3 — Human only.</strong> The agent documents the situation and its recommended action but does not execute under any circumstances. Examples: dropping tables or indexes, altering primary key constraints, changing replication topology, promoting a standby, modifying authentication configuration, anything involving <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DROP DATABASE</code>.</p>
 
@@ -342,13 +342,13 @@ TOOL_RISK_MAP = {
     "get_slow_queries": RiskTier.AUTONOMOUS,
     "analyze_query_plan": RiskTier.AUTONOMOUS,
     "run_analyze": RiskTier.AUTONOMOUS,
-    "cancel_query": RiskTier.AUTONOMOUS,         # pg_cancel_backend
-    "create_index_concurrent": RiskTier.AUTONOMOUS,
+    "cancel_query": RiskTier.AUTONOMOUS,         # KILL &lt;spid&gt;
+    "create_index_online": RiskTier.AUTONOMOUS,
     "update_stats_target": RiskTier.AUTONOMOUS,
     "create_index_blocking": RiskTier.REQUIRES_APPROVAL,
-    "terminate_session": RiskTier.REQUIRES_APPROVAL,  # pg_terminate_backend
-    "vacuum_full": RiskTier.REQUIRES_APPROVAL,
-    "alter_guc_reload": RiskTier.REQUIRES_APPROVAL,
+    "terminate_session": RiskTier.REQUIRES_APPROVAL,  # KILL &lt;spid&gt;
+    "rebuild_index_blocking": RiskTier.REQUIRES_APPROVAL,
+    "alter_config_reload": RiskTier.REQUIRES_APPROVAL,
     "drop_index": RiskTier.HUMAN_ONLY,
     "drop_table": RiskTier.HUMAN_ONLY,
     "alter_primary_key": RiskTier.HUMAN_ONLY,
@@ -810,7 +810,7 @@ if tier == RiskTier.AUTONOMOUS:
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Novel failure modes.</strong> The agent's knowledge of failure patterns is bounded by its training data and the institutional knowledge encoded in its system prompt. A corruption scenario involving an obscure third-party component, a previously unseen SQL Server bug, or a failure mode introduced by a new cloud storage layer is likely to produce confident but incorrect reasoning. When the agent encounters a situation it explicitly flags as outside its experience—which a well-designed system prompt will instruct it to do—that flag should be taken seriously and a human should take ownership.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Risk-significant timing decisions.</strong> Deciding to run a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VACUUM FULL</code> is not just a technical decision; it is also a business decision about which workload to trade against the maintenance window. The agent can reason about database load; it has no visibility into a product launch happening tomorrow or a board presentation that makes this afternoon the worst possible time for any disruption. Tier 2 approval exists partly to give a human the chance to apply this kind of context.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Risk-significant timing decisions.</strong> Deciding to run a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">blocking index REBUILD</code> is not just a technical decision; it is also a business decision about which workload to trade against the maintenance window. The agent can reason about database load; it has no visibility into a product launch happening tomorrow or a board presentation that makes this afternoon the worst possible time for any disruption. Tier 2 approval exists partly to give a human the chance to apply this kind of context.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Regulatory and compliance boundaries.</strong> In environments subject to SOX, HIPAA, PCI-DSS, or similar frameworks, certain database actions carry audit and compliance implications that extend well beyond their technical effects. Schema changes that affect data retention, access control modifications, and changes to encryption configuration should route to compliance-aware reviewers, not just on-call DBAs.</p>
 
