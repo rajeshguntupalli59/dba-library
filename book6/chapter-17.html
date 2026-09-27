@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 17: Incremental Indexing and Model Migration — AI-Native Apps on SQL Server</title>
+<meta name="description" content="Hash-based change detection, zero-downtime embedding model upgrades, and dual-index cutover.">
+<script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-200">
+  <div class="max-w-3xl mx-auto px-6 py-10">
+    <p class="text-blue-400 text-sm font-semibold tracking-wide uppercase mb-2">AI-Native Apps on SQL Server</p>
+    <p class="text-gray-500 text-sm mb-1">Chapter 17 of 40</p>
+    <h1 class="text-3xl font-bold text-white mb-8">Incremental Indexing and Model Migration</h1>
+    <article class="space-y-5">
+<p class="text-gray-300 leading-relaxed">A knowledge base is not a snapshot — documents change, get corrected, expire, and are replaced. The naive approach (re-ingest everything nightly) wastes embedding API budget, churns the vector index, and creates windows where the corpus is half-old and half-new. This chapter builds incremental indexing: detecting what changed, updating only the affected chunks, handling document versioning and deletion, and migrating embedding models without downtime. The goal is a corpus that is always current, with update costs proportional to the change — not to the corpus size.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">17.1 Change Detection: Hash Before You Embed</h3>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">content_hash</code> persisted computed column (§1.2) is the change detector. The sync job compares source documents against stored hashes and classifies each document:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>New:</strong> hash not present → full ingestion.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Unchanged:</strong> hash matches → skip entirely. This is the common case and the source of all savings.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Modified:</strong> same document ID, different hash → versioned update (§17.2).</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Deleted:</strong> document gone from source → tombstone (§17.3).</li>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Sync classification in one set-based pass.
+-- @source is a TVP of (external_id, content_hash, title, ...)
+CREATE OR ALTER PROCEDURE dbo.usp_classify_source_changes
+    @tenant_id UNIQUEIDENTIFIER,
+    @source dbo.SourceDocumentList READONLY
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SELECT s.external_id,
+           CASE
+               WHEN d.document_id IS NULL THEN N'new'
+               WHEN d.content_hash &lt;&gt; s.content_hash THEN N'modified'
+               ELSE N'unchanged'
+           END AS action,
+           d.document_id
+    FROM @source AS s
+    LEFT JOIN dbo.documents AS d
+      ON d.tenant_id = @tenant_id AND d.external_id = s.external_id;
+
+    -- Deleted: in our corpus but absent from the source feed
+    SELECT d.document_id, d.title
+    FROM dbo.documents AS d
+    WHERE d.tenant_id = @tenant_id AND d.is_active = 1
+      AND NOT EXISTS (SELECT 1 FROM @source AS s
+                      WHERE s.external_id = d.external_id);
+END;
+GO</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">external_id</code> column (source system's document key) is what makes this work across sync runs — add it if you have not already. Hash comparison happens in SQL, so the sync job only downloads content for new and modified documents.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">17.2 Versioned Updates: Replace Without Gaps</h3>
+
+<p class="text-gray-300 leading-relaxed">A modified document must never leave the corpus in a half-updated state. The versioned update pattern:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Insert the new version as a new document row</strong> (new <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">document_id</code>, same <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">external_id</code>, incremented <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">version</code>), with its chunks fully embedded and stored.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Flip active flags in one transaction:</strong> new version <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">is_active = 1</code>, old version <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">is_active = 0</code>. Retrieval filters <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">is_active = 1</code>, so the cutover is atomic — no query ever sees a mix.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Retain old versions</strong> per policy (audit, "what did the policy say in March?"). Archive or purge on schedule.</li>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>ALTER TABLE dbo.documents
+    ADD external_id NVARCHAR(500) NULL,
+        version     INT NOT NULL DEFAULT 1;
+GO
+
+-- Atomic cutover: new version goes live, old version retires, one transaction
+CREATE OR ALTER PROCEDURE dbo.usp_publish_document_version
+    @new_document_id UNIQUEIDENTIFIER
+AS
+BEGIN
+    SET NOCOUNT ON;
+    BEGIN TRAN;
+    DECLARE @ext NVARCHAR(500), @tenant UNIQUEIDENTIFIER;
+    SELECT @ext = external_id, @tenant = tenant_id
+    FROM dbo.documents WHERE document_id = @new_document_id;
+
+    UPDATE dbo.documents
+    SET is_active = 0, updated_at = SYSUTCDATETIME()
+    WHERE tenant_id = @tenant AND external_id = @ext
+      AND document_id &lt;&gt; @new_document_id AND is_active = 1;
+
+    UPDATE dbo.documents
+    SET is_active = 1
+    WHERE document_id = @new_document_id;
+    COMMIT;
+END;
+GO</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">17.3 Deletions and Tombstones</h3>
+
+<p class="text-gray-300 leading-relaxed">Deleting a document means deleting its chunks, its embeddings, its full-text entries, and its cached answers — across tables that the foreign keys only partly cover. The tombstone pattern makes deletion safe and auditable:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Mark deleted first</strong> (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">is_active = 0</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">deleted_at</code> timestamp). Retrieval stops returning it immediately.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Purge asynchronously</strong> after a grace period (7–30 days): delete chunks (cascades from the document FK), remove from the embedding cache, invalidate retrieval caches. The grace period allows un-deletion and gives downstream consumers time to react.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Keep the tombstone row</strong> (document with no chunks) as the audit record of what was deleted and when — required for compliance in regulated industries.</li>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">17.4 Embedding Model Migration Without Downtime</h3>
+
+<p class="text-gray-300 leading-relaxed">Upgrading the embedding model is the most disruptive corpus operation: every vector must be recomputed, and old and new vectors cannot be compared. The dual-write migration:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Phase 1 — backfill.</strong> Add a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">embedding_v2 VECTOR(1536)</code> column (or new dimension if the model changed). A background job re-embeds every chunk with the new model, throttled to stay within API rate limits. The old column keeps serving traffic.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Phase 2 — dual write.</strong> New ingestions write both <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">embedding</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">embedding_v2</code>. Build the new vector index on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">embedding_v2</code>.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Phase 3 — cutover.</strong> When backfill completes, flip the retrieval procedure to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">embedding_v2</code> behind a feature flag; compare quality metrics (Chapter 19) for a canary period.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Phase 4 — cleanup.</strong> Drop the old column and index, rename <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">embedding_v2 → embedding</code>, update <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">embedding_model</code>.</li>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Feature-flagged retrieval: one procedure, two vector columns
+CREATE OR ALTER PROCEDURE dbo.usp_hybrid_search_v2
+    @tenant_id UNIQUEIDENTIFIER, @query_text NVARCHAR(MAX),
+    @query_vector_json NVARCHAR(MAX), @match_count INT = 10,
+    @use_v2 BIT = 0   -- flag flipped per tenant during canary
+AS
+BEGIN
+    SET NOCOUNT ON;
+    IF @use_v2 = 1
+        SELECT TOP (@match_count) chunk_id, content,
+               VECTOR_DISTANCE('cosine', embedding_v2,
+                               CAST(@query_vector_json AS VECTOR(1536))) AS distance
+        FROM dbo.document_chunks
+        WHERE tenant_id = @tenant_id AND embedding_v2 IS NOT NULL
+        ORDER BY VECTOR_DISTANCE('cosine', embedding_v2,
+                                 CAST(@query_vector_json AS VECTOR(1536)));
+    ELSE
+        SELECT TOP (@match_count) chunk_id, content,
+               VECTOR_DISTANCE('cosine', embedding,
+                               CAST(@query_vector_json AS VECTOR(1536))) AS distance
+        FROM dbo.document_chunks
+        WHERE tenant_id = @tenant_id AND embedding IS NOT NULL
+        ORDER BY VECTOR_DISTANCE('cosine', embedding,
+                                 CAST(@query_vector_json AS VECTOR(1536)));
+END;
+GO</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">17.5 The Sync Scheduler</h3>
+
+<p class="text-gray-300 leading-relaxed">Tie it together with a scheduled sync job (SQL Agent or an external scheduler): classify changes (§17.1), enqueue new/modified documents to the ingest queue (§13.2), tombstone deletions, and report a summary. Run it on a cadence matched to source volatility — hourly for news-like corpora, daily for documentation, weekly for reference material. The classification query is set-based and cheap; the expensive work (embedding) only happens for genuinely changed documents.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">17.6 Rollback Plan for Failed Migrations</h3>
+
+<p class="text-gray-300 leading-relaxed">Every migration in §17.5 needs a tested rollback, because the failure you discover at 2 AM is always the one the plan didn't cover. The dual-column design (§17.3) makes rollback trivial: the cutover is a metadata update pointing reads at the new column, so rollback is the same update in reverse — one statement, seconds to execute. What makes rollback <em>safe</em> rather than merely fast is the preparation: keep the old column and its index for at least one full retention window after cutover (disk is cheap, re-embedding is not), snapshot the pre-migration recall metrics so you can prove the rollback restored quality, and rehearse the rollback on a staging copy before the production cutover. The rollback runbook fits on an index card: detect (recall drop &gt; 2 points or error spike), decide (on-call has unilateral authority — no committee at 2 AM), execute (one UPDATE to the routing metadata), verify (smoke queries + dashboard), then investigate at leisure. A migration without a rehearsed rollback is a hope, not a plan.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Hash before you embed:</strong> classify every source document as new/modified/unchanged/deleted with set-based hash comparison, and only pay embedding costs for genuine changes.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Version documents with atomic cutover</strong> — new version fully ingested first, then a single transaction flips is_active. Retrieval never sees a half-updated document.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Tombstone deletions with a grace period</strong> before async purge; keep the tombstone row as the compliance audit record.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Migrate embedding models with dual-write and a feature-flagged retrieval procedure:</strong> backfill → dual write → canary cutover → cleanup. Never mix vector spaces in one searchable set.</li>
+
+    </article>
+
+      <nav class="flex items-center justify-center gap-3 mt-12 mb-4 text-sm">
+        <a href="chapter-16.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">← Chapter 16</a>
+        <a href="index.html" class="px-4 py-2 rounded-lg bg-gray-800 text-gray-300 hover:bg-gray-700 transition">All Chapters</a>
+        <a href="chapter-18.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">Chapter 18 →</a>
+      </nav>
+<div class="bg-gradient-to-r from-blue-900/40 to-indigo-900/40 border border-blue-800/50 rounded-2xl p-6 mt-10">
+        <p class="text-gray-300 text-sm leading-relaxed"><strong class="text-white">Keep going.</strong> You're reading <em class="text-blue-300">AI-Native Apps on SQL Server</em> — one of seven free deep-dives in the DBA Library, covering SQL Server performance tuning, high availability, security, automation, and more. <a href="../index.html" class="text-blue-400 hover:text-blue-300 underline">Browse the full library →</a></p>
+      </div>
+    <footer class="text-center text-gray-600 text-xs mt-10 pb-6">DBA Library · AI-Native Apps on SQL Server · Free for the SQL Server community</footer>
+  </div>
+</body>
+</html>

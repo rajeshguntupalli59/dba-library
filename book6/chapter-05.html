@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 5: Connection Pooling for AI Apps: SqlClient Pooling at Scale — AI-Native Apps on SQL Server</title>
+<meta name="description" content="SqlClient/ADO.NET pooling tuned for chat bursts, streaming, and agent concurrency.">
+<script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-200">
+  <div class="max-w-3xl mx-auto px-6 py-10">
+    <p class="text-blue-400 text-sm font-semibold tracking-wide uppercase mb-2">AI-Native Apps on SQL Server</p>
+    <p class="text-gray-500 text-sm mb-1">Chapter 5 of 40</p>
+    <h1 class="text-3xl font-bold text-white mb-8">Connection Pooling for AI Apps: SqlClient Pooling at Scale</h1>
+    <article class="space-y-5">
+<p class="text-gray-300 leading-relaxed">AI applications are brutal on database connections. A single chat request can open a connection for the quota check, hold it through a 2-second LLM call if you are careless, then need another for persistence — multiply by thousands of concurrent users and the database drowns in connection setup, login storms, and worker-thread exhaustion. This chapter covers how SqlClient (ADO.NET) connection pooling actually works, how to size pools for AI workloads, the session-context pattern that makes pooling safe with row-level security, and the failure modes you will hit at scale. The goal: thousands of concurrent AI users on a few hundred physical connections, with p99 connection-acquisition latency under 5 milliseconds.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">5.1 Why AI Workloads Break Naive Connection Handling</h3>
+
+<p class="text-gray-300 leading-relaxed">Three properties of AI traffic conspire against the database:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Long request lifetimes.</strong> A chat request lives for seconds (LLM call), not milliseconds. Holding a connection across the LLM call serializes your entire pool behind model latency — the single most common AI-app outage pattern.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Bursty fan-out.</strong> One user message can trigger quota check, embedding lookup, hybrid retrieval, history load, persistence, and audit writes. Naive code opens a connection per step.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Spiky concurrency.</strong> Product launches, batch ingestion jobs, and evaluation harnesses create connection storms that overwhelm login processing even when steady-state load is fine.</li>
+
+<p class="text-gray-300 leading-relaxed">The fix has two parts: never hold a connection across an LLM or embedding API call (check out, query, return), and let the client-side pool multiplex many logical sessions onto few physical connections. SqlClient pooling does the second part automatically — if you configure it correctly.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">5.2 How SqlClient Pooling Works</h3>
+
+<p class="text-gray-300 leading-relaxed">SqlClient maintains one pool per unique connection string (plus process identity). Opening a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SqlConnection</code> checks out an idle physical connection from the pool; closing or disposing returns it. A fresh physical connection costs a TCP handshake, TLS negotiation, and a login sequence — typically 20–100 ms. A pool checkout costs microseconds.</p>
+
+<p class="text-gray-300 leading-relaxed">The pool is governed by connection-string keywords:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Max Pool Size (default 100).</strong> The ceiling on physical connections per pool. When exhausted, checkout requests queue until <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Connect Timeout</code> expires — then you get the infamous "timeout expired waiting for a connection" error.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Min Pool Size (default 0).</strong> Connections kept warm even when idle. Set to your steady-state floor (e.g., 10–20) to avoid cold-start login storms after deploys.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Connection Lifetime / Load Balance Timeout.</strong> Maximum age of a pooled connection. Set it below your load balancer's idle timeout so the pool recycles connections before the infrastructure kills them.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Connect Timeout (default 15s).</strong> How long a checkout waits for a free connection. For AI apps, fail fast: 5 seconds surfaces pool exhaustion as an actionable error instead of a cascading hang.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>MultipleActiveResultSets (MARS).</strong> Lets one connection interleave multiple active readers. Useful, but each MARS session still consumes server resources — prefer separate pooled checkouts for genuinely concurrent work.</li>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>// Production connection string for an AI API tier (.NET / SqlClient)
+var builder = new SqlConnectionStringBuilder
+{
+    DataSource = "sqlprod.database.windows.net",
+    InitialCatalog = "aiapp",
+    UserID = "aiapp_svc",
+    Password = Environment.GetEnvironmentVariable("DB_PASSWORD"),
+    Encrypt = true,
+    TrustServerCertificate = false,
+    MinPoolSize = 20,      // warm floor: no cold-start storm after deploy
+    MaxPoolSize = 200,     // ceiling sized to SQL Server worker threads
+    ConnectTimeout = 5,    // fail fast on pool exhaustion
+    ConnectRetryCount = 3, // ride out transient Azure blips
+    ConnectRetryInterval = 2,
+    ApplicationName = "aiapp-api",  // shows up in sys.dm_exec_sessions
+};
+string connectionString = builder.ConnectionString;
+
+// The correct lifetime pattern: open late, close early, NEVER across awaits
+// that call external APIs.
+await using (var conn = new SqlConnection(connectionString))
+{
+    await conn.OpenAsync();                       // pool checkout: microseconds
+    await using (var cmd = new SqlCommand("dbo.usp_hybrid_search", conn))
+    {
+        cmd.CommandType = CommandType.StoredProcedure;
+        cmd.Parameters.AddWithValue("@tenant_id", tenantId);
+        // ... parameters ...
+        await using var reader = await cmd.ExecuteReaderAsync();
+        // materialize results
+    }
+}   // Dispose returns the connection to the pool — even on exception</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The Python equivalent (pyodbc) relies on the ODBC Driver Manager pool, which is enabled by default: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Pooling=yes</code> in the connection string (or odbcinst.ini). The same discipline applies — context managers for lifetime, never hold across the LLM call.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">5.3 The Golden Rule: Release Before the Model Call</h3>
+
+<p class="text-gray-300 leading-relaxed">Restructure the Chapter 1 endpoint so the connection is held only during database phases:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># WRONG: connection held across a 2-second LLM call
+with db(tenant) as conn:          # checkout
+    quota_check(conn)
+    chunks = hybrid_search(conn)  # 50 ms of DB work...
+    answer = llm_call(chunks)      # ...then 2000 ms holding the connection idle
+    persist(conn, answer)          # connection idle 97% of its held time
+
+# RIGHT: three short checkouts, zero idle holding
+with db(tenant) as conn: quota_check(conn); history = load_history(conn)
+# connection returned to pool
+qvec = embed(query)                # no connection held
+chunks = None
+with db(tenant) as conn: chunks = hybrid_search(conn, qvec)
+# connection returned to pool
+answer = llm_call(chunks, history) # no connection held
+with db(tenant) as conn: persist_atomically(conn, answer)  # one transaction
+# connection returned to pool</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The math: if a request holds a connection for 2.5 seconds but only needs 150 ms of database time, correct checkout discipline multiplies your effective pool capacity by ~16x. This single refactor has fixed more AI-app database outages than any amount of pool-size tuning.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">5.4 Session Context and Pooling: Making RLS Safe</h3>
+
+<p class="text-gray-300 leading-relaxed">There is a subtle trap: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sp_set_session_context</code> stamps the tenant on the physical connection. When the connection returns to the pool and is reused for a different tenant, the stale stamp would leak data — except that <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sp_set_session_context</code> values are automatically reset when the connection is closed and returned to the pool (SqlClient issues <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sp_reset_connection</code> on checkout return, which clears session context). Still, defense in depth is warranted:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Always set the context immediately after checkout</strong>, before any query — the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db()</code> helper in Chapter 1 does this.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Never assume the context persists</strong> across checkouts; the pool makes no such guarantee.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Use read-only routing keys</strong> for replica checkouts (Chapter 35) so read and write pools do not share physical connections at all.</li>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Verify the reset behavior yourself: session context does not survive
+-- a pooled round-trip. This is what makes the pattern safe.
+-- Connection 1: EXEC sp_set_session_context 'tenant_id', 'aaa...';
+-- close → return to pool → checkout as Connection 2:
+SELECT SESSION_CONTEXT(N'tenant_id');  -- NULL: reset on return to pool</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">5.5 Sizing the Pool: Math, Not Superstition</h3>
+
+<p class="text-gray-300 leading-relaxed">Size from measured demand, not defaults. The formula:</p>
+
+<p class="text-gray-300 leading-relaxed"><code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">required_connections = peak_concurrent_requests × avg_db_hold_time_per_request / 1s × safety_factor(1.5)</code></p>
+
+<p class="text-gray-300 leading-relaxed">Worked example: 500 concurrent chat users, each request holds a connection for 3 checkouts × 50 ms = 150 ms total, safety factor 1.5 → 500 × 0.15 × 1.5 ≈ 113 connections. A <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Max Pool Size</code> of 200 leaves comfortable headroom. If the same requests held connections across the 2.5 s LLM call, you would need ~1,900 — which is why §5.3 comes before §5.5.</p>
+
+<p class="text-gray-300 leading-relaxed">Monitor these DMVs to validate sizing in production:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- How many sessions per application right now?
+SELECT s.program_name, s.host_name, COUNT(*) AS sessions,
+       SUM(CASE WHEN r.session_id IS NOT NULL THEN 1 ELSE 0 END) AS active_requests
+FROM sys.dm_exec_sessions AS s
+LEFT JOIN sys.dm_exec_requests AS r ON s.session_id = r.session_id
+WHERE s.is_user_process = 1
+GROUP BY s.program_name, s.host_name
+ORDER BY sessions DESC;
+
+-- Are checkouts queueing? Watch for THREADPOOL and connection waits.
+SELECT wait_type, waiting_tasks_count,
+       wait_time_ms / NULLIF(waiting_tasks_count, 0) AS avg_wait_ms
+FROM sys.dm_os_wait_stats
+WHERE wait_type IN ('THREADPOOL', 'LCK_M_X', 'ASYNC_NETWORK_IO')
+ORDER BY wait_time_ms DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">If <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ASYNC_NETWORK_IO</code> dominates, the application is not consuming result sets fast enough — usually a sign of holding readers open across processing. If <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">THREADPOOL</code> appears, the server is out of worker threads: reduce Max Pool Size or scale up, because more connections will only make it worse.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">5.6 Failure Modes at Scale</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Pool exhaustion.</strong> Symptom: "timeout expired" errors under load with low SQL Server CPU. Cause: connections held too long (see §5.3) or a leak (un-disposed connections). Diagnose with a counter on pool checkout latency; fix the hold time, not the pool size, first.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Login storms after deploy.</strong> All instances restart, Min Pool Size refills simultaneously, and the server spends its CPU on logins. Mitigate with staggered deploys and a modest Min Pool Size.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Azure SQL transient disconnects.</strong> Azure closes idle connections aggressively and fails over without warning. <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ConnectRetryCount</code> plus retry logic with exponential backoff on error numbers 40613, 40197, and 40501 handles the vast majority.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>One bad connection string, many pools.</strong> Pools are keyed by exact connection-string text. A password rotation that leaves two variants in flight, or per-tenant connection strings, fragments the pool into dozens of small pools that each hit their own Max Pool Size. Keep one canonical string per role (read/write).</li>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Never hold a pooled connection across an LLM or embedding API call.</strong> Check out, query, return — three short checkouts per chat turn instead of one 2.5-second hold. This multiplies effective pool capacity by an order of magnitude.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Size pools from measured hold time, not defaults.</strong> Peak concurrency × hold time × 1.5 safety factor; validate with sys.dm_exec_sessions and wait stats.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>sp_set_session_context is pool-safe</strong> because sp_reset_connection clears it on return — but always set it immediately after checkout as a matter of discipline.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>One canonical connection string per role.</strong> String-text differences fragment pools; per-tenant strings are a pool-exhaustion bug waiting to happen. Tenant isolation belongs in SESSION_CONTEXT and RLS, not in connection strings.</li>
+
+    </article>
+
+      <nav class="flex items-center justify-center gap-3 mt-12 mb-4 text-sm">
+        <a href="chapter-04.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">← Chapter 4</a>
+        <a href="index.html" class="px-4 py-2 rounded-lg bg-gray-800 text-gray-300 hover:bg-gray-700 transition">All Chapters</a>
+        <a href="chapter-06.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">Chapter 6 →</a>
+      </nav>
+<div class="bg-gradient-to-r from-blue-900/40 to-indigo-900/40 border border-blue-800/50 rounded-2xl p-6 mt-10">
+        <p class="text-gray-300 text-sm leading-relaxed"><strong class="text-white">Keep going.</strong> You're reading <em class="text-blue-300">AI-Native Apps on SQL Server</em> — one of seven free deep-dives in the DBA Library, covering SQL Server performance tuning, high availability, security, automation, and more. <a href="../index.html" class="text-blue-400 hover:text-blue-300 underline">Browse the full library →</a></p>
+      </div>
+    <footer class="text-center text-gray-600 text-xs mt-10 pb-6">DBA Library · AI-Native Apps on SQL Server · Free for the SQL Server community</footer>
+  </div>
+</body>
+</html>

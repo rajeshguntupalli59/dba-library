@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 32: Conversation Versioning and Edit History — AI-Native Apps on SQL Server</title>
+<meta name="description" content="Edit chains, regeneration siblings, conversation forks, and bounded version retention.">
+<script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-200">
+  <div class="max-w-3xl mx-auto px-6 py-10">
+    <p class="text-blue-400 text-sm font-semibold tracking-wide uppercase mb-2">AI-Native Apps on SQL Server</p>
+    <p class="text-gray-500 text-sm mb-1">Chapter 32 of 40</p>
+    <h1 class="text-3xl font-bold text-white mb-8">Conversation Versioning and Edit History</h1>
+    <article class="space-y-5">
+<p class="text-gray-300 leading-relaxed">Users edit their messages. They regenerate assistant responses. They branch a conversation to try a different direction. Each of these creates versions — and versions need storage, semantics, and UI. This chapter builds the versioning model: message edits as version chains, regenerations as sibling branches, conversation forks as first-class objects, and the retention policy that keeps version history from growing unbounded. The goal: users can always go back, the database always knows which version is current, and nothing the model saw is ever silently rewritten.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">32.1 Message Edits: Version Chains, Not Overwrites</h3>
+
+<p class="text-gray-300 leading-relaxed">When a user edits a sent message, never UPDATE the row in place. The original message is part of the audit trail (§24) — the model may have already responded to it, and rewriting history corrupts both forensics and the conversation's causal chain. Append a new version instead:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Versions live alongside messages; the message row points at "current"
+ALTER TABLE dbo.messages
+    ADD version_number INT NOT NULL DEFAULT 1,
+        superseded_by UNIQUEIDENTIFIER NULL;   -- the edit that replaced this
+
+CREATE TABLE dbo.message_versions (
+    version_id   UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWID(),
+    message_id   UNIQUEIDENTIFIER NOT NULL
+                 CONSTRAINT FK_mv_msg REFERENCES dbo.messages(message_id),
+    version_number INT NOT NULL,
+    content      NVARCHAR(MAX) NOT NULL,
+    edited_at    DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+    edit_reason  NVARCHAR(200) NULL,
+    CONSTRAINT UQ_mv UNIQUE (message_id, version_number)
+);
+
+-- Edit: freeze the current content as a version, then update the message
+CREATE OR ALTER PROCEDURE dbo.usp_edit_message
+    @message_id UNIQUEIDENTIFIER, @new_content NVARCHAR(MAX),
+    @edit_reason NVARCHAR(200) = NULL
+AS
+BEGIN
+    SET NOCOUNT ON;
+    BEGIN TRAN;
+    DECLARE @v INT, @old NVARCHAR(MAX);
+    SELECT @v = version_number, @old = content
+    FROM dbo.messages WITH (UPDLOCK) WHERE message_id = @message_id;
+
+    INSERT INTO dbo.message_versions (message_id, version_number, content, edit_reason)
+    VALUES (@message_id, @v, @old, @edit_reason);
+
+    UPDATE dbo.messages
+    SET content = @new_content, version_number = @v + 1,
+        updated_at = SYSUTCDATETIME()
+    WHERE message_id = @message_id;
+    -- Downstream effect: assistant messages AFTER this one were generated
+    -- from the old content. Mark them stale (§32.2) rather than deleting.
+    UPDATE dbo.messages
+    SET is_stale = 1
+    WHERE conversation_id = (SELECT conversation_id FROM dbo.messages
+                             WHERE message_id = @message_id)
+      AND created_at &gt; (SELECT created_at FROM dbo.messages
+                        WHERE message_id = @message_id)
+      AND role = N'assistant';
+    COMMIT;
+END;
+GO</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">32.2 Regenerations: Sibling Branches</h3>
+
+<p class="text-gray-300 leading-relaxed">Regenerating an assistant response creates siblings — multiple candidate answers to the same prompt. Store them as a branch group with one active member:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>ALTER TABLE dbo.messages
+    ADD branch_group_id UNIQUEIDENTIFIER NULL,  -- siblings share this
+        is_active BIT NOT NULL DEFAULT 1,       -- the visible sibling
+        is_stale  BIT NOT NULL DEFAULT 0;       -- generated from edited content
+
+-- Regenerate: deactivate current, insert new sibling (same branch group)
+CREATE OR ALTER PROCEDURE dbo.usp_regenerate_response
+    @message_id UNIQUEIDENTIFIER, @new_content NVARCHAR(MAX)
+AS
+BEGIN
+    SET NOCOUNT ON;
+    BEGIN TRAN;
+    DECLARE @conv UNIQUEIDENTIFIER, @grp UNIQUEIDENTIFIER, @model NVARCHAR(100);
+    SELECT @conv = conversation_id, @model = model,
+           @grp = ISNULL(branch_group_id, message_id)
+    FROM dbo.messages WITH (UPDLOCK) WHERE message_id = @message_id;
+
+    UPDATE dbo.messages SET is_active = 0
+    WHERE branch_group_id = @grp OR message_id = @grp;
+
+    INSERT INTO dbo.messages (conversation_id, role, content, model,
+                              branch_group_id, is_active)
+    VALUES (@conv, N'assistant', @new_content, @model, @grp, 1);
+    COMMIT;
+    -- The UI shows the active sibling with ← → navigation; inactive
+    -- siblings persist for comparison and for evaluation (§19: which
+    -- sibling got the better rating? that's preference data).
+END;
+GO</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Siblings are preference data gold: the user picked one and rejected others — the raw material for RLHF-style training (§30.3's training pairs, extended with chosen/rejected labels).</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">32.3 Conversation Forks</h3>
+
+<p class="text-gray-300 leading-relaxed">A fork copies a conversation's history up to a point so the user can try a different direction without losing the original. Implement forks as new conversations sharing history by reference:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>ALTER TABLE dbo.conversations
+    ADD forked_from_conversation_id UNIQUEIDENTIFIER NULL
+        CONSTRAINT FK_conv_fork REFERENCES dbo.conversations(conversation_id),
+        forked_at_message_id UNIQUEIDENTIFIER NULL;  -- fork point
+
+-- Fork: new conversation row; history read = original's messages up to the
+-- fork point + this conversation's own messages. No copying.
+CREATE OR ALTER PROCEDURE dbo.usp_fork_conversation
+    @conversation_id UNIQUEIDENTIFIER, @at_message_id UNIQUEIDENTIFIER,
+    @title NVARCHAR(200) = NULL
+AS
+BEGIN
+    SET NOCOUNT ON;
+    DECLARE @new_id UNIQUEIDENTIFIER = NEWID();
+    INSERT INTO dbo.conversations (conversation_id, tenant_id, user_id, title,
+                                   forked_from_conversation_id, forked_at_message_id)
+    SELECT @new_id, tenant_id, user_id,
+           ISNULL(@title, title + N' (fork)'),
+           @conversation_id, @at_message_id
+    FROM dbo.conversations WHERE conversation_id = @conversation_id;
+
+    -- History view: UNION ALL of shared prefix + own messages
+    -- (implement as a view or in the replay procedure §6.2)
+    SELECT @new_id AS new_conversation_id;
+END;
+GO
+-- Copy-on-write: the fork shares history by reference until the user edits
+-- a shared message — then §32.1's version chain records the divergence
+-- against the fork's conversation, leaving the original untouched.</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Reference-sharing keeps forks cheap (no data duplication); the version chain handles divergence. Deleting the original conversation must not cascade into shared history still referenced by forks — use reference counting or soft deletes (§38.2's erasure rules apply per-conversation).</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">32.4 Retention: Keeping Version History Bounded</h3>
+
+<p class="text-gray-300 leading-relaxed">Versions accumulate: every edit, every regeneration, every fork. Bound them:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Inactive siblings:</strong> keep the active sibling plus the N most recent (N=5 default); older siblings compress to metadata (model, tokens, rating) with content purged — the preference signal survives, the storage doesn't.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Edit versions:</strong> retain per the audit policy (§24.1's prompt tier, 90 days) — edits are forensic evidence.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Forks:</strong> inherit the conversation retention policy; abandoned forks (no activity in 90 days, never shared) are eligible for cleanup with user notice.</li>
+
+<p class="text-gray-300 leading-relaxed">The invariant: the user can always navigate back through their own visible history, while the database never grows a version graveyard nobody will ever read.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">32.5 UI Patterns for Version Navigation</h3>
+
+<p class="text-gray-300 leading-relaxed">Version storage (§32.1–32.3) is only half the feature — users need to see and navigate it. Three patterns cover the cases: <strong>inline edit affordance</strong> (hover reveals "edited" with a timestamp; clicking opens the version diff — old vs new side by side, computed at read time from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">message_versions</code>); <strong>sibling carousel</strong> for regenerations (← 2/4 → arrows under the active response, each sibling showing its model and token cost so users learn which models answer them best); and <strong>fork graph</strong> for power users (a lightweight branch diagram showing where conversations forked — essential when a user has five forks of the same debugging session and can't remember which one had the working answer). Keep the default view clean: versions are progressive disclosure, visible on demand, never cluttering the main reading flow. The rule is that no user should ever wonder "did I already ask this?" — the version UI answers by showing, not by making them remember.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Never overwrite edited messages:</strong> freeze the old content as a version, update the message, and mark downstream assistant messages stale — history is append-only.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Model regenerations as sibling branches</strong> with one active member; inactive siblings are preference data for training, not garbage.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Fork by reference, diverge by version chain:</strong> shared history costs nothing until edited, and deletes must respect surviving forks.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Bound version growth</strong> with sibling limits, audit-aligned edit retention, and abandoned-fork cleanup — navigable history without a version graveyard.</li>
+
+    </article>
+
+      <nav class="flex items-center justify-center gap-3 mt-12 mb-4 text-sm">
+        <a href="chapter-31.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">← Chapter 31</a>
+        <a href="index.html" class="px-4 py-2 rounded-lg bg-gray-800 text-gray-300 hover:bg-gray-700 transition">All Chapters</a>
+        <a href="chapter-33.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">Chapter 33 →</a>
+      </nav>
+<div class="bg-gradient-to-r from-blue-900/40 to-indigo-900/40 border border-blue-800/50 rounded-2xl p-6 mt-10">
+        <p class="text-gray-300 text-sm leading-relaxed"><strong class="text-white">Keep going.</strong> You're reading <em class="text-blue-300">AI-Native Apps on SQL Server</em> — one of seven free deep-dives in the DBA Library, covering SQL Server performance tuning, high availability, security, automation, and more. <a href="../index.html" class="text-blue-400 hover:text-blue-300 underline">Browse the full library →</a></p>
+      </div>
+    <footer class="text-center text-gray-600 text-xs mt-10 pb-6">DBA Library · AI-Native Apps on SQL Server · Free for the SQL Server community</footer>
+  </div>
+</body>
+</html>

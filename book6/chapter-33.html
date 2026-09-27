@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 33: Cost Attribution and Token Accounting per Tenant — AI-Native Apps on SQL Server</title>
+<meta name="description" content="Priced audit capture, monthly ledger closes, margin analysis, and spike detection.">
+<script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-200">
+  <div class="max-w-3xl mx-auto px-6 py-10">
+    <p class="text-blue-400 text-sm font-semibold tracking-wide uppercase mb-2">AI-Native Apps on SQL Server</p>
+    <p class="text-gray-500 text-sm mb-1">Chapter 33 of 40</p>
+    <h1 class="text-3xl font-bold text-white mb-8">Cost Attribution and Token Accounting per Tenant</h1>
+    <article class="space-y-5">
+<p class="text-gray-300 leading-relaxed">Tokens are the AI application's unit of cost, and in a multi-tenant system every token must be attributed: which tenant, which user, which feature, which model. Without attribution you cannot bill accurately, cannot identify the tenants destroying your margin, and cannot forecast spend. This chapter builds the complete accounting layer: capturing token usage at the source, the ledger schema, per-tenant cost rollups with provider pricing, margin analysis, and the anomaly detection that catches cost spikes before the invoice does.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">33.1 Capturing Usage at the Source</h3>
+
+<p class="text-gray-300 leading-relaxed">Every LLM call returns token counts. Capture them in the same transaction as the audit row (§24.1) — never as an afterthought, because a missed capture is unbilled cost:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- The audit row IS the accounting source: tokens captured per call
+-- Extend the request log with priced cost at write time (§1.2's table):
+ALTER TABLE dbo.llm_audit_log
+    ADD input_cost  DECIMAL(12,6) NULL,   -- priced at write time
+        output_cost DECIMAL(12,6) NULL;   -- using feature_costs weights (§25.3)
+
+-- Write path (inside the chat transaction): compute cost from the
+-- provider's usage response and the current price table, then insert.
+-- Pricing at write time freezes the cost basis — later price changes
+-- don't rewrite history (invoice disputes need immutable records).
+CREATE OR ALTER PROCEDURE dbo.usp_log_llm_call
+    @tenant_id UNIQUEIDENTIFIER, @user_id UNIQUEIDENTIFIER,
+    @conversation_id UNIQUEIDENTIFIER, @model NVARCHAR(100),
+    @feature NVARCHAR(100),
+    @prompt_tokens INT, @completion_tokens INT, @latency_ms INT
+AS
+BEGIN
+    SET NOCOUNT ON;
+    DECLARE @in_rate DECIMAL(10,4), @out_rate DECIMAL(10,4);
+    SELECT @in_rate = cost_per_1k FROM dbo.feature_costs
+    WHERE feature = @feature + N'_input';
+    SELECT @out_rate = cost_per_1k FROM dbo.feature_costs
+    WHERE feature = @feature + N'_output';
+    INSERT INTO dbo.llm_audit_log
+        (tenant_id, user_id, conversation_id, model, feature,
+         prompt_tokens, completion_tokens,
+         input_cost, output_cost, latency_ms, status)
+    VALUES (@tenant_id, @user_id, @conversation_id, @model, @feature,
+            @prompt_tokens, @completion_tokens,
+            @prompt_tokens / 1000.0 * ISNULL(@in_rate, 0),
+            @completion_tokens / 1000.0 * ISNULL(@out_rate, 0),
+            @latency_ms, N'ok');
+END;
+GO</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">33.2 The Ledger: Immutable Cost Records</h3>
+
+<p class="text-gray-300 leading-relaxed">The audit log is append-only, but accounting needs its own guarantees: priced records that never change, organized for billing queries. A ledger view over the audit log plus a monthly close:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Monthly ledger close: per-tenant, per-feature, per-model rollup.
+-- Written once, never updated — the invoice source of truth.
+CREATE TABLE dbo.cost_ledger (
+    ledger_id     UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWID(),
+    tenant_id     UNIQUEIDENTIFIER NOT NULL,
+    billing_month DATE NOT NULL,              -- first of month
+    feature       NVARCHAR(100) NOT NULL,
+    model         NVARCHAR(100) NOT NULL,
+    calls         BIGINT NOT NULL,
+    input_tokens  BIGINT NOT NULL,
+    output_tokens BIGINT NOT NULL,
+    total_cost    DECIMAL(14,4) NOT NULL,
+    closed_at     DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+    CONSTRAINT UQ_ledger UNIQUE (tenant_id, billing_month, feature, model)
+);
+
+CREATE OR ALTER PROCEDURE dbo.usp_close_monthly_ledger @month DATE
+AS
+BEGIN
+    SET NOCOUNT ON;
+    INSERT INTO dbo.cost_ledger
+        (tenant_id, billing_month, feature, model, calls,
+         input_tokens, output_tokens, total_cost)
+    SELECT tenant_id, @month, feature, model, COUNT(*),
+           SUM(prompt_tokens), SUM(completion_tokens),
+           SUM(ISNULL(input_cost,0) + ISNULL(output_cost,0))
+    FROM dbo.llm_audit_log
+    WHERE created_at &gt;= @month
+      AND created_at &lt; DATEADD(month, 1, @month)
+      AND status = N'ok'
+    GROUP BY tenant_id, feature, model;
+    -- Idempotent: UQ_ledger prevents double-close; re-runs fail cleanly.
+END;
+GO</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">33.3 Margin Analysis: Who Makes Money</h3>
+
+<p class="text-gray-300 leading-relaxed">Cost without revenue context is trivia. Join the ledger to plan revenue for per-tenant margin:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Per-tenant margin: plan revenue vs. token cost, with trend
+SELECT
+    l.tenant_id,
+    t.plan_name,
+    SUM(l.total_cost) AS token_cost,
+    MAX(p.monthly_price) AS plan_revenue,
+    MAX(p.monthly_price) - SUM(l.total_cost) AS margin,
+    CAST(100.0 * (MAX(p.monthly_price) - SUM(l.total_cost))
+         / NULLIF(MAX(p.monthly_price), 0) AS DECIMAL(5,2)) AS margin_pct
+FROM dbo.cost_ledger AS l
+JOIN dbo.tenants AS t ON t.tenant_id = l.tenant_id
+JOIN dbo.plans AS p ON p.plan_name = t.plan_name
+WHERE l.billing_month = @month
+GROUP BY l.tenant_id, t.plan_name
+HAVING MAX(p.monthly_price) - SUM(l.total_cost) &lt; 0   -- losing money
+ORDER BY margin ASC;
+-- The tenants at the top of this list get (in order): usage investigation
+-- (§24.4 forensics), plan upsell outreach, then rate-limit tightening (§25).</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Segment further by feature and model: a tenant profitable overall may be losing money specifically on agent runs with an expensive reasoning model — the fix is routing (§2.3's model router), not a price increase.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">33.4 Anomaly Detection: Catching Spikes Early</h3>
+
+<p class="text-gray-300 leading-relaxed">A tenant's usage jumping 10x overnight is either growth or a compromised key / runaway agent. Detect it with a simple statistical guard on the daily rollup:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Daily spend anomaly: today vs. trailing 30-day mean + 3σ
+WITH daily AS (
+    SELECT tenant_id, CAST(created_at AS DATE) AS d,
+           SUM(ISNULL(input_cost,0) + ISNULL(output_cost,0)) AS cost
+    FROM dbo.llm_audit_log
+    WHERE created_at &gt;= DATEADD(day, -31, SYSUTCDATETIME())
+    GROUP BY tenant_id, CAST(created_at AS DATE)
+),
+stats AS (
+    SELECT tenant_id,
+           AVG(cost) AS mean_cost,
+           STDEV(cost) AS sd_cost,
+           MAX(CASE WHEN d = CAST(SYSUTCDATETIME() AS DATE) THEN cost END) AS today
+    FROM daily GROUP BY tenant_id
+)
+SELECT tenant_id, today, mean_cost, sd_cost
+FROM stats
+WHERE today &gt; mean_cost + 3 * ISNULL(sd_cost, 0)
+  AND today &gt; 10.0;   -- ignore tiny tenants' noise
+-- Alert → automatic response options: tighten the tenant's rate bucket (§25.1),
+-- require approval for agent runs (§20.4), or page the on-call. Never auto-
+-- suspend a paying tenant; do auto-throttle while investigating.</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Run the anomaly check hourly from the usage_windows data (§25.2) for fresher signals. The response ladder — throttle first, investigate, then decide — protects revenue while containing cost.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">33.5 Showback vs Chargeback</h3>
+
+<p class="text-gray-300 leading-relaxed">Cost attribution (§33.1–33.3) answers "what did it cost"; showback and chargeback decide "who feels it." <strong>Showback</strong> reports costs without billing them — the tenant dashboard (§25.4) shows "your AI usage this month: $412" as information. Use showback during beta, for internal teams, and for plans where AI is bundled: it creates cost awareness without pricing friction. <strong>Chargeback</strong> actually invoices — per-token overage billing, feature-metered line items, margin-positive by construction. The ledger (§33.2) supports both from the same data; the difference is purely in the billing integration. The recommended progression: launch with showback (learn the real cost distribution first — your pricing guesses are wrong), move high-cost features to chargeback once you have three months of ledger data, and keep showback dashboards visible even under chargeback — tenants who watch their meter optimize their own usage, which lowers your costs too. One caution: never surprise-charge. The first chargeback invoice should reference months of showback history the tenant already saw coming.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Capture tokens and price them at write time</strong> in the audit transaction — the priced cost basis must be immutable for invoice disputes.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Close a monthly ledger per tenant/feature/model</strong> as the invoice source of truth; idempotent closes with unique constraints prevent double-billing.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Join cost to plan revenue for margin analysis,</strong> segmented by feature and model — fix routing before raising prices.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Detect spend anomalies statistically and throttle before suspending:</strong> automatic rate tightening while investigating protects both margin and the customer relationship.</li>
+
+    </article>
+
+      <nav class="flex items-center justify-center gap-3 mt-12 mb-4 text-sm">
+        <a href="chapter-32.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">← Chapter 32</a>
+        <a href="index.html" class="px-4 py-2 rounded-lg bg-gray-800 text-gray-300 hover:bg-gray-700 transition">All Chapters</a>
+        <a href="chapter-34.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">Chapter 34 →</a>
+      </nav>
+<div class="bg-gradient-to-r from-blue-900/40 to-indigo-900/40 border border-blue-800/50 rounded-2xl p-6 mt-10">
+        <p class="text-gray-300 text-sm leading-relaxed"><strong class="text-white">Keep going.</strong> You're reading <em class="text-blue-300">AI-Native Apps on SQL Server</em> — one of seven free deep-dives in the DBA Library, covering SQL Server performance tuning, high availability, security, automation, and more. <a href="../index.html" class="text-blue-400 hover:text-blue-300 underline">Browse the full library →</a></p>
+      </div>
+    <footer class="text-center text-gray-600 text-xs mt-10 pb-6">DBA Library · AI-Native Apps on SQL Server · Free for the SQL Server community</footer>
+  </div>
+</body>
+</html>

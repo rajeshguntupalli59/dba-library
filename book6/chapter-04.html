@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 4: Designing AI-Ready Schemas in SQL Server — AI-Native Apps on SQL Server</title>
+<meta name="description" content="Schema patterns for conversations, vectors, memory, audit, and multi-tenant AI data.">
+<script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-200">
+  <div class="max-w-3xl mx-auto px-6 py-10">
+    <p class="text-blue-400 text-sm font-semibold tracking-wide uppercase mb-2">AI-Native Apps on SQL Server</p>
+    <p class="text-gray-500 text-sm mb-1">Chapter 4 of 40</p>
+    <h1 class="text-3xl font-bold text-white mb-8">Designing AI-Ready Schemas in SQL Server</h1>
+    <article class="space-y-5">
+<p class="text-gray-300 leading-relaxed">Chapter 1 handed you a complete schema; this chapter explains the design decisions behind it so you can extend it with confidence. AI workloads stress databases in unusual ways: very wide rows (embeddings), very high insert rates (messages, audit logs), mixed access patterns (point lookups plus vector scans plus analytics), and payloads whose shape is defined by model vendors rather than by you. Good schema design absorbs all four. You will learn normalization boundaries for AI entities, when JSON beats columns and vice versa, indexing strategy for the five dominant access patterns, partitioning for hot tables, and the temporal-table pattern that makes AI outputs auditable by default.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">4.1 The Five Dominant Access Patterns</h3>
+
+<p class="text-gray-300 leading-relaxed">Design starts from queries, not entities. Every AI application in this book serves five access patterns; the schema must make all five fast:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Point lookups by key.</strong> Fetch a conversation, a user, a chunk. Clustered primary keys on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">UNIQUEIDENTIFIER</code> handle these — but consider <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">NEWSEQUENTIALID()</code> instead of <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">NEWID()</code> for insert-heavy tables to avoid page splits and index fragmentation.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Range scans by tenant and time.</strong> "Last 10 messages in this conversation," "audit rows for this tenant this month." Composite indexes with tenant first, time second: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">(tenant_id, created_at DESC)</code>.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Vector similarity with filters.</strong> The hybrid search procedure. Needs the vector index plus selective relational predicates applied before or during the ANN walk.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Analytical aggregations.</strong> Token usage by tenant, error rates by model. Columnstore indexes on the audit and messages tables make these scans 10–100x faster (see §4.5).</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>High-rate appends.</strong> Messages, audit rows, chunk inserts. Minimal indexing on the write path, delayed durability where acceptable, and partitioning so old data can age out without deletes.</li>
+
+<p class="text-gray-300 leading-relaxed">When two patterns conflict — analytics wants a columnstore, point lookups want a rowstore — use a nonclustered columnstore index on top of the rowstore table. You get both: transactional writes plus analytical scans, maintained by the engine.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">4.2 Normalization Boundaries: What Gets Its Own Table</h3>
+
+<p class="text-gray-300 leading-relaxed">The Chapter 1 schema normalizes along entity lifecycle boundaries:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Documents vs. chunks.</strong> Separate tables because they have different lifecycles (documents version; chunks are immutable once embedded), different sizes (one document → hundreds of chunks), and different indexes (full-text on documents, vector on chunks).</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Conversations vs. messages.</strong> Separate tables because message volume dwarfs conversation volume 50:1, and the two are queried differently (conversation lists vs. message streams). A conversation row holds aggregates — total tokens, title — maintained by triggers or application writes.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Audit log as its own table.</strong> Never reuse the messages table for audit. Audit rows have different retention, different access control (support staff read audit; never messages), and different indexing. Physical separation is a compliance feature.</li>
+
+<p class="text-gray-300 leading-relaxed">The anti-pattern is the "one big AI table" — stuffing messages, chunks, and audit events into a single events table with a type discriminator. It destroys indexing selectivity, makes retention policies impossible to express, and turns every query into a filter on the discriminator column. Normalize on lifecycle, denormalize on read path (covering indexes, indexed views) — never the reverse.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">4.3 Columns vs. JSON: The Decision Rule</h3>
+
+<p class="text-gray-300 leading-relaxed">Chapter 3 stated the rule; here is the full decision procedure for every new field:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Make it a column if:</strong> you filter on it, join on it, aggregate it, constrain it (CHECK/FOREIGN KEY), or index it for ordering. Examples: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">token_count</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">status</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">role</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">latency_ms</code>.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Make it JSON if:</strong> its schema is defined by a model vendor, it varies per model version, it is write-once/read-rarely, or it is genuinely schemaless user data. Examples: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">tool_calls</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">citations</code>, raw provider responses.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Promote JSON paths to computed columns</strong> when a JSON field becomes hot. SQL Server makes this painless:</li>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- A JSON field got hot: promote it to an indexed computed column
+-- without changing the application write path.
+ALTER TABLE dbo.messages
+    ADD first_tool AS (JSON_VALUE(tool_calls, '$[0].function.name')) PERSISTED;
+
+CREATE INDEX IX_messages_first_tool
+    ON dbo.messages (first_tool)
+    WHERE first_tool IS NOT NULL;
+
+-- Now "all conversations that called get_refund_policy" is an index seek:
+SELECT conversation_id, COUNT(*)
+FROM dbo.messages
+WHERE first_tool = 'get_refund_policy'
+GROUP BY conversation_id;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">This promotion path is the reason to start with JSON for uncertain fields: you are never locked in. The persisted computed column materializes the value, the index makes it searchable, and the application keeps writing the same JSON.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">4.4 Keys, Identity, and the NEWSEQUENTIALID Decision</h3>
+
+<p class="text-gray-300 leading-relaxed">AI tables are insert-heavy: every chat turn writes rows, every ingestion writes hundreds of chunks. Random <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">NEWID()</code> values as clustered keys cause page splits and fragmentation under sustained inserts. The fix is <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">NEWSEQUENTIALID()</code> for clustered keys on hot tables:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Hot append tables: sequential GUIDs keep inserts at the end of the index
+CREATE TABLE dbo.messages_hot (
+    message_id      UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWSEQUENTIALID(),
+    ...
+);
+
+-- Reference/dimension tables: NEWID() is fine, inserts are rare
+-- Public-facing IDs: keep random NEWID() so IDs are unguessable in URLs/APIs.
+-- Internal hot tables: NEWSEQUENTIALID() for insert performance.</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The nuanced rule: use <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">NEWSEQUENTIALID()</code> on the clustered key of append-heavy tables (messages, audit log, chunks), and expose a separate random external ID if the key ever appears in a URL. Sequential GUIDs are guessable across restarts on some versions — never use a clustered sequential key as a capability token.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">4.5 Columnstore for the Analytics Path</h3>
+
+<p class="text-gray-300 leading-relaxed">The audit log and messages tables serve two masters: transactional appends and analytical scans ("tokens per tenant per day"). A nonclustered columnstore index gives you both without ETL:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Analytical accelerator on the audit log: rowstore stays for OLTP,
+-- columnstore serves the dashboards.
+CREATE NONCLUSTERED COLUMNSTORE INDEX NCCI_audit_analytics
+    ON dbo.llm_audit_log (tenant_id, model, status, total_tokens,
+                          latency_ms, created_at);
+
+-- The "tokens per tenant per day" dashboard query now scans compressed
+-- column segments instead of millions of rows:
+SELECT tenant_id,
+       CAST(created_at AS DATE) AS day,
+       SUM(total_tokens) AS tokens,
+       AVG(CAST(latency_ms AS FLOAT)) AS avg_latency
+FROM dbo.llm_audit_log
+WHERE created_at &gt;= DATEADD(day, -90, SYSUTCDATETIME())
+GROUP BY tenant_id, CAST(created_at AS DATE);</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Columnstore compression on audit data is typically 5–10x, and aggregation queries run an order of magnitude faster. The tradeoff is a small write-amplification cost as rows move from the delta store to compressed segments — negligible next to the LLM latencies dominating the pipeline.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">4.6 Partitioning Hot Tables by Time</h3>
+
+<p class="text-gray-300 leading-relaxed">Messages and audit tables grow without bound. Partitioning by month on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">created_at</code> gives you three superpowers: partition elimination for time-range queries, fast archival via partition switching instead of deletes, and isolated index maintenance per partition.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Monthly partitions on the audit log
+CREATE PARTITION FUNCTION PF_audit_monthly (DATETIME2)
+    AS RANGE RIGHT FOR VALUES
+    ('2026-01-01','2026-02-01','2026-03-01','2026-04-01','2026-05-01','2026-06-01',
+     '2026-07-01','2026-08-01','2026-09-01','2026-10-01','2026-11-01','2026-12-01');
+
+CREATE PARTITION SCHEME PS_audit_monthly
+    AS PARTITION PF_audit_monthly ALL TO ([PRIMARY]);
+
+-- Recreate the table on the scheme (do this at design time, not later)
+CREATE TABLE dbo.llm_audit_log (
+    ... -- same columns as §1.2
+    CONSTRAINT PK_audit PRIMARY KEY (log_id, created_at)
+) ON PS_audit_monthly (created_at);
+
+-- Age out old data in milliseconds: switch the oldest partition out
+-- instead of DELETEing millions of rows.
+ALTER TABLE dbo.llm_audit_log
+    SWITCH PARTITION 2 TO dbo.llm_audit_log_archive PARTITION 2;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Plan the partition function a year ahead and add future boundary points with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SPLIT RANGE</code> monthly — a one-line maintenance job. GDPR's right-to-be-forgotten (Chapter 38) becomes dramatically cheaper when a user's data can be located by time partition first.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">4.7 Temporal Tables: Auditable AI Outputs by Default</h3>
+
+<p class="text-gray-300 leading-relaxed">AI outputs change meaning over time — a regenerated answer, a corrected summary, a re-ranked result. System-versioned temporal tables keep every version automatically, which is the cheapest possible compliance story:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Every version of every AI-generated summary, kept automatically
+CREATE TABLE dbo.ai_summaries (
+    summary_id      UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWID(),
+    conversation_id UNIQUEIDENTIFIER NOT NULL,
+    summary_text    NVARCHAR(MAX) NOT NULL,
+    model           NVARCHAR(100) NOT NULL,
+    valid_from      DATETIME2 GENERATED ALWAYS AS ROW START NOT NULL,
+    valid_to        DATETIME2 GENERATED ALWAYS AS ROW END NOT NULL,
+    PERIOD FOR SYSTEM_TIME (valid_from, valid_to)
+) WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = dbo.ai_summaries_history));
+
+-- "What did the summary say last Tuesday?" — time travel in one clause
+SELECT summary_text
+FROM dbo.ai_summaries
+FOR SYSTEM_TIME AS OF '2026-09-22 12:00:00'
+WHERE conversation_id = @cid;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Temporal tables answer the question every AI incident review asks — "what exactly did the system say at the time?" — without application code. Use them for summaries, generated reports, and any AI output a human might later dispute. Chapter 32 builds the full versioning strategy on this foundation.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Design from the five access patterns.</strong> Point lookups, tenant-time ranges, filtered vector search, analytical aggregations, and high-rate appends — every index and partitioning decision traces back to one of these.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Normalize on entity lifecycle.</strong> Documents vs. chunks, conversations vs. messages, audit as its own table. Never the "one big AI events table."</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Columns for filter/join/aggregate; JSON for vendor-shaped payloads; promote hot JSON paths to persisted computed columns.</strong> The promotion path means you are never locked into an early guess.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>NEWSEQUENTIALID on hot clustered keys, nonclustered columnstore for analytics, monthly partitioning for retention, temporal tables for versioned outputs.</strong> These four features together handle the scale and compliance demands of production AI data.</li>
+
+    </article>
+
+      <nav class="flex items-center justify-center gap-3 mt-12 mb-4 text-sm">
+        <a href="chapter-03.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">← Chapter 3</a>
+        <a href="index.html" class="px-4 py-2 rounded-lg bg-gray-800 text-gray-300 hover:bg-gray-700 transition">All Chapters</a>
+        <a href="chapter-05.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">Chapter 5 →</a>
+      </nav>
+<div class="bg-gradient-to-r from-blue-900/40 to-indigo-900/40 border border-blue-800/50 rounded-2xl p-6 mt-10">
+        <p class="text-gray-300 text-sm leading-relaxed"><strong class="text-white">Keep going.</strong> You're reading <em class="text-blue-300">AI-Native Apps on SQL Server</em> — one of seven free deep-dives in the DBA Library, covering SQL Server performance tuning, high availability, security, automation, and more. <a href="../index.html" class="text-blue-400 hover:text-blue-300 underline">Browse the full library →</a></p>
+      </div>
+    <footer class="text-center text-gray-600 text-xs mt-10 pb-6">DBA Library · AI-Native Apps on SQL Server · Free for the SQL Server community</footer>
+  </div>
+</body>
+</html>

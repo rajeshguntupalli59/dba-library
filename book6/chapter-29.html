@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 29: Streaming Chat Responses with SqlDataReader — AI-Native Apps on SQL Server</title>
+<meta name="description" content="Streaming reads, buffered token persistence, heartbeats, and backpressure.">
+<script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-200">
+  <div class="max-w-3xl mx-auto px-6 py-10">
+    <p class="text-blue-400 text-sm font-semibold tracking-wide uppercase mb-2">AI-Native Apps on SQL Server</p>
+    <p class="text-gray-500 text-sm mb-1">Chapter 29 of 40</p>
+    <h1 class="text-3xl font-bold text-white mb-8">Streaming Chat Responses with SqlDataReader</h1>
+    <article class="space-y-5">
+<p class="text-gray-300 leading-relaxed">Users perceive latency, not throughput: a chat response that streams its first token in 300ms feels instant even if the full answer takes 10 seconds; a response that arrives complete after 10 seconds feels broken. Streaming is therefore a UX requirement, and the database side has its own streaming story: reading large result sets without buffering them in memory, writing streaming tokens without one INSERT per token, and keeping the connection healthy across a long-lived stream. This chapter covers streaming on both sides of the wire.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">29.1 Streaming Reads: SequentialAccess and Yield</h3>
+
+<p class="text-gray-300 leading-relaxed">Retrieval for a streaming chat (Chapter 13) can return hundreds of chunks; buffering them all in a DataTable before generation starts adds latency and memory pressure. Stream them instead:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>// C# — stream retrieval rows straight into the prompt builder
+async IAsyncEnumerable&lt;Chunk&gt; StreamChunksAsync(
+    Guid tenantId, float[] queryVector, int topK)
+{
+    using var conn = new SqlConnection(_connStr);
+    await conn.OpenAsync();
+    using var cmd = new SqlCommand("dbo.usp_vector_search", conn);
+    cmd.CommandType = CommandType.StoredProcedure;
+    cmd.Parameters.AddWithValue("@tenant_id", tenantId);
+    cmd.Parameters.AddWithValue("@qv", queryVector);  // SqlClient 2025: float[] → VECTOR
+    cmd.Parameters.AddWithValue("@top_k", topK);
+
+    // SequentialAccess: streams large NVARCHAR/VECTOR columns without
+    // buffering the whole row; CommandBehavior.SequentialAccess + yield
+    // keeps memory flat regardless of result size.
+    using var reader = await cmd.ExecuteReaderAsync(CommandBehavior.SequentialAccess);
+    while (await reader.ReadAsync())
+    {
+        yield return new Chunk {
+            ChunkId = reader.GetGuid(0),
+            Text    = reader.GetString(1),   // streamed, not buffered
+            Score   = reader.GetDouble(2)
+        };
+    }
+}
+// The caller appends chunks to the prompt as they arrive and can even
+// start generation once enough context is assembled (early cutoff).</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The pattern generalizes: any large read on the chat path — conversation history replay (§6.2), blackboard snapshots (§26.1) — should stream rather than buffer. <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CommandBehavior.SequentialAccess</code> is the one-line change that converts a memory spike into a flat line.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">29.2 Streaming Writes: Buffering Token Batches</h3>
+
+<p class="text-gray-300 leading-relaxed">As the LLM streams tokens, the application must persist the growing message — for crash recovery (§6.3's atomic assistant insert) and so the user sees progress. One INSERT per token is absurd; one INSERT at the end loses everything on crash. The middle path: buffer tokens and flush periodically:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>// Token persistence: buffer 50 tokens or 2 seconds, whichever comes first,
+// then UPDATE the in-progress message row (created at stream start).
+async Task StreamAndPersistAsync(Guid messageId, IAsyncEnumerable&lt;string&gt; tokens,
+                                SqlConnection conn /* held open for the stream */)
+{
+    var buffer = new StringBuilder();
+    var lastFlush = DateTime.UtcNow;
+    int count = 0;
+
+    await foreach (var token in tokens)
+    {
+        ForwardToClient(token);              // SSE / websocket → user sees it now
+        buffer.Append(token);
+        if (++count % 50 == 0 || DateTime.UtcNow - lastFlush &gt; TimeSpan.FromSeconds(2))
+        {
+            // Single UPDATE per flush — cheap, and crash recovery replays
+            // from the last flush point, not from zero.
+            using var cmd = new SqlCommand(
+                "UPDATE dbo.messages SET content = @c, updated_at = SYSUTCDATETIME() " +
+                "WHERE message_id = @m", conn);
+            cmd.Parameters.AddWithValue("@c", buffer.ToString());
+            cmd.Parameters.AddWithValue("@m", messageId);
+            await cmd.ExecuteNonQueryAsync();
+            lastFlush = DateTime.UtcNow;
+        }
+    }
+    // Finalize: mark complete, record token counts for audit (§24.1)
+    using var done = new SqlCommand(
+        "UPDATE dbo.messages SET content = @c, status = N'complete', " +
+        "prompt_tokens = @pt, completion_tokens = @ct, " +
+        "updated_at = SYSUTCDATETIME() WHERE message_id = @m", conn);
+    ...
+}</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Holding one pooled connection open for the stream's duration is fine — but size the pool (§5.1) for concurrent streams, not just concurrent requests. A thousand users each streaming on a held connection needs a thousand pool slots (or multiplexed streaming with fewer, longer-held connections — measure your actual concurrency).</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">29.3 Heartbeats, Timeouts, and Broken Streams</h3>
+
+<p class="text-gray-300 leading-relaxed">Streams break: networks drop, clients navigate away, providers stall. Three defenses:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Server-sent heartbeats.</strong> Send a comment/keep-alive frame every 15 seconds during generation gaps so proxies and load balancers don't kill idle connections. The client's EventSource ignores them; the infrastructure stays happy.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Command timeouts with resume.</strong> Set the generation's database operations to sane timeouts; on timeout, the message row's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">status = 'streaming'</code> plus last flush position lets a retry resume from the last flush instead of restarting (§11.2's checkpoint pattern applied to streams).</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Orphan-stream reaper.</strong> A scheduled job marks <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">streaming</code> messages older than N minutes (no flush, no finalize) as <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">abandoned</code> — they render as partial responses with a "regenerate" affordance instead of hanging forever.</li>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Orphan-stream reaper: runs every 5 minutes
+UPDATE dbo.messages
+SET status = N'abandoned', updated_at = SYSUTCDATETIME()
+OUTPUT INSERTED.message_id, INSERTED.conversation_id
+INTO @reaped  -- notify the client to offer "regenerate"
+WHERE status = N'streaming'
+  AND updated_at &lt; DATEADD(minute, -10, SYSUTCDATETIME());
+-- 10 minutes without a flush: the stream is dead. The partial content stays
+-- (better than nothing), flagged so the UI can offer regeneration.</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">29.4 Backpressure: When Generation Outruns Consumption</h3>
+
+<p class="text-gray-300 leading-relaxed">Fast providers can emit tokens faster than slow clients consume them. Unbounded server-side buffering of a fast stream for a slow client is a memory leak with extra steps. Apply backpressure:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Bounded channels</strong> between the provider stream and the response writer (e.g., <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Channel&lt;string&gt;</code> with capacity 200). When full, the reader pauses — the provider's HTTP stream buffers in the OS, which is its job.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Client disconnect detection:</strong> stop generation when the client goes away (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">HttpContext.RequestAborted</code>). Continuing to burn tokens for nobody is the streaming equivalent of the runaway agent.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Flush the token buffer on disconnect</strong> before abandoning — the partial message is still valuable context for the next turn.</li>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">29.5 Mobile and Low-Bandwidth Clients</h3>
+
+<p class="text-gray-300 leading-relaxed">Streaming assumes a stable connection — mobile clients violate that assumption constantly: tunnels, elevators, network handoffs. Design the stream protocol for hostile networks. <strong>Resumable streams:</strong> every flushed token batch (§29.2) carries a sequence number, and the client tracks the last sequence it rendered — on reconnect, it requests "resume from sequence N" and the server replays from the persisted buffer instead of restarting generation. <strong>Adaptive verbosity:</strong> when the client's measured bandwidth drops, the server can truncate the in-progress response gracefully (finish the current sentence, mark the message <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">truncated_low_bandwidth</code>) rather than letting the stream stall until the user gives up — a complete short answer beats an abandoned long one. <strong>Offline queuing:</strong> the mobile client queues the user's message locally and syncs when connectivity returns; the server-side idempotency key (conversation_id + client_message_id) makes the retry safe. Test the mobile path with a network conditioner that injects 30% packet loss and 2-second latency spikes — if the chat still feels usable, the streaming layer is production-ready. If it falls over, no amount of server-side optimization will save it.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<p class="text-gray-300 leading-relaxed">One final streaming consideration: log stream lifecycle events (started, first-token latency, flush count, completion or abandonment reason) into the audit tables. Stream telemetry is the only way to distinguish "the model is slow" from "the network is slow" from "the client went away" — three problems with three different owners and three different fixes. Without per-stream telemetry, every streaming complaint becomes a guessing game.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Stream reads with SequentialAccess and IAsyncEnumerable</strong> — never buffer large result sets on the chat path; memory stays flat and generation can start early.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Stream writes with periodic buffered flushes</strong> (50 tokens or 2 seconds) — crash recovery replays from the last flush, and pool sizing must account for held streaming connections.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Defend the stream:</strong> heartbeats for idle connections, timeouts with resume-from-flush, and an orphan-stream reaper that converts dead streams into partial responses with regenerate affordances.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Apply backpressure with bounded channels and stop generating when the client disconnects</strong> — tokens burned for nobody are pure waste.</li>
+
+    </article>
+
+      <nav class="flex items-center justify-center gap-3 mt-12 mb-4 text-sm">
+        <a href="chapter-28.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">← Chapter 28</a>
+        <a href="index.html" class="px-4 py-2 rounded-lg bg-gray-800 text-gray-300 hover:bg-gray-700 transition">All Chapters</a>
+        <a href="chapter-30.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">Chapter 30 →</a>
+      </nav>
+<div class="bg-gradient-to-r from-blue-900/40 to-indigo-900/40 border border-blue-800/50 rounded-2xl p-6 mt-10">
+        <p class="text-gray-300 text-sm leading-relaxed"><strong class="text-white">Keep going.</strong> You're reading <em class="text-blue-300">AI-Native Apps on SQL Server</em> — one of seven free deep-dives in the DBA Library, covering SQL Server performance tuning, high availability, security, automation, and more. <a href="../index.html" class="text-blue-400 hover:text-blue-300 underline">Browse the full library →</a></p>
+      </div>
+    <footer class="text-center text-gray-600 text-xs mt-10 pb-6">DBA Library · AI-Native Apps on SQL Server · Free for the SQL Server community</footer>
+  </div>
+</body>
+</html>

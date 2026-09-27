@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 15: Efficient Vector Retrieval at Scale — AI-Native Apps on SQL Server</title>
+<meta name="description" content="Vector indexes, search procedures, hybrid search, and keeping recall high as corpora grow.">
+<script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-200">
+  <div class="max-w-3xl mx-auto px-6 py-10">
+    <p class="text-blue-400 text-sm font-semibold tracking-wide uppercase mb-2">AI-Native Apps on SQL Server</p>
+    <p class="text-gray-500 text-sm mb-1">Chapter 15 of 40</p>
+    <h1 class="text-3xl font-bold text-white mb-8">Efficient Vector Retrieval at Scale</h1>
+    <article class="space-y-5">
+<p class="text-gray-300 leading-relaxed">Ingestion determines what <em>can</em> be found; query-time retrieval determines what <em>is</em> found — and how fast. This chapter is the performance and quality manual for the retrieval path: writing vector queries the optimizer can accelerate, tuning the recall/latency tradeoff of the DiskANN index, pre-filtering vs. post-filtering for metadata constraints, the oversample-and-rerank pattern, and diagnosing retrieval problems with execution plans and DMVs. Every millisecond here multiplies across thousands of chat turns per hour.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">15.1 Anatomy of an Efficient Vector Query</h3>
+
+<p class="text-gray-300 leading-relaxed">The canonical pattern from §3.2, annotated with what the optimizer needs:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>DECLARE @q VECTOR(1536) = CAST(@query_json AS VECTOR(1536));
+
+SELECT TOP (@k)
+    chunk_id, document_id, chunk_index, content,
+    VECTOR_DISTANCE('cosine', embedding, @q) AS distance
+FROM dbo.document_chunks
+WHERE tenant_id = @tenant_id        -- (1) selective relational predicate
+  AND embedding IS NOT NULL         -- (2) excludes un-embedded rows
+  AND is_active = 1                 -- (3) any other cheap filters
+ORDER BY VECTOR_DISTANCE('cosine', embedding, @q);  -- (4) matches index metric
+-- Requirements for index use:
+--   * ORDER BY expression exactly matches the indexed VECTOR_DISTANCE call
+--   * metric ('cosine') matches the CREATE VECTOR INDEX metric
+--   * TOP(@k) present — the index is a top-k structure, not a sort</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Verify index usage with the actual execution plan: look for the vector index seek operator. If you see a clustered index scan with a sort, one of the four requirements is violated — most commonly a metric mismatch or the ORDER BY expression differing subtly from the indexed expression (e.g., different argument order).</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">15.2 Pre-Filtering vs. Post-Filtering</h3>
+
+<p class="text-gray-300 leading-relaxed">Metadata constraints ("only docs from the last 90 days," "only the contracts folder") interact with ANN search in two ways:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Pre-filtering:</strong> apply the relational predicate first, then ANN-search within the filtered set. Correct and precise, but the ANN graph was built over the full corpus — heavily filtered queries may find too few candidates in the pruned subgraph.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Post-filtering:</strong> ANN-search the full corpus for oversampled candidates (e.g., top 100), then apply the filter. Better recall when filters are selective, but wasteful when the filter eliminates most candidates.</li>
+
+<p class="text-gray-300 leading-relaxed">The rule of thumb: if the filter selects more than ~5% of the corpus, pre-filter; if less, post-filter with oversampling. SQL Server's approach — relational predicates in the WHERE clause composed with the vector ORDER BY — effectively pre-filters, which is correct for the tenant predicate (always selective enough in multi-tenant corpora) and for most metadata filters in this book. For extremely selective filters (a single document out of millions), skip the vector index entirely and brute-force within the filtered set:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Extremely selective filter: brute force beats the index
+-- (a few hundred rows; the graph walk overhead isn't worth it)
+SELECT TOP (@k) chunk_id, content,
+       VECTOR_DISTANCE('cosine', embedding, @q) AS distance
+FROM dbo.document_chunks
+WHERE document_id = @single_doc     -- ultra-selective: hundreds of rows
+  AND embedding IS NOT NULL
+ORDER BY VECTOR_DISTANCE('cosine', embedding, @q);
+-- The optimizer chooses a scan + sort here; that's the right plan.
+-- Don't fight it with index hints.</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">15.3 Oversample and Rerank</h3>
+
+<p class="text-gray-300 leading-relaxed">ANN search is approximate; the top-8 by cosine distance is not always the best-8 for the user's question. The production pattern: oversample cheaply, rerank expensively.</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Stage 1 — ANN oversample:</strong> retrieve top 50–100 by <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_DISTANCE</code>. Milliseconds, approximate.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Stage 2 — RRF fusion:</strong> merge with the full-text arm's top 50–100 (Chapter 1's procedure already does this).</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Stage 3 — cross-encoder rerank (optional):</strong> score the top 20–30 candidates with a dedicated reranking model (Cohere Rerank, or a self-hosted cross-encoder). 50–200 ms for dramatically better ordering on hard queries.</li>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Stage 3 rerank in Python (only when the query warrants it)
+def retrieve_with_rerank(question, qvec, tenant_id, k_final=8):
+    # Stages 1+2: oversampled hybrid search from SQL Server
+    candidates = hybrid_search(tenant_id, question, qvec, k=60)
+    if len(candidates) &lt; 20 or is_simple_question(question):
+        return candidates[:k_final]   # skip rerank: not worth the latency
+    # Stage 3: cross-encoder rerank of the top 30
+    texts = [c.content for c in candidates[:30]]
+    scores = rerank_model.score(question, texts)  # e.g. Cohere Rerank API
+    ranked = sorted(zip(candidates[:30], scores),
+                    key=lambda x: x[1], reverse=True)
+    return [c for c, _ in ranked[:k_final]]</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Gate the rerank on query complexity — simple factual questions rarely benefit, while ambiguous multi-hop questions often do. Log the rerank delta (how much the ordering changed) to decide whether the stage earns its latency.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">15.4 Tuning Recall vs. Latency</h3>
+
+<p class="text-gray-300 leading-relaxed">The DiskANN search exposes the candidate list size ("search list") as the recall/latency knob: larger lists explore more of the graph (higher recall, higher latency). Tune it empirically:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Build a recall benchmark.</strong> Sample 200 representative queries; compute brute-force top-10 (exact) and index top-10; recall = overlap / 10. Store this as a scheduled job — recall drifts as the corpus grows.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Set per-workload search lists.</strong> Interactive chat wants p95 under 100 ms even at 95% recall; nightly evaluation harnesses can afford 500 ms for 99% recall. Different callers, different settings.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Watch the tradeoff curve, not a single point.</strong> Plot recall vs. p95 latency across search-list sizes; the knee of the curve is your operating point. Re-plot quarterly or after large ingestions.</li>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">15.5 Diagnosing Retrieval Problems</h3>
+
+<p class="text-gray-300 leading-relaxed">When users report "the assistant can't find things," work through this checklist:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Is the content in the corpus?</strong> Query <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dbo.documents</code> for the expected document and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dbo.ingest_log</code> for its ingestion status. Half of "retrieval failures" are ingestion failures.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Is it embedded?</strong> Check <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">embedding IS NOT NULL</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">embedding_model</code> on the expected chunks. A failed embed stage leaves NULLs that the query silently excludes.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Does brute force find it?</strong> Run the exact <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_DISTANCE</code> ORDER BY without TOP (or with a huge TOP) and see where the expected chunk ranks. If brute force ranks it #3 but the index missed it, widen the search list. If brute force ranks it #200, the problem is chunking or the embedding model — not the index.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Is the query the problem?</strong> Try the rewritten standalone query (§13.3) and key phrases from the expected chunk. Vague questions retrieve vaguely — sometimes the fix is query rewriting, not index tuning.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Check the plan.</strong> Actual execution plan on the retrieval procedure: vector index seek present? Predicate pushed before the ANN walk? Stale statistics on the chunks table can mislead the optimizer after bulk ingestions — <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">UPDATE STATISTICS</code> after large loads.</li>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Brute-force rank check: where SHOULD the expected chunk have ranked?
+DECLARE @q VECTOR(1536) = CAST(@query_json AS VECTOR(1536));
+WITH ranked AS (
+    SELECT chunk_id,
+           ROW_NUMBER() OVER (
+               ORDER BY VECTOR_DISTANCE('cosine', embedding, @q)) AS brute_rank
+    FROM dbo.document_chunks
+    WHERE tenant_id = @tenant_id AND embedding IS NOT NULL
+)
+SELECT brute_rank FROM ranked WHERE chunk_id = @expected_chunk_id;
+-- brute_rank &lt;= 10 but index missed it → widen search list
+-- brute_rank = 347 → chunking/embedding problem, not an index problem</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Match the ORDER BY expression and metric exactly to the vector index definition, always use TOP, and keep selective relational predicates in the WHERE clause.</strong> Verify with the actual execution plan.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Pre-filter for normal metadata constraints; post-filter with oversampling for ultra-selective ones; brute-force when the filter leaves only hundreds of rows.</strong> Let the optimizer choose — don't hint it into a bad plan.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Oversample with ANN, fuse with RRF, rerank the top candidates with a cross-encoder only when query complexity justifies the latency.</strong> Log the rerank delta to keep the stage honest.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Diagnose retrieval failures bottom-up:</strong> corpus → embedded → brute-force rank → query quality → execution plan. Most "search is broken" reports are ingestion gaps or chunking problems, not index problems.</li>
+
+    </article>
+
+      <nav class="flex items-center justify-center gap-3 mt-12 mb-4 text-sm">
+        <a href="chapter-14.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">← Chapter 14</a>
+        <a href="index.html" class="px-4 py-2 rounded-lg bg-gray-800 text-gray-300 hover:bg-gray-700 transition">All Chapters</a>
+        <a href="chapter-16.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">Chapter 16 →</a>
+      </nav>
+<div class="bg-gradient-to-r from-blue-900/40 to-indigo-900/40 border border-blue-800/50 rounded-2xl p-6 mt-10">
+        <p class="text-gray-300 text-sm leading-relaxed"><strong class="text-white">Keep going.</strong> You're reading <em class="text-blue-300">AI-Native Apps on SQL Server</em> — one of seven free deep-dives in the DBA Library, covering SQL Server performance tuning, high availability, security, automation, and more. <a href="../index.html" class="text-blue-400 hover:text-blue-300 underline">Browse the full library →</a></p>
+      </div>
+    <footer class="text-center text-gray-600 text-xs mt-10 pb-6">DBA Library · AI-Native Apps on SQL Server · Free for the SQL Server community</footer>
+  </div>
+</body>
+</html>

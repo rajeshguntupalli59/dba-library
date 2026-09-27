@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 30: Change Data Capture for AI Data Pipelines — AI-Native Apps on SQL Server</title>
+<meta name="description" content="Before/after row images for feature deltas, audit diffs, warehouse sync, and training data.">
+<script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-200">
+  <div class="max-w-3xl mx-auto px-6 py-10">
+    <p class="text-blue-400 text-sm font-semibold tracking-wide uppercase mb-2">AI-Native Apps on SQL Server</p>
+    <p class="text-gray-500 text-sm mb-1">Chapter 30 of 40</p>
+    <h1 class="text-3xl font-bold text-white mb-8">Change Data Capture for AI Data Pipelines</h1>
+    <article class="space-y-5">
+<p class="text-gray-300 leading-relaxed">Chapter 27's Change Tracking answered "which rows changed." Change Data Capture answers the harder question: "what did they look like before and after?" CDC reads the transaction log asynchronously and records full before/after row images — the raw material for AI data pipelines: feature computation on deltas, audit diffs, warehouse synchronization, and training-data extraction. This chapter enables CDC, consumes its change tables, and builds the pipeline patterns that turn a stream of row versions into AI-ready datasets.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">30.1 Enabling CDC and Reading Change Tables</h3>
+
+<p class="text-gray-300 leading-relaxed">CDC requires SQL Server Agent (it runs capture jobs) and is enabled per-database, then per-table. Unlike Change Tracking, it captures the actual data — which columns you choose:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Enable CDC on the database (needs SQL Server Agent running)
+EXEC sys.sp_cdc_enable_db;
+GO
+
+-- Capture before/after images for the tables AI pipelines consume
+EXEC sys.sp_cdc_enable_table
+    @source_schema = N'dbo',
+    @source_name   = N'orders',
+    @role_name     = NULL,               -- or a gating role for access control
+    @captured_column_list = N'order_id, tenant_id, status, total, updated_at';
+    -- captured_column_list: capture only what pipelines need. CDC stores
+    -- full row images; excluding large text columns halves the volume.
+GO
+
+-- Consume: all changes in an LSN interval, with operation codes
+DECLARE @from_lsn BINARY(10) = sys.fn_cdc_get_min_lsn('dbo_orders');
+DECLARE @to_lsn   BINARY(10) = sys.fn_cdc_get_max_lsn();
+SELECT
+    __$start_lsn, __$seqval,
+    CASE __$operation WHEN 1 THEN 'delete' WHEN 2 THEN 'insert'
+                     WHEN 3 THEN 'update_before' WHEN 4 THEN 'update_after' END AS op,
+    order_id, tenant_id, status, total, updated_at,
+    __$update_mask                                      -- which columns changed
+FROM cdc.fn_cdc_get_all_changes_dbo_orders(@from_lsn, @to_lsn, N'all');
+-- 'all': one row per change with before AND after images for updates.
+-- The consumer tracks its LSN cursor like the CT worker tracked versions.</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Key differences from Change Tracking: CDC is asynchronous (log-based, minimal impact on the write path), captures data not just keys, and retains history per its own retention (default 3 days — tune it to your slowest consumer). The cost is storage: every change writes a row image.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">30.2 Pipeline Pattern 1: Feature Deltas for ML</h3>
+
+<p class="text-gray-300 leading-relaxed">ML features are often deltas: order total changed by X, status moved from A to B, user message count grew by N. CDC's before/after images compute these directly:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Feature pipeline: order-value deltas and status transitions
+-- Consumes CDC changes, writes training/inference features
+WITH changes AS (
+    SELECT * FROM cdc.fn_cdc_get_all_changes_dbo_orders(@from_lsn, @to_lsn, N'all')
+),
+deltas AS (
+    SELECT
+        after.order_id, after.tenant_id,
+        after.total - before.total AS total_delta,
+        before.status AS from_status, after.status AS to_status,
+        after.__$start_lsn AS lsn
+    FROM changes AS after
+    JOIN changes AS before
+      ON before.order_id = after.order_id
+     AND before.__$operation = 3 AND after.__$operation = 4
+     AND before.__$seqval = after.__$seqval   -- same change, before/after pair
+    WHERE after.__$operation = 4
+)
+INSERT INTO dbo.ml_feature_store (order_id, tenant_id, total_delta,
+                                  from_status, to_status, event_lsn, created_at)
+SELECT order_id, tenant_id, total_delta, from_status, to_status, lsn,
+       SYSUTCDATETIME()
+FROM deltas;
+-- Idempotency: UNIQUE constraint on (order_id, event_lsn) — replays are safe.
+-- The feature store feeds PREDICT (§3.3) and offline training alike.</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">30.3 Pipeline Pattern 2: Audit Diffs and Warehouse Sync</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Audit diffs.</strong> Compliance often needs "who changed this field from X to Y and when." CDC's before/after images plus the transaction timestamp answer directly — richer than the hash-chained request log (§24.3), which covers AI actions rather than data mutations. Join CDC output with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">fn_cdc_map_lsn_to_time</code> for human-readable timelines.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Warehouse sync.</strong> The embedding/feature warehouse (§17) stays current by replaying CDC changes instead of full re-scans: inserts/updates upsert, deletes tombstone. The LSN cursor is the sync watermark — exactly-once with idempotent upserts keyed on (key, LSN).</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Training-data extraction.</strong> Supervised fine-tuning needs (input, outcome) pairs: the conversation as input, the eventual resolution as the label. CDC on the tickets table captures the resolution transitions — the pipeline joins the conversation history to the resolved outcome by key, producing labeled pairs no human had to annotate.</li>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Training-pair extraction: conversation + eventual outcome
+-- When a ticket transitions to 'resolved', emit a labeled pair
+WITH resolved AS (
+    SELECT after.ticket_id, after.tenant_id, after.resolution_notes,
+           after.__$start_lsn AS lsn
+    FROM cdc.fn_cdc_get_all_changes_dbo_tickets(@from, @to, N'all') AS after
+    JOIN cdc.fn_cdc_get_all_changes_dbo_tickets(@from, @to, N'all') AS before
+      ON before.ticket_id = after.ticket_id
+     AND before.__$operation = 3 AND after.__$operation = 4
+     AND before.__$seqval = after.__$seqval
+    WHERE after.status = N'resolved' AND before.status != N'resolved'
+)
+INSERT INTO dbo.training_pairs (ticket_id, tenant_id, conversation_json,
+                                outcome_label, outcome_notes, event_lsn)
+SELECT r.ticket_id, r.tenant_id,
+       (SELECT content FROM dbo.messages AS m
+        WHERE m.conversation_id = t.conversation_id
+        ORDER BY m.created_at FOR JSON PATH) AS conversation_json,
+       N'resolved', r.resolution_notes, r.lsn
+FROM resolved AS r
+JOIN dbo.tickets AS t ON t.ticket_id = r.ticket_id;
+-- Human review samples the pairs before they enter training (§19.5's loop).</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">30.4 Operating CDC: Retention, Latency, and Cleanup</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Retention vs. slowest consumer.</strong> CDC's cleanup job deletes change rows older than the retention period (default 3 days). Every consumer's LSN cursor must advance faster than retention — monitor cursor lag per consumer and alert before cleanup overtakes anyone.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Capture latency.</strong> The log-reader agent polls on a schedule; changes appear in CDC tables seconds after commit, not instantly. Pipelines that need sub-second reaction should use Change Tracking triggers (§27) for the alert and CDC for the payload.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Schema changes.</strong> Adding a column to a captured table requires re-enabling CDC capture for the new column set — coordinate DDL on captured tables with the pipeline owners, and let the drift detector (§23.3) flag captured-table changes for review.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Storage growth.</strong> High-churn tables with wide captured column lists grow CDC tables fast. Capture only needed columns, keep retention as short as the slowest consumer allows, and partition large change tables if queries slow down.</li>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">30.5 CDC on Azure SQL: What's Different</h3>
+
+<p class="text-gray-300 leading-relaxed">On Azure SQL Database, CDC works with two practical differences from self-hosted SQL Server. First, there is no SQL Server Agent — the capture and cleanup jobs are managed by the platform, which means less operational control: you cannot reschedule the capture job's polling interval or add custom steps to it. Size your consumer lag expectations accordingly and monitor with the platform's metrics rather than <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">msdb</code> job history. Second, CDC change tables live in the same database and consume your DTU/vCore budget — on a busy OLTP database, a high-churn captured table can measurably increase resource consumption, so capture narrow column lists (§30.1) and keep retention tight. For elastic-pool databases, remember the pool shares resources: one tenant's CDC-heavy change tables affect the whole pool. When CDC's platform-managed nature chafes, the alternative is Azure Data Factory or Fabric event streams consuming the same logical changes — but for in-database AI pipelines, CDC remains the simplest correct choice.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>CDC captures before/after row images asynchronously from the transaction log</strong> — the raw material for feature deltas, audit diffs, warehouse sync, and training-pair extraction.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Consume with LSN cursors and idempotent writes</strong> keyed on (key, LSN); pair before/after rows by __$seqval for delta computation.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Combine CT and CDC:</strong> Change Tracking for the low-latency trigger, CDC for the rich payload — each covers the other's weakness.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Operate it deliberately:</strong> retention must exceed the slowest consumer's lag, capture only needed columns, coordinate DDL on captured tables, and monitor cursor lag before cleanup overtakes anyone.</li>
+
+    </article>
+
+      <nav class="flex items-center justify-center gap-3 mt-12 mb-4 text-sm">
+        <a href="chapter-29.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">← Chapter 29</a>
+        <a href="index.html" class="px-4 py-2 rounded-lg bg-gray-800 text-gray-300 hover:bg-gray-700 transition">All Chapters</a>
+        <a href="chapter-31.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">Chapter 31 →</a>
+      </nav>
+<div class="bg-gradient-to-r from-blue-900/40 to-indigo-900/40 border border-blue-800/50 rounded-2xl p-6 mt-10">
+        <p class="text-gray-300 text-sm leading-relaxed"><strong class="text-white">Keep going.</strong> You're reading <em class="text-blue-300">AI-Native Apps on SQL Server</em> — one of seven free deep-dives in the DBA Library, covering SQL Server performance tuning, high availability, security, automation, and more. <a href="../index.html" class="text-blue-400 hover:text-blue-300 underline">Browse the full library →</a></p>
+      </div>
+    <footer class="text-center text-gray-600 text-xs mt-10 pb-6">DBA Library · AI-Native Apps on SQL Server · Free for the SQL Server community</footer>
+  </div>
+</body>
+</html>

@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 11: Conversation Compression and Summarization — AI-Native Apps on SQL Server</title>
+<meta name="description" content="Token budgets, rolling summaries, checkpoints, and graceful degradation under pressure.">
+<script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-200">
+  <div class="max-w-3xl mx-auto px-6 py-10">
+    <p class="text-blue-400 text-sm font-semibold tracking-wide uppercase mb-2">AI-Native Apps on SQL Server</p>
+    <p class="text-gray-500 text-sm mb-1">Chapter 11 of 40</p>
+    <h1 class="text-3xl font-bold text-white mb-8">Conversation Compression and Summarization</h1>
+    <article class="space-y-5">
+<p class="text-gray-300 leading-relaxed">Context windows are finite; conversations are not. When history exceeds the token budget (§6.2), the naive approach drops the oldest turns — silently discarding the very context that makes long conversations valuable. Summarization replaces dropped turns with a compressed representation: the model reads the expiring turns, writes a dense summary, and the summary takes their place in the prompt. This chapter builds the summarization pipeline — when to trigger it, how to summarize without losing critical detail, where to store summaries, and the recursive summarization pattern for conversations that outlive even their summaries.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">11.1 When to Summarize: The Trigger Conditions</h3>
+
+<p class="text-gray-300 leading-relaxed">Summarization triggers on three conditions, checked whenever history is loaded:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Budget pressure.</strong> History tokens exceed ~70% of the allocated history budget. Summarize the oldest 50% of turns, keep the newest verbatim. The 70% threshold (not 100%) leaves room for the summary itself plus the current turn.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Session close.</strong> The Chapter 7 expiry job fires summarization for the whole conversation — this is the archival summary stored in long-term memory (§8.3).</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Explicit checkpoint.</strong> Long-running agent tasks (Chapter 26) checkpoint their state periodically; each checkpoint includes a summary so a crashed agent resumes from the summary rather than replaying hundreds of turns.</li>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE dbo.conversation_summaries (
+    summary_id      UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWID(),
+    conversation_id UNIQUEIDENTIFIER NOT NULL
+                    CONSTRAINT FK_sum_conversation
+                    REFERENCES dbo.conversations(conversation_id) ON DELETE CASCADE,
+    tenant_id       UNIQUEIDENTIFIER NOT NULL,
+    -- The turn range this summary covers (inclusive)
+    from_seq        INT NOT NULL,
+    to_seq          INT NOT NULL,
+    summary_text    NVARCHAR(MAX) NOT NULL,
+    summary_tokens  INT NOT NULL,
+    model           NVARCHAR(100) NOT NULL,   -- which model wrote the summary
+    created_at      DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+    CONSTRAINT CK_sum_range CHECK (from_seq &lt;= to_seq)
+);
+CREATE INDEX IX_summaries_conversation
+    ON dbo.conversation_summaries(conversation_id, from_seq);</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">from_seq / to_seq</code> range is the crucial design element: it records exactly which turns the summary replaces, so history assembly can splice summaries and verbatim turns without gaps or overlaps.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">11.2 Writing Good Summaries: The Prompt Contract</h3>
+
+<p class="text-gray-300 leading-relaxed">A summary prompt needs a contract — the summary will be read by a model, not a human, so optimize for machine consumption:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Preserve decisions, commitments, and open questions.</strong> "User decided to use the pro plan" matters; "user said hello" does not.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Preserve entities and identifiers.</strong> Order numbers, names, dates, error codes — the tokens most likely to be referenced later.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Preserve unresolved state.</strong> "Waiting on the user to provide the log file" — the summary must capture what happens next.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Target a compression ratio, not a length.</strong> "Compress to ~15% of input tokens" adapts to conversation length better than "write 5 sentences."</li>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Summarization worker (Python)
+SUMMARY_PROMPT = """You are compressing a conversation for future reference.
+The summary will be read by an AI assistant continuing this conversation.
+Rules:
+- Preserve all decisions, commitments, entities, identifiers, and open questions.
+- Drop greetings, small talk, and restated information.
+- Write in third person, present tense, dense factual style.
+- Target approximately 15% of the input token count.
+- End with an 'Open items:' list if anything is unresolved."""
+
+def summarize_range(conversation_id, from_seq, to_seq, tenant_id):
+    turns = load_turns(conversation_id, from_seq, to_seq)
+    text = "\n".join(f"{t.role}: {t.content}" for t in turns)
+    summary = llm(SUMMARY_PROMPT + "\n\n" + text, model="gpt-4o-mini")
+    # Use a cheap model: summarization quality plateaus quickly,
+    # and this runs on every long conversation.
+    with db(tenant_id) as conn:
+        conn.execute("""
+            INSERT INTO dbo.conversation_summaries
+                (conversation_id, tenant_id, from_seq, to_seq,
+                 summary_text, summary_tokens, model)
+            VALUES (?, ?, ?, ?, ?, ?, 'gpt-4o-mini')""",
+            conversation_id, tenant_id, from_seq, to_seq,
+            summary, count_tokens(summary))
+        conn.commit()</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Use a cheap model for summarization. Empirical testing across many deployments shows summary quality plateaus quickly — a mini-class model at 15% compression is nearly indistinguishable from a frontier model for this task, at one-tenth the cost.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">11.3 Assembling History with Summaries Spliced In</h3>
+
+<p class="text-gray-300 leading-relaxed">The history loader from §6.2 gains a splicing step: covered turn ranges are replaced by their summaries, newest turns stay verbatim:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE OR ALTER PROCEDURE dbo.usp_load_history_with_summaries
+    @conversation_id UNIQUEIDENTIFIER,
+    @token_budget    INT = 6000
+AS
+BEGIN
+    SET NOCOUNT ON;
+    -- Summaries first (oldest), as system-context blocks
+    SELECT N'summary' AS kind, from_seq AS seq,
+           N'[Summary of turns ' + CAST(from_seq AS NVARCHAR(10)) + N'-'
+             + CAST(to_seq AS NVARCHAR(10)) + N'] ' + summary_text AS content,
+           summary_tokens AS tokens
+    FROM dbo.conversation_summaries
+    WHERE conversation_id = @conversation_id
+    UNION ALL
+    -- Then verbatim turns NOT covered by any summary
+    SELECT N'turn', m.seq, m.content, m.token_count
+    FROM dbo.messages AS m
+    WHERE m.conversation_id = @conversation_id
+      AND m.is_current = 1
+      AND NOT EXISTS (
+          SELECT 1 FROM dbo.conversation_summaries AS s
+          WHERE s.conversation_id = m.conversation_id
+            AND m.seq BETWEEN s.from_seq AND s.to_seq)
+    ORDER BY seq ASC;
+    -- Caller applies the token-budget window (§6.2) over this unified stream.
+END;
+GO</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">NOT EXISTS</code> anti-join guarantees no turn is ever double-counted — a summary and its covered turns never appear together. The bracketed prefix tells the model what it is reading, which measurably reduces confabulation about summarized events.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">11.4 Recursive Summarization for Very Long Conversations</h3>
+
+<p class="text-gray-300 leading-relaxed">Summaries themselves accumulate. A conversation with 50 summaries has the same budget problem one level up. The fix is recursive: when summary tokens exceed their own budget, summarize the summaries.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Summaries reference their children for the recursive rollup
+ALTER TABLE dbo.conversation_summaries
+    ADD parent_summary_id UNIQUEIDENTIFIER NULL
+        CONSTRAINT FK_sum_parent
+        REFERENCES dbo.conversation_summaries(summary_id),
+        summary_level INT NOT NULL DEFAULT 0;
+GO
+-- Level 0: summarizes raw turns. Level 1: summarizes level-0 summaries, etc.
+-- The loader prefers the highest level available for old ranges:
+--   WHERE summary_level = (SELECT MAX(summary_level) ... for that range)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">In practice, two levels handle essentially every real conversation: level-0 summaries of turn ranges, and a single level-1 "conversation so far" summary. Three levels is a sign the conversation should have been split — consider suggesting a fresh conversation to the user at that point.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">11.5 Validating Summary Quality</h3>
+
+<p class="text-gray-300 leading-relaxed">Summaries are lossy by design; validate that the loss is acceptable. The automated check: an LLM judge compares answers generated with full history versus summarized history on a sample of questions about the conversation. If answer equivalence drops below your threshold (typically 90%), the compression ratio is too aggressive or the summary prompt needs the contract terms from §11.2 reinforced. Run this evaluation monthly — it is cheap and it catches prompt drift (Chapter 19).</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Record the exact turn range each summary covers (from_seq/to_seq)</strong> so history assembly splices summaries and verbatim turns with no gaps or overlaps — enforced by a NOT EXISTS anti-join.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Summarize for machine consumption:</strong> decisions, entities, open items, ~15% compression ratio, third-person dense style — written by a cheap model, since quality plateaus quickly.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Trigger on budget pressure (70% of history budget), session close, and agent checkpoints</strong> — and recurse summaries into higher levels when they accumulate.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Validate with an LLM judge comparing full-history vs. summarized-history answers monthly.</strong> Summarization is lossy; measure the loss instead of assuming it.</li>
+
+    </article>
+
+      <nav class="flex items-center justify-center gap-3 mt-12 mb-4 text-sm">
+        <a href="chapter-10.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">← Chapter 10</a>
+        <a href="index.html" class="px-4 py-2 rounded-lg bg-gray-800 text-gray-300 hover:bg-gray-700 transition">All Chapters</a>
+        <a href="chapter-12.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">Chapter 12 →</a>
+      </nav>
+<div class="bg-gradient-to-r from-blue-900/40 to-indigo-900/40 border border-blue-800/50 rounded-2xl p-6 mt-10">
+        <p class="text-gray-300 text-sm leading-relaxed"><strong class="text-white">Keep going.</strong> You're reading <em class="text-blue-300">AI-Native Apps on SQL Server</em> — one of seven free deep-dives in the DBA Library, covering SQL Server performance tuning, high availability, security, automation, and more. <a href="../index.html" class="text-blue-400 hover:text-blue-300 underline">Browse the full library →</a></p>
+      </div>
+    <footer class="text-center text-gray-600 text-xs mt-10 pb-6">DBA Library · AI-Native Apps on SQL Server · Free for the SQL Server community</footer>
+  </div>
+</body>
+</html>

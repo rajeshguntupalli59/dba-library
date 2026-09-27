@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 3: SQL Server&#x27;s Native AI Toolkit: VECTOR Type, ML Services, and Semantic Search — AI-Native Apps on SQL Server</title>
+<meta name="description" content="Native VECTOR, vector indexes, VECTOR_DISTANCE, ML Services, PREDICT, full-text, and JSON — the built-in AI toolkit.">
+<script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-200">
+  <div class="max-w-3xl mx-auto px-6 py-10">
+    <p class="text-blue-400 text-sm font-semibold tracking-wide uppercase mb-2">AI-Native Apps on SQL Server</p>
+    <p class="text-gray-500 text-sm mb-1">Chapter 3 of 40</p>
+    <h1 class="text-3xl font-bold text-white mb-8">SQL Server&#x27;s Native AI Toolkit: VECTOR Type, ML Services, and Semantic Search</h1>
+    <article class="space-y-5">
+<p class="text-gray-300 leading-relaxed">Chapters 1 and 2 used SQL Server 2025's AI features without fully explaining them. This chapter is the deep reference: the native VECTOR data type and everything you can do with it, the DiskANN vector index and how to tune it, VECTOR_DISTANCE and the distance metrics, Machine Learning Services with sp_execute_external_script and the PREDICT function for in-database scoring, full-text and semantic search, and the JSON type that ties flexible AI payloads together. If you only read one internals chapter in this book, make it this one — every later chapter builds on these primitives.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">3.1 The VECTOR Data Type</h3>
+
+<p class="text-gray-300 leading-relaxed">SQL Server 2025 introduces VECTOR as a first-class data type: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR(n)</code> stores an n-dimensional array of single-precision floats, with n up to 1998. Unlike stuffing embeddings into <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">NVARCHAR(MAX)</code> as JSON or into a varbinary blob, the engine understands the type: it validates dimensions on write, stores the values in a compact binary layout, and exposes them to the query optimizer for vector-aware plans.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Declaring and populating VECTOR columns
+CREATE TABLE dbo.demo_vectors (
+    id        INT IDENTITY PRIMARY KEY,
+    label     NVARCHAR(100) NOT NULL,
+    embedding VECTOR(1536) NOT NULL
+);
+
+-- Insert from a JSON array string — the standard ingestion path
+INSERT INTO dbo.demo_vectors (label, embedding)
+VALUES (N'intro doc', CAST('[0.12, -0.04, 0.88, ...]' AS VECTOR(1536)));
+
+-- From a Python list: json.dumps(vec) then CAST(? AS VECTOR(1536))
+-- The engine rejects wrong-dimension input at write time:
+--   "The dimension of the vector must match" error on mismatch.
+
+-- Inspect: cast back to readable form
+SELECT id, label, CAST(embedding AS NVARCHAR(MAX)) AS embedding_json
+FROM dbo.demo_vectors;
+
+-- Vector arithmetic building blocks
+SELECT
+    VECTOR_DISTANCE('cosine',   a.embedding, b.embedding) AS cosine_dist,
+    VECTOR_DISTANCE('euclidean',a.embedding, b.embedding) AS euclid_dist,
+    VECTOR_DISTANCE('dot',      a.embedding, b.embedding) AS neg_dot_product
+FROM dbo.demo_vectors AS a
+CROSS JOIN dbo.demo_vectors AS b
+WHERE a.id &lt;&gt; b.id;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Three rules govern the type. First, the dimension is fixed at declaration: a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR(1536)</code> column only accepts 1536-dimensional vectors, which is exactly the guardrail you want when an embedding-model upgrade could silently corrupt your index. Second, vectors are stored as float32 — if your model emits float64, cast down at ingestion and accept the negligible precision loss. Third, NULL vectors are permitted and simply excluded from similarity ordering; use filtered indexes (Chapter 1, §1.2) to keep un-embedded rows out of hot paths.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">3.2 VECTOR_DISTANCE: The Three Metrics</h3>
+
+<p class="text-gray-300 leading-relaxed"><code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_DISTANCE(metric, v1, v2)</code> is the workhorse function. The metric argument chooses the geometry:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>'cosine' — the default for text embeddings.</strong> Returns 1 minus cosine similarity, so 0 means identical direction and 2 means opposite. Use it for OpenAI, Azure OpenAI, Cohere, and most text embedding models, which are trained with cosine-ish objectives.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>'euclidean' — straight-line distance.</strong> Appropriate when magnitude carries meaning, such as image embeddings or learned representations where the training loss was Euclidean.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>'dot' — negative dot product.</strong> Useful for maximum-inner-product search (MIPS) when vectors are not normalized; lower is "more similar" because the function negates the product to keep the ORDER BY ASC convention.</li>
+
+<p class="text-gray-300 leading-relaxed">The metric must match the metric declared on the vector index (next section), or the optimizer cannot use the index. Pick the metric when you create the table, document it next to the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">embedding_model</code> column, and never mix metrics within one searchable set.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Canonical nearest-neighbor query pattern used throughout this book
+DECLARE @q VECTOR(1536) = CAST(@query_vector_json AS VECTOR(1536));
+
+SELECT TOP (@k)
+    chunk_id, document_id, chunk_index, content,
+    VECTOR_DISTANCE('cosine', embedding, @q) AS distance
+FROM dbo.document_chunks
+WHERE tenant_id = @tenant_id
+  AND embedding IS NOT NULL
+ORDER BY VECTOR_DISTANCE('cosine', embedding, @q);  -- ASC: smaller = closer</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">3.3 The Vector Index: DiskANN Under the Hood</h3>
+
+<p class="text-gray-300 leading-relaxed">A sequential scan computing <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_DISTANCE</code> over millions of rows is correct but slow. The vector index — <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE VECTOR INDEX</code> — builds a DiskANN graph over the vectors, giving approximate nearest-neighbor search with logarithmic-ish scaling. Create it once per vector column:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE VECTOR INDEX IX_chunks_embedding
+    ON dbo.document_chunks (embedding)
+    WITH (METRIC = 'cosine', TYPE = 'diskann');
+GO
+
+-- Verify the index exists and check its state
+SELECT name, type_desc, is_disabled
+FROM sys.indexes
+WHERE object_id = OBJECT_ID('dbo.document_chunks')
+  AND name = 'IX_chunks_embedding';</code></pre>
+
+<p class="text-gray-300 leading-relaxed">How DiskANN works, in one paragraph: the index organizes vectors into a navigable graph where each vector links to a diverse set of neighbors. A query starts at an entry point and greedily walks toward the query vector, keeping a candidate list (the "search list size") and expanding the most promising nodes. A larger search list means higher recall at higher latency — the fundamental ANN tradeoff, exposed at query time so different workloads can choose differently.</p>
+
+<p class="text-gray-300 leading-relaxed">Practical tuning guidance:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Build with parallelism and memory.</strong> Index builds are CPU- and memory-intensive. Build during off-peak windows with an adequate memory grant; monitor with the vector-index DMVs.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Incremental inserts are supported.</strong> New chunks become searchable without a rebuild — the graph absorbs inserts online. This is what makes the ingestion pipeline in Chapter 1 viable at scale.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Filtered predicates compose.</strong> <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WHERE tenant_id = @t</code> plus the vector ordering gives you per-tenant ANN search from one physical index — the foundation of multi-tenant RAG in Chapter 18.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Measure recall, not just latency.</strong> Compare the index's top-k against a brute-force top-k on a sample workload. If recall drops below your threshold, widen the search list size before blaming the model.</li>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">3.4 Machine Learning Services and sp_execute_external_script</h3>
+
+<p class="text-gray-300 leading-relaxed">SQL Server Machine Learning Services runs Python and R inside the database engine via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sp_execute_external_script</code>. For AI applications its sweet spots are: feature engineering at scale (tokenize and aggregate millions of rows where the data lives), batch scoring with classic ML models, and embedding-adjacent preprocessing that would be wasteful to round-trip through the application tier.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Enable external scripts (one-time, requires restart of Launchpad service)
+EXEC sp_configure 'external scripts enabled', 1;
+RECONFIGURE;
+GO
+
+-- Example: score message toxicity in-database with a Python model
+-- InputDataSet arrives as a pandas DataFrame; OutputDataSet returns rows.
+EXEC sp_execute_external_script
+    @language = N'Python',
+    @script = N'
+import pickle
+model = pickle.loads(model_blob)
+OutputDataSet = InputDataSet.copy()
+OutputDataSet["toxicity"] = model.predict_proba(InputDataSet[["len", "caps_ratio", "exclaim"]])[:, 1]
+',
+    @input_data_1 = N'SELECT message_id, LEN(content) AS len,
+                              CAST(LEN(content) - LEN(REPLACE(content, UPPER(content), content)) AS FLOAT)
+                                / NULLIF(LEN(content), 0) AS caps_ratio
+                       FROM dbo.messages WHERE toxicity IS NULL',
+    @params = N'@model_blob VARBINARY(MAX)',
+    @model_blob = @pickled_model
+WITH RESULT SETS ((message_id UNIQUEIDENTIFIER, toxicity FLOAT));</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Two cautions. First, external scripts run under the SQL Server Launchpad service account — lock down its permissions and never let ad-hoc scripts touch the network. Second, ML Services is for batch and near-real-time scoring, not per-request LLM inference: keep the hot chat path in the API tier and use in-database ML for background enrichment (toxicity flags, quality scores, clustering) that later queries can filter on.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">3.5 PREDICT: In-Database Scoring in Pure T-SQL</h3>
+
+<p class="text-gray-300 leading-relaxed">Where ML Services is a Python sandbox, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">PREDICT</code> is native T-SQL scoring: it applies a trained model (stored as <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VARBINARY(MAX)</code>) to relational input, returning predictions as a table. It is the fastest way to score millions of rows because there is no process boundary at all.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Score every un-scored message with a pre-trained ONNX/native model
+-- stored in dbo.ml_models(model VARBINARY(MAX)).
+DECLARE @m VARBINARY(MAX) = (SELECT model FROM dbo.ml_models WHERE name = 'quality_v3');
+
+SELECT m.message_id,
+       p.prediction AS quality_score
+FROM PREDICT(MODEL = @m,
+             DATA = (SELECT CAST(token_count AS REAL) AS tokens,
+                            CAST(latency_ms AS REAL) AS latency
+                     FROM dbo.messages WHERE quality_score IS NULL) AS d)
+     WITH (prediction REAL) AS p
+JOIN dbo.messages AS m ON m.message_id = d.message_id;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">In AI applications, PREDICT shines for model-routing decisions: score the incoming query's complexity with a tiny classifier and route simple questions to a cheap model and hard ones to the frontier model. Chapter 33 uses exactly this pattern for cost attribution.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">3.6 Full-Text Search and Semantic Search</h3>
+
+<p class="text-gray-300 leading-relaxed">SQL Server's full-text search (CONTAINS, FREETEXT, CONTAINSTABLE, FREETEXTTABLE) is the keyword arm of every hybrid query in this book. The setup from Chapter 1 — full-text catalog, index on the content column with automatic change tracking — gives you stemming, thesaurus expansion, and proximity operators:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Keyword search with ranking, ready to fuse with vector results
+SELECT TOP (20) dc.chunk_id, dc.content, ft.RANK AS text_rank
+FROM dbo.document_chunks AS dc
+INNER JOIN CONTAINSTABLE(dbo.document_chunks, content,
+                         'refund NEAR policy AND enterprise') AS ft
+    ON dc.chunk_id = ft.[KEY]
+WHERE dc.tenant_id = @tenant_id
+ORDER BY ft.RANK DESC;
+
+-- FREETEXTTABLE for natural-language queries: inflectional expansion,
+-- thesaurus, and weighting handled by the engine
+SELECT TOP (20) dc.chunk_id, dc.content, ft.RANK
+FROM dbo.document_chunks AS dc
+INNER JOIN FREETEXTTABLE(dbo.document_chunks, content,
+                         @user_question) AS ft
+    ON dc.chunk_id = ft.[KEY]
+WHERE dc.tenant_id = @tenant_id
+ORDER BY ft.RANK DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The hybrid pattern from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">usp_hybrid_search</code> (§1.4) is the synthesis: the vector arm finds semantically similar chunks, the full-text arm finds lexically matching chunks, and Reciprocal Rank Fusion merges them. Neither arm alone is sufficient — vector search misses exact product codes and error strings, full-text search misses paraphrases. Together, in one procedure, they are the retrieval backbone of the entire book.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">3.7 The Native JSON Type</h3>
+
+<p class="text-gray-300 leading-relaxed">SQL Server 2025's native <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">JSON</code> type validates documents on write and stores them in an efficient binary format, replacing the old pattern of <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">NVARCHAR(MAX)</code> + <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ISJSON</code> check constraints. Combined with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">JSON_VALUE</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">JSON_QUERY</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">OPENJSON</code>, and JSON indexes, it is where flexible AI payloads — tool calls, citations, model parameters, preference blobs — live throughout this book.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- JSON path queries against AI payloads
+SELECT message_id,
+       JSON_VALUE(tool_calls, '$[0].function.name') AS first_tool,
+       JSON_VALUE(citations,  '$[0].score')          AS top_citation_score
+FROM dbo.messages
+WHERE JSON_VALUE(tool_calls, '$[0].function.name') = 'get_refund_policy';
+
+-- Shred a JSON array into rows for analytics
+SELECT c.chunk_id, c.score
+FROM dbo.messages AS m
+CROSS APPLY OPENJSON(m.citations)
+    WITH (chunk_id UNIQUEIDENTIFIER '$.chunk_id',
+          score    FLOAT             '$.score') AS c
+WHERE m.message_id = @mid;
+
+-- Index a hot JSON path for selective filters
+CREATE INDEX IX_messages_first_tool
+    ON dbo.messages (JSON_VALUE(tool_calls, '$[0].function.name'))
+    WHERE tool_calls IS NOT NULL;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The design rule for JSON in this book: fixed, queryable, relational-meaningful fields become columns; variable, model-shaped payloads become JSON. Citations are JSON because their schema follows the model provider; <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">token_count</code> is a column because billing queries aggregate it.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>VECTOR(n) is a first-class type with dimension validation on write.</strong> Declare the dimension once per column, match it to your embedding model, and let the engine reject mismatches instead of debugging silent corruption.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Match the VECTOR_DISTANCE metric to the vector index metric.</strong> Cosine for text embeddings, Euclidean where magnitude matters, dot for MIPS — and the same metric on the index, or the optimizer cannot use it.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>DiskANN vector indexes make ANN search incremental.</strong> New vectors become searchable without rebuilds, and tenant predicates compose with the vector ordering for multi-tenant RAG on a single index.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Use ML Services for batch enrichment and PREDICT for native-speed scoring.</strong> Keep per-request LLM inference in the API tier; score millions of rows where the data lives.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Hybrid search is vector arm + full-text arm + RRF, all in T-SQL.</strong> CONTAINSTABLE/FREETEXTTABLE cover the lexical side; VECTOR_DISTANCE covers the semantic side; the procedure fuses them before any row leaves the engine.</li>
+
+    </article>
+
+      <nav class="flex items-center justify-center gap-3 mt-12 mb-4 text-sm">
+        <a href="chapter-02.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">← Chapter 2</a>
+        <a href="index.html" class="px-4 py-2 rounded-lg bg-gray-800 text-gray-300 hover:bg-gray-700 transition">All Chapters</a>
+        <a href="chapter-04.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">Chapter 4 →</a>
+      </nav>
+<div class="bg-gradient-to-r from-blue-900/40 to-indigo-900/40 border border-blue-800/50 rounded-2xl p-6 mt-10">
+        <p class="text-gray-300 text-sm leading-relaxed"><strong class="text-white">Keep going.</strong> You're reading <em class="text-blue-300">AI-Native Apps on SQL Server</em> — one of seven free deep-dives in the DBA Library, covering SQL Server performance tuning, high availability, security, automation, and more. <a href="../index.html" class="text-blue-400 hover:text-blue-300 underline">Browse the full library →</a></p>
+      </div>
+    <footer class="text-center text-gray-600 text-xs mt-10 pb-6">DBA Library · AI-Native Apps on SQL Server · Free for the SQL Server community</footer>
+  </div>
+</body>
+</html>

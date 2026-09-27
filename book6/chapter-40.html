@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 40: Architecture Reference: Production AI App on SQL Server — AI-Native Apps on SQL Server</title>
+<meta name="description" content="The complete system: request lifecycle, data flows, runbooks, and the build order.">
+<script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-200">
+  <div class="max-w-3xl mx-auto px-6 py-10">
+    <p class="text-blue-400 text-sm font-semibold tracking-wide uppercase mb-2">AI-Native Apps on SQL Server</p>
+    <p class="text-gray-500 text-sm mb-1">Chapter 40 of 40</p>
+    <h1 class="text-3xl font-bold text-white mb-8">Architecture Reference: Production AI App on SQL Server</h1>
+    <article class="space-y-5">
+<p class="text-gray-300 leading-relaxed">Thirty-nine chapters of patterns need one page that shows how they fit together. This final chapter is the architecture reference: the complete system diagram in words, the request lifecycle of a single chat turn touching a dozen patterns, the data flow of the ingestion pipeline, the operational runbooks checklist, and the build order for a team starting from zero. When someone asks "how does it all hang together?" — this is the answer.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">40.1 The System at a Glance</h3>
+
+<p class="text-gray-300 leading-relaxed">Four layers, one database at the center:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Client layer:</strong> chat UI with streaming (SSE, Chapter 29), quota display (§25.4), conversation/version navigation (§32), feedback widgets (§19.4).</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Application layer:</strong> API gateway (auth, rate limiting §25, tenant resolution §18), chat orchestrator (session §7, memory assembly §8–10, prompt construction §37.2), agent runtime (§20, §26), text-to-SQL service (§22–23).</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Data layer (SQL Server):</strong> conversations and messages (§6), vector store (§3, §15), memory tables (§8–10), audit and ledger (§24, §33), queues and blackboard (§13, §26, §28), catalog (§22–23). RLS (§12) and guardrails (§22.3) enforced here, not in the app.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Pipeline layer:</strong> ingestion workers (§14, CDC §30), eval harness (§19), drift detection (§23.3), anomaly detection (§33.4), backup/erasure jobs (§38).</li>
+
+<p class="text-gray-300 leading-relaxed">The design principle repeated across all forty chapters: <strong>the database is the system of record for state, the application is stateless orchestration, and every cross-cutting concern (security, audit, cost, rate limiting) lives in the database where it cannot be bypassed.</strong></p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">40.2 A Single Chat Turn, End to End</h3>
+
+<p class="text-gray-300 leading-relaxed">One user message traverses the architecture like this:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">1.</span> Gateway authenticates, resolves tenant, checks the rate bucket (§25.1) and quota windows (§25.2) — 429/402 on failure.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">2.</span> Session validated (§7.2); conversation row locked with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sp_getapplock</code> (§7.2); user message inserted in the request transaction (§1.5).</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">3.</span> Semantic cache checked (§34.1) — hit: skip to step 8.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">4.</span> Memory assembled: short-term window (§8.1), long-term facts (§8.2), preferences (§10.2), compression state if over budget (§11).</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">5.</span> Retrieval: query embedded (embedding cache §34.2), vector search with metadata filters (§15–16), RLS applied (§12.1).</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">6.</span> Prompt built: system rules, delimited untrusted content (§37.2), memory, retrieved context, history replay (§6.2).</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">7.</span> LLM called (or agent loop §20.1 for complex requests); tokens streamed to the client (§29.2) with periodic persistence.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">8.</span> Output validated (§37.3); audit rows written with priced tokens (§24.1, §33.1); usage windows incremented (§25.2).</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">9.</span> Memory updated: new facts extracted (§9.2), summary refresh check (§11.3), feedback hooks attached (§19.4).</li>
+
+<p class="text-gray-300 leading-relaxed">Nine steps, each a chapter; the whole turn typically completes in 1–3 seconds with the first token streaming in under a second.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">40.3 The Ingestion Data Flow</h3>
+
+<p class="text-gray-300 leading-relaxed">Documents flow through the complementary pipeline: upload → validation and suspicious-content screening (§37.3) → chunking (§14.1) → embedding (cache §34.2, batching §14.2) → vector store insert (§14.3) → Service Broker event (§28.1) → downstream reactions (semantic index refresh, notification invalidation §28.3). Change Tracking (§27) and CDC (§30) keep derived stores current; the drift detector (§23.3) keeps the schema catalog honest; the eval harness (§19) keeps quality measured.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">40.4 Operational Runbooks Checklist</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Daily:</strong> review the AI ops dashboard (§36.3), anomaly alerts (§33.4), dead letters (§28.2), eval score trends (§19.3).</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Weekly:</strong> profiling refresh (§23.2), index maintenance (§15.3), retention sweeps (§38.4), cache effectiveness review (§34.4).</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Monthly:</strong> ledger close (§33.2), margin analysis (§33.3), golden-set promotion review (§19.5), access review (who can read prompt_audit?).</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Quarterly:</strong> schema exposure review (§23.4), load-test re-run (§39.4), disaster-recovery drill (restore + erasure replay §38.3), model/pricing updates (§25.3, §17.3).</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Incidents:</strong> one runbook (§36.4) — dashboard → audit timeline → DMV/Query Store evidence → containment (kill switch §37.4, throttle §33.4) → postmortem with new regression tests (§39.3).</li>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">40.5 Build Order for a New Team</h3>
+
+<p class="text-gray-300 leading-relaxed">If you are starting from zero, build in this order — each phase is independently useful:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Phase 1 — Chat that works:</strong> schema (§4), pooling (§5), sessions (§7), history (§6), audit (§24), basic RAG (§13–14). Ship an internal demo.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Phase 2 — Multi-tenant production:</strong> RLS (§12), quotas (§25), cost ledger (§33), observability (§36), caching (§34), streaming (§29). Ship the beta.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Phase 3 — Intelligence:</strong> memory system (§8–11), eval harness (§19), agents (§20–21), text-to-SQL (§22–23). Ship the differentiators.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Phase 4 — Hardening:</strong> prompt-injection defenses (§37), erasure (§38), versioning (§32), multi-agent (§26), scale-out (§35), testing (§39). Ship with confidence.</li>
+
+<p class="text-gray-300 leading-relaxed">Resist building Phase 3 before Phase 2 is solid — agents without quotas are billing incidents, memory without evaluation is unmeasurable, and text-to-SQL without audit is a compliance finding waiting to happen.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">40.6 Anti-Patterns to Avoid</h3>
+
+<p class="text-gray-300 leading-relaxed">Forty chapters of patterns; a closing catalog of the mistakes they prevent:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>The God Prompt:</strong> stuffing everything into one giant system prompt instead of the memory architecture (§8–11). It works until the context window fills, then fails mysteriously.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>RLS in the application layer:</strong> filtering by tenant_id in code instead of the database (§12). One missed WHERE clause is a breach; the database never misses.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Unbounded agents:</strong> agent loops without budgets (§26.5) or approval gates (§20.4). The first surprise is always the invoice.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Embeddings without provenance:</strong> vectors with no record of model, version, or source (§17). Unmigratable, undebuggable, untrustworthy.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Audit as an afterthought:</strong> bolting on logging after launch. The forensic queries (§24.4) only work if the data was captured — you cannot retroactively observe.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Caching the uncacheable:</strong> semantic-caching time-sensitive answers (§34.1). A stale "your order shipped" is worse than a slow one.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Phase 3 before Phase 2:</strong> agents and memory before quotas, audit, and observability (§40.5). Intelligence without operations is a demo, not a product.</li>
+
+<p class="text-gray-300 leading-relaxed">Pin this list where the team can see it. Every anti-pattern here was learned the expensive way by someone — the cheapest lesson is the one you read instead of lived.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<p class="text-gray-300 leading-relaxed">And the meta-lesson behind all forty chapters: the database is not the boring part of the AI stack — it is the part that makes the exciting parts trustworthy. Prompts are ephemeral, models are interchangeable, but the state in SQL Server is what persists, what bills, what complies, and what the user comes back to. Invest in the data layer with the same seriousness you invest in model selection, and the AI application becomes a system instead of a demo. That is what this book was for.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+<p class="text-gray-300 leading-relaxed">If you take one thing from this book, take the request lifecycle in §40.2: nine stages, each independently built, tested, and observed. Tape it to the wall. Every production incident you will ever have in this system is one of those nine stages failing — and now you know which one to look at first.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>The database is the system of record; the application is stateless orchestration;</strong> security, audit, cost, and rate limiting live in the database where they cannot be bypassed.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>A single chat turn traverses nine stages</strong> — rate check, session, cache, memory, retrieval, prompt, generation, audit, memory update — each independently built, tested, and observed.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Operate on a cadence:</strong> daily dashboards and alerts, weekly maintenance, monthly ledger and margins, quarterly reviews and drills, one incident runbook.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Build in phases — chat, multi-tenant production, intelligence, hardening</strong> — and never let Phase 3 ambition outrun Phase 2 foundations.</li>
+
+    </article>
+
+      <nav class="flex items-center justify-center gap-3 mt-12 mb-4 text-sm">
+        <a href="chapter-39.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">← Chapter 39</a>
+        <a href="index.html" class="px-4 py-2 rounded-lg bg-gray-800 text-gray-300 hover:bg-gray-700 transition">All Chapters</a>
+        <span class="px-4 py-2 rounded-lg bg-gray-900 text-gray-600">End →</span>
+      </nav>
+<div class="bg-gradient-to-r from-blue-900/40 to-indigo-900/40 border border-blue-800/50 rounded-2xl p-6 mt-10">
+        <p class="text-gray-300 text-sm leading-relaxed"><strong class="text-white">Keep going.</strong> You're reading <em class="text-blue-300">AI-Native Apps on SQL Server</em> — one of seven free deep-dives in the DBA Library, covering SQL Server performance tuning, high availability, security, automation, and more. <a href="../index.html" class="text-blue-400 hover:text-blue-300 underline">Browse the full library →</a></p>
+      </div>
+    <footer class="text-center text-gray-600 text-xs mt-10 pb-6">DBA Library · AI-Native Apps on SQL Server · Free for the SQL Server community</footer>
+  </div>
+</body>
+</html>

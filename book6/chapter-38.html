@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 38: GDPR and Data Erasure in AI Systems — AI-Native Apps on SQL Server</title>
+<meta name="description" content="Data inventory, the erasure procedure, derived-data hard parts, and retention with legal hold.">
+<script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-200">
+  <div class="max-w-3xl mx-auto px-6 py-10">
+    <p class="text-blue-400 text-sm font-semibold tracking-wide uppercase mb-2">AI-Native Apps on SQL Server</p>
+    <p class="text-gray-500 text-sm mb-1">Chapter 38 of 40</p>
+    <h1 class="text-3xl font-bold text-white mb-8">GDPR and Data Erasure in AI Systems</h1>
+    <article class="space-y-5">
+<p class="text-gray-300 leading-relaxed">The right to erasure ("right to be forgotten") is straightforward for a CRUD app: delete the user's rows. For an AI application it sprawls: conversation history, vector embeddings derived from the user's documents, semantic cache entries, training pairs, audit logs with legal retention, backups, and replicas. This chapter builds the erasure machinery: the data inventory that makes erasure complete, the erasure procedure that walks every store, the derived-data problem (embeddings are personal data too), and the retention framework that reconciles erasure with legal hold.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">38.1 The Data Inventory: Knowing Where Personal Data Lives</h3>
+
+<p class="text-gray-300 leading-relaxed">You cannot erase what you cannot find. The inventory maps every table holding personal data, registered when the table is created and verified by the drift detector (§23.3):</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE dbo.personal_data_inventory (
+    table_schema  NVARCHAR(128) NOT NULL,
+    table_name    NVARCHAR(128) NOT NULL,
+    user_key_col  NVARCHAR(128) NOT NULL,     -- how to find the user's rows
+    data_category NVARCHAR(50) NOT NULL       -- 'content', 'derived', 'audit'
+                  CONSTRAINT CK_pdi_cat CHECK (data_category IN
+                      (N'content', N'derived', N'audit')),
+    erasure_rule  NVARCHAR(50) NOT NULL       -- 'delete', 'anonymize', 'retain_legal'
+                  CONSTRAINT CK_pdi_rule CHECK (erasure_rule IN
+                      (N'delete', N'anonymize', N'retain_legal')),
+    CONSTRAINT PK_pdi PRIMARY KEY (table_schema, table_name)
+);
+-- Seed it for every personal-data store:
+--   messages (content/delete), message_versions (content/delete),
+--   document_chunks (derived/delete — embeddings of user docs),
+--   semantic_cache (derived/delete), training_pairs (derived/anonymize),
+--   llm_audit_log (audit/retain_legal — then anonymize user_id after retention),
+--   answer_feedback (content/anonymize — keep the signal, drop the person).</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The three categories drive three treatments: <strong>content</strong> (the user's actual data — delete), <strong>derived</strong> (embeddings, caches, training pairs computed from content — delete or anonymize), <strong>audit</strong> (legal retention — retain, then anonymize when retention expires).</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">38.2 The Erasure Procedure</h3>
+
+<p class="text-gray-300 leading-relaxed">One procedure walks the inventory in dependency order (children before parents), applying each table's rule:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE OR ALTER PROCEDURE dbo.usp_erase_user
+    @user_id UNIQUEIDENTIFIER, @request_id UNIQUEIDENTIFIER
+AS
+BEGIN
+    SET NOCOUNT ON;
+    -- Log the erasure request itself (the request is audit; the data is not)
+    INSERT INTO dbo.erasure_requests (request_id, user_id, requested_at, status)
+    VALUES (@request_id, @user_id, SYSUTCDATETIME(), N'in_progress');
+
+    BEGIN TRAN;
+    -- Derived stores first (no FK dependencies outward)
+    DELETE FROM dbo.document_chunks
+    WHERE document_id IN (SELECT document_id FROM dbo.documents
+                          WHERE user_id = @user_id);
+    DELETE FROM dbo.semantic_cache WHERE user_id = @user_id;  -- via tenant scoping
+    DELETE FROM dbo.embedding_cache WHERE text_hash IN (
+        SELECT text_hash FROM dbo.user_text_hashes WHERE user_id = @user_id);
+
+    -- Content: versions, messages, conversations (children before parents)
+    DELETE FROM dbo.message_versions
+    WHERE message_id IN (SELECT message_id FROM dbo.messages
+                         WHERE user_id = @user_id);
+    DELETE FROM dbo.messages WHERE user_id = @user_id;
+    DELETE FROM dbo.conversations WHERE user_id = @user_id;
+    DELETE FROM dbo.documents WHERE user_id = @user_id;
+
+    -- Anonymize: keep the signal, drop the person
+    UPDATE dbo.answer_feedback SET user_id = NULL,
+           details = JSON_MODIFY(details, '$.anonymized', JSON_QUERY(N'true'))
+    WHERE user_id = @user_id;
+    UPDATE dbo.training_pairs SET tenant_id = NULL -- break attribution
+    WHERE tenant_id = (SELECT tenant_id FROM dbo.users WHERE user_id = @user_id);
+
+    -- Audit: retained per legal basis; user_id pseudonymized at retention end
+    -- (a scheduled job, not this procedure)
+    UPDATE dbo.erasure_requests
+    SET status = N'complete', completed_at = SYSUTCDATETIME()
+    WHERE request_id = @request_id;
+    COMMIT;
+    -- Downstream: purge vector index entries (§17.2), invalidate caches (§34),
+    -- tombstone the user in the warehouse sync (§30.3).
+END;
+GO</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">38.3 The Hard Parts: Derived Data, Backups, and Models</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Embeddings are personal data.</strong> A vector derived from a user's document can, in principle, be inverted toward the source text. Erasure must delete the vectors (§17.2's tombstone path), not just the documents.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Backups.</strong> You cannot delete from last month's backup without destroying the backup. The compliant pattern: document that backups age out on their retention schedule (e.g., 30 days), encrypt backups per-tenant where feasible (destroying the key cryptographically erases the tenant's backup data), and ensure restores re-run erasure for requests received during the backup window.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Trained models.</strong> If user data entered fine-tuning (§30.3), the model itself "remembers." Full unlearning is a research problem; the practical controls are: exclude erased users' pairs from future training runs, version training datasets so erased data never re-enters, and document the limitation in the privacy notice.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Replicas and caches.</strong> Erasure on the primary replicates naturally (Availability Groups, §35.1's secondaries); application caches (§34) need explicit invalidation keyed by user_id.</li>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">38.4 Retention Framework and Legal Hold</h3>
+
+<p class="text-gray-300 leading-relaxed">Erasure is not the only rule — some data must be kept. The retention framework reconciles them:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Default retention per category:</strong> content (account lifetime + 30 days), derived (90 days), prompt audit (90 days, §24.1), request audit (7 years or per jurisdiction).</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Legal hold overrides erasure:</strong> a hold flag on the user suspends <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">usp_erase_user</code> for audit-category data — the procedure checks the hold table first and refuses with a logged exception.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Retention sweeps:</strong> scheduled jobs enforce the defaults (the same partitioning/purge machinery as §4.6), so erasure-by-request and erasure-by-schedule share one code path.</li>
+
+<p class="text-gray-300 leading-relaxed">Document everything: the inventory, the procedure's completion log, the backup aging policy, the training-data versioning. GDPR compliance is demonstrated with records, not intentions.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">38.5 Data Subject Access Requests: The Other Direction</h3>
+
+<p class="text-gray-300 leading-relaxed">Erasure (§38.2) deletes; access requests disclose — "show me everything you have on me." The same inventory (§38.1) powers both, but the output is a report, not a deletion. Build <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">usp_export_user_data</code> as the mirror of the erasure procedure: walk the inventory in any order, serialize each table's rows for the user to JSON, and package with a manifest (what was included, what was excluded and why — audit-category data retained under legal basis is disclosed as metadata, not content). Two subtleties: <strong>derived data</strong> (embeddings, training pairs) must be included — it is personal data even if the user never saw it — exported in an interpretable form (the source text the embedding came from, not the raw vector); and <strong>other people's data</strong> must be redacted — a shared conversation exports only the requester's messages, with other participants' content removed or anonymized. Deliver within the statutory window (30 days GDPR), log the request and fulfillment in the audit trail, and reuse the packaging for the inevitable "can I take my data to a competitor" portability requests — the format is the same, only the legal basis differs.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<p class="text-gray-300 leading-relaxed">Remember that erasure and access rights also apply to the machine-learning artifacts: if a user's data contributed to a fine-tuned model or to aggregated analytics, the access report should disclose that contribution in plain language, and the erasure procedure should exclude their data from the next training run. Regulators increasingly ask about model memorization specifically — having a documented answer ("training datasets are versioned, erased users are excluded from future runs, here is the log") turns a hard question into a routine one.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Maintain a personal-data inventory</strong> mapping every store to its erasure rule (delete / anonymize / retain_legal) — verified by the schema drift detector.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>One erasure procedure walks the inventory in dependency order,</strong> handling derived stores, content, anonymization, and audit retention — with the request itself logged.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Face the hard parts explicitly:</strong> embeddings are personal data, backups age out (or crypto-erase per tenant), training datasets are versioned so erased data never re-enters, caches invalidate by user.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Reconcile erasure with retention</strong> through per-category defaults, legal-hold overrides, and scheduled sweeps sharing one code path — and document all of it.</li>
+
+    </article>
+
+      <nav class="flex items-center justify-center gap-3 mt-12 mb-4 text-sm">
+        <a href="chapter-37.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">← Chapter 37</a>
+        <a href="index.html" class="px-4 py-2 rounded-lg bg-gray-800 text-gray-300 hover:bg-gray-700 transition">All Chapters</a>
+        <a href="chapter-39.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">Chapter 39 →</a>
+      </nav>
+<div class="bg-gradient-to-r from-blue-900/40 to-indigo-900/40 border border-blue-800/50 rounded-2xl p-6 mt-10">
+        <p class="text-gray-300 text-sm leading-relaxed"><strong class="text-white">Keep going.</strong> You're reading <em class="text-blue-300">AI-Native Apps on SQL Server</em> — one of seven free deep-dives in the DBA Library, covering SQL Server performance tuning, high availability, security, automation, and more. <a href="../index.html" class="text-blue-400 hover:text-blue-300 underline">Browse the full library →</a></p>
+      </div>
+    <footer class="text-center text-gray-600 text-xs mt-10 pb-6">DBA Library · AI-Native Apps on SQL Server · Free for the SQL Server community</footer>
+  </div>
+</body>
+</html>

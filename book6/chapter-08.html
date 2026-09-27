@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 8: Short-Term and Long-Term Memory Design — AI-Native Apps on SQL Server</title>
+<meta name="description" content="Working-memory windows, durable fact tables, and memory consolidation pipelines.">
+<script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-200">
+  <div class="max-w-3xl mx-auto px-6 py-10">
+    <p class="text-blue-400 text-sm font-semibold tracking-wide uppercase mb-2">AI-Native Apps on SQL Server</p>
+    <p class="text-gray-500 text-sm mb-1">Chapter 8 of 40</p>
+    <h1 class="text-3xl font-bold text-white mb-8">Short-Term and Long-Term Memory Design</h1>
+    <article class="space-y-5">
+<p class="text-gray-300 leading-relaxed">Human memory has two systems: working memory (small, fast, fleeting) and long-term memory (vast, slower, durable). AI applications need the same split, and the failure mode of confusing them is expensive — stuffing everything into the prompt wastes tokens and money; storing everything durably and retrieving nothing makes the assistant feel amnesiac. This chapter designs the two-tier memory architecture: the short-term tier (recent turns, session scratch state) optimized for millisecond access, and the long-term tier (summaries, facts, embeddings of past conversations) optimized for relevance-ranked retrieval. Both tiers live in SQL Server, with a promotion pipeline moving memories between them.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">8.1 The Two Tiers and Their Contracts</h3>
+
+<p class="text-gray-300 leading-relaxed">Each tier has a distinct contract with the rest of the system:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Short-term memory: the last N turns, verbatim.</strong> Sourced from the messages table (§6.2), bounded by the token budget, ordered chronologically. Latency budget: single-digit milliseconds. Eviction policy: oldest turns fall off as the budget fills.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Long-term memory: distilled knowledge about the user.</strong> Conversation summaries, extracted facts ("user prefers morning meetings"), preference records, and embeddings of past conversations for semantic recall. Sourced from dedicated tables, retrieved by relevance — not recency. Latency budget: tens of milliseconds.</li>
+
+<p class="text-gray-300 leading-relaxed">The prompt assembly order is fixed: system prompt → long-term memories (ranked by relevance) → short-term turns (chronological) → current user message. Long-term memories go first because they are the most likely to be truncated if the budget runs out — and a truncated recent turn is worse than a truncated old fact.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
+    U[User message] --> STM[Short-term: last N turns verbatim]
+    U --> LTM[Long-term: summaries + facts + semantic recall]
+    STM --> PA[Prompt assembly]
+    LTM --> PA
+    PA --> LLM[LLM call]
+    LLM --> P[Promotion pipeline]
+    P -->|summarize| LTM
+    P -->|extract facts| LTM
+    P -->|embed| LTM</pre></div>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">8.2 The Long-Term Memory Schema</h3>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Distilled, long-lived memories about a user
+CREATE TABLE dbo.long_term_memories (
+    memory_id       UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWID(),
+    user_id         UNIQUEIDENTIFIER NOT NULL
+                    CONSTRAINT FK_ltm_user REFERENCES dbo.users(user_id) ON DELETE CASCADE,
+    tenant_id       UNIQUEIDENTIFIER NOT NULL,
+    memory_type     NVARCHAR(30) NOT NULL
+                    CONSTRAINT CK_ltm_type CHECK (memory_type IN
+                        (N'summary', N'fact', N'preference', N'episode')),
+    -- summary: compressed conversation; fact: atomic statement;
+    -- preference: durable likes/dislikes; episode: notable past interaction
+    content         NVARCHAR(MAX) NOT NULL,
+    embedding       VECTOR(1536) NULL,   -- for semantic recall of episodes/facts
+    importance      DECIMAL(3,2) NOT NULL DEFAULT 0.50,  -- 0..1, decayed over time
+    source_conversation_id UNIQUEIDENTIFIER NULL,
+    created_at      DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+    last_recalled_at DATETIME2 NULL,
+    recall_count    INT NOT NULL DEFAULT 0
+);
+CREATE VECTOR INDEX IX_ltm_embedding
+    ON dbo.long_term_memories (embedding)
+    WITH (METRIC = 'cosine', TYPE = 'diskann');
+CREATE INDEX IX_ltm_user_type ON dbo.long_term_memories(user_id, memory_type, importance DESC);</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">importance</code> score is the key innovation: every memory carries a weight that decays with time and increases with recall. Retrieval ranks by a blend of semantic similarity and importance, so frequently-useful memories surface and stale ones fade without explicit deletion.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">8.3 The Promotion Pipeline: Short-Term → Long-Term</h3>
+
+<p class="text-gray-300 leading-relaxed">When a session closes (Chapter 7's expiry job), the promotion worker distills it into long-term memories. This is a background job, not part of the chat request — it can take seconds and retry freely:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Promotion worker (Python pseudocode, runs off session_close_queue)
+def promote_session(session_id, conversation_id, user_id, tenant_id):
+    turns = load_full_conversation(conversation_id)   # Chapter 6
+    if len(turns) &lt; 4:
+        return  # too short to distill; skip
+
+    # 1. Summarize the conversation with the LLM
+    summary = llm(f"Summarize this conversation in 5 sentences or less, "
+                  f"focusing on durable facts about the user:\n{turns}")
+
+    # 2. Extract atomic facts as structured JSON
+    facts = llm_json(f"Extract durable facts about the user as a JSON array "
+                     f"of short statements. Omit anything ephemeral:\n{turns}")
+    # facts = ["User manages a team of 12 DBAs", "Prefers terse answers", ...]
+
+    # 3. Embed summary + facts, store as long-term memories
+    with db(tenant_id) as conn:
+        store_memory(conn, user_id, tenant_id, 'summary', summary,
+                     embed(summary), importance=0.7,
+                     source_conversation_id=conversation_id)
+        for fact in facts:
+            # Deduplicate: skip if a near-identical fact already exists
+            if not near_duplicate(conn, user_id, fact):
+                store_memory(conn, user_id, tenant_id, 'fact', fact,
+                             embed(fact), importance=0.6,
+                             source_conversation_id=conversation_id)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Deduplication matters: without it, ten conversations about the same preference create ten competing memories. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">near_duplicate</code> check runs a vector search for existing facts above a similarity threshold — if found, it bumps the existing memory's importance instead of inserting a duplicate.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">8.4 Recall: Assembling Long-Term Context</h3>
+
+<p class="text-gray-300 leading-relaxed">At chat time, long-term recall runs a hybrid query: semantic similarity against the current message, blended with importance, filtered to the user:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE OR ALTER PROCEDURE dbo.usp_recall_memories
+    @user_id      UNIQUEIDENTIFIER,
+    @query_vector VECTOR(1536),
+    @top_n        INT = 5
+AS
+BEGIN
+    SET NOCOUNT ON;
+    -- Blend: 70% semantic similarity, 30% importance.
+    -- Cosine distance d in [0,2]; convert to similarity (1 - d/2).
+    SELECT TOP (@top_n)
+        memory_id, memory_type, content, importance,
+        (0.7 * (1 - VECTOR_DISTANCE('cosine', embedding, @query_vector) / 2.0)
+         + 0.3 * importance) AS score
+    FROM dbo.long_term_memories
+    WHERE user_id = @user_id
+      AND embedding IS NOT NULL
+    ORDER BY score DESC;
+
+    -- Reinforcement: recalled memories get more important, and we record
+    -- the recall so rarely-used memories can decay (see §8.5).
+    -- (UPDATE issued by the caller for the returned memory_ids.)
+END;
+GO</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The caller then updates <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">recall_count</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">last_recalled_at</code>, and bumps <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">importance</code> slightly for returned memories — the reinforcement loop that keeps the memory store self-curating.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">8.5 Forgetting: Decay and Pruning</h3>
+
+<p class="text-gray-300 leading-relaxed">A memory system that never forgets becomes a liability — stale facts contradict newer ones and retrieval quality degrades. Two mechanisms keep the store healthy:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Importance decay.</strong> A nightly job multiplies importance by 0.99 for memories not recalled in 30 days. Memories that nobody uses fade toward zero and stop being retrieved.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Contradiction resolution.</strong> When a new fact near-duplicates an old one with conflicting content ("prefers morning meetings" vs. "moved standup to afternoons"), the promotion worker marks the old memory superseded rather than deleting it — the history of the user's preferences is itself useful signal.</li>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Nightly decay job
+UPDATE dbo.long_term_memories
+SET importance = importance * 0.99
+WHERE last_recalled_at &lt; DATEADD(day, -30, SYSUTCDATETIME())
+   OR (last_recalled_at IS NULL AND created_at &lt; DATEADD(day, -30, SYSUTCDATETIME()));
+
+-- Prune fully-decayed, never-recalled trivia (keep summaries and preferences)
+DELETE FROM dbo.long_term_memories
+WHERE importance &lt; 0.05 AND recall_count = 0
+  AND memory_type IN (N'fact', N'episode');</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Split memory into short-term (verbatim recent turns) and long-term (distilled summaries, facts, preferences).</strong> Assemble prompts as system → long-term (relevance-ranked) → short-term (chronological) → current message.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Promote asynchronously on session close:</strong> summarize, extract atomic facts, deduplicate against existing memories, and embed — never in the chat request path.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Rank recall by semantic similarity blended with importance, and reinforce on recall.</strong> Frequently-useful memories surface; stale ones fade.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Design forgetting deliberately:</strong> nightly importance decay, contradiction supersession instead of deletion, and pruning of decayed trivia. A memory store that never forgets rots.</li>
+
+    </article>
+
+      <nav class="flex items-center justify-center gap-3 mt-12 mb-4 text-sm">
+        <a href="chapter-07.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">← Chapter 7</a>
+        <a href="index.html" class="px-4 py-2 rounded-lg bg-gray-800 text-gray-300 hover:bg-gray-700 transition">All Chapters</a>
+        <a href="chapter-09.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">Chapter 9 →</a>
+      </nav>
+<div class="bg-gradient-to-r from-blue-900/40 to-indigo-900/40 border border-blue-800/50 rounded-2xl p-6 mt-10">
+        <p class="text-gray-300 text-sm leading-relaxed"><strong class="text-white">Keep going.</strong> You're reading <em class="text-blue-300">AI-Native Apps on SQL Server</em> — one of seven free deep-dives in the DBA Library, covering SQL Server performance tuning, high availability, security, automation, and more. <a href="../index.html" class="text-blue-400 hover:text-blue-300 underline">Browse the full library →</a></p>
+      </div>
+    <footer class="text-center text-gray-600 text-xs mt-10 pb-6">DBA Library · AI-Native Apps on SQL Server · Free for the SQL Server community</footer>
+  </div>
+</body>
+</html>

@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 28: Event-Driven AI with Service Broker and Query Notifications — AI-Native Apps on SQL Server</title>
+<meta name="description" content="Transactional messaging with Service Broker and cache invalidation with SqlDependency.">
+<script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-200">
+  <div class="max-w-3xl mx-auto px-6 py-10">
+    <p class="text-blue-400 text-sm font-semibold tracking-wide uppercase mb-2">AI-Native Apps on SQL Server</p>
+    <p class="text-gray-500 text-sm mb-1">Chapter 28 of 40</p>
+    <h1 class="text-3xl font-bold text-white mb-8">Event-Driven AI with Service Broker and Query Notifications</h1>
+    <article class="space-y-5">
+<p class="text-gray-300 leading-relaxed">Chapter 27 polled for changes; this chapter pushes. SQL Server offers two push mechanisms for event-driven AI: Service Broker — reliable, transactional, queued messaging inside the database — and Query Notifications (SqlDependency) — cache invalidation when a query's results change. Together they cover the two event shapes AI applications need: "do this work now" (Broker) and "your cached answer is stale" (notifications). This chapter builds both, with the reliability patterns that make push safe in production.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">28.1 Service Broker: Reliable Intra-Database Messaging</h3>
+
+<p class="text-gray-300 leading-relaxed">Service Broker was introduced in §1.7 for document-ingested events. The full pattern has four parts: message types and contracts (the schema of the conversation), queues (durable storage), services (addressable endpoints), and activation (automatic processing):</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Event vocabulary for the AI application
+CREATE MESSAGE TYPE [//aiapp/DocumentIngested] VALIDATION = WELL_FORMED_XML;
+CREATE MESSAGE TYPE [//aiapp/TriageRequested]  VALIDATION = WELL_FORMED_XML;
+CREATE MESSAGE TYPE [//aiapp/QuotaExhausted]   VALIDATION = WELL_FORMED_XML;
+CREATE MESSAGE TYPE [//aiapp/RunCompleted]      VALIDATION = WELL_FORMED_XML;
+
+CREATE CONTRACT [//aiapp/AIContract] (
+    [//aiapp/DocumentIngested] SENT BY INITIATOR,
+    [//aiapp/TriageRequested]  SENT BY INITIATOR,
+    [//aiapp/QuotaExhausted]   SENT BY INITIATOR,
+    [//aiapp/RunCompleted]     SENT BY INITIATOR
+);
+
+CREATE QUEUE dbo.AIEventQueue WITH STATUS = ON;
+CREATE SERVICE [//aiapp/AIService]
+    ON QUEUE dbo.AIEventQueue ([//aiapp/AIContract]);
+GO
+
+-- Activated stored procedure: processes messages automatically on arrival
+CREATE OR ALTER PROCEDURE dbo.usp_ai_event_activator
+AS
+BEGIN
+    SET NOCOUNT ON;
+    DECLARE @h UNIQUEIDENTIFIER, @mtype NVARCHAR(256), @body NVARCHAR(MAX);
+    WHILE (1 = 1)
+    BEGIN
+        BEGIN TRAN;
+        WAITFOR (
+            RECEIVE TOP (1) @h = conversation_handle,
+                            @mtype = message_type_name,
+                            @body = CAST(message_body AS NVARCHAR(MAX))
+            FROM dbo.AIEventQueue
+        ), TIMEOUT 5000;
+        IF @@ROWCOUNT = 0 BEGIN ROLLBACK; BREAK; END;
+
+        -- Route by message type; each handler is idempotent (§20.2)
+        IF @mtype = N'//aiapp/DocumentIngested'
+            EXEC dbo.usp_on_document_ingested @body;
+        ELSE IF @mtype = N'//aiapp/TriageRequested'
+            EXEC dbo.usp_on_triage_requested @body;
+        ELSE IF @mtype = N'//aiapp/QuotaExhausted'
+            EXEC dbo.usp_on_quota_exhausted @body;
+        ELSE IF @mtype = N'//aiapp/RunCompleted'
+            EXEC dbo.usp_on_run_completed @body;
+
+        -- EndDialog / Error messages: always END CONVERSATION to clean up
+        IF @mtype IN (N'http://schemas.microsoft.com/SQL/ServiceBroker/EndDialog',
+                      N'http://schemas.microsoft.com/SQL/ServiceBroker/Error')
+            END CONVERSATION @h;
+        COMMIT;
+    END
+END;
+GO
+ALTER QUEUE dbo.AIEventQueue WITH ACTIVATION (
+    STATUS = ON, PROCEDURE_NAME = dbo.usp_ai_event_activator,
+    MAX_QUEUE_READERS = 4, EXECUTE AS OWNER);
+GO</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Activation is the key feature: SQL Server launches the procedure automatically when messages arrive — no external scheduler, no polling loop. <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">MAX_QUEUE_READERS = 4</code> gives parallel processing; each RECEIVE is transactional, so a handler failure rolls back the message back onto the queue for retry.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">28.2 Poison Messages and Error Handling</h3>
+
+<p class="text-gray-300 leading-relaxed">A message that always fails will retry forever, blocking the queue. Service Broker's poison-message detection disables the queue after five consecutive rollbacks — which converts a bad message into a full outage. Handle it explicitly:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Catch handler errors inside the activator</strong> and move the failed message to a dead-letter table with the error — then COMMIT, so the poison message leaves the queue.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Alert on dead-letter inserts.</strong> Every dead letter is a bug or a data problem worth investigating.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Monitor queue depth and disabled queues.</strong> A growing queue means handlers can't keep up; a disabled queue means poison-message protection fired.</li>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE dbo.ai_dead_letters (
+    dead_letter_id UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWID(),
+    message_type   NVARCHAR(256) NOT NULL,
+    body           NVARCHAR(MAX) NULL,
+    error_message  NVARCHAR(MAX) NOT NULL,
+    failed_at      DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
+);
+
+-- Inside the activator, wrap each handler:
+BEGIN TRY
+    EXEC dbo.usp_on_document_ingested @body;
+END TRY
+BEGIN CATCH
+    INSERT INTO dbo.ai_dead_letters (message_type, body, error_message)
+    VALUES (@mtype, @body, ERROR_MESSAGE());
+    -- COMMIT (not ROLLBACK): the poison message is consumed, recorded,
+    -- and the queue keeps moving.
+END CATCH;
+
+-- Operational monitors
+SELECT name, is_receive_enabled, is_enqueue_enabled
+FROM sys.service_queues WHERE name = 'AIEventQueue';
+-- is_receive_enabled = 0 → poison protection fired: investigate dead letters,
+-- fix the handler, then ALTER QUEUE ... WITH STATUS = ON.</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">28.3 Query Notifications: Invalidating Caches on Change</h3>
+
+<p class="text-gray-300 leading-relaxed">Service Broker pushes work; Query Notifications push invalidation. Register a query with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SqlDependency</code> (SqlClient) and SQL Server notifies you when the results would change — the foundation of the retrieval cache from §2.5:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>// C# — cache the tenant's document list, invalidate on change
+async Task&lt;List&lt;Doc&gt;&gt; GetDocumentsAsync(Guid tenantId)
+{
+    if (_cache.TryGetValue(tenantId, out var docs)) return docs;
+
+    using var conn = new SqlConnection(_connStr);
+    await conn.OpenAsync();
+    using var cmd = new SqlCommand(
+        "SELECT document_id, title, updated_at FROM dbo.documents " +
+        "WHERE tenant_id = @t AND is_active = 1", conn);
+    cmd.Parameters.AddWithValue("@t", tenantId);
+
+    var dep = new SqlDependency(cmd);
+    dep.OnChange += (_, e) => {
+        _cache.Remove(tenantId);   // invalidate on ANY change to the result set
+        // Re-subscribe on next GetDocumentsAsync call (notifications are one-shot)
+    };
+    SqlDependency.Start(_connStr);  // once per process
+
+    docs = await LoadAsync(cmd);
+    _cache.Set(tenantId, docs, TimeSpan.FromMinutes(10));
+    return docs;
+}</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Notifications are one-shot (re-subscribe after each fires) and coarse (any change to the result set invalidates, without saying what changed). They are perfect for cache invalidation — "something changed, refetch" — and wrong for change data ("what changed" is Chapter 27/30's job). The query must meet notification requirements: fully qualified names, no SELECT *, no aggregates over the notified query in most cases — keep notified queries simple and put complexity in the refetch.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">28.4 Choosing Between Push Mechanisms</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Service Broker:</strong> durable, transactional, ordered per conversation, with automatic activation. Use for work dispatch (ingest this, triage that) where losing an event is unacceptable.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Query Notifications:</strong> lightweight, one-shot, invalidation-only. Use for cache coherence where the subscriber re-reads authoritative state.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Change Tracking polling (§27.2):</strong> simplest, works across any client, latency bounded by poll interval. Use when 5-second latency is fine and you want minimal moving parts.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>External bus (Service Bus/Kafka):</strong> cross-database, cross-service, replayable. Graduate here when events must leave the database boundary.</li>
+
+<p class="text-gray-300 leading-relaxed">The progression is deliberate: start with Change Tracking polling, add Query Notifications for hot caches, use Service Broker for transactional work dispatch, and reach for an external bus only when the database boundary becomes the constraint.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">28.5 Monitoring the Event Backbone</h3>
+
+<p class="text-gray-300 leading-relaxed">Events are invisible when healthy and catastrophic when not — which is exactly why the event backbone needs dedicated monitoring beyond §28.2's queue checks. Track four signals per queue: <strong>depth over time</strong> (growth means consumers are falling behind — alert on sustained growth, not spikes), <strong>age of oldest message</strong> (the true latency signal — a queue with 10,000 fresh messages is fine, one with a 2-hour-old message is not), <strong>dead-letter rate</strong> (any sustained rate above zero is a bug being fed continuously), and <strong>activation health</strong> (is the activated procedure actually running, or did someone disable activation during maintenance and forget to re-enable it?). Add one end-to-end canary: every 5 minutes, enqueue a synthetic event with a timestamp and verify a handler processes it within the SLO — this catches the silent failures (disabled queues, broken activation, poisoned handlers that commit without processing) that depth metrics miss. The canary is the difference between "the queue looks fine" and "events actually flow."</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Service Broker gives you transactional, activated messaging inside the database</strong> — SEND in the business transaction, automatic procedure activation on arrival, parallel readers, per-conversation ordering.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Defeat poison messages explicitly:</strong> catch handler errors into a dead-letter table and COMMIT, alert on dead letters, and monitor queue state — never let the five-rollback protection fire unnoticed.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Use Query Notifications (SqlDependency) for cache invalidation, not change data.</strong> One-shot, coarse-grained, perfect for "refetch your cache" — keep notified queries simple.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Progress deliberately:</strong> Change Tracking polling → Query Notifications → Service Broker → external bus, each step taken when the previous mechanism's limits bind.</li>
+
+    </article>
+
+      <nav class="flex items-center justify-center gap-3 mt-12 mb-4 text-sm">
+        <a href="chapter-27.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">← Chapter 27</a>
+        <a href="index.html" class="px-4 py-2 rounded-lg bg-gray-800 text-gray-300 hover:bg-gray-700 transition">All Chapters</a>
+        <a href="chapter-29.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">Chapter 29 →</a>
+      </nav>
+<div class="bg-gradient-to-r from-blue-900/40 to-indigo-900/40 border border-blue-800/50 rounded-2xl p-6 mt-10">
+        <p class="text-gray-300 text-sm leading-relaxed"><strong class="text-white">Keep going.</strong> You're reading <em class="text-blue-300">AI-Native Apps on SQL Server</em> — one of seven free deep-dives in the DBA Library, covering SQL Server performance tuning, high availability, security, automation, and more. <a href="../index.html" class="text-blue-400 hover:text-blue-300 underline">Browse the full library →</a></p>
+      </div>
+    <footer class="text-center text-gray-600 text-xs mt-10 pb-6">DBA Library · AI-Native Apps on SQL Server · Free for the SQL Server community</footer>
+  </div>
+</body>
+</html>

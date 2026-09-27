@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 13: Building End-to-End RAG on SQL Server — AI-Native Apps on SQL Server</title>
+<meta name="description" content="The complete retrieval-augmented generation pipeline from question to grounded answer.">
+<script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-200">
+  <div class="max-w-3xl mx-auto px-6 py-10">
+    <p class="text-blue-400 text-sm font-semibold tracking-wide uppercase mb-2">AI-Native Apps on SQL Server</p>
+    <p class="text-gray-500 text-sm mb-1">Chapter 13 of 40</p>
+    <h1 class="text-3xl font-bold text-white mb-8">Building End-to-End RAG on SQL Server</h1>
+    <article class="space-y-5">
+<p class="text-gray-300 leading-relaxed">Chapters 1–12 built the components: schema, vector search, history, memory, sessions, isolation. This chapter assembles them into the complete retrieval-augmented generation pipeline — the flagship architecture of AI-native applications — running entirely on SQL Server 2025 plus a thin API tier. You will see the full data flow from document upload to cited answer, the Azure deployment variant, the operational runbook for the pipeline in production, and the failure modes unique to RAG with their mitigations. Treat this chapter as the integration test for everything before it.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">13.1 The Pipeline, End to End</h3>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph LR
+    D[Document upload] --> C[Chunking worker]
+    C --> E[Embedding API]
+    E --> S[(SQL Server: chunks + VECTOR)]
+    S --> VI[Vector index + full-text index]
+    Q[User question] --> EQ[Embed query]
+    EQ --> HS[usp_hybrid_search]
+    VI --> HS
+    HS --> R[Top-k chunks]
+    R --> P[Prompt assembly + history + profile]
+    P --> LLM[LLM call]
+    LLM --> A[Cited answer]
+    A --> T[(Persist: messages + audit)]
+    T --> SB[Service Broker event]</pre></div>
+
+<p class="text-gray-300 leading-relaxed">The left half (ingestion) is asynchronous and idempotent; the right half (retrieval) is synchronous and latency-sensitive. SQL Server sits at the center of both — the only shared state in the diagram. This is the architectural payoff of the single-database thesis: the ingestion worker and the API tier coordinate through tables and queues, never through direct calls.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">13.2 Ingestion at Scale: The Worker Fleet</h3>
+
+<p class="text-gray-300 leading-relaxed">Chapter 1's Celery worker handles one document per task. At scale, three refinements matter:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Claim-based work distribution.</strong> Instead of a Redis queue, use a SQL Server work table with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">READPAST</code> + <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">UPDLOCK</code> row claiming — workers pull documents without a separate broker, and crashed workers' claims expire via a heartbeat timestamp.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Batch embedding with backpressure.</strong> The embedding API has rate limits; the worker tracks in-flight requests and pauses chunk production when the limit approaches, rather than failing and retrying.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Idempotent re-ingestion.</strong> The MERGE on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">(tenant_id, content_hash)</code> makes re-uploads safe; the chunk DELETE + re-INSERT inside the same transaction makes re-embedding atomic.</li>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Work queue in SQL Server: claim-based, no external broker needed
+CREATE TABLE dbo.ingest_queue (
+    queue_id      UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWID(),
+    tenant_id     UNIQUEIDENTIFIER NOT NULL,
+    document_id   UNIQUEIDENTIFIER NOT NULL,
+    status        NVARCHAR(20) NOT NULL DEFAULT N'pending'
+                  CONSTRAINT CK_iq_status CHECK (status IN
+                      (N'pending',N'claimed',N'done',N'failed')),
+    claimed_by    NVARCHAR(200) NULL,
+    claimed_at    DATETIME2 NULL,
+    attempts      INT NOT NULL DEFAULT 0,
+    error_message NVARCHAR(MAX) NULL,
+    created_at    DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
+);
+CREATE INDEX IX_iq_claim ON dbo.ingest_queue(status, created_at)
+    INCLUDE (queue_id, tenant_id, document_id)
+    WHERE status = N'pending';
+
+-- Workers claim work with READPAST: never block on another worker's row
+CREATE OR ALTER PROCEDURE dbo.usp_claim_ingest_work
+    @worker_id NVARCHAR(200), @batch_size INT = 5
+AS
+BEGIN
+    SET NOCOUNT ON;
+    UPDATE TOP (@batch_size) dbo.ingest_queue WITH (READPAST, UPDLOCK)
+    SET status = N'claimed', claimed_by = @worker_id,
+        claimed_at = SYSUTCDATETIME(), attempts = attempts + 1
+    OUTPUT INSERTED.queue_id, INSERTED.tenant_id, INSERTED.document_id
+    WHERE status = N'pending'
+       OR (status = N'claimed' AND claimed_at &lt; DATEADD(minute, -15, SYSUTCDATETIME()));
+    -- The OR clause reclaims work from dead workers after 15 minutes.
+END;
+GO</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">13.3 The Retrieval Path in Production</h3>
+
+<p class="text-gray-300 leading-relaxed">The retrieval half from Chapter 1 needs three production additions:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Query rewriting.</strong> Before embedding, a cheap model rewrites the user's question into a standalone query ("What is our refund policy?" + history "we were discussing enterprise plans" → "What is the refund policy for enterprise plan customers?"). Rewritten queries retrieve dramatically better because embeddings match on self-contained text.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Retrieval guardrails.</strong> If hybrid search returns zero chunks above the similarity floor, answer from general knowledge and say so — never let the model invent citations. The response includes a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">grounded: true/false</code> flag stored with the message.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Citation verification.</strong> A post-generation check confirms each cited chunk ID actually appears in the retrieved set — catching the model hallucinating source references, which happens more often than anyone admits.</li>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Production retrieval with rewriting + guardrails (Python)
+def retrieve(question, history, tenant_id, user_id):
+    # 1. Rewrite into a standalone query (cheap model, ~200ms)
+    standalone = rewrite_query(question, history[-4:])
+
+    # 2. Embed once; check the embedding cache first (§2.5)
+    qvec = get_or_compute_embedding(standalone)
+
+    # 3. Hybrid search with a similarity floor
+    chunks = hybrid_search(tenant_id, standalone, qvec, k=8, min_score=0.70)
+
+    # 4. Guardrail: no grounding → flag it, don't fake it
+    grounded = len(chunks) &gt; 0
+    return chunks, grounded, standalone
+
+def verify_citations(answer_citations, retrieved_ids):
+    # Every [Source N] must map to a retrieved chunk_id
+    return all(c["chunk_id"] in retrieved_ids for c in answer_citations)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">13.4 The Azure Deployment Variant</h3>
+
+<p class="text-gray-300 leading-relaxed">The same pipeline on Azure, with managed services replacing self-hosted components:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Azure SQL Database (Hyperscale)</strong> for the database — automated backups, point-in-time restore, Hyperscale storage for large vector corpora, built-in HA.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Azure OpenAI</strong> for embeddings and chat — data residency, private endpoints, and content filtering built in.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Azure Container Apps or App Service</strong> for the API tier — scale-to-zero for dev, autoscale on HTTP for production.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Azure Functions or Container Apps jobs</strong> for the ingestion workers — event-driven on blob upload, replacing the Celery fleet.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Azure Service Bus</strong> replacing Service Broker for cross-service events when the architecture outgrows a single database.</li>
+
+<p class="text-gray-300 leading-relaxed">The migration path is incremental: point the connection string at Azure SQL, swap the embedding endpoint to Azure OpenAI, and move workers to Functions one at a time. The T-SQL is unchanged — that portability was the point of building on standard SQL Server features.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">13.5 RAG Failure Modes and Mitigations</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Retrieved but ignored.</strong> The model answers from parametric knowledge despite good chunks. Mitigation: stronger system-prompt grounding instructions + the citation-verification check (§13.3); measure grounded-answer rate (Chapter 19).</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Chunking destroyed the answer.</strong> The relevant sentence was split across two chunks, neither ranked highly. Mitigation: overlapping chunks (Chapter 14) and parent-document fallback — if chunk scores are low, retrieve the full parent document.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Stale index.</strong> The document was updated but the old chunks still rank. Mitigation: the atomic re-ingest transaction (§13.2) plus <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">is_active</code> filtering so replaced versions never surface.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Embedding model drift.</strong> The provider updates the model; new query vectors live in a slightly different space than stored vectors. Mitigation: pin the model version, track it in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">embedding_model</code>, and re-embed on version change (Chapter 17).</li>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">13.6 Grounding Citations in Answers</h3>
+
+<p class="text-gray-300 leading-relaxed">A RAG answer without citations is a claim without evidence. Require the generation prompt to cite the chunks it used — <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">[doc:Q3-handbook §4.2]</code> — and store the citation mapping (answer → chunk_ids) alongside the message. Citations serve three purposes: users can verify claims against sources, the feedback loop (§19.4) can attribute a wrong answer to the specific chunk that misled the model, and compliance reviewers can trace any answer to its evidence. Validate citations mechanically: every cited chunk_id must be in the retrieved set for that turn — a citation to a chunk that was never retrieved is a hallucinated citation, which is worse than no citation at all. Render citations as clickable links in the UI that scroll to the source document.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>The RAG pipeline splits into async idempotent ingestion and sync latency-sensitive retrieval, with SQL Server as the only shared state.</strong> Workers and API coordinate through tables and queues, never direct calls.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Production retrieval adds query rewriting, similarity floors with grounded flags, and citation verification</strong> on top of the hybrid search core — these three close the most common quality gaps.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>The Azure variant swaps infrastructure, not T-SQL:</strong> Azure SQL Hyperscale, Azure OpenAI, Container Apps, Functions workers. Portability was the design goal from Chapter 1.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Know the four RAG failure modes by name</strong> — retrieved-but-ignored, chunking damage, stale index, model drift — and have a mitigation deployed for each before launch.</li>
+
+    </article>
+
+      <nav class="flex items-center justify-center gap-3 mt-12 mb-4 text-sm">
+        <a href="chapter-12.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">← Chapter 12</a>
+        <a href="index.html" class="px-4 py-2 rounded-lg bg-gray-800 text-gray-300 hover:bg-gray-700 transition">All Chapters</a>
+        <a href="chapter-14.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">Chapter 14 →</a>
+      </nav>
+<div class="bg-gradient-to-r from-blue-900/40 to-indigo-900/40 border border-blue-800/50 rounded-2xl p-6 mt-10">
+        <p class="text-gray-300 text-sm leading-relaxed"><strong class="text-white">Keep going.</strong> You're reading <em class="text-blue-300">AI-Native Apps on SQL Server</em> — one of seven free deep-dives in the DBA Library, covering SQL Server performance tuning, high availability, security, automation, and more. <a href="../index.html" class="text-blue-400 hover:text-blue-300 underline">Browse the full library →</a></p>
+      </div>
+    <footer class="text-center text-gray-600 text-xs mt-10 pb-6">DBA Library · AI-Native Apps on SQL Server · Free for the SQL Server community</footer>
+  </div>
+</body>
+</html>

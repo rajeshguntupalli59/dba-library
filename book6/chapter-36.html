@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 36: Observability: DMVs, Query Store, and AI Metrics — AI-Native Apps on SQL Server</title>
+<meta name="description" content="DMVs for AI bottlenecks, Query Store for generated SQL, and the unified AI dashboard.">
+<script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-200">
+  <div class="max-w-3xl mx-auto px-6 py-10">
+    <p class="text-blue-400 text-sm font-semibold tracking-wide uppercase mb-2">AI-Native Apps on SQL Server</p>
+    <p class="text-gray-500 text-sm mb-1">Chapter 36 of 40</p>
+    <h1 class="text-3xl font-bold text-white mb-8">Observability: DMVs, Query Store, and AI Metrics</h1>
+    <article class="space-y-5">
+<p class="text-gray-300 leading-relaxed">You cannot operate what you cannot see. AI applications add a new observability dimension on top of the classic database one: alongside query performance and resource pressure, you must watch token spend, model latency, retrieval quality, and agent behavior. SQL Server's native observability — Dynamic Management Views and Query Store — covers the database half; the audit and metrics tables from earlier chapters cover the AI half. This chapter unifies them into one operational picture.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">36.1 DMVs for AI Workload Health</h3>
+
+<p class="text-gray-300 leading-relaxed">The DMVs that matter most for AI workloads are the ones around the three bottlenecks: vector search CPU, connection pool pressure, and blocking on hot rows:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- 1) What is the vector search costing? Top queries by CPU.
+SELECT TOP 10
+    qs.execution_count,
+    qs.total_worker_time / 1000 AS total_cpu_ms,
+    qs.total_worker_time / qs.execution_count / 1000 AS avg_cpu_ms,
+    SUBSTRING(st.text, 1, 120) AS query_preview
+FROM sys.dm_exec_query_stats AS qs
+CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) AS st
+WHERE st.text LIKE N'%usp_vector_search%'
+ORDER BY qs.total_worker_time DESC;
+-- avg_cpu_ms climbing over weeks → the vector index needs attention (§15.3).
+
+-- 2) Connection pressure: waiting tasks and what they're waiting on
+SELECT wt.wait_type, COUNT(*) AS waiting_tasks,
+       AVG(wt.wait_duration_ms) AS avg_wait_ms
+FROM sys.dm_os_waiting_tasks AS wt
+GROUP BY wt.wait_type ORDER BY waiting_tasks DESC;
+-- LCK_M_X on rate_buckets → bucket row contention (§5.3's hot-row pattern).
+-- THREADPOOL → pool exhaustion: add pool capacity or cut held connections.
+
+-- 3) Who is blocking whom right now?
+SELECT s.session_id, s.login_name, s.program_name,
+       r.blocking_session_id, r.wait_type, r.wait_time,
+       SUBSTRING(t.text, 1, 100) AS running_sql
+FROM sys.dm_exec_sessions AS s
+JOIN sys.dm_exec_requests AS r ON r.session_id = s.session_id
+CROSS APPLY sys.dm_exec_sql_text(r.sql_handle) AS t
+WHERE r.blocking_session_id &gt; 0;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">36.2 Query Store: Regression Detection for Generated SQL</h3>
+
+<p class="text-gray-300 leading-relaxed">Text-to-SQL (§22) and agent tool SQL (§20.2) generate queries the DBA never wrote — which makes plan regressions invisible until users complain. Query Store captures query history and plans automatically:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Enable Query Store (on by default in Azure SQL)
+ALTER DATABASE aiapp SET QUERY_STORE = ON;
+GO
+
+-- Find queries whose performance regressed recently
+SELECT q.query_id, p.plan_id,
+       rs.avg_duration / 1000 AS avg_duration_ms,
+       rs.avg_cpu_time / 1000 AS avg_cpu_ms,
+       rs.count_executions,
+       q.query_sql_text
+FROM sys.query_store_query AS q
+JOIN sys.query_store_plan AS p ON p.query_id = q.query_id
+JOIN sys.query_store_runtime_stats AS rs ON rs.plan_id = p.plan_id
+WHERE rs.runtime_stats_interval_id IN (
+        SELECT runtime_stats_interval_id
+        FROM sys.query_store_runtime_stats_interval
+        WHERE start_time &gt; DATEADD(day, -7, SYSUTCDATETIME()))
+ORDER BY rs.avg_duration DESC;
+-- For generated SQL: force the good plan (sp_query_store_force_plan) while
+-- the prompt/guardrails are fixed — Query Store buys time for the AI layer.</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Query Store is also the audit trail for generated SQL: every distinct generated query text is captured with its plans and runtime stats — the DBA can see exactly what the AI asked the database to do, and how often.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">36.3 The AI Metrics Layer</h3>
+
+<p class="text-gray-300 leading-relaxed">Database observability covers the "how fast"; the AI metrics cover the "how well and at what cost." Build them as views over the audit tables:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- AI operational dashboard: one view, refreshed every 5 minutes
+CREATE OR ALTER VIEW dbo.vw_ai_ops_dashboard AS
+SELECT
+    (SELECT COUNT(*) FROM dbo.llm_audit_log
+     WHERE created_at &gt;= DATEADD(hour, -1, SYSUTCDATETIME())) AS llm_calls_last_hour,
+    (SELECT SUM(ISNULL(input_cost,0)+ISNULL(output_cost,0))
+     FROM dbo.llm_audit_log
+     WHERE CAST(created_at AS DATE) = CAST(SYSUTCDATETIME() AS DATE)) AS spend_today,
+    (SELECT AVG(CAST(latency_ms AS FLOAT)) FROM dbo.llm_audit_log
+     WHERE created_at &gt;= DATEADD(hour, -1, SYSUTCDATETIME())) AS avg_latency_ms_1h,
+    (SELECT COUNT(*) FROM dbo.llm_audit_log
+     WHERE created_at &gt;= DATEADD(hour, -1, SYSUTCDATETIME())
+       AND status != N'ok') AS errors_last_hour,
+    (SELECT COUNT(*) FROM dbo.agent_runs
+     WHERE started_at &gt;= DATEADD(hour, -1, SYSUTCDATETIME())) AS agent_runs_1h,
+    (SELECT AVG(CAST(confidence AS FLOAT)) FROM dbo.retrieval_feedback
+     WHERE created_at &gt;= DATEADD(day, -1, SYSUTCDATETIME())) AS avg_retrieval_conf_24h,
+    (SELECT COUNT(*) FROM dbo.ai_dead_letters
+     WHERE failed_at &gt;= DATEADD(hour, -1, SYSUTCDATETIME())) AS dead_letters_1h;
+GO
+-- Alert thresholds: errors_last_hour &gt; 50, spend_today &gt; 2× daily budget,
+-- dead_letters_1h &gt; 0, avg_latency_ms_1h &gt; p99 SLO. Wire to your alerting.</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">36.4 Correlating the Two Halves</h3>
+
+<p class="text-gray-300 leading-relaxed">The most powerful observability comes from joining the halves: a latency spike in the AI dashboard correlated with a plan regression in Query Store, or a cost spike (§33.4) correlated with a specific generated query's execution count exploding. Practical correlation keys:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Time:</strong> both halves share <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">created_at</code> — the incident timeline (§24.4) overlaid with wait stats tells the story.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Query text hash:</strong> hash generated SQL at the tool layer and store it in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">agent_actions</code>; join to Query Store's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">query_sql_text</code> for cost-per-generated-query.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Tenant:</strong> every audit row carries <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">tenant_id</code>; Resource Governor / workload groups tag database work per tenant — the join identifies the noisy tenant in both cost and resource terms.</li>
+
+<p class="text-gray-300 leading-relaxed">Build one incident runbook that starts from the AI dashboard, drills into the audit timeline, and lands on the DMV/Query Store evidence. Two observability halves with one runbook is what "operated" actually means.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">36.5 SLOs for AI Features</h3>
+
+<p class="text-gray-300 leading-relaxed">Observability (§36.1–36.4) without objectives is just expensive logging. Define SLOs per AI feature, measured from the audit tables:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Chat latency:</strong> p95 time-to-first-token &lt; 1.5s, p95 full-response &lt; 15s. Time-to-first-token is the UX metric (§29); full-response bounds the tail.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Availability:</strong> 99.9% of chat requests succeed (status = 'ok'), excluding provider outages — track provider-attributed failures separately so you're not SLO-violated by someone else's incident.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Answer quality:</strong> weekly golden-set faithfulness ≥ baseline (§19.3) — a quality SLO, unusual for infrastructure teams, essential for AI.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Cost efficiency:</strong> tokens per successful task trending down or flat — the anti-SLO that catches the slow cost creep of growing prompts and chatty agents.</li>
+
+<p class="text-gray-300 leading-relaxed">Publish the SLOs on the same dashboard as the metrics, with burn-rate alerts (fast-burn: page; slow-burn: ticket). Review them quarterly: an SLO nobody can meet is a fiction, and an SLO always met with room to spare is a missed opportunity to promise more. The quality SLO deserves special attention — it is the one your competitors aren't measuring, and the one your users feel most directly.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Watch the three AI bottlenecks with DMVs:</strong> vector-search CPU (query stats), connection pressure (waiting tasks), and hot-row blocking (exec requests).</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Query Store is the safety net for generated SQL</strong> — automatic plan history, regression detection, and plan forcing while the AI layer is fixed.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Build the AI metrics as views over audit tables:</strong> call volume, spend, latency, errors, agent runs, retrieval confidence, dead letters — with alert thresholds.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Correlate the halves with shared keys</strong> (time, query hash, tenant) and run one incident runbook across both.</li>
+
+    </article>
+
+      <nav class="flex items-center justify-center gap-3 mt-12 mb-4 text-sm">
+        <a href="chapter-35.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">← Chapter 35</a>
+        <a href="index.html" class="px-4 py-2 rounded-lg bg-gray-800 text-gray-300 hover:bg-gray-700 transition">All Chapters</a>
+        <a href="chapter-37.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">Chapter 37 →</a>
+      </nav>
+<div class="bg-gradient-to-r from-blue-900/40 to-indigo-900/40 border border-blue-800/50 rounded-2xl p-6 mt-10">
+        <p class="text-gray-300 text-sm leading-relaxed"><strong class="text-white">Keep going.</strong> You're reading <em class="text-blue-300">AI-Native Apps on SQL Server</em> — one of seven free deep-dives in the DBA Library, covering SQL Server performance tuning, high availability, security, automation, and more. <a href="../index.html" class="text-blue-400 hover:text-blue-300 underline">Browse the full library →</a></p>
+      </div>
+    <footer class="text-center text-gray-600 text-xs mt-10 pb-6">DBA Library · AI-Native Apps on SQL Server · Free for the SQL Server community</footer>
+  </div>
+</body>
+</html>

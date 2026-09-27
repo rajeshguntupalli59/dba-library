@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 22: Text-to-SQL with Guardrails — AI-Native Apps on SQL Server</title>
+<meta name="description" content="Generating safe SQL from natural language: schema catalogs, validation gates, and result limits.">
+<script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-200">
+  <div class="max-w-3xl mx-auto px-6 py-10">
+    <p class="text-blue-400 text-sm font-semibold tracking-wide uppercase mb-2">AI-Native Apps on SQL Server</p>
+    <p class="text-gray-500 text-sm mb-1">Chapter 22 of 40</p>
+    <h1 class="text-3xl font-bold text-white mb-8">Text-to-SQL with Guardrails</h1>
+    <article class="space-y-5">
+<p class="text-gray-300 leading-relaxed">Text-to-SQL turns "how many enterprise tenants signed up last quarter?" into a query, runs it, and explains the result. It is the highest-leverage AI feature for data teams — and the easiest to get dangerously wrong, because the model writes code that runs against production data. This chapter builds a text-to-SQL layer with safety as the foundation: schema grounding that keeps the model honest, generation with constrained decoding, the multi-stage validation pipeline from §21.3 expanded into a full framework, and the feedback loop that improves accuracy over time.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">22.1 Schema Grounding: What the Model Sees</h3>
+
+<p class="text-gray-300 leading-relaxed">A model that has not seen your schema will invent tables. Grounding gives it the truth — but the full schema is too large for the prompt. The retrieval approach: embed table and column descriptions, and fetch only the relevant schema per question.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Schema catalog: human descriptions + embeddings for retrieval
+CREATE TABLE dbo.schema_catalog (
+    object_schema NVARCHAR(128) NOT NULL,
+    object_name   NVARCHAR(128) NOT NULL,
+    object_type   NVARCHAR(20) NOT NULL
+                  CONSTRAINT CK_sc_type CHECK (object_type IN (N'table',N'view')),
+    description   NVARCHAR(MAX) NOT NULL,   -- "Orders placed by users; one row per order"
+    embedding     VECTOR(1536) NULL,
+    is_exposed    BIT NOT NULL DEFAULT 0,   -- allowlist for text-to-SQL
+    CONSTRAINT PK_schema_catalog PRIMARY KEY (object_schema, object_name)
+);
+CREATE TABLE dbo.schema_column_catalog (
+    object_schema NVARCHAR(128) NOT NULL,
+    object_name   NVARCHAR(128) NOT NULL,
+    column_name   NVARCHAR(128) NOT NULL,
+    description   NVARCHAR(MAX) NOT NULL,   -- "Total including tax, in USD"
+    example_values NVARCHAR(500) NULL,      -- "129.99, 45.00" — grounds formats
+    CONSTRAINT PK_scc PRIMARY KEY (object_schema, object_name, column_name)
+);
+
+-- Per-question schema retrieval: top-5 relevant tables + their columns
+CREATE OR ALTER PROCEDURE dbo.usp_relevant_schema
+    @query_vector VECTOR(1536), @top_n INT = 5
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SELECT TOP (@top_n)
+        sc.object_schema, sc.object_name, sc.description,
+        (SELECT scc.column_name, scc.description, scc.example_values
+         FROM dbo.schema_column_catalog AS scc
+         WHERE scc.object_schema = sc.object_schema
+           AND scc.object_name = sc.object_name
+         FOR JSON PATH) AS columns
+    FROM dbo.schema_catalog AS sc
+    WHERE sc.is_exposed = 1
+    ORDER BY VECTOR_DISTANCE('cosine', sc.embedding, @query_vector);
+END;
+GO</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">example_values</code> column is disproportionately valuable: models constantly guess wrong about date formats, enum casings, and ID shapes. Two example values per ambiguous column eliminate an entire class of generation errors.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">22.2 Generation: Constrained and Grounded</h3>
+
+<p class="text-gray-300 leading-relaxed">The generation prompt combines the retrieved schema, the business glossary, and hard rules:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Generation prompt assembly (Python)
+TEXT2SQL_SYSTEM = """You write T-SQL for SQL Server 2025. Rules:
+1. SELECT only. Never INSERT, UPDATE, DELETE, MERGE, DROP, ALTER, EXEC.
+2. Use ONLY the tables and columns in the provided schema.
+3. Always include the tenant filter: WHERE tenant_id = @tenant_id.
+4. Always use TOP (@n) with @n <= 100, or aggregate.
+5. Prefer CTEs over subqueries for readability.
+6. For dates use SYSUTCDATETIME() and DATEADD, never GETDATE() assumptions.
+7. If the question cannot be answered from the schema, say so."""
+
+def generate_sql(question, tenant_id):
+    qvec = embed(question)
+    schema = relevant_schema(qvec)          # §22.1
+    glossary = get_glossary_terms(question) # "ARR", "churn" → definitions
+    sql = llm(TEXT2SQL_SYSTEM + schema + glossary + question,
+              model="gpt-4o", temperature=0)  # temperature 0: deterministic
+    return sql</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Temperature 0 matters: text-to-SQL should be deterministic. The same question asked twice should produce the same query — both for user trust and because the validation cache (§22.4) keys on the SQL text.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">22.3 The Validation Pipeline</h3>
+
+<p class="text-gray-300 leading-relaxed">Generated SQL passes through five gates before execution. Any failure returns a structured error to the agent loop (§20.1), which may retry generation once with the error as feedback:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Gate 1 — Parse.</strong> The statement must parse as a single SELECT/WITH…SELECT. Reject everything else syntactically.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Gate 2 — Allowlist.</strong> Every referenced table/column must be in the exposed catalog. Reject unknown objects — this catches hallucinated tables.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Gate 3 — Tenant filter.</strong> The WHERE clause must constrain <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">tenant_id</code> (or the query must go through a procedure that does). Static analysis on the parsed tree, not string matching.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Gate 4 — Cost guard.</strong> Run <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SET SHOWPLAN_XML ON</code> and reject plans with estimated cost above threshold, missing-TOP scans over large tables, or cartesian joins. The model cannot be trusted with performance.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Gate 5 — Execute as least-privilege.</strong> The final backstop: RLS + procedure-only grants (§21.4) contain anything the gates missed.</li>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Gate 4: cost guard via estimated plan (Python pseudocode)
+def check_cost(sql, max_cost=100.0):
+    with pyodbc.connect(CONN_STR) as conn:
+        plan_xml = conn.execute("SET SHOWPLAN_XML ON;" + sql).fetchone()[0]
+        root = ET.fromstring(plan_xml)
+        cost = float(root.find(".//{*}RelOp").attrib["EstimatedTotalSubtreeCost"])
+        # Reject: runaway scans, missing TOP on large tables
+        if cost &gt; max_cost:
+            raise ValidationError(f"Estimated cost {cost:.1f} exceeds {max_cost}")
+        # Also reject if the plan scans the messages/chunks tables without TOP
+        ...</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">22.4 Caching and Learning</h3>
+
+<p class="text-gray-300 leading-relaxed">Text-to-SQL has a beautiful property: questions repeat. "How many signups last week?" gets asked every Monday. Cache validated SQL by normalized question text:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE dbo.text2sql_cache (
+    question_hash CHAR(64) PRIMARY KEY,  -- SHA2_256(normalized question)
+    question_text NVARCHAR(MAX) NOT NULL,
+    sql_text      NVARCHAR(MAX) NOT NULL,
+    hit_count     INT NOT NULL DEFAULT 0,
+    last_validated_at DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+    -- Invalidate when the schema changes: bump schema_version on DDL
+    schema_version INT NOT NULL,
+    created_at    DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
+);
+-- Hit path: hash → validated SQL → execute. Miss path: generate → validate →
+-- execute → cache. Schema migrations bump the version, invalidating stale SQL.</code></pre>
+
+<p class="text-gray-300 leading-relaxed">And the learning loop: log every generated query with its validation outcome and user feedback (§19.4). Queries that fail validation reveal prompt gaps ("the model keeps using GETDATE()") — fix the system prompt. Queries users down-vote reveal semantic gaps — add glossary terms or column descriptions. The text-to-SQL layer improves the way the rest of the system does: measured, stored, iterated.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">22.5 Explaining Generated SQL in Plain Language</h3>
+
+<p class="text-gray-300 leading-relaxed">Users who ask questions in English deserve answers about the SQL, not just from it. After generating and validating the query, make a second LLM call: "explain what this SQL does in two sentences for a non-technical user," and show the explanation alongside the results. This closes the trust loop — the user can see that "average order value by region" actually computed an average grouped by region, and catch the misinterpretation before acting on wrong numbers. Store the explanation with the cached query (§22.4) so repeat questions don't pay for re-explanation. For power users, offer a "show SQL" toggle: transparency about the generated query turns skeptics into advocates, because they can verify the logic instead of trusting the black box. And when the explanation reveals the model misunderstood the question ("it filtered by ship date, but I meant order date"), that correction is the highest-value feedback in the system — route it straight into the glossary (§23) and the golden set (§19.1).</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Ground generation on retrieved schema slices, not the full catalog</strong> — with human descriptions and example values per column. Example values eliminate the largest class of generation errors.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Generate deterministically (temperature 0) and validate through five gates:</strong> parse, allowlist, tenant filter, cost guard via estimated plan, least-privilege execution.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Cache validated SQL by question hash and invalidate on schema version bumps.</strong> Repeated questions should never pay generation cost twice.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Feed validation failures and user feedback back into the prompt and glossary.</strong> Text-to-SQL accuracy compounds through the same measure-store-iterate loop as the rest of the system.</li>
+
+    </article>
+
+      <nav class="flex items-center justify-center gap-3 mt-12 mb-4 text-sm">
+        <a href="chapter-21.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">← Chapter 21</a>
+        <a href="index.html" class="px-4 py-2 rounded-lg bg-gray-800 text-gray-300 hover:bg-gray-700 transition">All Chapters</a>
+        <a href="chapter-23.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">Chapter 23 →</a>
+      </nav>
+<div class="bg-gradient-to-r from-blue-900/40 to-indigo-900/40 border border-blue-800/50 rounded-2xl p-6 mt-10">
+        <p class="text-gray-300 text-sm leading-relaxed"><strong class="text-white">Keep going.</strong> You're reading <em class="text-blue-300">AI-Native Apps on SQL Server</em> — one of seven free deep-dives in the DBA Library, covering SQL Server performance tuning, high availability, security, automation, and more. <a href="../index.html" class="text-blue-400 hover:text-blue-300 underline">Browse the full library →</a></p>
+      </div>
+    <footer class="text-center text-gray-600 text-xs mt-10 pb-6">DBA Library · AI-Native Apps on SQL Server · Free for the SQL Server community</footer>
+  </div>
+</body>
+</html>

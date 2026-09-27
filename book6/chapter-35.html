@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 35: Scaling AI Apps on Azure SQL — AI-Native Apps on SQL Server</title>
+<meta name="description" content="Read scale-out, elastic pools, Hyperscale vectors, and deferring the sharding decision.">
+<script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-200">
+  <div class="max-w-3xl mx-auto px-6 py-10">
+    <p class="text-blue-400 text-sm font-semibold tracking-wide uppercase mb-2">AI-Native Apps on SQL Server</p>
+    <p class="text-gray-500 text-sm mb-1">Chapter 35 of 40</p>
+    <h1 class="text-3xl font-bold text-white mb-8">Scaling AI Apps on Azure SQL</h1>
+    <article class="space-y-5">
+<p class="text-gray-300 leading-relaxed">Everything so far assumed a single SQL Server. Growth breaks that assumption along three axes: read volume (more chat users), write volume (more ingestion), and data size (more vectors, more history). Azure SQL is the scaling path this book standardizes on — but scaling is a sequence of deliberate steps, not a single migration. This chapter walks the ladder: read scale-out with replicas, elastic pools for multi-tenant economics, Hyperscale for very large vector stores, and the sharding decision you should defer as long as possible.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">35.1 Read Scale-Out: Replicas for Chat Workloads</h3>
+
+<p class="text-gray-300 leading-relaxed">Chat workloads are read-heavy: history replay, vector search, semantic cache lookups, dashboard reads. Azure SQL's read scale-out routes these to free readable secondaries:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Route by operation:</strong> writes (message inserts, audit writes, bucket consumption) go to the primary; reads (history replay, vector search, cache lookups) go to the secondary via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ApplicationIntent=ReadOnly</code> in the connection string.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Accept replication lag consciously:</strong> a message inserted on the primary may not be visible on the secondary for a second or two. The chat path reads the just-written conversation from the primary (§6.2's replay-after-write); background reads (analytics, eval sampling) tolerate the lag.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Vector search scales beautifully on replicas:</strong> it's CPU-bound and read-only — the ideal secondary workload. Size the secondary for vector-search concurrency, not the primary.</li>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>// Two connection strings, one decision per operation
+var writeDb = "Server=tcp:aiapp.database.windows.net;Database=aiapp;"
+            + "ApplicationIntent=ReadWrite;...";   // default
+var readDb  = "Server=tcp:aiapp.database.windows.net;Database=aiapp;"
+            + "ApplicationIntent=ReadOnly;...";     // readable secondary
+
+// The data layer picks: writes + read-your-write → writeDb;
+// everything else → readDb. One helper, used everywhere:
+IDbConnection ForQuery(bool mustSeeOwnWrites) =&gt;
+    new SqlConnection(mustSeeOwnWrites ? writeDb : readDb);</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">35.2 Elastic Pools: Multi-Tenant Economics</h3>
+
+<p class="text-gray-300 leading-relaxed">Multi-tenant AI apps (§18) often run one database per tenant — which means hundreds of databases with spiky, uncorrelated usage. Elastic pools share DTUs/vCores across the pool: quiet tenants subsidize busy ones, and you pay for the pool's peak rather than each database's peak:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Pool by usage profile,</strong> not randomly: put tenants with similar vector-search intensity in the same pool so the shared resources match the workload shape.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Set per-database min/max</strong> so one tenant's embedding backfill (§14.2) can't starve the pool — the noisy-neighbor guard from §18.4, now at the infrastructure layer.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Monitor pool utilization, not just database utilization:</strong> the pool eDTU/vCore percentage is the scaling signal; add capacity when sustained above 70%, not when one tenant spikes.</li>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">35.3 Hyperscale: When Vectors Get Very Large</h3>
+
+<p class="text-gray-300 leading-relaxed">The vector store (§3.2) grows linearly with documents × chunks — millions of 1536-dimensional vectors is tens of gigabytes before indexes. Hyperscale separates compute from storage (up to 128 TB) and scales them independently:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Scale compute for search concurrency,</strong> storage for corpus size — independently. A 50 GB vector store with 200 concurrent searches needs big compute and modest storage; Hyperscale prices them separately.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Named replicas</strong> give isolated read scale-out for specific workloads: one replica for the chat vector search, another for the analytics team's embedding scans — each sized to its workload.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Rapid scale-up</strong> handles the predictable spikes: scale compute up before the Monday-morning ingest backfill, down after. The vector index rebuilds (§15.3) run faster on bigger compute — schedule them during scaled-up windows.</li>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">35.4 The Sharding Decision (Defer It)</h3>
+
+<p class="text-gray-300 leading-relaxed">True sharding — splitting tenants across databases/servers with a shard map — is the last resort, not the first. Before sharding, exhaust:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Read scale-out</strong> (§35.1) for read pressure.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Bigger compute / Hyperscale</strong> for data size and search concurrency.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Caching</strong> (Chapter 34) to cut the load itself — a 40% semantic-cache hit rate is a 40% load reduction no infrastructure change can match.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Workload isolation</strong> — move batch analytics (§4.5's columnstore queries) and embedding backfills to replicas or separate databases before they contend with chat.</li>
+
+<p class="text-gray-300 leading-relaxed">When sharding becomes unavoidable (single-database limits genuinely bind), shard by tenant with the tenant_id → database map in a small shard-map database — the application's connection factory (§35.1's helper) resolves the database per tenant. Cross-shard queries go through the analytics pipeline (§4.5), never through cross-database joins on the chat path. And note what sharding costs: every pattern in this book that assumed one database (RLS, hash chains, CDC cursors) now needs a per-shard instance.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">35.5 Disaster Recovery for AI Applications</h3>
+
+<p class="text-gray-300 leading-relaxed">Scaling (§35.1–35.4) is about handling growth; disaster recovery is about surviving loss — and AI applications have recovery requirements beyond the database backup. The RPO/RTO conversation needs four tiers, because not all AI state is equal:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Tier 0 — Conversations, audit, ledger:</strong> zero data loss tolerated. Synchronous replication (Availability Groups / Azure SQL's built-in HA) plus point-in-time restore. The audit log's hash chain (§24.3) verifies post-recovery integrity — recompute the chain after any restore and alert on mismatch.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Tier 1 — Vector store and derived indexes:</strong> recoverable by re-running ingestion (§14), so the RPO can be hours — but re-embedding a large corpus takes time and API budget. Keep geo-replicated backups of the vector tables anyway; the re-ingest path is the fallback, not the plan.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Tier 2 — Caches and ephemeral state:</strong> not backed up at all. The warming procedure (§34.5) rebuilds them after failover — which is why warming must be automated, because failovers happen at the worst possible time.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Tier 3 — Sessions and in-flight streams:</strong> expected to be lost. Clients reconnect, resume from persisted buffers (§29.5), and the orphan reaper (§29.3) cleans up whatever didn't survive.</li>
+
+<p class="text-gray-300 leading-relaxed">Drill the failover quarterly (§40.4): restore the backup to a secondary region, verify the chain, warm the caches, replay yesterday's erasure requests (§38.3's backup-window rule), and measure the actual RTO against the SLA. The drill's most common finding is not a database problem — it's that the application's connection strings, key vault references, or model provider keys weren't part of the recovery plan. DR for an AI app is a system drill, not a database drill.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<p class="text-gray-300 leading-relaxed">One more scaling lever that teams overlook: move the embedding workload off the database entirely. Embedding computation (§14.2) is CPU/GPU-bound batch work that gains nothing from running near the data — run it on a dedicated compute pool (Azure Container Instances, a Kubernetes job) that writes vectors back through the ingest queue. This isolates the spikiest, least latency-sensitive workload from the chat path, letting the database tier scale for queries while the embedding tier scales for throughput. Separation of workloads is scaling's quiet superpower.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+<p class="text-gray-300 leading-relaxed">Whatever tier you run, keep one non-production environment at production scale for the load tests (§39.4) and chaos experiments (§39.5). Scaling confidence comes from evidence, not architecture diagrams — and the cost of that environment is rounding error next to a single scaling-related outage.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Scale reads first:</strong> ApplicationIntent=ReadOnly routes chat's read-heavy workload to secondaries; keep read-your-write operations on the primary.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Use elastic pools for multi-tenant economics</strong> — pool by usage profile, cap per-database consumption, and scale on pool utilization.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Hyperscale separates vector-store compute from storage</strong> — scale each independently, isolate workloads on named replicas, and exploit rapid scale-up for batch windows.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Defer sharding until every cheaper option is exhausted,</strong> then shard by tenant with a shard-map database — and budget for per-shard instances of every pattern in this book.</li>
+
+    </article>
+
+      <nav class="flex items-center justify-center gap-3 mt-12 mb-4 text-sm">
+        <a href="chapter-34.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">← Chapter 34</a>
+        <a href="index.html" class="px-4 py-2 rounded-lg bg-gray-800 text-gray-300 hover:bg-gray-700 transition">All Chapters</a>
+        <a href="chapter-36.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">Chapter 36 →</a>
+      </nav>
+<div class="bg-gradient-to-r from-blue-900/40 to-indigo-900/40 border border-blue-800/50 rounded-2xl p-6 mt-10">
+        <p class="text-gray-300 text-sm leading-relaxed"><strong class="text-white">Keep going.</strong> You're reading <em class="text-blue-300">AI-Native Apps on SQL Server</em> — one of seven free deep-dives in the DBA Library, covering SQL Server performance tuning, high availability, security, automation, and more. <a href="../index.html" class="text-blue-400 hover:text-blue-300 underline">Browse the full library →</a></p>
+      </div>
+    <footer class="text-center text-gray-600 text-xs mt-10 pb-6">DBA Library · AI-Native Apps on SQL Server · Free for the SQL Server community</footer>
+  </div>
+</body>
+</html>

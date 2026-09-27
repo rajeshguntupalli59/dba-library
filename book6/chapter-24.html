@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 24: Audit Logging Every AI Action in SQL Server — AI-Native Apps on SQL Server</title>
+<meta name="description" content="Request, action, and prompt audit tiers, hash-chained tamper evidence, and forensic queries.">
+<script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-200">
+  <div class="max-w-3xl mx-auto px-6 py-10">
+    <p class="text-blue-400 text-sm font-semibold tracking-wide uppercase mb-2">AI-Native Apps on SQL Server</p>
+    <p class="text-gray-500 text-sm mb-1">Chapter 24 of 40</p>
+    <h1 class="text-3xl font-bold text-white mb-8">Audit Logging Every AI Action in SQL Server</h1>
+    <article class="space-y-5">
+<p class="text-gray-300 leading-relaxed">Every LLM call, every tool execution, every prompt version, every token spent — in a production AI application, all of it must be recorded. Audit logs are the difference between "the AI did something wrong and we don't know what" and a precise, timestamped, replayable record. This chapter builds the complete audit story: what to log and at which granularity, the schema that keeps high-volume logging fast, tamper-evidence for compliance, and the queries that turn audit rows into incident timelines, cost reports, and behavior forensics.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">24.1 What Gets Logged: The Audit Contract</h3>
+
+<p class="text-gray-300 leading-relaxed">Log at three granularities, each serving a different consumer:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Request level (llm_audit_log, §1.2).</strong> One row per LLM call: model, tokens, latency, status, tenant, user, conversation. Consumers: billing, cost attribution (Chapter 33), latency dashboards.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Action level (agent_actions, §20.3).</strong> One row per tool call: arguments, results, approval linkage. Consumers: debugging, compliance, evaluation replay.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Prompt level (new).</strong> The exact prompt sent and the exact completion received, stored for a shorter retention window. Consumers: incident forensics ("what exactly did the model see?"), prompt regression analysis. This is the most sensitive tier — prompts contain user data.</li>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Prompt-level audit: full fidelity, short retention, restricted access
+CREATE TABLE dbo.prompt_audit (
+    prompt_audit_id UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWID(),
+    log_id          UNIQUEIDENTIFIER NOT NULL   -- FK to llm_audit_log
+                    CONSTRAINT FK_pa_log REFERENCES dbo.llm_audit_log(log_id),
+    tenant_id       UNIQUEIDENTIFIER NOT NULL,
+    system_prompt   NVARCHAR(MAX) NOT NULL,
+    messages_json   JSON NOT NULL,             -- the full message array sent
+    completion_json JSON NULL,                 -- the raw provider response
+    prompt_hash     CHAR(64) NOT NULL,         -- SHA2_256 for dedup/lookup
+    created_at      DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
+);
+-- Partitioned monthly (§4.6); retention 90 days, then purged.
+-- Access: support-lead role only; every read logged (see §24.4).</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The prompt audit is deliberately separate from the request log: different retention (90 days vs. years), different access control (support-leads only), and different storage economics (prompts are large). Never mix tiers — a single table with mixed retention is a compliance trap.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">24.2 Write Path: Fast, Non-Blocking, Never Lost</h3>
+
+<p class="text-gray-300 leading-relaxed">Audit writes happen on the hottest path in the system — every chat turn. Three techniques keep them from becoming the bottleneck:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Write in the request transaction (§1.5), but keep the row narrow.</strong> The request-level row is fixed-width-ish and cheap. The prompt-level payload goes to a separate table written by a background worker reading from a queue — never block the chat response on a multi-kilobyte prompt write.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Minimal indexing on the write path.</strong> The clustered key plus the two or three indexes from §1.2. Analytical indexes (columnstore, §4.5) absorb the read load without burdening inserts.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Delayed durability for the prompt tier only.</strong> Request-level audit must be fully durable (billing depends on it); prompt payloads can tolerate the small data-loss window of delayed durability in exchange for much higher throughput.</li>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Background prompt-audit writer: dequeue, write, done.
+-- The chat path enqueues (Service Broker or table queue); this worker persists.
+CREATE OR ALTER PROCEDURE dbo.usp_flush_prompt_audit
+AS
+BEGIN
+    SET NOCOUNT ON;
+    -- Claim a batch with READPAST (same pattern as §13.2)
+    WITH claimed AS (
+        SELECT TOP (500) queue_id, log_id, tenant_id,
+               system_prompt, messages_json, completion_json, prompt_hash
+        FROM dbo.prompt_audit_queue WITH (READPAST, UPDLOCK, ROWLOCK)
+        WHERE status = N'pending'
+        ORDER BY created_at
+    )
+    INSERT INTO dbo.prompt_audit
+        (log_id, tenant_id, system_prompt, messages_json,
+         completion_json, prompt_hash)
+    OUTPUT INSERTED.log_id INTO @done
+    SELECT log_id, tenant_id, system_prompt, messages_json,
+           completion_json, prompt_hash
+    FROM claimed;
+    -- Mark claimed rows done in the same transaction.
+END;
+GO</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">24.3 Tamper-Evidence: Hash-Chained Audit Logs</h3>
+
+<p class="text-gray-300 leading-relaxed">For regulated industries, "we logged it" is not enough — you must prove the log was not altered. Hash chaining makes each row cryptographically commit to all previous rows:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Each audit row chains to the previous row's hash.
+-- Altering any historical row breaks every subsequent chain link.
+ALTER TABLE dbo.llm_audit_log
+    ADD chain_hash CHAR(64) NULL,
+        prev_chain_hash CHAR(64) NULL;
+GO
+
+-- Maintained by the insert procedure (single writer serialization per day
+-- partition keeps this contention-free in practice):
+--   prev = SELECT TOP 1 chain_hash FROM dbo.llm_audit_log ORDER BY created_at DESC
+--   chain_hash = SHA2_256(CONCAT(prev, log_id, tenant_id, model,
+--                                total_tokens, created_at))
+--
+-- Nightly verifier job recomputes the chain; any mismatch pages the team.
+-- For stronger guarantees, anchor the daily terminal hash externally
+-- (write it to immutable blob storage) — then tampering requires
+-- rewriting both the database and the external anchor.</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Hash chaining is cheap (one hash per insert, one verification pass nightly) and converts "trust us" into "verify us." Pair it with SQL Server Audit (the built-in feature) capturing DDL and privileged access — the chain proves the rows are intact; SQL Server Audit proves nobody bypassed the application to change them.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">24.4 Forensics Queries: From Rows to Timelines</h3>
+
+<p class="text-gray-300 leading-relaxed">The audit schema pays for itself during incidents. The essential forensic queries:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Incident timeline: everything one user did in a window
+SELECT a.created_at, a.model, c.title AS conversation,
+       a.prompt_tokens, a.completion_tokens, a.status, a.latency_ms,
+       LEFT(pa.system_prompt, 120) AS prompt_preview
+FROM dbo.llm_audit_log AS a
+LEFT JOIN dbo.conversations AS c ON c.conversation_id = a.conversation_id
+LEFT JOIN dbo.prompt_audit AS pa ON pa.log_id = a.log_id
+WHERE a.user_id = @user_id
+  AND a.created_at BETWEEN @from AND @to
+ORDER BY a.created_at;
+
+-- Blast radius: which tenants were affected by a bad prompt version?
+SELECT a.tenant_id, COUNT(*) AS calls,
+       SUM(CASE WHEN f.rating = 'down' THEN 1 ELSE 0 END) AS downvotes
+FROM dbo.llm_audit_log AS a
+LEFT JOIN dbo.answer_feedback AS f ON f.message_id IN (
+    SELECT message_id FROM dbo.messages WHERE conversation_id = a.conversation_id)
+WHERE a.created_at &gt;= @deploy_time
+GROUP BY a.tenant_id ORDER BY downvotes DESC;
+
+-- Cost spike forensics: what drove yesterday's token surge?
+SELECT TOP 20 a.user_id, SUM(a.total_tokens) AS tokens, COUNT(*) AS calls,
+       AVG(CAST(a.latency_ms AS FLOAT)) AS avg_latency
+FROM dbo.llm_audit_log AS a
+WHERE a.created_at &gt;= DATEADD(day, -1, SYSUTCDATETIME())
+GROUP BY a.user_id ORDER BY tokens DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Build these as saved procedures or views before you need them — during an incident is the wrong time to be writing forensic SQL.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">24.5 Access Reviews for Audit Data</h3>
+
+<p class="text-gray-300 leading-relaxed">Audit logs concentrate everything sensitive — prompts, user data, behavior patterns — which makes <em>access to the audit log</em> itself a privileged operation requiring oversight. Run quarterly access reviews: who holds the support-lead role that can read <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">prompt_audit</code>, is each grant still justified, and does the read-log show access patterns consistent with their job? Automate the evidence gathering (role membership from the database, read counts from the access log) so the review is a 30-minute sign-off, not a week-long project. Revoke aggressively — audit access should be the hardest permission in the system to keep, because it is the permission that watches all the others.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Audit at three granularities with separate tables and retentions:</strong> request level (billing, years), action level (debugging/compliance, years), prompt level (forensics, 90 days, restricted access).</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Keep audit writes off the critical path:</strong> narrow rows in the request transaction, bulky prompt payloads via a background queue worker, minimal write-path indexing, delayed durability only for the prompt tier.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Hash-chain the audit log and anchor daily terminal hashes externally</strong> for tamper-evidence; pair with SQL Server Audit for privileged-access coverage.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Pre-build forensic queries as procedures</strong> — incident timelines, blast-radius analysis, cost-spike forensics — before the incident happens.</li>
+
+    </article>
+
+      <nav class="flex items-center justify-center gap-3 mt-12 mb-4 text-sm">
+        <a href="chapter-23.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">← Chapter 23</a>
+        <a href="index.html" class="px-4 py-2 rounded-lg bg-gray-800 text-gray-300 hover:bg-gray-700 transition">All Chapters</a>
+        <a href="chapter-25.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">Chapter 25 →</a>
+      </nav>
+<div class="bg-gradient-to-r from-blue-900/40 to-indigo-900/40 border border-blue-800/50 rounded-2xl p-6 mt-10">
+        <p class="text-gray-300 text-sm leading-relaxed"><strong class="text-white">Keep going.</strong> You're reading <em class="text-blue-300">AI-Native Apps on SQL Server</em> — one of seven free deep-dives in the DBA Library, covering SQL Server performance tuning, high availability, security, automation, and more. <a href="../index.html" class="text-blue-400 hover:text-blue-300 underline">Browse the full library →</a></p>
+      </div>
+    <footer class="text-center text-gray-600 text-xs mt-10 pb-6">DBA Library · AI-Native Apps on SQL Server · Free for the SQL Server community</footer>
+  </div>
+</body>
+</html>

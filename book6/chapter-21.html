@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 21: MCP and SQL Server: Direct AI Access to Your Database — AI-Native Apps on SQL Server</title>
+<meta name="description" content="Model Context Protocol servers over SQL Server: resources, tools, and guarded access.">
+<script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-200">
+  <div class="max-w-3xl mx-auto px-6 py-10">
+    <p class="text-blue-400 text-sm font-semibold tracking-wide uppercase mb-2">AI-Native Apps on SQL Server</p>
+    <p class="text-gray-500 text-sm mb-1">Chapter 21 of 40</p>
+    <h1 class="text-3xl font-bold text-white mb-8">MCP and SQL Server: Direct AI Access to Your Database</h1>
+    <article class="space-y-5">
+<p class="text-gray-300 leading-relaxed">The Model Context Protocol (MCP) standardizes how AI applications connect to data sources: instead of every app writing bespoke database integrations, an MCP server exposes your database's capabilities — schema, queries, procedures — over a uniform protocol that any MCP client (Claude, IDE assistants, agent frameworks) can consume. This chapter builds an MCP server over SQL Server: exposing safe read tools, the schema-introspection resources, the security model that keeps "direct AI access" from becoming "unrestricted AI access," and the operational practices for running MCP in production.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">21.1 What MCP Gives You</h3>
+
+<p class="text-gray-300 leading-relaxed">Without MCP, each AI client needs custom code to reach your database: connection handling, schema discovery, query execution, result formatting. With MCP, you write one server that exposes:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Tools:</strong> callable functions like <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">run_report</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">lookup_customer</code> — the same stored-procedure tools from Chapter 20, now protocol-accessible.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Resources:</strong> readable data like <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">schema://tables/orders</code> — the model's way of discovering what exists.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Prompts:</strong> pre-built prompt templates like <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">analyze_churn</code> that encode your team's analytical best practices.</li>
+
+<p class="text-gray-300 leading-relaxed">The MCP server in this chapter is a Python process using the MCP SDK, with pyodbc underneath — the same data-access layer as the rest of the book, so the security model (RLS, least-privilege logins, procedure-only access) carries over unchanged.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">21.2 Building the MCP Server</h3>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># mcp_server.py — MCP server over SQL Server
+# Dependencies: pip install mcp pyodbc
+import json
+import pyodbc
+from mcp.server.fastmcp import FastMCP
+
+mcp = FastMCP("sqlserver-ai")
+CONN_STR = ("DRIVER={ODBC Driver 18 for SQL Server};SERVER=localhost,1433;"
+            "DATABASE=aiapp;UID=mcp_reader;PWD=secret;TrustServerCertificate=yes;")
+# NOTE: mcp_reader is a least-privilege login: EXECUTE on whitelisted
+# procedures only, RLS policies applied. See §21.4.
+
+def q(proc: str, *params):
+    with pyodbc.connect(CONN_STR) as conn:
+        cur = conn.cursor()
+        # Tenant/user context comes from the MCP session (authenticated caller)
+        cur.execute("EXEC sp_set_session_context 'tenant_id', ?", TENANT.get())
+        cur.execute("EXEC sp_set_session_context 'user_id', ?", USER.get())
+        rows = cur.execute(f"EXEC {proc} " + ",".join("?" * len(params)),
+                           *params).fetchall()
+        cols = [c[0] for c in cur.description]
+        return [dict(zip(cols, r)) for r in rows]
+
+@mcp.tool()
+def lookup_orders(status: str = None, max_rows: int = 20) -&gt; str:
+    """Look up the caller's orders, optionally filtered by status."""
+    rows = q("dbo.tool_lookup_orders", TENANT.get(), USER.get(),
+             status, None, max_rows, None)
+    return json.dumps(rows, default=str)
+
+@mcp.tool()
+def hybrid_search(question: str, k: int = 8) -&gt; str:
+    """Semantic + keyword search over the knowledge base."""
+    import openai
+    vec = openai.OpenAI().embeddings.create(
+        model="text-embedding-3-small", input=question).data[0].embedding
+    rows = q("dbo.usp_hybrid_search", TENANT.get(), question,
+             json.dumps(vec), k)
+    return json.dumps(rows, default=str)
+
+@mcp.resource("schema://tables/{table}")
+def table_schema(table: str) -&gt; str:
+    """Column definitions for a whitelisted table."""
+    if table not in {"orders", "documents", "conversations"}:
+        raise ValueError("Table not exposed via MCP")
+    with pyodbc.connect(CONN_STR) as conn:
+        rows = conn.execute("""
+            SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = 'dbo' AND TABLE_NAME = ?
+            ORDER BY ORDINAL_POSITION""", table).fetchall()
+        return json.dumps([{"column": r[0], "type": r[1],
+                            "nullable": r[2]} for r in rows])
+
+@mcp.prompt()
+def analyze_churn() -&gt; str:
+    """Best-practice prompt for churn analysis over the orders schema."""
+    return ("Analyze customer churn using the orders table. "
+            "1) Call lookup_orders for recent cancelled orders. "
+            "2) Summarize cancellation patterns by product line. "
+            "3) Never reveal other customers' data.")
+
+if __name__ == "__main__":
+    mcp.run()</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Three design decisions are load-bearing. First, tools wrap stored procedures — never raw SQL. Second, the resource allowlist (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">{"orders", "documents", "conversations"}</code>) is explicit; schema discovery does not mean schema exposure. Third, session context is stamped per MCP session from the authenticated caller — the same RLS enforcement as every other path.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">21.3 Text-to-SQL Through MCP: Guardrailed Generation</h3>
+
+<p class="text-gray-300 leading-relaxed">MCP clients will ask to "run a query." The safe answer is a text-to-SQL tool with guardrails, not an open query endpoint:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Generate against the allowlisted schema only</strong> — the model sees the resource schemas from §21.2, nothing else.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Validate the generated SQL before execution:</strong> parse it, reject anything that is not a single SELECT (no INSERT/UPDATE/DELETE/DROP/EXEC), reject access to non-allowlisted tables, enforce TOP.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Execute as the least-privilege login</strong> with RLS active — the final backstop if validation misses something.</li>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>@mcp.tool()
+def ask_data(question: str) -&gt; str:
+    """Answer a data question by generating and running a safe SELECT."""
+    sql = llm_generate_sql(question, ALLOWED_SCHEMAS)  # Chapter 22
+    validate_select_only(sql, ALLOWED_TABLES)          # raises on violation
+    sql = enforce_top(sql, 100)
+    with pyodbc.connect(CONN_STR) as conn:
+        stamp_context(conn)
+        rows = conn.execute(sql).fetchall()
+        return json.dumps([dict(zip([c[0] for c in conn.description], r))
+                           for r in rows], default=str)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Chapter 22 covers the generation side in depth; the MCP chapter's contribution is the execution sandbox around it.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">21.4 The Security Model</h3>
+
+<p class="text-gray-300 leading-relaxed">"Direct AI access to your database" sounds alarming because, done naively, it is. The layered model:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Authentication at the MCP transport.</strong> The MCP client authenticates (OAuth/API key); the server maps the identity to tenant_id/user_id. Anonymous MCP access to production data is never acceptable.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Least-privilege SQL login per MCP deployment.</strong> <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">mcp_reader</code> gets EXECUTE on whitelisted procedures and nothing else. A separate <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">mcp_writer</code> exists only if write tools are exposed — most deployments are read-only.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>RLS on every table</strong> (§12.2) — the model cannot query its way across tenants even with a valid session.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Audit everything.</strong> Every MCP tool call logs to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dbo.llm_audit_log</code> (or the agent action log for agentic clients) with the MCP session ID. "The AI looked at what?" must always be answerable.</li>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- MCP reader login: procedure-only access, RLS-enforced reads
+CREATE LOGIN mcp_reader WITH PASSWORD = '...';
+CREATE USER mcp_reader FOR LOGIN mcp_reader;
+CREATE ROLE mcp_read_role;
+ALTER ROLE mcp_read_role ADD MEMBER mcp_reader;
+GRANT EXECUTE ON dbo.tool_lookup_orders TO mcp_read_role;
+GRANT EXECUTE ON dbo.usp_hybrid_search TO mcp_read_role;
+GRANT EXECUTE ON dbo.usp_filtered_vector_search TO mcp_read_role;
+-- No direct table SELECT grants: all reads flow through procedures,
+-- and RLS policies filter every row by the stamped session context.</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">21.5 Running MCP in Production</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Rate-limit per MCP client</strong> (Chapter 25's quota procedures apply — MCP tool calls consume the same token/row budgets).</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Version your tool contracts.</strong> Tools are an API; changing a procedure signature breaks deployed clients. Version tools (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">lookup_orders_v2</code>) and deprecate, don't mutate.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Monitor tool-call patterns</strong> for anomalies — a client calling <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ask_data</code> in a tight loop is either a runaway agent or an exfiltration attempt; alert on both.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Test with the adversarial suite</strong> from §12.5, extended to MCP: cross-tenant tool calls, schema resources for non-allowlisted tables, and SQL-injection attempts through the text-to-SQL tool.</li>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>An MCP server over SQL Server exposes tools (procedures), resources (allowlisted schemas), and prompts (analytical templates)</strong> — one integration that every MCP client can consume.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Tools wrap stored procedures, never raw SQL;</strong> text-to-SQL goes through generate → validate (SELECT-only, allowlisted tables, enforced TOP) → execute as a least-privilege login.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Security is four layers:</strong> authenticated MCP transport mapped to tenant/user, least-privilege SQL logins, RLS on every table, and complete audit logging of every tool call.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Operate MCP like an API:</strong> rate limits, versioned tool contracts, anomaly monitoring on call patterns, and the adversarial test suite extended to the MCP surface.</li>
+
+    </article>
+
+      <nav class="flex items-center justify-center gap-3 mt-12 mb-4 text-sm">
+        <a href="chapter-20.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">← Chapter 20</a>
+        <a href="index.html" class="px-4 py-2 rounded-lg bg-gray-800 text-gray-300 hover:bg-gray-700 transition">All Chapters</a>
+        <a href="chapter-22.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">Chapter 22 →</a>
+      </nav>
+<div class="bg-gradient-to-r from-blue-900/40 to-indigo-900/40 border border-blue-800/50 rounded-2xl p-6 mt-10">
+        <p class="text-gray-300 text-sm leading-relaxed"><strong class="text-white">Keep going.</strong> You're reading <em class="text-blue-300">AI-Native Apps on SQL Server</em> — one of seven free deep-dives in the DBA Library, covering SQL Server performance tuning, high availability, security, automation, and more. <a href="../index.html" class="text-blue-400 hover:text-blue-300 underline">Browse the full library →</a></p>
+      </div>
+    <footer class="text-center text-gray-600 text-xs mt-10 pb-6">DBA Library · AI-Native Apps on SQL Server · Free for the SQL Server community</footer>
+  </div>
+</body>
+</html>

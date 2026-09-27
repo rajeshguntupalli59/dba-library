@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 2: The AI Application Stack on SQL Server — AI-Native Apps on SQL Server</title>
+<meta name="description" content="The layered stack: client, application, data, and pipeline layers, and how they communicate.">
+<script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-200">
+  <div class="max-w-3xl mx-auto px-6 py-10">
+    <p class="text-blue-400 text-sm font-semibold tracking-wide uppercase mb-2">AI-Native Apps on SQL Server</p>
+    <p class="text-gray-500 text-sm mb-1">Chapter 2 of 40</p>
+    <h1 class="text-3xl font-bold text-white mb-8">The AI Application Stack on SQL Server</h1>
+    <article class="space-y-5">
+<p class="text-gray-300 leading-relaxed">Chapter 1 argued that SQL Server can be the single operational backbone for AI applications. This chapter zooms out to the full stack: where the LLM sits, where the vector layer lives, where relational data fits, and how the three interact in a production topology. You will learn the reference architecture that the rest of this book implements piece by piece, the request lifecycle of a single chat turn across every layer, and how to make build-vs-buy decisions for each component without painting yourself into a corner. Everything here maps to SQL Server 2025 and Azure services, so the architecture you design on your laptop deploys to the cloud without a rewrite.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">2.1 The Three Layers of an AI Application</h3>
+
+<p class="text-gray-300 leading-relaxed">Every production AI application decomposes into three layers, regardless of framework or vendor:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>The reasoning layer (LLM).</strong> A hosted model API — Azure OpenAI, Anthropic, or a self-hosted model — that turns prompts into text, tool calls, and structured outputs. It is stateless: every call must carry its full context.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>The retrieval layer (vectors + relational).</strong> Embeddings, similarity search, metadata filters, conversation history, and permissions. In this book this entire layer is SQL Server: the native VECTOR type, DiskANN vector indexes, full-text search, and T-SQL.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>The system-of-record layer (relational).</strong> Users, tenants, billing, audit logs, quotas, and configuration. Also SQL Server — the same database, the same transactions, the same backup story.</li>
+
+<p class="text-gray-300 leading-relaxed">The critical design decision is that layers two and three are the <em>same database</em>. Splitting retrieval and system-of-record across two systems forces you to solve distributed transactions for operations as simple as "store the answer and charge the user." Keeping them together means one transaction, one backup, one security model.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TB
+    Client[Client app] --> API[API tier - FastAPI / ASP.NET]
+    API --> LLM[Reasoning layer - Azure OpenAI / LLM API]
+    API --> SQL[(SQL Server 2025)]
+    subgraph SQL [Single SQL Server database]
+        V[VECTOR columns + vector indexes]
+        R[Relational tables - users, tenants, billing]
+        J[JSON columns - flexible AI outputs]
+        F[Full-text indexes - hybrid search]
+        Q[Service Broker - internal events]
+    end
+    LLM -.->|embeddings| V
+    API --> V
+    API --> R</pre></div>
+
+<p class="text-gray-300 leading-relaxed">Notice what is missing from the diagram: no standalone vector database, no separate cache tier for correctness-critical data, no message broker for internal events. Each of those can be added later for scale, but none is required to ship.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">2.2 The Lifecycle of a Single Chat Turn</h3>
+
+<p class="text-gray-300 leading-relaxed">Tracing one request through the stack makes the layering concrete. A user sends "What is our refund policy for enterprise customers?" Here is what happens, in order, with timings from a typical production deployment:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>0–5 ms — Authenticate and set context.</strong> The API validates the JWT, resolves the tenant, and checks out a pooled SqlClient connection. <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sp_set_session_context</code> stamps the tenant ID so row-level security applies to every subsequent statement on that connection.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>5–15 ms — Quota check.</strong> A single indexed lookup against a quotas table verifies the tenant has not exhausted its monthly token budget. Denied requests fail fast here, before any LLM spend.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>15–250 ms — Embed the query.</strong> The API calls the embedding model. This is the first network hop outside your infrastructure and usually the largest fixed cost in the pipeline after the LLM call itself.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>250–300 ms — Hybrid retrieval.</strong> <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">usp_hybrid_search</code> runs the vector arm (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_DISTANCE</code> over the DiskANN index) and the full-text arm (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CONTAINSTABLE</code>), fuses the rankings, and returns the top chunks — all tenant-filtered by the security policy.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>300–320 ms — Load conversation history.</strong> The last N messages come from the messages table, ordered by creation time. A covering index on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">(conversation_id, created_at)</code> keeps this at single-digit milliseconds.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>320–2500 ms — LLM call.</strong> The prompt (system instructions + retrieved context + history + user message) goes to the model. This dominates wall-clock time; everything else in the pipeline exists to make this call as effective as possible.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>2500–2540 ms — Persist atomically.</strong> User message, assistant message, token accounting, quota decrement, and audit log row commit in one transaction. Service Broker emits the post-commit event for downstream consumers.</li>
+
+<p class="text-gray-300 leading-relaxed">Two observations fall out of this trace. First, the database is on the critical path three times (quota, retrieval, persist) and each visit is tens of milliseconds — the database is never the bottleneck when indexed correctly. Second, the LLM call is 80%+ of latency, which means retrieval quality (getting the right context) matters far more than retrieval speed for end-user experience.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">2.3 Where Each Piece Runs: On-Prem, Container, Azure</h3>
+
+<p class="text-gray-300 leading-relaxed">The same T-SQL runs in three deployment shapes. Choosing between them is an operational decision, not an application rewrite:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>SQL Server 2025 on your own hardware or VM.</strong> Full control, bring your own GPUs for ML Services scoring, predictable cost at scale. You own backups, patching, and high availability (Always On availability groups).</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>SQL Server 2025 in containers.</strong> The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">mcr.microsoft.com/mssql/server:2025-latest</code> image from Chapter 1. Ideal for development and CI; viable in production on Kubernetes with persistent volumes, though availability-group orchestration takes real effort.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Azure SQL Database / Managed Instance.</strong> Automated backups with point-in-time restore, built-in HA, serverless auto-pause for dev workloads, Hyperscale for very large vector corpora. The VECTOR type and vector indexes are available in Azure SQL Database, so the schema from Chapter 1 deploys unchanged.</li>
+
+<p class="text-gray-300 leading-relaxed">The recommended progression is: containers for local development, Azure SQL Database serverless for staging and early production, then Hyperscale or Managed Instance (or self-hosted) as data volume and compliance requirements grow. Because the application talks to all three through the same TDS protocol and the same T-SQL, environment promotion is a connection-string change.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">2.4 The Embedding Pipeline as a First-Class Citizen</h3>
+
+<p class="text-gray-300 leading-relaxed">Embeddings are the bridge between the reasoning layer and the retrieval layer, and they deserve the same engineering rigor as any other data pipeline. A production embedding pipeline has four stages:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Chunking.</strong> Splitting documents into retrievable units (Chapter 14). Chunk boundaries determine retrieval granularity; overlap preserves context across boundaries.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Embedding.</strong> Calling the embedding model in batches. Batch size, retry policy, and rate-limit handling live here.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Storage.</strong> Writing vectors into <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR</code> columns transactionally alongside their source text and metadata.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Indexing.</strong> The DiskANN vector index makes new vectors searchable. Unlike some systems, SQL Server's vector index handles incremental inserts without a full rebuild.</li>
+
+<p class="text-gray-300 leading-relaxed">Model versioning cuts across all four stages: the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">embedding_model</code> column from Chapter 1 exists because vectors from different models live in different geometric spaces and cannot be compared. The pipeline must never mix models within a single searchable set — a constraint best enforced with a filtered index or check constraint, not application discipline.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Guardrail: one embedding model per tenant corpus at a time.
+-- The filtered unique index below permits exactly one "active" model
+-- per tenant; flip the flag only after the re-embed completes.
+ALTER TABLE dbo.document_chunks
+    ADD embedding_active BIT NOT NULL DEFAULT 1;
+
+CREATE UNIQUE INDEX UQ_chunks_active_model
+    ON dbo.document_chunks(tenant_id, embedding_model)
+    WHERE embedding_active = 1;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">2.5 Caching Strategy Across the Stack</h3>
+
+<p class="text-gray-300 leading-relaxed">AI applications have three distinct cacheable surfaces, each with different invalidation semantics:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Embedding cache.</strong> The mapping from text to vector is deterministic per model. Cache embeddings by <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SHA2_256(text + model)</code> in a table; repeated queries for the same question skip the embedding API call entirely. This is a correctness-safe cache — the value never changes.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Retrieval cache.</strong> The mapping from (query vector, filters) to chunk lists changes whenever the corpus changes. Cache with a short TTL or invalidate via Change Tracking on the chunks table (Chapter 34).</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Completion cache.</strong> The mapping from prompt to LLM response. Exact-match caching saves the most money but risks stale answers; semantic caching (match on similar prompts via vector search) trades precision for hit rate. Both live naturally in SQL Server tables keyed by request hash or vector.</li>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Embedding cache: deterministic, never stale for a fixed model
+CREATE TABLE dbo.embedding_cache (
+    cache_key   CHAR(64) PRIMARY KEY,      -- SHA2_256(model + NUL + text)
+    model       NVARCHAR(100) NOT NULL,
+    embedding   VECTOR(1536) NOT NULL,
+    created_at  DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
+);
+
+-- Lookup-or-compute pattern in T-SQL
+CREATE OR ALTER PROCEDURE dbo.usp_get_embedding
+    @model NVARCHAR(100), @text NVARCHAR(MAX), @embedding VECTOR(1536) OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON;
+    DECLARE @key CHAR(64) =
+        CONVERT(CHAR(64), HASHBYTES('SHA2_256', @model + NCHAR(0) + @text), 2);
+    SELECT @embedding = embedding FROM dbo.embedding_cache WHERE cache_key = @key;
+    -- Caller computes the embedding on NULL and calls usp_put_embedding.
+END;
+GO</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">2.6 Build-vs-Buy Decisions Per Layer</h3>
+
+<p class="text-gray-300 leading-relaxed">For each layer, the pragmatic default is:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>LLM: buy.</strong> Use Azure OpenAI or a managed model API. Self-hosting a frontier-class model is a research project, not an infrastructure decision. Reserve self-hosting for small classification or embedding models where latency and data-residency demand it.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Embeddings: buy the API, own the storage.</strong> Call a managed embedding API, but store the vectors in your own SQL Server. This keeps you portable across embedding providers — re-embedding is expensive, so the vectors are the asset.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Retrieval and system of record: build on SQL Server.</strong> This is the thesis of the book. The moat of an AI application is its data model — tenants, permissions, history, feedback — and that moat lives in your schema, not in a vendor's API.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Observability: buy the platform, own the data.</strong> Ship traces and metrics to your observability platform, but keep the raw audit rows in SQL Server (Chapter 36). The raw rows are what let you answer "what exactly did the model see?" during an incident.</li>
+
+<p class="text-gray-300 leading-relaxed">The unifying principle: own everything that is a durable asset (vectors, history, feedback, audit trails) and rent everything that is fungible compute (model inference, embedding calls). SQL Server is where the durable assets live.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>The stack has three layers — reasoning, retrieval, system of record — and the last two are the same SQL Server database.</strong> Collapsing retrieval and system-of-record into one engine eliminates distributed transactions from the hottest paths in the application.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>A single chat turn touches SQL Server three times and the LLM once; the LLM dominates latency.</strong> Optimize retrieval for quality (right context) over raw speed, and keep every database visit indexed and measured in milliseconds.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>The same T-SQL runs on-prem, in containers, and on Azure SQL.</strong> Environment promotion is a connection-string change, which makes the local-to-cloud path genuinely incremental.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Own durable assets, rent fungible compute.</strong> Vectors, history, feedback, and audit trails live in your SQL Server; model inference and embedding calls are rented APIs. The embedding cache table is the cheapest latency win in the whole stack.</li>
+
+    </article>
+
+      <nav class="flex items-center justify-center gap-3 mt-12 mb-4 text-sm">
+        <a href="chapter-01.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">← Chapter 1</a>
+        <a href="index.html" class="px-4 py-2 rounded-lg bg-gray-800 text-gray-300 hover:bg-gray-700 transition">All Chapters</a>
+        <a href="chapter-03.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">Chapter 3 →</a>
+      </nav>
+<div class="bg-gradient-to-r from-blue-900/40 to-indigo-900/40 border border-blue-800/50 rounded-2xl p-6 mt-10">
+        <p class="text-gray-300 text-sm leading-relaxed"><strong class="text-white">Keep going.</strong> You're reading <em class="text-blue-300">AI-Native Apps on SQL Server</em> — one of seven free deep-dives in the DBA Library, covering SQL Server performance tuning, high availability, security, automation, and more. <a href="../index.html" class="text-blue-400 hover:text-blue-300 underline">Browse the full library →</a></p>
+      </div>
+    <footer class="text-center text-gray-600 text-xs mt-10 pb-6">DBA Library · AI-Native Apps on SQL Server · Free for the SQL Server community</footer>
+  </div>
+</body>
+</html>

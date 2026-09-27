@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 6: Storing Conversation History in SQL Server — AI-Native Apps on SQL Server</title>
+<meta name="description" content="Message tables, atomic turns, history replay, and crash-safe streaming persistence.">
+<script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-200">
+  <div class="max-w-3xl mx-auto px-6 py-10">
+    <p class="text-blue-400 text-sm font-semibold tracking-wide uppercase mb-2">AI-Native Apps on SQL Server</p>
+    <p class="text-gray-500 text-sm mb-1">Chapter 6 of 40</p>
+    <h1 class="text-3xl font-bold text-white mb-8">Storing Conversation History in SQL Server</h1>
+    <article class="space-y-5">
+<p class="text-gray-300 leading-relaxed">Conversation history is the working memory of every AI application: the ordered list of turns that lets the model maintain context across a multi-turn dialogue. It sounds trivial — "just store the messages" — until you face the real requirements: loading the last N turns in milliseconds, enforcing per-user isolation, counting tokens accurately for billing and context-window management, handling edits and regenerations, and aging out old conversations without downtime. This chapter builds the production history store on the messages table from Chapter 1, with the indexes, procedures, and maintenance jobs that keep it fast at millions of rows.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">6.1 The Message Model</h3>
+
+<p class="text-gray-300 leading-relaxed">The messages table from §1.2 stores each turn with its role, content, token count, model metadata, citations, and tool calls. Three refinements make it production-grade:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Immutable messages.</strong> Never UPDATE a message's content. Edits and regenerations are new rows (see §6.4). Immutability makes caching safe, auditing trivial, and replication conflict-free.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Sequence within the conversation.</strong> A <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">seq</code> integer per conversation gives you gap-free ordering even when two messages share a timestamp — which happens constantly under concurrency.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Token counts at write time.</strong> Count tokens when the message is created (the application knows the model and tokenizer) and store the count. Recomputing tokens on read is wasteful and tokenizer-version-dependent.</li>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Refinements to the messages table for production history
+ALTER TABLE dbo.messages ADD seq INT NULL;
+GO
+
+-- Backfill + enforce gap-free sequencing per conversation
+WITH ranked AS (
+    SELECT message_id,
+           ROW_NUMBER() OVER (PARTITION BY conversation_id
+                              ORDER BY created_at, message_id) AS rn
+    FROM dbo.messages
+)
+UPDATE m SET m.seq = r.rn
+FROM dbo.messages AS m JOIN ranked AS r ON m.message_id = r.message_id;
+GO
+ALTER TABLE dbo.messages ALTER COLUMN seq INT NOT NULL;
+GO
+
+-- The hot index: conversation history loads are always
+-- "this conversation, most recent first"
+CREATE UNIQUE INDEX IX_messages_conversation_seq
+    ON dbo.messages (conversation_id, seq DESC)
+    INCLUDE (role, content, token_count, model, created_at);
+GO
+
+-- Insert procedure assigns the next sequence number atomically
+CREATE OR ALTER PROCEDURE dbo.usp_append_message
+    @conversation_id UNIQUEIDENTIFIER,
+    @tenant_id       UNIQUEIDENTIFIER,
+    @role            NVARCHAR(20),
+    @content         NVARCHAR(MAX),
+    @token_count     INT = NULL,
+    @model           NVARCHAR(100) = NULL,
+    @citations       JSON = NULL,
+    @tool_calls      JSON = NULL,
+    @latency_ms      INT = NULL
+AS
+BEGIN
+    SET NOCOUNT ON;
+    DECLARE @seq INT;
+    -- UPDLOCK + HOLDLOCK serializes appends within one conversation
+    SELECT @seq = ISNULL(MAX(seq), 0) + 1
+    FROM dbo.messages WITH (UPDLOCK, HOLDLOCK)
+    WHERE conversation_id = @conversation_id;
+
+    INSERT INTO dbo.messages
+        (conversation_id, tenant_id, role, content, token_count,
+         model, citations, tool_calls, latency_ms, seq)
+    OUTPUT INSERTED.message_id, INSERTED.seq
+    VALUES (@conversation_id, @tenant_id, @role, @content, @token_count,
+            @model, @citations, @tool_calls, @latency_ms, @seq);
+END;
+GO</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">UPDLOCK, HOLDLOCK</code> hint serializes concurrent appends to the same conversation — two parallel tool-call completions cannot grab the same sequence number. The covering index means the history load never touches the clustered index.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">6.2 Loading History: Windowing for the Context Budget</h3>
+
+<p class="text-gray-300 leading-relaxed">The model has a finite context window; history loading is a budgeting problem. The standard policy: take the most recent turns that fit within a token budget, always keeping the system prompt and the latest user message:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Load the most recent messages fitting a token budget.
+-- Oldest-first output, ready to append to the LLM message list.
+CREATE OR ALTER PROCEDURE dbo.usp_load_history_window
+    @conversation_id UNIQUEIDENTIFIER,
+    @token_budget    INT = 6000
+AS
+BEGIN
+    SET NOCOUNT ON;
+    WITH ordered AS (
+        SELECT role, content, token_count, seq,
+               SUM(ISNULL(token_count, 0)) OVER (
+                   ORDER BY seq DESC
+                   ROWS UNBOUNDED PRECEDING) AS running_tokens
+        FROM dbo.messages
+        WHERE conversation_id = @conversation_id
+    )
+    SELECT role, content, token_count
+    FROM ordered
+    WHERE running_tokens - ISNULL(token_count, 0) &lt; @token_budget
+    ORDER BY seq ASC;
+END;
+GO</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The window function accumulates tokens from newest to oldest; the filter keeps every message whose predecessors fit the budget. When history exceeds the budget, the oldest turns fall off — which is exactly when Chapter 11's summarization takes over, replacing dropped turns with a compressed summary so context is never silently lost.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">6.3 Token Accounting: The Running Total</h3>
+
+<p class="text-gray-300 leading-relaxed">The conversations table carries <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">total_tokens</code> as a maintained aggregate — updated by the same transaction that appends messages. Do not compute it with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SUM()</code> on read; at millions of messages that aggregation becomes the slowest part of loading a conversation list.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Maintain the aggregate in the append procedure (add to usp_append_message)
+-- or via an AFTER INSERT trigger for writers that bypass the procedure:
+CREATE OR ALTER TRIGGER dbo.trg_messages_token_rollup
+ON dbo.messages AFTER INSERT
+AS
+BEGIN
+    SET NOCOUNT ON;
+    UPDATE c
+    SET c.total_tokens = c.total_tokens + i.tokens_added,
+        c.updated_at   = SYSUTCDATETIME()
+    FROM dbo.conversations AS c
+    JOIN (SELECT conversation_id, SUM(ISNULL(token_count, 0)) AS tokens_added
+          FROM inserted GROUP BY conversation_id) AS i
+      ON c.conversation_id = i.conversation_id;
+END;
+GO
+
+-- Reconciliation job: heal any drift (e.g., from backfills) nightly
+-- using a set-based MERGE rather than row-by-row fixes.
+CREATE OR ALTER PROCEDURE dbo.usp_reconcile_token_totals
+AS
+BEGIN
+    SET NOCOUNT ON;
+    WITH actual AS (
+        SELECT conversation_id, SUM(ISNULL(token_count, 0)) AS real_total
+        FROM dbo.messages GROUP BY conversation_id
+    )
+    UPDATE c
+    SET c.total_tokens = a.real_total
+    FROM dbo.conversations AS c
+    JOIN actual AS a ON c.conversation_id = a.conversation_id
+    WHERE c.total_tokens &lt;&gt; a.real_total;
+END;
+GO</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">6.4 Edits, Regenerations, and Branches</h3>
+
+<p class="text-gray-300 leading-relaxed">Real users edit their messages and regenerate answers. Because messages are immutable, these become new rows with lineage:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Edited user message:</strong> insert a new message row with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">supersedes</code> pointing at the old row; the old row stays for audit. History loads filter to the latest version per logical turn.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Regenerated assistant answer:</strong> same pattern — new row, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">supersedes</code> the previous answer. Keep both: the discarded answer is valuable training signal for evaluation (Chapter 19).</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Branching ("retry from here"):</strong> new messages get a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">branch_id</code>; the conversation forks without duplicating shared prefix rows.</li>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>ALTER TABLE dbo.messages
+    ADD supersedes_message_id UNIQUEIDENTIFIER NULL
+        CONSTRAINT FK_messages_supersedes
+        REFERENCES dbo.messages(message_id),
+        branch_id UNIQUEIDENTIFIER NULL,
+        is_current BIT NOT NULL DEFAULT 1;
+GO
+
+-- History load that respects edits: latest version of each logical turn
+CREATE OR ALTER PROCEDURE dbo.usp_load_history_current
+    @conversation_id UNIQUEIDENTIFIER,
+    @branch_id       UNIQUEIDENTIFIER = NULL
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SELECT role, content, token_count
+    FROM dbo.messages
+    WHERE conversation_id = @conversation_id
+      AND is_current = 1
+      AND (@branch_id IS NULL OR branch_id IS NULL OR branch_id = @branch_id)
+    ORDER BY seq ASC;
+END;
+GO</code></pre>
+
+<p class="text-gray-300 leading-relaxed">When a regeneration supersedes an answer, set <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">is_current = 0</code> on the old row in the same transaction that inserts the new one. The audit trail stays complete; the model only ever sees current rows.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">6.5 Retention and Archival</h3>
+
+<p class="text-gray-300 leading-relaxed">Conversation history grows forever unless you plan otherwise. The tiered strategy:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Hot (0–90 days):</strong> rowstore with the covering index from §6.1. All interactive loads hit this tier.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Warm (90 days–2 years):</strong> monthly partitions (§4.6) with a columnstore index. Conversation replays and analytics still work; single-conversation loads stay fast via partition elimination.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Cold (2+ years or per policy):</strong> partition switch-out to an archive table on cheaper storage, or export to Parquet in Azure Blob Storage. The conversation list shows archived conversations with their summaries (Chapter 11) so the UI never shows a hole.</li>
+
+<p class="text-gray-300 leading-relaxed">Implement the aging as a monthly SQL Agent job that switches the oldest hot partition to warm and the oldest warm partition to the archive table. No DELETEs, no log bloat, no blocking — partition switching is metadata-only.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Messages are immutable; edits and regenerations are new rows with lineage.</strong> The is_current flag keeps model-visible history clean while the audit trail stays complete.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>A per-conversation sequence number plus a covering index makes history loads a single index seek.</strong> Serialize appends with UPDLOCK/HOLDLOCK to keep sequences gap-free under concurrency.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Load history against a token budget with a running-total window function</strong>, and maintain total_tokens as a write-time aggregate — never SUM() on read.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Tier retention hot → warm → cold with monthly partitions and switch-out archival.</strong> Metadata-only moves, no mass deletes, and summaries keep the UI complete for archived conversations.</li>
+
+    </article>
+
+      <nav class="flex items-center justify-center gap-3 mt-12 mb-4 text-sm">
+        <a href="chapter-05.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">← Chapter 5</a>
+        <a href="index.html" class="px-4 py-2 rounded-lg bg-gray-800 text-gray-300 hover:bg-gray-700 transition">All Chapters</a>
+        <a href="chapter-07.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">Chapter 7 →</a>
+      </nav>
+<div class="bg-gradient-to-r from-blue-900/40 to-indigo-900/40 border border-blue-800/50 rounded-2xl p-6 mt-10">
+        <p class="text-gray-300 text-sm leading-relaxed"><strong class="text-white">Keep going.</strong> You're reading <em class="text-blue-300">AI-Native Apps on SQL Server</em> — one of seven free deep-dives in the DBA Library, covering SQL Server performance tuning, high availability, security, automation, and more. <a href="../index.html" class="text-blue-400 hover:text-blue-300 underline">Browse the full library →</a></p>
+      </div>
+    <footer class="text-center text-gray-600 text-xs mt-10 pb-6">DBA Library · AI-Native Apps on SQL Server · Free for the SQL Server community</footer>
+  </div>
+</body>
+</html>

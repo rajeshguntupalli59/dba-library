@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 31: JSON for Flexible AI Output Storage — AI-Native Apps on SQL Server</title>
+<meta name="description" content="Relational spine plus JSON payload: validation, indexing, and the promotion path to columns.">
+<script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-200">
+  <div class="max-w-3xl mx-auto px-6 py-10">
+    <p class="text-blue-400 text-sm font-semibold tracking-wide uppercase mb-2">AI-Native Apps on SQL Server</p>
+    <p class="text-gray-500 text-sm mb-1">Chapter 31 of 40</p>
+    <h1 class="text-3xl font-bold text-white mb-8">JSON for Flexible AI Output Storage</h1>
+    <article class="space-y-5">
+<p class="text-gray-300 leading-relaxed">LLMs output semi-structured data: extracted entities with varying fields, tool arguments with per-tool schemas, evaluation scores with evolving rubrics. Relational tables demand a fixed schema; the model's output refuses to hold still. SQL Server's native JSON support — the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">JSON</code> data type, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">OPENJSON</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">JSON_VALUE</code>/<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">JSON_QUERY</code>, and JSON indexes — lets you store flexible payloads without abandoning queryability. This chapter establishes the JSON discipline: where JSON belongs and where it doesn't, schema validation with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ISJSON</code> and check constraints, indexing JSON paths, and the promotion path from JSON field to relational column.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">31.1 Where JSON Belongs (and Where It Doesn't)</h3>
+
+<p class="text-gray-300 leading-relaxed">The rule: <strong>relational for what you filter, join, and aggregate; JSON for what you store and occasionally read.</strong></p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>JSON is right for:</strong> tool-call arguments (per-tool schemas), agent action payloads, evaluation rubric scores, extracted entities with varying attributes, raw provider responses, user preference blobs with evolving keys.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>JSON is wrong for:</strong> tenant_id, user_id, timestamps, statuses you filter on, anything in a JOIN or GROUP BY. If you find yourself indexing five JSON paths and joining on two of them, promote those fields to columns — §31.4.</li>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- The hybrid pattern: relational spine + JSON payload
+CREATE TABLE dbo.agent_actions (
+    action_id    UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWID(),
+    run_id       UNIQUEIDENTIFIER NOT NULL,   -- relational: filtered, joined
+    agent_name   NVARCHAR(100) NOT NULL,      -- relational: grouped
+    tool_name    NVARCHAR(100) NOT NULL,      -- relational: filtered
+    created_at   DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(), -- relational
+    arguments    JSON NOT NULL,               -- flexible: per-tool schema
+    result       JSON NULL,                   -- flexible: per-tool output
+    CONSTRAINT CK_action_json CHECK (ISJSON(arguments) = 1
+                                     AND (result IS NULL OR ISJSON(result) = 1))
+);
+-- The spine answers "show me this run's actions"; the payload answers
+-- "what arguments did the search tool get on step 4?" — each queried rarely
+-- enough that JSON path access is fine.</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">31.2 Querying JSON: Path Access and Shredding</h3>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Scalar extraction: JSON_VALUE for single values
+SELECT action_id, tool_name,
+       JSON_VALUE(arguments, '$.query') AS search_query,
+       JSON_VALUE(result, '$.latency_ms') AS tool_latency
+FROM dbo.agent_actions
+WHERE run_id = @run_id AND tool_name = N'web_search';
+
+-- Shredding arrays: OPENJSON turns a JSON array into rows
+SELECT a.action_id, s.[key] AS step, s.value AS step_detail
+FROM dbo.agent_actions AS a
+CROSS APPLY OPENJSON(a.result, '$.steps') AS s
+WHERE a.action_id = @action_id;
+
+-- Filtering on a JSON field (occasional analytics — not the hot path)
+SELECT COUNT(*)
+FROM dbo.answer_feedback
+WHERE JSON_VALUE(details, '$.rubric.coherence') &lt; 3;
+-- Frequent? Promote to a column (§31.4) instead of scanning JSON.</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">JSON_VALUE</code> returns scalars; <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">JSON_QUERY</code> returns objects/arrays; <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">OPENJSON</code> shreds into relational rows for joins and aggregations. For analytics over JSON at scale, shred into a columnstore staging table nightly rather than running <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">OPENJSON</code> over millions of rows per query.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">31.3 Validating and Indexing JSON</h3>
+
+<p class="text-gray-300 leading-relaxed">Flexible does not mean lawless. Validate at write time, index the paths you actually query:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- 1) Structural validation: ISJSON check constraints (see §31.1) are the
+--    minimum. For per-tool argument shapes, validate in the tool procedure:
+CREATE OR ALTER PROCEDURE dbo.usp_record_tool_call
+    @run_id UNIQUEIDENTIFIER, @tool_name NVARCHAR(100), @args JSON
+AS
+BEGIN
+    SET NOCOUNT ON;
+    -- Tool-specific shape checks: required keys per tool
+    IF @tool_name = N'database_query'
+       AND JSON_VALUE(@args, '$.sql') IS NULL
+        THROW 50001, N'database_query requires $.sql', 1;
+    IF @tool_name = N'vector_search'
+       AND JSON_VALUE(@args, '$.top_k') IS NULL
+        THROW 50002, N'vector_search requires $.top_k', 1;
+    INSERT INTO dbo.agent_actions (run_id, tool_name, arguments)
+    VALUES (@run_id, @tool_name, @args);
+END;
+GO
+
+-- 2) Index a hot JSON path with a computed column
+ALTER TABLE dbo.answer_feedback
+    ADD coherence_score AS CAST(JSON_VALUE(details, '$.rubric.coherence') AS INT);
+CREATE INDEX IX_feedback_coherence ON dbo.answer_feedback(coherence_score)
+    WHERE coherence_score IS NOT NULL;
+-- Now "find low-coherence answers" seeks instead of scanning. If a second
+-- and third path need indexes, that's the promotion signal (§31.4).</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">31.4 The Promotion Path: JSON Field → Relational Column</h3>
+
+<p class="text-gray-300 leading-relaxed">JSON fields that graduate to first-class query citizens get promoted. The promotion is a migration, not a rewrite:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Signal:</strong> a JSON path appears in WHERE/JOIN/GROUP BY regularly, needs an index, or needs a foreign key or check constraint.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Migration:</strong> add the column, backfill from the JSON path, add constraints/indexes, then dual-write (trigger or procedure writes both) during a transition window.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Completion:</strong> when all readers use the column, stop writing the JSON key (or keep it for backward compatibility with old consumers).</li>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Promoting $.rubric.coherence from JSON to a real column
+ALTER TABLE dbo.answer_feedback ADD coherence INT NULL;
+GO
+UPDATE dbo.answer_feedback
+SET coherence = CAST(JSON_VALUE(details, '$.rubric.coherence') AS INT)
+WHERE coherence IS NULL
+  AND JSON_VALUE(details, '$.rubric.coherence') IS NOT NULL;
+GO
+-- Reads switch to the column; the JSON key stays for old consumers.
+-- New writes populate both until the transition window closes.</code></pre>
+
+<p class="text-gray-300 leading-relaxed">This lifecycle — JSON for exploration, relational for production — is the healthy way to evolve AI output schemas. Starting relational for unknown shapes slows you down; staying JSON for hot paths slows the database down. Promote deliberately.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">31.5 JSON vs Relational: A Decision Framework</h3>
+
+<p class="text-gray-300 leading-relaxed">Teams argue about JSON vs relational as a matter of taste; make it a matter of measurement. Score each candidate field on four questions:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Query pattern:</strong> filtered/joined/aggregated more than occasionally? Relational. Read whole and rarely queried? JSON.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Schema stability:</strong> shape known and stable? Relational. Shape evolving with the product, per-tool, or per-rubric? JSON.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Integrity needs:</strong> foreign keys, check constraints beyond ISJSON, or cross-row invariants? Relational — JSON cannot enforce relationships.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Write/read ratio:</strong> written once, read rarely in full (audit payloads, raw provider responses)? JSON. Read constantly in slices (dashboards)? Relational.</li>
+
+<p class="text-gray-300 leading-relaxed">Two fields scoring 3–1 either way are judgment calls — default to JSON for AI-generated payloads (their schemas evolve fastest) and relational for anything the billing, security, or compliance teams will query. Revisit the decision annually: the framework's real value is making the JSON-vs-relational choice explicit and reviewable instead of accidental. And remember the escape hatch is always §31.4's promotion path — starting JSON is reversible, starting relational for an unknown shape is just slower.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<p class="text-gray-300 leading-relaxed">A final JSON caution: never let AI-generated JSON flow into <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">OPENJSON</code> shredding or dynamic SQL without validation. The model occasionally emits malformed JSON — truncated by token limits, or with trailing commas — and a shredding query that throws mid-pipeline turns one bad response into a failed batch. Wrap JSON parsing in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ISJSON</code> guards with a quarantine path: invalid payloads land in a review table with the raw text preserved, the pipeline continues, and a human (or a repair prompt) fixes the stragglers. Validate at the boundary, always.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Relational spine + JSON payload:</strong> filter/join/aggregate columns stay relational; flexible per-tool, per-rubric, per-extraction payloads live in JSON.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Validate at write time</strong> with ISJSON check constraints plus per-tool shape checks in the recording procedures — flexible never means lawless.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Index hot JSON paths via computed columns,</strong> and shred arrays with OPENJSON into staging tables for analytics instead of per-query shredding at scale.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Promote deliberately:</strong> JSON for exploration, relational for production — migrate hot paths to columns with backfill and dual-write windows.</li>
+
+    </article>
+
+      <nav class="flex items-center justify-center gap-3 mt-12 mb-4 text-sm">
+        <a href="chapter-30.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">← Chapter 30</a>
+        <a href="index.html" class="px-4 py-2 rounded-lg bg-gray-800 text-gray-300 hover:bg-gray-700 transition">All Chapters</a>
+        <a href="chapter-32.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">Chapter 32 →</a>
+      </nav>
+<div class="bg-gradient-to-r from-blue-900/40 to-indigo-900/40 border border-blue-800/50 rounded-2xl p-6 mt-10">
+        <p class="text-gray-300 text-sm leading-relaxed"><strong class="text-white">Keep going.</strong> You're reading <em class="text-blue-300">AI-Native Apps on SQL Server</em> — one of seven free deep-dives in the DBA Library, covering SQL Server performance tuning, high availability, security, automation, and more. <a href="../index.html" class="text-blue-400 hover:text-blue-300 underline">Browse the full library →</a></p>
+      </div>
+    <footer class="text-center text-gray-600 text-xs mt-10 pb-6">DBA Library · AI-Native Apps on SQL Server · Free for the SQL Server community</footer>
+  </div>
+</body>
+</html>

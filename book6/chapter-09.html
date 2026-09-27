@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 9: Semantic Memory: Facts the AI Remembers — AI-Native Apps on SQL Server</title>
+<meta name="description" content="Extracting, storing, resolving, and decaying long-term facts about users.">
+<script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-200">
+  <div class="max-w-3xl mx-auto px-6 py-10">
+    <p class="text-blue-400 text-sm font-semibold tracking-wide uppercase mb-2">AI-Native Apps on SQL Server</p>
+    <p class="text-gray-500 text-sm mb-1">Chapter 9 of 40</p>
+    <h1 class="text-3xl font-bold text-white mb-8">Semantic Memory: Facts the AI Remembers</h1>
+    <article class="space-y-5">
+<p class="text-gray-300 leading-relaxed">Chapter 8 built the long-term memory store from distilled summaries and facts. But distillation loses detail, and sometimes the user asks about something specific that happened three months ago — "what did we decide about the refund policy back in June?" Semantic memory answers by searching the raw conversation history itself: every past conversation gets an embedding, and a new question retrieves the most semantically relevant past conversations. This chapter builds that capability — conversation-level embeddings, the retrieval procedure, and the UX patterns that make past conversations genuinely useful instead of a gimmick.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">9.1 What Gets Embedded: Conversation-Level Representations</h3>
+
+<p class="text-gray-300 leading-relaxed">A conversation is hundreds of turns; an embedding model takes a few thousand tokens. The representation must compress without losing the "aboutness" of the conversation. Three strategies, in increasing quality:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Title + first user message.</strong> Cheap, often sufficient for "find the conversation about X." Fails when the topic drifts mid-conversation.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>LLM-generated summary.</strong> The Chapter 8 promotion summary, embedded. Captures the full arc of the conversation in the model's own words. The recommended default.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Multi-vector: summary + key turns.</strong> Embed the summary plus the 3–5 highest-signal turns (questions asked, decisions made), store all vectors, and take the max similarity at query time. Best recall, 4–6x the storage.</li>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Conversation-level embeddings for semantic recall
+CREATE TABLE dbo.conversation_embeddings (
+    conversation_id UNIQUEIDENTIFIER PRIMARY KEY
+                    CONSTRAINT FK_ce_conversation
+                    REFERENCES dbo.conversations(conversation_id) ON DELETE CASCADE,
+    tenant_id       UNIQUEIDENTIFIER NOT NULL,
+    user_id         UNIQUEIDENTIFIER NOT NULL,
+    -- representation: 'summary' | 'title_first' | 'multivector'
+    representation  NVARCHAR(20) NOT NULL DEFAULT N'summary',
+    summary_text    NVARCHAR(MAX) NULL,     -- the embedded text, for display
+    embedding       VECTOR(1536) NOT NULL,
+    embedded_at     DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
+);
+CREATE VECTOR INDEX IX_ce_embedding
+    ON dbo.conversation_embeddings (embedding)
+    WITH (METRIC = 'cosine', TYPE = 'diskann');
+CREATE INDEX IX_ce_user ON dbo.conversation_embeddings(user_id, embedded_at DESC);</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Populate this table in the Chapter 8 promotion pipeline — the summary already exists there, so embedding it is one extra API call per closed conversation.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">9.2 Retrieval: "Have We Talked About This Before?"</h3>
+
+<p class="text-gray-300 leading-relaxed">The retrieval procedure finds past conversations relevant to the current message, excluding the active conversation:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE OR ALTER PROCEDURE dbo.usp_find_related_conversations
+    @user_id         UNIQUEIDENTIFIER,
+    @current_conversation_id UNIQUEIDENTIFIER,
+    @query_vector    VECTOR(1536),
+    @top_n           INT = 3,
+    @min_similarity  FLOAT = 0.75   -- cosine similarity floor
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SELECT TOP (@top_n)
+        ce.conversation_id,
+        c.title,
+        ce.summary_text,
+        (1 - VECTOR_DISTANCE('cosine', ce.embedding, @query_vector) / 2.0) AS similarity,
+        c.created_at,
+        (SELECT COUNT(*) FROM dbo.messages m
+          WHERE m.conversation_id = ce.conversation_id) AS turn_count
+    FROM dbo.conversation_embeddings AS ce
+    JOIN dbo.conversations AS c ON c.conversation_id = ce.conversation_id
+    WHERE ce.user_id = @user_id
+      AND ce.conversation_id &lt;&gt; @current_conversation_id
+      AND (1 - VECTOR_DISTANCE('cosine', ce.embedding, @query_vector) / 2.0) &gt;= @min_similarity
+    ORDER BY VECTOR_DISTANCE('cosine', ce.embedding, @query_vector);
+END;
+GO</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">@min_similarity</code> floor is critical: without it, the procedure always returns <em>something</em>, and "something" is often irrelevant. Tune the floor on real data — start at 0.75 and adjust until fewer than 5% of surfaced conversations get dismissed by users.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">9.3 Three UX Patterns for Surfacing the Past</h3>
+
+<p class="text-gray-300 leading-relaxed">Retrieval is only half the problem; presentation determines whether users trust it:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Silent context injection.</strong> The related conversation's summary is added to the prompt's long-term section without telling the user. Best for continuity ("as we discussed last month…"), but risks confusion if the recall is wrong — keep the similarity floor high.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Suggested reference.</strong> The UI shows "Related: Refund policy discussion (Jun 12)" as a clickable chip; the user decides whether to include it. Lower risk, slightly more friction. The recommended default for most products.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Explicit search.</strong> A "search past conversations" box powered by <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">usp_find_related_conversations</code> with a lower similarity floor and more results. Power-user feature; also the easiest to evaluate (Chapter 19).</li>
+
+<p class="text-gray-300 leading-relaxed">Log which pattern surfaces which conversation and whether the user engages — that feedback tunes both the similarity floor and the promotion quality over time.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">9.4 Privacy Boundaries in Semantic Recall</h3>
+
+<p class="text-gray-300 leading-relaxed">Semantic memory crosses a privacy line that short-term history does not: it resurfaces things the user may have forgotten they said. Three guardrails:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Strict user scoping.</strong> The procedure filters <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">user_id = @user_id</code> — never recall across users, even within a tenant. Add the RLS policy from Chapter 1 on top for defense in depth.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Sensitive-topic exclusion.</strong> Let users mark conversations private; private conversations get no embedding row at all. Deletion must cascade to the embedding (the foreign key with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ON DELETE CASCADE</code> handles this).</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Transparency.</strong> When the assistant uses a past conversation, say so: "Based on our June discussion…". Silent use of forgotten statements erodes trust fast.</li>
+
+<p class="text-gray-300 leading-relaxed">Chapter 38 extends these guardrails into full GDPR compliance — the right to be forgotten must reach embeddings, summaries, and memories, not just raw messages.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">9.5 Fact Lifecycle in Practice: A Worked Example</h3>
+
+<p class="text-gray-300 leading-relaxed">Watch a single fact travel the full lifecycle. A user says "we migrated to Azure SQL last quarter" in March:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Extraction (§9.2):</strong> the consolidation worker emits <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">("user's database platform", "Azure SQL", confidence 0.85, durable)</code>, sourced to the conversation.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Resolution (§9.3):</strong> the old fact <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">("user's database platform", "on-prem SQL Server 2019", confidence 0.9)</code> conflicts on the same attribute. The new statement is explicit and recent, so it wins; the old fact is superseded, not deleted.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Recall (§9.4):</strong> in June the user asks "how do I tune my database?" — retrieval surfaces the Azure SQL fact, and the assistant's advice targets Azure SQL specifics (elastic pools, Hyperscale) instead of on-prem trace flags. The superseded 2019 fact stays buried.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Decay:</strong> by December the fact's confidence has decayed to 0.45 with no reinforcement. It still retrieves, but ranked below fresher facts — appropriately tentative.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Resurrection:</strong> the user mentions "our Azure SQL costs" — an implicit confirmation. Confidence jumps back to 0.8, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">last_confirmed_at</code> updates, and the fact is durable again.</li>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- The full lifecycle as queries the consolidation worker runs nightly
+-- 1) Decay stale durable facts
+UPDATE dbo.user_facts
+SET confidence = confidence * 0.97
+WHERE fact_type = N'durable'
+  AND last_confirmed_at &lt; DATEADD(day, -30, SYSUTCDATETIME())
+  AND confidence &gt; 0.3;
+-- 2) Resurrect implicitly confirmed facts (reinforcement signal from §9.2)
+UPDATE f SET confidence = LEAST(0.95, f.confidence + 0.25),
+             last_confirmed_at = SYSUTCDATETIME()
+FROM dbo.user_facts AS f
+JOIN dbo.fact_confirmations AS c
+  ON c.fact_id = f.fact_id AND c.confirmed_at &gt; f.last_confirmed_at;
+-- 3) Compact: merge near-duplicate facts the extractor created separately
+--    (same user, same attribute, cosine-similar values → keep highest confidence)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The lifecycle is what separates a fact table from a junk drawer: every fact has a confidence trajectory, a provenance chain, and a defined end (superseded, decayed below threshold, or explicitly retracted). Build the worker that runs these three statements nightly before you have ten thousand facts — retrofitting lifecycle management onto an unmanaged fact table means deciding the fate of each row by hand.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Embed conversation summaries (from the promotion pipeline) for semantic recall of past conversations.</strong> Summary-level embeddings capture aboutness; multi-vector representations buy extra recall at 4–6x storage.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Enforce a similarity floor so retrieval returns nothing rather than something irrelevant.</strong> Tune it on real dismissal data, not intuition.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Default to suggested references over silent injection</strong> until your recall precision earns the user's trust.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Scope recall strictly to the user, support private conversations with no embeddings, and always disclose when past conversations inform an answer.</strong> Semantic memory is powerful precisely because it remembers what users forgot — handle that power explicitly.</li>
+
+    </article>
+
+      <nav class="flex items-center justify-center gap-3 mt-12 mb-4 text-sm">
+        <a href="chapter-08.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">← Chapter 8</a>
+        <a href="index.html" class="px-4 py-2 rounded-lg bg-gray-800 text-gray-300 hover:bg-gray-700 transition">All Chapters</a>
+        <a href="chapter-10.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">Chapter 10 →</a>
+      </nav>
+<div class="bg-gradient-to-r from-blue-900/40 to-indigo-900/40 border border-blue-800/50 rounded-2xl p-6 mt-10">
+        <p class="text-gray-300 text-sm leading-relaxed"><strong class="text-white">Keep going.</strong> You're reading <em class="text-blue-300">AI-Native Apps on SQL Server</em> — one of seven free deep-dives in the DBA Library, covering SQL Server performance tuning, high availability, security, automation, and more. <a href="../index.html" class="text-blue-400 hover:text-blue-300 underline">Browse the full library →</a></p>
+      </div>
+    <footer class="text-center text-gray-600 text-xs mt-10 pb-6">DBA Library · AI-Native Apps on SQL Server · Free for the SQL Server community</footer>
+  </div>
+</body>
+</html>

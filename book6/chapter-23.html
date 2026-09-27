@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 23: Schema Introspection for AI Query Generation — AI-Native Apps on SQL Server</title>
+<meta name="description" content="Automated catalog discovery, data profiling, drift detection, and the self-healing loop.">
+<script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-200">
+  <div class="max-w-3xl mx-auto px-6 py-10">
+    <p class="text-blue-400 text-sm font-semibold tracking-wide uppercase mb-2">AI-Native Apps on SQL Server</p>
+    <p class="text-gray-500 text-sm mb-1">Chapter 23 of 40</p>
+    <h1 class="text-3xl font-bold text-white mb-8">Schema Introspection for AI Query Generation</h1>
+    <article class="space-y-5">
+<p class="text-gray-300 leading-relaxed">Chapter 22 assumed a curated schema catalog. This chapter builds the machinery that keeps that catalog honest: automated introspection of the live database — tables, columns, keys, statistics, and data profiles — so the catalog reflects reality instead of documentation aspirations. You will learn what to introspect and how often, how to detect schema drift that breaks generated queries, data profiling that grounds the model's assumptions, and the self-healing loop where introspection updates the catalog automatically. The catalog is a cache; introspection is the source of truth.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">23.1 What to Introspect</h3>
+
+<p class="text-gray-300 leading-relaxed">SQL Server's catalog views expose everything the model needs, in four layers:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Structure:</strong> tables, columns, types, nullability from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">INFORMATION_SCHEMA</code> / <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.columns</code>. The skeleton.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Relationships:</strong> primary keys, foreign keys, unique constraints from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.foreign_keys</code>. The join graph — the model's most common source of errors when missing.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Statistics:</strong> row counts, value distributions from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_db_partition_stats</code> and column statistics. Tells the model which tables are large (aggregate, don't scan) and which columns are selective.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Data profile:</strong> sampled distinct values, min/max, null fraction per column. Grounds the model's assumptions about formats and enums far better than type names alone.</li>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- The introspection sweep: structure + relationships in one pass
+-- (run by a scheduled job; results upserted into the catalog tables)
+SELECT
+    s.name AS schema_name, t.name AS table_name,
+    c.name AS column_name,
+    TYPE_NAME(c.user_type_id) AS data_type,
+    c.max_length, c.precision, c.scale, c.is_nullable,
+    CASE WHEN pk.column_id IS NOT NULL THEN 1 ELSE 0 END AS is_pk,
+    fk.ref_table, fk.ref_column
+FROM sys.tables AS t
+JOIN sys.schemas AS s ON s.schema_id = t.schema_id
+JOIN sys.columns AS c ON c.object_id = t.object_id
+LEFT JOIN (
+    SELECT ic.object_id, ic.column_id
+    FROM sys.indexes AS i
+    JOIN sys.index_columns AS ic
+      ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+    WHERE i.is_primary_key = 1
+) AS pk ON pk.object_id = c.object_id AND pk.column_id = c.column_id
+LEFT JOIN (
+    SELECT fkc.parent_object_id AS object_id, fkc.parent_column_id AS column_id,
+           OBJECT_NAME(fk.referenced_object_id) AS ref_table,
+           COL_NAME(fk.referenced_object_id, fkc.referenced_column_id) AS ref_column
+    FROM sys.foreign_keys AS fk
+    JOIN sys.foreign_key_columns AS fkc
+      ON fkc.constraint_object_id = fk.object_id
+) AS fk ON fk.object_id = c.object_id AND fk.column_id = c.column_id
+WHERE s.name = 'dbo'
+ORDER BY schema_name, table_name, c.column_id;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">23.2 Data Profiling: Grounding the Model's Assumptions</h3>
+
+<p class="text-gray-300 leading-relaxed">Types lie by omission: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">NVARCHAR(30)</code> does not tell the model the column holds 'pending'/'shipped'/'delivered'. Profiling samples each exposed column and records the reality:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Profile: distinct values (if few), min/max, null fraction
+-- Run per exposed column; store in schema_column_catalog
+CREATE OR ALTER PROCEDURE dbo.usp_profile_column
+    @schema NVARCHAR(128), @table NVARCHAR(128), @column NVARCHAR(128)
+AS
+BEGIN
+    SET NOCOUNT ON;
+    DECLARE @sql NVARCHAR(MAX) = N'
+    SELECT @distinct_out = COUNT(DISTINCT ' + QUOTENAME(@column) + N'),
+           @nulls_out   = SUM(CASE WHEN ' + QUOTENAME(@column) + N' IS NULL THEN 1 ELSE 0 END),
+           @total_out   = COUNT(*)
+    FROM ' + QUOTENAME(@schema) + N'.' + QUOTENAME(@table) + N'
+    TABLESAMPLE SYSTEM (10 PERCENT);';
+    -- If distinct &lt;= 20, capture the value list as example_values.
+    -- Always capture min/max for dates and numbers.
+    -- QUOTENAME everywhere: this is dynamic SQL over catalog inputs.
+END;
+GO</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Profile on a schedule matched to data volatility (weekly for most tables, daily for fast-moving ones), and always with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">TABLESAMPLE</code> — full scans of the messages table for profiling would be absurd. The profile deltas (new distinct values appearing) are themselves a signal: a new <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">status</code> value the model has never seen is a generation risk worth flagging.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">23.3 Schema Drift Detection</h3>
+
+<p class="text-gray-300 leading-relaxed">Schemas change: columns added, renamed, dropped; tables partitioned; types widened. Every change is a potential text-to-SQL breakage. The drift detector compares the live introspection against the catalog snapshot:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Added columns/tables:</strong> introspect, profile, and propose catalog entries — a human approves exposure (new columns are not auto-exposed; §22.1's allowlist is a security boundary).</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Dropped/renamed columns:</strong> immediately invalidate cached queries referencing them (§22.4's schema_version bump) and alert — generated SQL will fail validation until the prompt's schema is refreshed.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Type changes:</strong> flag for review; a widened <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">NVARCHAR</code> is harmless, a changed date semantics is not.</li>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Drift detection: live schema vs. catalog snapshot
+-- Returns added/dropped/changed objects since the last sweep
+WITH live AS (
+    SELECT s.name AS sch, t.name AS tbl, c.name AS col,
+           TYPE_NAME(c.user_type_id) AS typ, c.is_nullable
+    FROM sys.tables AS t
+    JOIN sys.schemas AS s ON s.schema_id = t.schema_id
+    JOIN sys.columns AS c ON c.object_id = t.object_id
+),
+snap AS (
+    SELECT object_schema AS sch, object_name AS tbl, column_name AS col
+    FROM dbo.schema_column_catalog
+)
+SELECT 'dropped_or_renamed' AS drift, s.sch, s.tbl, s.col
+FROM snap AS s
+WHERE NOT EXISTS (SELECT 1 FROM live AS l
+                  WHERE l.sch = s.sch AND l.tbl = s.tbl AND l.col = s.col)
+UNION ALL
+SELECT 'added', l.sch, l.tbl, l.col
+FROM live AS l
+WHERE NOT EXISTS (SELECT 1 FROM snap AS s
+                  WHERE s.sch = l.sch AND s.tbl = l.tbl AND s.col = l.col);
+-- DDL trigger on the database keeps a change log so drift is attributed,
+-- not just detected: who changed what, when.</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">23.4 The Self-Healing Loop</h3>
+
+<p class="text-gray-300 leading-relaxed">Tie introspection, drift detection, and the text-to-SQL layer into a loop:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Nightly:</strong> introspection sweep → catalog upsert → profile refresh → drift report.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>On drift:</strong> bump <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">schema_version</code> (invalidates cached SQL), re-embed changed table descriptions (schema retrieval stays current), alert on dropped objects.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>On validation failure spike:</strong> if Gate 2 (allowlist) rejections spike, the catalog is stale — trigger an out-of-cycle sweep instead of blaming the model.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Quarterly:</strong> human review of proposed exposures (added columns awaiting approval) and glossary updates from failed questions.</li>
+
+<p class="text-gray-300 leading-relaxed">The loop's invariant: the catalog never drifts more than 24 hours from the live schema, cached SQL never survives a schema change, and every automated step leaves an audit trail of what changed and why.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">23.5 Glossary Management: The Human Layer</h3>
+
+<p class="text-gray-300 leading-relaxed">Introspection captures what the database <em>is</em>; the glossary captures what it <em>means</em>. "Active customer" might mean <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">status = 'A' AND last_order_date &gt; DATEADD(year, -1, GETDATE())</code> — no catalog view will tell the model that. Maintain the glossary as a versioned table (term, definition, canonical SQL fragment, owner), let the text-to-SQL prompt inject relevant entries (§22.2), and source new entries from failed questions: every week, review the questions the model got wrong and ask "which glossary entry would have prevented this?" The glossary is the highest-leverage text-to-SQL investment — one well-written definition fixes a whole class of errors, and unlike prompt tuning, it compounds.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Introspect four layers — structure, relationships, statistics, data profile — on a schedule,</strong> and treat the catalog as a cache with the live database as the source of truth.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Profile with TABLESAMPLE and record distinct values, min/max, and null fractions.</strong> Example values ground the model's assumptions; new distinct values are an early warning.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Detect drift by diffing live introspection against the catalog snapshot,</strong> invalidate cached SQL on any change, and never auto-expose new columns — the allowlist is a security boundary.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Close the loop:</strong> nightly sweeps, drift-triggered version bumps and re-embedding, validation-spike-triggered out-of-cycle sweeps, quarterly human review.</li>
+
+    </article>
+
+      <nav class="flex items-center justify-center gap-3 mt-12 mb-4 text-sm">
+        <a href="chapter-22.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">← Chapter 22</a>
+        <a href="index.html" class="px-4 py-2 rounded-lg bg-gray-800 text-gray-300 hover:bg-gray-700 transition">All Chapters</a>
+        <a href="chapter-24.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">Chapter 24 →</a>
+      </nav>
+<div class="bg-gradient-to-r from-blue-900/40 to-indigo-900/40 border border-blue-800/50 rounded-2xl p-6 mt-10">
+        <p class="text-gray-300 text-sm leading-relaxed"><strong class="text-white">Keep going.</strong> You're reading <em class="text-blue-300">AI-Native Apps on SQL Server</em> — one of seven free deep-dives in the DBA Library, covering SQL Server performance tuning, high availability, security, automation, and more. <a href="../index.html" class="text-blue-400 hover:text-blue-300 underline">Browse the full library →</a></p>
+      </div>
+    <footer class="text-center text-gray-600 text-xs mt-10 pb-6">DBA Library · AI-Native Apps on SQL Server · Free for the SQL Server community</footer>
+  </div>
+</body>
+</html>

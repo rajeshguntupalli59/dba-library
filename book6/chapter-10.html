@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 10: User Preferences and Personalization — AI-Native Apps on SQL Server</title>
+<meta name="description" content="Preference storage, conflict resolution, PII handling, and personalization that respects privacy.">
+<script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-200">
+  <div class="max-w-3xl mx-auto px-6 py-10">
+    <p class="text-blue-400 text-sm font-semibold tracking-wide uppercase mb-2">AI-Native Apps on SQL Server</p>
+    <p class="text-gray-500 text-sm mb-1">Chapter 10 of 40</p>
+    <h1 class="text-3xl font-bold text-white mb-8">User Preferences and Personalization</h1>
+    <article class="space-y-5">
+<p class="text-gray-300 leading-relaxed">Preferences are the highest-value memories in the system: "prefers terse answers," "works in healthcare," "allergic to peanuts," "wants code in Python, not JavaScript." A single preference, correctly applied, improves every future interaction. This chapter builds the preference store — explicit preferences the user states, implicit preferences inferred from behavior, conflict resolution when they disagree, and the injection mechanism that gets preferences into the prompt without bloating it. Preferences are also the most privacy-sensitive data in the system, so the chapter closes with the consent and visibility model.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">10.1 Explicit vs. Implicit Preferences</h3>
+
+<p class="text-gray-300 leading-relaxed">Preferences arrive through two channels with very different trust levels:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Explicit:</strong> the user says "always answer concisely" or toggles a setting. High confidence, stored verbatim, applied unconditionally.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Implicit:</strong> inferred from behavior — the user always asks for Python examples, always dismisses long answers, always converts times to IST. Medium confidence, needs corroboration before being treated as fact.</li>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE dbo.user_preferences (
+    preference_id   UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWID(),
+    user_id         UNIQUEIDENTIFIER NOT NULL
+                    CONSTRAINT FK_pref_user REFERENCES dbo.users(user_id) ON DELETE CASCADE,
+    tenant_id       UNIQUEIDENTIFIER NOT NULL,
+    category        NVARCHAR(50) NOT NULL
+                    CONSTRAINT CK_pref_category CHECK (category IN
+                        (N'communication', N'domain', N'format', N'privacy', N'other')),
+    preference_key  NVARCHAR(200) NOT NULL,   -- e.g. 'answer_style', 'code_language'
+    preference_value NVARCHAR(MAX) NOT NULL,  -- e.g. 'terse', 'python'
+    source          NVARCHAR(20) NOT NULL
+                    CONSTRAINT CK_pref_source CHECK (source IN (N'explicit', N'inferred')),
+    confidence      DECIMAL(3,2) NOT NULL DEFAULT 1.00,  -- 1.0 for explicit
+    observations    INT NOT NULL DEFAULT 1,   -- corroboration count for inferred
+    is_active       BIT NOT NULL DEFAULT 1,
+    created_at      DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+    updated_at      DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+    CONSTRAINT UQ_pref_user_key UNIQUE (user_id, preference_key, is_active)
+);
+CREATE INDEX IX_pref_user_cat ON dbo.user_preferences(user_id, category)
+    WHERE is_active = 1;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The partial unique index on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">(user_id, preference_key)</code> where active enforces the one-active-value rule: a user has exactly one active <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">answer_style</code> at a time. History of superseded preferences stays in the table with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">is_active = 0</code> — useful for understanding preference drift.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">10.2 Inferring Preferences from Behavior</h3>
+
+<p class="text-gray-300 leading-relaxed">Inference runs as a background job over recent conversations, looking for repeated patterns. The rules must be conservative — a single observation is noise, three is signal:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Example inference: user consistently asks for a specific code language.
+-- Runs nightly over the last 7 days of assistant messages containing code.
+WITH code_requests AS (
+    SELECT m.conversation_id, c.user_id,
+           JSON_VALUE(m.tool_calls, '$[0].function.name') AS tool_used,
+           m.content
+    FROM dbo.messages AS m
+    JOIN dbo.conversations AS c ON c.conversation_id = m.conversation_id
+    WHERE m.role = 'user'
+      AND m.created_at &gt;= DATEADD(day, -7, SYSUTCDATETIME())
+      AND m.content LIKE N'%python%'
+)
+-- In practice this is an LLM classification job; the SQL identifies
+-- candidate conversations and the model confirms the pattern.
+-- Promotion rule (in the worker):
+--   observations &gt;= 3 AND no conflicting explicit preference
+--   → INSERT inferred preference with confidence 0.6 + observations count</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The promotion rule has two gates: corroboration (≥3 independent observations) and non-conflict (no explicit preference on the same key). Inferred preferences start at confidence 0.6 and gain 0.1 per additional observation week, capped at 0.9 — they never reach 1.0, which is reserved for explicit statements.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">10.3 Conflict Resolution</h3>
+
+<p class="text-gray-300 leading-relaxed">Preferences conflict. The user said "terse answers" in January but has been asking follow-up "explain more" questions all March. Resolution rules, in priority order:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Explicit beats inferred, always.</strong> An explicit statement is a deliberate act; inference is a guess. Never let an inferred preference override an explicit one on the same key.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Newer explicit beats older explicit.</strong> Supersede the old row (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">is_active = 0</code>), insert the new one. People change.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Contradictory inferred preferences decay each other.</strong> If behavior supports both "terse" and "detailed," reduce both confidences — the truth is probably "it depends on topic," which is a refinement, not a contradiction.</li>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE OR ALTER PROCEDURE dbo.usp_set_preference
+    @user_id UNIQUEIDENTIFIER, @tenant_id UNIQUEIDENTIFIER,
+    @category NVARCHAR(50), @key NVARCHAR(200), @value NVARCHAR(MAX),
+    @source NVARCHAR(20) = N'explicit'
+AS
+BEGIN
+    SET NOCOUNT ON;
+    BEGIN TRAN;
+    -- Explicit statements retire any active preference on the same key,
+    -- including inferred ones.
+    IF @source = N'explicit'
+        UPDATE dbo.user_preferences
+        SET is_active = 0, updated_at = SYSUTCDATETIME()
+        WHERE user_id = @user_id AND preference_key = @key AND is_active = 1;
+
+    INSERT INTO dbo.user_preferences
+        (user_id, tenant_id, category, preference_key, preference_value,
+         source, confidence)
+    VALUES (@user_id, @tenant_id, @category, @key, @value,
+            @source, CASE WHEN @source = N'explicit' THEN 1.00 ELSE 0.60 END);
+    COMMIT;
+END;
+GO</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">10.4 Injecting Preferences into the Prompt</h3>
+
+<p class="text-gray-300 leading-relaxed">Preferences must reach the model without consuming the context budget. The technique: compile active preferences into a compact "user profile" block, cached per user and invalidated on preference change:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE OR ALTER PROCEDURE dbo.usp_get_user_profile_block
+    @user_id UNIQUEIDENTIFIER
+AS
+BEGIN
+    SET NOCOUNT ON;
+    -- One row per category, compact "key: value" lines
+    SELECT category,
+           STRING_AGG(preference_key + ': ' + preference_value,
+                       '; ') WITHIN GROUP (ORDER BY preference_key) AS block
+    FROM dbo.user_preferences
+    WHERE user_id = @user_id AND is_active = 1
+      AND (source = N'explicit' OR confidence &gt;= 0.7)
+    GROUP BY category;
+END;
+GO
+-- Rendered into the system prompt as:
+--   [User profile — communication] answer_style: terse; greeting: none
+--   [User profile — format] code_language: python; units: metric
+-- Typical cost: 30-60 tokens. Highest ROI tokens in the entire prompt.</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The confidence gate (≥0.7 for inferred) keeps half-baked inferences out of the prompt. Cache the rendered block per user with a version counter incremented by <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">usp_set_preference</code> — profile blocks change rarely and are read on every turn.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">10.5 Consent and Visibility</h3>
+
+<p class="text-gray-300 leading-relaxed">Preferences are surveillance-adjacent: the system watches behavior and writes down conclusions. The consent model must be explicit:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Show users what you inferred.</strong> A "What the assistant knows about you" page listing every active preference with its source. Inferred preferences get a confirm/dismiss control — dismissal sets <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">is_active = 0</code> and blocks re-inference of that key for 90 days.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Category-level opt-out.</strong> A user can disable inference entirely while keeping explicit preferences. Store the opt-out on the users table, checked by the inference job.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Export and delete with the user record.</strong> Preferences are personal data under GDPR — the Chapter 38 deletion procedure must cover this table, including the inactive history rows.</li>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">10.6 Preference Expiry: Tastes Change</h3>
+
+<p class="text-gray-300 leading-relaxed">Preferences rot faster than facts. A user's "concise answers" preference from onboarding may not survive their first complex debugging session; a saved "Python 3.10" may be two versions stale. Give learned preferences a time-to-live: high-confidence explicit preferences last a year, inferred preferences decay in 90 days without reinforcement, and every applied preference carries its age so the model can hedge ("you usually prefer concise answers — want the detailed version this time?"). Expiry is not deletion — expired preferences move to a history table where they remain visible in the preference UI (§10.5) and can be reactivated with one click. The alternative is a personalization system that confidently serves who the user was two years ago.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Separate explicit from inferred preferences, with confidence and corroboration counts on inferred rows.</strong> Promote inference to fact only after ≥3 independent observations and no conflicting explicit preference.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Enforce one active value per key with a partial unique index; supersede instead of deleting.</strong> Preference history reveals drift that current values hide.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Compile preferences into a compact cached profile block in the system prompt.</strong> At 30–60 tokens, these are the highest-ROI tokens in the prompt — but gate inferred preferences on confidence.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Make inference visible and revocable.</strong> A "what the assistant knows" page, per-key dismissal with a cooling-off period, and category-level opt-out are not optional features — they are the consent model.</li>
+
+    </article>
+
+      <nav class="flex items-center justify-center gap-3 mt-12 mb-4 text-sm">
+        <a href="chapter-09.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">← Chapter 9</a>
+        <a href="index.html" class="px-4 py-2 rounded-lg bg-gray-800 text-gray-300 hover:bg-gray-700 transition">All Chapters</a>
+        <a href="chapter-11.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">Chapter 11 →</a>
+      </nav>
+<div class="bg-gradient-to-r from-blue-900/40 to-indigo-900/40 border border-blue-800/50 rounded-2xl p-6 mt-10">
+        <p class="text-gray-300 text-sm leading-relaxed"><strong class="text-white">Keep going.</strong> You're reading <em class="text-blue-300">AI-Native Apps on SQL Server</em> — one of seven free deep-dives in the DBA Library, covering SQL Server performance tuning, high availability, security, automation, and more. <a href="../index.html" class="text-blue-400 hover:text-blue-300 underline">Browse the full library →</a></p>
+      </div>
+    <footer class="text-center text-gray-600 text-xs mt-10 pb-6">DBA Library · AI-Native Apps on SQL Server · Free for the SQL Server community</footer>
+  </div>
+</body>
+</html>

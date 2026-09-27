@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 7: Session Management for Stateful AI — AI-Native Apps on SQL Server</title>
+<meta name="description" content="Session tokens, turn locking with sp_getapplock, and state that survives restarts.">
+<script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-200">
+  <div class="max-w-3xl mx-auto px-6 py-10">
+    <p class="text-blue-400 text-sm font-semibold tracking-wide uppercase mb-2">AI-Native Apps on SQL Server</p>
+    <p class="text-gray-500 text-sm mb-1">Chapter 7 of 40</p>
+    <h1 class="text-3xl font-bold text-white mb-8">Session Management for Stateful AI</h1>
+    <article class="space-y-5">
+<p class="text-gray-300 leading-relaxed">Chapter 6 stored the messages; this chapter manages the session around them. A session is the live, mutable state of an in-progress conversation: which conversation is active, what the model is currently generating, per-session settings (model, temperature, system prompt version), rate-limit counters, and the locks that prevent two requests from interleaving turns. Get session management wrong and you get interleaved answers, lost tool-call state, and double-billing. This chapter builds a session layer in SQL Server that is fast enough for per-request use and robust enough for multi-instance API tiers.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">7.1 Sessions vs. Conversations</h3>
+
+<p class="text-gray-300 leading-relaxed">Conversations are durable history (Chapter 6). Sessions are ephemeral coordination state with a TTL. The distinction matters because they have opposite access patterns: conversations are append-mostly and read sequentially; sessions are read-modify-write at high frequency with short lifetimes.</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Conversation:</strong> the permanent record. Survives server restarts, audited, retained per policy.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Session:</strong> "user X is actively chatting right now with these settings." Expires after inactivity, safe to lose (it can be rebuilt from the conversation).</li>
+
+<p class="text-gray-300 leading-relaxed">Storing sessions in SQL Server rather than Redis is a deliberate choice for most teams: one fewer system, transactional consistency with the conversation it references, and session data that survives in backups. Redis earns its place only when session churn exceeds what your SQL Server can comfortably handle (tens of thousands of updates per second) — measure before adding it.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE dbo.chat_sessions (
+    session_id      UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWID(),
+    user_id         UNIQUEIDENTIFIER NOT NULL
+                    CONSTRAINT FK_session_user REFERENCES dbo.users(user_id),
+    tenant_id       UNIQUEIDENTIFIER NOT NULL,
+    conversation_id UNIQUEIDENTIFIER NULL
+                    CONSTRAINT FK_session_conversation
+                    REFERENCES dbo.conversations(conversation_id),
+    -- Live generation state
+    status          NVARCHAR(20) NOT NULL DEFAULT N'active'
+                    CONSTRAINT CK_session_status
+                    CHECK (status IN (N'active',N'generating',N'awaiting_tool',N'closed')),
+    model           NVARCHAR(100) NOT NULL,
+    system_prompt_version INT NOT NULL DEFAULT 1,
+    temperature     DECIMAL(3,2) NULL,
+    -- Mutable counters, updated per turn
+    turn_count      INT NOT NULL DEFAULT 0,
+    tokens_this_session INT NOT NULL DEFAULT 0,
+    last_activity_at DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+    expires_at      DATETIME2 NOT NULL,
+    session_data    JSON NULL,   -- scratch space: pending tool calls, UI state
+    CONSTRAINT CK_session_expiry CHECK (expires_at &gt; last_activity_at)
+);
+CREATE INDEX IX_sessions_user_active
+    ON dbo.chat_sessions(user_id, last_activity_at DESC)
+    WHERE status &lt;&gt; N'closed';
+CREATE INDEX IX_sessions_expiry ON dbo.chat_sessions(expires_at)
+    WHERE status &lt;&gt; N'closed';</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">7.2 The Turn Lock: Preventing Interleaved Generations</h3>
+
+<p class="text-gray-300 leading-relaxed">The most damaging session bug: the user sends two messages quickly (or double-clicks), and two API instances both generate answers concurrently. The messages interleave, tool calls execute twice, and the user is billed double. The fix is a per-session turn lock acquired before generation and released after persistence:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE OR ALTER PROCEDURE dbo.usp_session_begin_turn
+    @session_id UNIQUEIDENTIFIER,
+    @timeout_ms INT = 30000
+AS
+BEGIN
+    SET NOCOUNT ON;
+    -- sp_getapplock on a session-scoped resource: exactly one holder
+    -- per session across ALL API instances. Returns 0 on grant.
+    DECLARE @rc INT;
+    EXEC @rc = sp_getapplock
+        @Resource = @session_id,          -- uniqueidentifier converts implicitly
+        @LockMode = 'Exclusive',
+        @LockOwner = 'Session',
+        @LockTimeout = @timeout_ms;
+    IF @rc &lt; 0
+    BEGIN
+        -- -1 timeout, -2 cancelled, -3 deadlock victim, -999 parameter error
+        THROW 50001, 'Session is already generating a response. Please wait.', 1;
+    END
+    UPDATE dbo.chat_sessions
+    SET status = N'generating', last_activity_at = SYSUTCDATETIME()
+    WHERE session_id = @session_id;
+END;
+GO
+
+CREATE OR ALTER PROCEDURE dbo.usp_session_end_turn
+    @session_id UNIQUEIDENTIFIER,
+    @tokens_used INT
+AS
+BEGIN
+    SET NOCOUNT ON;
+    UPDATE dbo.chat_sessions
+    SET status = N'active',
+        turn_count = turn_count + 1,
+        tokens_this_session = tokens_this_session + @tokens_used,
+        last_activity_at = SYSUTCDATETIME(),
+        expires_at = DATEADD(minute, 30, SYSUTCDATETIME())
+    WHERE session_id = @session_id;
+    EXEC sp_releaseapplock @Resource = @session_id, @LockOwner = 'Session';
+END;
+GO</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sp_getapplock</code> is the right primitive here because it works across connections and across API instances — it is a database-level named lock, not an in-process mutex. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Session</code> lock owner ties the lock to the connection, so if the API instance crashes mid-generation, closing the connection releases the lock automatically. No orphaned locks, no manual cleanup.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">7.3 Session Lifecycle and Expiry</h3>
+
+<p class="text-gray-300 leading-relaxed">Sessions expire after inactivity (30 minutes is the common default). Expiry is a state transition, not a delete — expired sessions become the raw material for summarization (Chapter 11) and analytics:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Agent job, every 5 minutes: close expired sessions
+CREATE OR ALTER PROCEDURE dbo.usp_expire_sessions
+AS
+BEGIN
+    SET NOCOUNT ON;
+    -- Only close sessions not actively generating; a generation in flight
+    -- extends its own expiry via usp_session_end_turn.
+    UPDATE dbo.chat_sessions
+    SET status = N'closed'
+    OUTPUT INSERTED.session_id, INSERTED.conversation_id,
+           INSERTED.tokens_this_session
+        INTO dbo.session_close_queue (session_id, conversation_id, tokens_used)
+    WHERE status IN (N'active', N'awaiting_tool')
+      AND expires_at &lt; SYSUTCDATETIME();
+END;
+GO
+-- dbo.session_close_queue feeds the summarization worker (Chapter 11):
+-- "conversation just ended, compress it now while it's fresh."</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Note the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">OUTPUT ... INTO</code> clause: the expiry job atomically closes sessions and enqueues follow-up work in one statement. No polling loop, no missed sessions, no double-processing.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">7.4 Per-Session Settings and Prompt Versioning</h3>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">system_prompt_version</code> column exists because prompts change and sessions are long-lived. When you deploy prompt v7, in-flight sessions on v6 must finish on v6 — mid-conversation prompt swaps produce incoherent behavior and corrupt your evaluation data (Chapter 19 compares prompt versions; mixing them within a session invalidates the comparison).</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Prompt registry: versioned, immutable once published
+CREATE TABLE dbo.prompt_versions (
+    prompt_name NVARCHAR(100) NOT NULL,
+    version     INT NOT NULL,
+    prompt_text NVARCHAR(MAX) NOT NULL,
+    published_at DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+    is_current  BIT NOT NULL DEFAULT 0,
+    CONSTRAINT PK_prompt_versions PRIMARY KEY (prompt_name, version)
+);
+
+-- New sessions pick up the current version; existing sessions keep theirs
+CREATE OR ALTER PROCEDURE dbo.usp_session_create
+    @user_id UNIQUEIDENTIFIER, @tenant_id UNIQUEIDENTIFIER,
+    @model NVARCHAR(100), @conversation_id UNIQUEIDENTIFIER = NULL
+AS
+BEGIN
+    SET NOCOUNT ON;
+    DECLARE @pv INT = (SELECT MAX(version) FROM dbo.prompt_versions
+                       WHERE prompt_name = 'chat_system' AND is_current = 1);
+    INSERT INTO dbo.chat_sessions
+        (user_id, tenant_id, conversation_id, model,
+         system_prompt_version, expires_at)
+    OUTPUT INSERTED.session_id
+    VALUES (@user_id, @tenant_id, @conversation_id, @model,
+            @pv, DATEADD(minute, 30, SYSUTCDATETIME()));
+END;
+GO</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">7.5 Multi-Instance Coordination</h3>
+
+<p class="text-gray-300 leading-relaxed">With several API instances behind a load balancer, session affinity ("sticky sessions") is tempting but fragile — instances recycle, and affinity breaks. The database-backed design in this chapter needs no affinity: any instance can serve any request for any session because the lock (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sp_getapplock</code>), the state (the sessions table), and the history (the messages table) are all in SQL Server. The load balancer stays dumb, instances stay stateless, and scaling the API tier is a replica-count change.</p>
+
+<p class="text-gray-300 leading-relaxed">The one thing to watch: clock skew between instances makes <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">expires_at</code> comparisons unreliable if computed in application code. Always compute expiry in T-SQL with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SYSUTCDATETIME()</code> — the database clock is the single source of truth.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Sessions are ephemeral coordination state; conversations are durable history.</strong> Store sessions in SQL Server until measured churn proves you need a dedicated cache — one fewer system to operate.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Guard every generation with sp_getapplock on the session ID.</strong> Database-level named locks serialize turns across all API instances, and Session-scoped ownership auto-releases on connection close.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Expire sessions with OUTPUT INTO to atomically enqueue follow-up work</strong> like summarization, and pin in-flight sessions to their prompt version — never hot-swap prompts mid-conversation.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Keep API instances stateless; let the database coordinate.</strong> No sticky sessions needed when locks, state, and history all live in SQL Server — and always use SYSUTCDATETIME() for expiry, never the app server clock.</li>
+
+    </article>
+
+      <nav class="flex items-center justify-center gap-3 mt-12 mb-4 text-sm">
+        <a href="chapter-06.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">← Chapter 6</a>
+        <a href="index.html" class="px-4 py-2 rounded-lg bg-gray-800 text-gray-300 hover:bg-gray-700 transition">All Chapters</a>
+        <a href="chapter-08.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">Chapter 8 →</a>
+      </nav>
+<div class="bg-gradient-to-r from-blue-900/40 to-indigo-900/40 border border-blue-800/50 rounded-2xl p-6 mt-10">
+        <p class="text-gray-300 text-sm leading-relaxed"><strong class="text-white">Keep going.</strong> You're reading <em class="text-blue-300">AI-Native Apps on SQL Server</em> — one of seven free deep-dives in the DBA Library, covering SQL Server performance tuning, high availability, security, automation, and more. <a href="../index.html" class="text-blue-400 hover:text-blue-300 underline">Browse the full library →</a></p>
+      </div>
+    <footer class="text-center text-gray-600 text-xs mt-10 pb-6">DBA Library · AI-Native Apps on SQL Server · Free for the SQL Server community</footer>
+  </div>
+</body>
+</html>

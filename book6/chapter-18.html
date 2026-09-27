@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 18: Multi-Tenant RAG Architectures — AI-Native Apps on SQL Server</title>
+<meta name="description" content="Per-tenant isolation strategies, noisy-neighbor guards, and tenant-aware retrieval.">
+<script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-200">
+  <div class="max-w-3xl mx-auto px-6 py-10">
+    <p class="text-blue-400 text-sm font-semibold tracking-wide uppercase mb-2">AI-Native Apps on SQL Server</p>
+    <p class="text-gray-500 text-sm mb-1">Chapter 18 of 40</p>
+    <h1 class="text-3xl font-bold text-white mb-8">Multi-Tenant RAG Architectures</h1>
+    <article class="space-y-5">
+<p class="text-gray-300 leading-relaxed">Every table in this book carries a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">tenant_id</code>. This chapter explains the tenancy architecture those columns implement: the three tenancy models (silo, pool, bridge) and when each fits, how the pooled model — one database, all tenants — stays safe and fast at scale, per-tenant configuration and quotas, the noisy-neighbor problem in vector search, and the migration path from pooled to siloed when a tenant outgrows the pool. Multi-tenancy done right is invisible to tenants and cheap to operate; done wrong it is a breach waiting for a headline.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">18.1 The Three Tenancy Models</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Silo: one database per tenant.</strong> Maximum isolation, per-tenant scaling and backup, but N databases to patch, monitor, and pay for. Right for enterprise tenants with compliance mandates (data residency, dedicated encryption keys) and for your largest 5% of tenants.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Pool: one database, all tenants.</strong> <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">tenant_id</code> on every row, RLS enforcing boundaries. Cheapest to operate, fastest to onboard — a new tenant is an INSERT, not a provisioning workflow. Right for the long tail of small-to-medium tenants. This book's default.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Bridge: pools for the tail, silos for the head.</strong> Tenants start pooled and graduate to silos on size, compliance need, or willingness to pay. The application routes by a tenant registry. This is where most successful SaaS products end up.</li>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Tenant registry: where each tenant lives and how they're configured
+CREATE TABLE dbo.tenant_registry (
+    tenant_id       UNIQUEIDENTIFIER PRIMARY KEY,
+    name            NVARCHAR(200) NOT NULL,
+    deployment      NVARCHAR(20) NOT NULL DEFAULT N'pooled'
+                    CONSTRAINT CK_tr_deployment CHECK (deployment IN
+                        (N'pooled', N'silo')),
+    -- For silo tenants: which server/database
+    server_name     NVARCHAR(200) NULL,
+    database_name   NVARCHAR(200) NULL,
+    -- Per-tenant knobs (pooled tenants share the database's)
+    embedding_model NVARCHAR(100) NOT NULL DEFAULT N'text-embedding-3-small',
+    vector_metric   NVARCHAR(20) NOT NULL DEFAULT N'cosine',
+    monthly_token_quota BIGINT NULL,
+    data_residency  NVARCHAR(50) NULL,   -- e.g. 'EU', 'US'
+    created_at      DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
+);</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The registry makes the bridge model a routing decision: the API looks up the tenant's deployment and opens the right connection string. Pooled tenants share the procedures in this book; silo tenants get their own database with the same schema.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">18.2 Making the Pool Fast: Tenant-First Indexing</h3>
+
+<p class="text-gray-300 leading-relaxed">In the pooled model, every query filters by tenant. Index design follows one rule: <strong>tenant_id leads every composite index.</strong> This gives the optimizer partition-like elimination — queries touch only the tenant's slice of each index.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Tenant-first indexing across the hot tables
+CREATE INDEX IX_chunks_tenant_doc
+    ON dbo.document_chunks(tenant_id, document_id, chunk_index);
+CREATE INDEX IX_messages_tenant_time
+    ON dbo.messages(tenant_id, created_at DESC)
+    INCLUDE (conversation_id, role, token_count);
+CREATE INDEX IX_audit_tenant_time
+    ON dbo.llm_audit_log(tenant_id, created_at DESC)
+    INCLUDE (model, status, total_tokens);
+
+-- For very large pools, partitioned alignment: partition the chunks table
+-- by tenant hash so each tenant's data is physically clustered.
+CREATE PARTITION FUNCTION PF_tenant_hash (INT)
+    AS RANGE LEFT FOR VALUES (0,1,2,3,4,5,6,7);  -- 8 partitions
+CREATE PARTITION SCHEME PS_tenant_hash AS PARTITION PF_tenant_hash ALL TO ([PRIMARY]);
+-- tenant_bucket = ABS(CHECKSUM(tenant_id)) % 8 as persisted computed column,
+-- then partition the table on it. Partition elimination per tenant query.</code></pre>
+
+<p class="text-gray-300 leading-relaxed">For vector search specifically, the single shared DiskANN index with a tenant predicate (§15.1) works well into the millions of chunks. Beyond that, consider per-tenant filtered vector indexes for your largest tenants — the vector index equivalent of graduation to a silo, without moving the data.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">18.3 The Noisy-Neighbor Problem</h3>
+
+<p class="text-gray-300 leading-relaxed">Tenant A runs a 10-million-chunk backfill; Tenant B's chat latency triples. Three mitigations, in escalating order:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Workload isolation with Resource Governor.</strong> Classify sessions by login or application name into workload groups with CPU and memory caps. The ingestion workers' group gets a ceiling; the interactive API group gets a floor.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Throttled ingestion per tenant.</strong> The claim procedure (§13.2) takes a per-tenant concurrency limit from the registry — no tenant's backfill starves others' incremental updates.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Graduation.</strong> A tenant that consistently exceeds its fair share gets moved to a silo (or a dedicated elastic pool on Azure SQL). The registry makes this a data migration, not an application rewrite.</li>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Resource Governor: cap the ingestion workload's CPU
+CREATE WORKLOAD GROUP wg_ingestion WITH (REQUEST_MAX_CPU_TIME_SEC = 3600);
+CREATE WORKLOAD GROUP wg_interactive WITH (REQUEST_MAX_CPU_TIME_SEC = 60);
+-- Classifier function routes by login: svc_ingest → wg_ingestion,
+-- svc_api → wg_interactive. Interactive queries always get CPU headroom.</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">18.4 Per-Tenant Configuration and Quotas</h3>
+
+<p class="text-gray-300 leading-relaxed">Tenants differ: embedding models, retrieval depth, prompt versions, token quotas. Store per-tenant configuration in the registry and resolve it once per request:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE dbo.tenant_config (
+    tenant_id       UNIQUEIDENTIFIER PRIMARY KEY
+                    CONSTRAINT FK_tc_tenant REFERENCES dbo.tenants(tenant_id),
+    retrieval_k     INT NOT NULL DEFAULT 8,
+    similarity_floor DECIMAL(3,2) NOT NULL DEFAULT 0.70,
+    enable_rerank   BIT NOT NULL DEFAULT 0,
+    monthly_token_quota BIGINT NULL,       -- NULL = unlimited
+    tokens_used_this_month BIGINT NOT NULL DEFAULT 0,
+    quota_reset_at  DATETIME2 NOT NULL,
+    CONSTRAINT CK_tc_k CHECK (retrieval_k BETWEEN 1 AND 50)
+);
+
+-- Atomic quota check-and-decrement: exactly one statement, no race
+CREATE OR ALTER PROCEDURE dbo.usp_consume_quota
+    @tenant_id UNIQUEIDENTIFIER, @tokens INT
+AS
+BEGIN
+    SET NOCOUNT ON;
+    UPDATE dbo.tenant_config
+    SET tokens_used_this_month = tokens_used_this_month + @tokens
+    OUTPUT INSERTED.tokens_used_this_month, INSERTED.monthly_token_quota
+    WHERE tenant_id = @tenant_id
+      AND (monthly_token_quota IS NULL
+           OR tokens_used_this_month + @tokens &lt;= monthly_token_quota);
+    IF @@ROWCOUNT = 0
+        THROW 50003, 'Monthly token quota exceeded.', 1;
+END;
+GO</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The single-statement UPDATE…WHERE is the pattern: the quota check and the decrement are atomic, so concurrent requests cannot overshoot. A monthly SQL Agent job resets <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">tokens_used_this_month</code> and advances <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">quota_reset_at</code>.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">18.5 Graduating a Tenant to a Silo</h3>
+
+<p class="text-gray-300 leading-relaxed">When a tenant outgrows the pool, migrate with zero downtime:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Provision</strong> the silo database with the same schema (source-controlled migrations make this a script run).</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Backfill</strong> the tenant's rows (all tables, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WHERE tenant_id = @t</code>) into the silo. For large tenants, use incremental batches keyed on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">created_at</code>.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Dual-write</strong> new rows to both pool and silo during a cutover window (application feature flag).</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Verify</strong> row counts match, then flip the registry's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">deployment</code> to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">silo</code> — the API routes to the new database on the next request.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Purge</strong> the tenant's rows from the pool after a retention window.</li>
+
+<p class="text-gray-300 leading-relaxed">Because every procedure in this book takes <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">@tenant_id</code> and the schema is identical, the silo database needs no application changes — only the connection string changes, driven by the registry.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Default to the pooled model, design for the bridge model.</strong> One database with tenant_id everywhere and RLS enforcement; the tenant registry routes tenants to pools or silos without application changes.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>tenant_id leads every composite index</strong> — and consider hash-partitioning the largest tables by tenant for physical isolation within the pool.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Fight noisy neighbors with Resource Governor, per-tenant ingestion throttles, and graduation.</strong> A tenant that outgrows its fair share gets a silo, not an apology.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Make quota consumption a single atomic UPDATE…WHERE statement</strong> so concurrent requests cannot overshoot, and resolve per-tenant config once per request from the registry.</li>
+
+    </article>
+
+      <nav class="flex items-center justify-center gap-3 mt-12 mb-4 text-sm">
+        <a href="chapter-17.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">← Chapter 17</a>
+        <a href="index.html" class="px-4 py-2 rounded-lg bg-gray-800 text-gray-300 hover:bg-gray-700 transition">All Chapters</a>
+        <a href="chapter-19.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">Chapter 19 →</a>
+      </nav>
+<div class="bg-gradient-to-r from-blue-900/40 to-indigo-900/40 border border-blue-800/50 rounded-2xl p-6 mt-10">
+        <p class="text-gray-300 text-sm leading-relaxed"><strong class="text-white">Keep going.</strong> You're reading <em class="text-blue-300">AI-Native Apps on SQL Server</em> — one of seven free deep-dives in the DBA Library, covering SQL Server performance tuning, high availability, security, automation, and more. <a href="../index.html" class="text-blue-400 hover:text-blue-300 underline">Browse the full library →</a></p>
+      </div>
+    <footer class="text-center text-gray-600 text-xs mt-10 pb-6">DBA Library · AI-Native Apps on SQL Server · Free for the SQL Server community</footer>
+  </div>
+</body>
+</html>

@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 16: Metadata Filtering for Precise Retrieval — AI-Native Apps on SQL Server</title>
+<meta name="description" content="Combining vector similarity with relational filters for precise, permission-aware retrieval.">
+<script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-200">
+  <div class="max-w-3xl mx-auto px-6 py-10">
+    <p class="text-blue-400 text-sm font-semibold tracking-wide uppercase mb-2">AI-Native Apps on SQL Server</p>
+    <p class="text-gray-500 text-sm mb-1">Chapter 16 of 40</p>
+    <h1 class="text-3xl font-bold text-white mb-8">Metadata Filtering for Precise Retrieval</h1>
+    <article class="space-y-5">
+<p class="text-gray-300 leading-relaxed">"Find refund-policy chunks similar to this question" is a demo. "Find refund-policy chunks similar to this question, from documents published in the last year, in the enterprise product line, that this user is permitted to read, excluding anything already cited in this session" is a product. The difference is metadata filtering composed with vector search — the single biggest advantage of keeping vectors in SQL Server instead of a standalone vector database. This chapter covers filter design (what metadata to store and how), the composition patterns for combining filters with ANN search, permission-aware retrieval, and the indexing that keeps filtered vector queries fast.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">16.1 Designing Filterable Metadata</h3>
+
+<p class="text-gray-300 leading-relaxed">Metadata is stored twice, in two forms, for two purposes:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Columns for filterable attributes.</strong> Anything in a WHERE clause becomes a column: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">tenant_id</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">document_id</code>, publish date, product line, language, content type. Columns are indexable, sargable, and constrainable.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>JSON for descriptive attributes.</strong> Anything displayed or passed through — author name, source system IDs, custom tags — stays in the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">metadata</code> JSON column. Promote to columns when a JSON path starts appearing in filters (§4.3).</li>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Promote filterable attributes to first-class columns
+ALTER TABLE dbo.documents
+    ADD product_line  NVARCHAR(100) NULL,
+        language_code CHAR(2) NULL DEFAULT 'en',
+        published_at  DATETIME2 NULL,
+        doc_type      NVARCHAR(50) NULL
+                      CONSTRAINT CK_doc_type CHECK (doc_type IN
+                          (N'policy',N'guide',N'faq',N'contract',N'release_notes',N'other'));
+GO
+CREATE INDEX IX_documents_filters
+    ON dbo.documents(tenant_id, product_line, published_at DESC)
+    INCLUDE (doc_type, language_code);
+GO
+-- Chunks inherit filterability through the document join — or denormalize
+-- the hottest filter columns onto the chunk row to avoid the join:
+ALTER TABLE dbo.document_chunks
+    ADD product_line NVARCHAR(100) NULL, published_at DATETIME2 NULL;
+GO</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Denormalizing hot filter columns onto chunks is a deliberate, documented tradeoff: it duplicates data to eliminate a join on the hottest query in the system. Maintain it with a trigger on documents or, better, write both in the ingestion transaction — the ingestion worker already has the values.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">16.2 The Filtered Retrieval Procedure</h3>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE OR ALTER PROCEDURE dbo.usp_filtered_vector_search
+    @tenant_id    UNIQUEIDENTIFIER,
+    @query_vector VECTOR(1536),
+    @match_count  INT = 10,
+    -- Optional filters: NULL means "no constraint"
+    @product_line NVARCHAR(100) = NULL,
+    @doc_type     NVARCHAR(50)  = NULL,
+    @language_code CHAR(2)      = NULL,
+    @published_after DATETIME2  = NULL,
+    @exclude_chunk_ids NVARCHAR(MAX) = NULL  -- JSON array: already cited
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SELECT TOP (@match_count)
+        dc.chunk_id, dc.document_id, dc.chunk_index, dc.content,
+        VECTOR_DISTANCE('cosine', dc.embedding, @query_vector) AS distance
+    FROM dbo.document_chunks AS dc
+    WHERE dc.tenant_id = @tenant_id
+      AND dc.embedding IS NOT NULL
+      AND (@product_line IS NULL  OR dc.product_line = @product_line)
+      AND (@doc_type IS NULL      OR dc.doc_type = @doc_type)
+      AND (@language_code IS NULL OR dc.language_code = @language_code)
+      AND (@published_after IS NULL OR dc.published_at &gt;= @published_after)
+      AND (@exclude_chunk_ids IS NULL OR dc.chunk_id NOT IN (
+              SELECT CAST(value AS UNIQUEIDENTIFIER)
+              FROM OPENJSON(@exclude_chunk_ids)))
+    ORDER BY VECTOR_DISTANCE('cosine', dc.embedding, @query_vector);
+END;
+GO</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">(@param IS NULL OR column = @param)</code> pattern gives you one procedure for all filter combinations instead of a combinatorial explosion of procedures. The catch is parameter sniffing: the first execution's plan gets cached and reused for wildly different filter selectivities. Mitigate with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">OPTION (RECOMPILE)</code> on this procedure — the compile cost is trivial next to a vector search, and a fresh plan per filter combination is worth it.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">16.3 Permission-Aware Retrieval</h3>
+
+<p class="text-gray-300 leading-relaxed">The hardest filter is permissions: "documents this user may read." Document-level ACLs join through a permissions table:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE dbo.document_permissions (
+    document_id UNIQUEIDENTIFIER NOT NULL
+                CONSTRAINT FK_dp_document REFERENCES dbo.documents(document_id) ON DELETE CASCADE,
+    -- Either a user, a group, or NULL+NULL meaning "all tenant users"
+    user_id     UNIQUEIDENTIFIER NULL,
+    group_id    UNIQUEIDENTIFIER NULL,
+    can_read    BIT NOT NULL DEFAULT 1,
+    CONSTRAINT PK_doc_permissions PRIMARY KEY (document_id, user_id, group_id)
+);
+
+-- Permission-aware retrieval: semi-join before the ANN ordering
+SELECT TOP (@k) dc.chunk_id, dc.content,
+       VECTOR_DISTANCE('cosine', dc.embedding, @q) AS distance
+FROM dbo.document_chunks AS dc
+WHERE dc.tenant_id = @tenant_id
+  AND dc.embedding IS NOT NULL
+  AND EXISTS (
+      SELECT 1 FROM dbo.document_permissions AS p
+      WHERE p.document_id = dc.document_id
+        AND p.can_read = 1
+        AND (p.user_id = @user_id
+             OR p.group_id IN (SELECT group_id FROM dbo.user_groups
+                               WHERE user_id = @user_id)
+             OR (p.user_id IS NULL AND p.group_id IS NULL))  -- tenant-public
+  )
+ORDER BY VECTOR_DISTANCE('cosine', dc.embedding, @q)
+OPTION (RECOMPILE);</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The EXISTS semi-join is the right shape: it filters without duplicating chunk rows (a JOIN would multiply rows for multi-group documents). For very large permission tables, denormalize a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">visibility</code> flag onto documents ("public within tenant" vs. "restricted") and only pay the EXISTS cost for restricted documents.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">16.4 Session Exclusion and Freshness Filters</h3>
+
+<p class="text-gray-300 leading-relaxed">Two filters deserve special attention because they change per request:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Already-cited exclusion.</strong> Passing cited chunk IDs as a JSON array (§16.2) prevents the assistant from citing the same chunk five times in a long session. Keep the exclusion list in the session's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">session_data</code> JSON and append on each turn.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Freshness.</strong> <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">published_after</code> handles "what changed recently" questions. For time-sensitive corpora (release notes, policies), consider a freshness boost in the ranking — blend recency into the score rather than hard-filtering, so slightly older authoritative documents can still surface.</li>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Freshness as a soft boost instead of a hard filter:
+-- newer chunks get a small score bonus, older authoritative docs survive.
+SELECT TOP (@k) dc.chunk_id, dc.content,
+       VECTOR_DISTANCE('cosine', dc.embedding, @q)
+         - 0.05 * DATEDIFF(day, dc.published_at, SYSUTCDATETIME()) * -1
+         AS boosted_distance
+FROM dbo.document_chunks AS dc
+WHERE dc.tenant_id = @tenant_id AND dc.embedding IS NOT NULL
+ORDER BY boosted_distance;
+-- Tune the 0.05 coefficient: too high and recency beats relevance.</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">16.5 Filter-First vs Vector-First Execution</h3>
+
+<p class="text-gray-300 leading-relaxed">When a query has both a vector predicate and relational filters, the engine must choose an order — and the right choice depends on selectivity. <strong>Filter-first</strong> (apply relational predicates, then vector-search the survivors) wins when filters are highly selective: "contracts from 2024" over a ten-year corpus eliminates 90% of rows before the expensive distance computation. <strong>Vector-first</strong> (vector-search broadly, then filter the candidates) wins when filters are weak but the vector predicate is strong. SQL Server's optimizer makes this choice for plain queries, but vector predicates are opaque to costing — so encode the heuristic in the search procedure: estimate filter selectivity from statistics (§23.1), and when the filter is selective (under ~10% of the corpus), pre-filter with a relational seek into a temp table before the vector search. Log the chosen strategy per query; when recall complaints arrive, the strategy log tells you whether the filter-first path discarded the right answer before the vector search ever saw it.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Columns for filters, JSON for display — and denormalize hot filter columns onto chunks</strong> to keep the hottest query join-free. Promote JSON paths to columns the moment they appear in WHERE clauses.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>One procedure with NULL-able filter parameters plus OPTION (RECOMPILE)</strong> beats a combinatorial explosion of specialized procedures and defeats parameter sniffing.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Permission filtering is an EXISTS semi-join, not a JOIN</strong> — and a visibility flag lets you skip the permission check entirely for tenant-public documents.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Prefer soft boosts over hard filters for freshness</strong> so authoritative older documents can still surface, and exclude already-cited chunks per session to keep long conversations varied.</li>
+
+    </article>
+
+      <nav class="flex items-center justify-center gap-3 mt-12 mb-4 text-sm">
+        <a href="chapter-15.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">← Chapter 15</a>
+        <a href="index.html" class="px-4 py-2 rounded-lg bg-gray-800 text-gray-300 hover:bg-gray-700 transition">All Chapters</a>
+        <a href="chapter-17.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">Chapter 17 →</a>
+      </nav>
+<div class="bg-gradient-to-r from-blue-900/40 to-indigo-900/40 border border-blue-800/50 rounded-2xl p-6 mt-10">
+        <p class="text-gray-300 text-sm leading-relaxed"><strong class="text-white">Keep going.</strong> You're reading <em class="text-blue-300">AI-Native Apps on SQL Server</em> — one of seven free deep-dives in the DBA Library, covering SQL Server performance tuning, high availability, security, automation, and more. <a href="../index.html" class="text-blue-400 hover:text-blue-300 underline">Browse the full library →</a></p>
+      </div>
+    <footer class="text-center text-gray-600 text-xs mt-10 pb-6">DBA Library · AI-Native Apps on SQL Server · Free for the SQL Server community</footer>
+  </div>
+</body>
+</html>

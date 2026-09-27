@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 20: Giving Agents Database Tools — AI-Native Apps on SQL Server</title>
+<meta name="description" content="Tool schemas, the agent loop, least-privilege SQL tools, and approval gates for risky actions.">
+<script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-200">
+  <div class="max-w-3xl mx-auto px-6 py-10">
+    <p class="text-blue-400 text-sm font-semibold tracking-wide uppercase mb-2">AI-Native Apps on SQL Server</p>
+    <p class="text-gray-500 text-sm mb-1">Chapter 20 of 40</p>
+    <h1 class="text-3xl font-bold text-white mb-8">Giving Agents Database Tools</h1>
+    <article class="space-y-5">
+<p class="text-gray-300 leading-relaxed">RAG answers questions; agents take actions. An AI agent is an LLM in a loop — observe, reason, act — where "act" means calling tools, and the most powerful tools query and mutate your database. This chapter covers the agent-database interface: designing tool functions over your schema, the execution loop with its safety rails, transactional action patterns, and the observability that makes agent behavior debuggable. The database is not just the agent's memory here — it is the agent's hands.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">20.1 The Agent Loop</h3>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
+    G[Goal] --> P[Plan next step - LLM]
+    P --> T{Tool call?}
+    T -->|yes| V[Validate arguments]
+    V --> E[Execute against SQL Server]
+    E --> O[Observation: rows / status]
+    O --> P
+    T -->|no| D[Done: final answer]
+    E -->|error| R[Retry or replan]
+    R --> P</pre></div>
+
+<p class="text-gray-300 leading-relaxed">The loop's database touchpoints are validation (are the arguments sane?), execution (the stored procedure call), and observation (rows returned become the next prompt's context). Every iteration is logged — the agent's "thought process" is only debuggable if each tool call, its arguments, and its results are recorded.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">20.2 Designing Tool Functions Over Your Schema</h3>
+
+<p class="text-gray-300 leading-relaxed">Tools are stored procedures with LLM-friendly contracts. Design rules:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>One tool, one intent.</strong> <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">lookup_order</code>, not <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">run_sql</code>. Never give an agent raw SQL access — the tool surface is the security boundary (Chapter 37).</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Typed, validated parameters.</strong> The procedure validates ranges, formats, and permissions before touching data. Validation failures return structured errors the agent can act on.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Bounded results.</strong> Every read tool takes <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">@max_rows</code> with a sane default. An agent that SELECTs a million rows blows the context window and the budget.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Idempotency keys on writes.</strong> Agents retry; retries must not double-apply. Every mutating tool takes <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">@idempotency_key</code> and returns the existing result on replay.</li>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Agent tool: look up orders with bounded, validated, tenant-scoped reads
+CREATE OR ALTER PROCEDURE dbo.tool_lookup_orders
+    @tenant_id       UNIQUEIDENTIFIER,
+    @user_id         UNIQUEIDENTIFIER,
+    @status          NVARCHAR(30) = NULL,
+    @since           DATETIME2 = NULL,
+    @max_rows        INT = 20,
+    @idempotency_key UNIQUEIDENTIFIER = NULL   -- ignored for reads; required for writes
+AS
+BEGIN
+    SET NOCOUNT ON;
+    -- Validation the agent can understand and fix
+    IF @max_rows &gt; 100
+        THROW 50010, 'max_rows cannot exceed 100. Narrow your filters instead.', 1;
+    IF @status IS NOT NULL AND @status NOT IN
+       (N'pending', N'shipped', N'delivered', N'cancelled', N'refunded')
+        THROW 50011, 'Unknown status. Valid: pending, shipped, delivered, cancelled, refunded.', 1;
+
+    SELECT TOP (@max_rows)
+        order_id, status, total_amount, created_at,
+        JSON_VALUE(metadata, '$.tracking_number') AS tracking_number
+    FROM dbo.orders
+    WHERE tenant_id = @tenant_id
+      AND user_id = @user_id
+      AND (@status IS NULL OR status = @status)
+      AND (@since IS NULL OR created_at &gt;= @since)
+    ORDER BY created_at DESC;
+END;
+GO
+
+-- Agent tool: issue a refund — mutating, idempotent, audited
+CREATE OR ALTER PROCEDURE dbo.tool_issue_refund
+    @tenant_id       UNIQUEIDENTIFIER,
+    @user_id         UNIQUEIDENTIFIER,
+    @order_id        UNIQUEIDENTIFIER,
+    @amount          DECIMAL(12,2),
+    @reason          NVARCHAR(500),
+    @idempotency_key UNIQUEIDENTIFIER
+AS
+BEGIN
+    SET NOCOUNT ON;
+    BEGIN TRAN;
+    -- Idempotency: replay returns the original result
+    IF EXISTS (SELECT 1 FROM dbo.agent_actions
+               WHERE idempotency_key = @idempotency_key)
+    BEGIN
+        SELECT action_id, status, result_summary
+        FROM dbo.agent_actions WHERE idempotency_key = @idempotency_key;
+        COMMIT; RETURN;
+    END
+    -- ... validate order ownership, amount &lt;= refundable, etc. ...
+    -- ... perform refund, log to agent_actions with the idempotency key ...
+    COMMIT;
+END;
+GO</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">20.3 The Agent Action Log</h3>
+
+<p class="text-gray-300 leading-relaxed">Every tool call is recorded — arguments, results, timing, and the agent run it belongs to. This table is the agent's flight recorder:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE dbo.agent_runs (
+    run_id          UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWID(),
+    tenant_id       UNIQUEIDENTIFIER NOT NULL,
+    user_id         UNIQUEIDENTIFIER NOT NULL,
+    goal            NVARCHAR(MAX) NOT NULL,
+    status          NVARCHAR(20) NOT NULL DEFAULT N'running'
+                    CONSTRAINT CK_ar_status CHECK (status IN
+                        (N'running',N'completed',N'failed',N'awaiting_approval',N'cancelled')),
+    model           NVARCHAR(100) NOT NULL,
+    started_at      DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+    ended_at        DATETIME2 NULL
+);
+
+CREATE TABLE dbo.agent_actions (
+    action_id       UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWID(),
+    run_id          UNIQUEIDENTIFIER NOT NULL
+                    CONSTRAINT FK_aa_run REFERENCES dbo.agent_runs(run_id),
+    step_number     INT NOT NULL,
+    tool_name       NVARCHAR(200) NOT NULL,
+    arguments       JSON NOT NULL,
+    result_summary  NVARCHAR(MAX) NULL,   -- truncated observation for the log
+    result_rows     INT NULL,
+    status          NVARCHAR(20) NOT NULL DEFAULT N'success'
+                    CONSTRAINT CK_aa_status CHECK (status IN
+                        (N'success',N'error',N'denied',N'timeout')),
+    error_message   NVARCHAR(MAX) NULL,
+    idempotency_key UNIQUEIDENTIFIER NULL,
+    duration_ms     INT NULL,
+    created_at      DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+    CONSTRAINT UQ_aa_idempotency UNIQUE (idempotency_key)
+        WHERE idempotency_key IS NOT NULL
+);</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The action log serves three masters: debugging ("why did the agent refund twice?"), evaluation (replay runs against new prompts, Chapter 19), and compliance (who authorized what — paired with the approval workflow in §20.4).</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">20.4 Human Approval for Consequential Actions</h3>
+
+<p class="text-gray-300 leading-relaxed">Read tools run freely; write tools go through a policy gate. The three-tier policy:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Auto-approve:</strong> low-stakes writes (draft creation, preference updates, cart changes). Logged, reversible.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Require approval:</strong> money movement, external communications, data deletion. The agent pauses with status <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">awaiting_approval</code>; a human approves via UI; the run resumes with the approval recorded.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Denied:</strong> actions outside the agent's granted scope never execute — the tool procedure itself rejects them (defense in depth, Chapter 37).</li>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE dbo.agent_approvals (
+    approval_id   UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWID(),
+    run_id        UNIQUEIDENTIFIER NOT NULL,
+    action_id     UNIQUEIDENTIFIER NOT NULL,   -- the proposed action
+    proposed_at   DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+    decided_at    DATETIME2 NULL,
+    decision      NVARCHAR(20) NULL
+                  CONSTRAINT CK_ap_decision CHECK (decision IN
+                      (N'approved', N'rejected', N'expired')),
+    decided_by    UNIQUEIDENTIFIER NULL,       -- human user_id
+    expires_at    DATETIME2 NOT NULL DEFAULT (DATEADD(hour, 4, SYSUTCDATETIME()))
+);
+-- The agent loop polls: approved → execute; rejected/expired → replan or stop.
+-- Approval requests surface in the UI with full argument context.</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">20.5 Transactional Action Patterns</h3>
+
+<p class="text-gray-300 leading-relaxed">Agent actions that touch multiple tables use the same transactional discipline as Chapter 1's endpoint — with one addition: the action log row is written in the <em>same</em> transaction as the action itself. If the action rolls back, its log entry rolls back too, and the agent sees the error as its observation. There is never a log entry claiming an action succeeded when it did not.</p>
+
+<p class="text-gray-300 leading-relaxed">For multi-step workflows (book flight → charge card → send confirmation), use the saga pattern: each step is its own transaction with a compensating action recorded upfront. If step 3 fails, the agent executes the compensations for steps 1–2. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">agent_actions</code> table with its step numbers is the saga log — recovery is "replay uncompensated steps in reverse."</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">20.6 Tool Result Caching</h3>
+
+<p class="text-gray-300 leading-relaxed">Agents call the same tools with the same arguments repeatedly — the researcher re-runs a search it already ran, two agents query the same dashboard. Cache deterministic tool results keyed by (tool_name, argument hash) with short TTLs: search results for 5 minutes, database lookups for 1 minute, anything time-sensitive not at all. The cache lives in the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">result_cache</code> table (§34.3) with the agent run as part of the key namespace, so cached results never leak across tenants or runs. Invalidate aggressively on writes: any successful write tool clears the cached reads for the affected tables. Measure the hit rate per tool — a search tool with a 40% hit rate just cut the agent's API bill nearly in half, and the caching code was twenty lines.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Tools are stored procedures with LLM-friendly contracts:</strong> one intent per tool, validated parameters, bounded results, idempotency keys on every write. Never give an agent raw SQL.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Log every tool call with arguments, results, and timing in the same transaction as the action itself.</strong> The action log is the flight recorder for debugging, evaluation replay, and compliance.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Gate consequential actions on human approval</strong> with a three-tier policy (auto-approve / require approval / denied) and an approvals table the agent loop polls.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Use sagas with compensating actions for multi-step workflows.</strong> Each step commits independently; failures trigger reverse-order compensation driven by the action log.</li>
+
+    </article>
+
+      <nav class="flex items-center justify-center gap-3 mt-12 mb-4 text-sm">
+        <a href="chapter-19.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">← Chapter 19</a>
+        <a href="index.html" class="px-4 py-2 rounded-lg bg-gray-800 text-gray-300 hover:bg-gray-700 transition">All Chapters</a>
+        <a href="chapter-21.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">Chapter 21 →</a>
+      </nav>
+<div class="bg-gradient-to-r from-blue-900/40 to-indigo-900/40 border border-blue-800/50 rounded-2xl p-6 mt-10">
+        <p class="text-gray-300 text-sm leading-relaxed"><strong class="text-white">Keep going.</strong> You're reading <em class="text-blue-300">AI-Native Apps on SQL Server</em> — one of seven free deep-dives in the DBA Library, covering SQL Server performance tuning, high availability, security, automation, and more. <a href="../index.html" class="text-blue-400 hover:text-blue-300 underline">Browse the full library →</a></p>
+      </div>
+    <footer class="text-center text-gray-600 text-xs mt-10 pb-6">DBA Library · AI-Native Apps on SQL Server · Free for the SQL Server community</footer>
+  </div>
+</body>
+</html>

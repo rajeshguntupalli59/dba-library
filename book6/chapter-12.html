@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 12: Memory Isolation and Row-Level Security — AI-Native Apps on SQL Server</title>
+<meta name="description" content="RLS predicates that keep every tenant&#x27;s memories, vectors, and history strictly separated.">
+<script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-200">
+  <div class="max-w-3xl mx-auto px-6 py-10">
+    <p class="text-blue-400 text-sm font-semibold tracking-wide uppercase mb-2">AI-Native Apps on SQL Server</p>
+    <p class="text-gray-500 text-sm mb-1">Chapter 12 of 40</p>
+    <h1 class="text-3xl font-bold text-white mb-8">Memory Isolation and Row-Level Security</h1>
+    <article class="space-y-5">
+<p class="text-gray-300 leading-relaxed">Chapters 6–11 built a rich memory system. Now the hard question: how do you guarantee that User A's memories never leak into User B's conversations? In a multi-tenant AI application, a memory leak is not a bug — it is a data breach. This chapter builds isolation as a layered defense: row-level security as the enforcement backbone, session context as the identity carrier, application-level checks as the first line, and the audit and testing practices that prove isolation holds. The principle is defense in depth: no single layer is trusted alone.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">12.1 The Threat Model</h3>
+
+<p class="text-gray-300 leading-relaxed">Memory leaks happen through four paths, each needing its own mitigation:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Query leakage.</strong> A missing <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WHERE user_id = ?</code> returns another user's memories. Mitigation: RLS policies that make the filter automatic.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Retrieval leakage.</strong> Vector search returns chunks or memories from another tenant because the ANN query lacked a tenant predicate. Mitigation: tenant predicates composed with vector ordering (Chapter 15), enforced by RLS.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Prompt leakage.</strong> Correctly retrieved memories for User A get injected into User B's prompt because of a session mix-up. Mitigation: session binding validated on every turn (§12.3).</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Inference leakage.</strong> The model itself reveals memorized training-adjacent data. Mitigation: this is a model-behavior problem — keep sensitive data out of prompts sent to shared models, and prefer Azure OpenAI's data-residency commitments for regulated workloads.</li>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">12.2 RLS Policies Across Every Memory Table</h3>
+
+<p class="text-gray-300 leading-relaxed">Chapter 1 put RLS on chunks and documents. Extend the same pattern to every memory-bearing table — messages, sessions, long-term memories, preferences, summaries, embeddings:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- One predicate function per identity grain, then one policy per table.
+-- Tenant grain (shared within a tenant's support staff, for example):
+CREATE FUNCTION security.fn_tenant_filter(@tenant_id UNIQUEIDENTIFIER)
+RETURNS TABLE WITH SCHEMABINDING
+AS RETURN SELECT 1 AS access
+           WHERE @tenant_id = CAST(SESSION_CONTEXT(N'tenant_id') AS UNIQUEIDENTIFIER);
+GO
+
+-- User grain (strictest: the user sees only their own rows)
+CREATE FUNCTION security.fn_user_filter(@user_id UNIQUEIDENTIFIER)
+RETURNS TABLE WITH SCHEMABINDING
+AS RETURN SELECT 1 AS access
+           WHERE @user_id = CAST(SESSION_CONTEXT(N'user_id') AS UNIQUEIDENTIFIER);
+GO
+
+-- Apply user-grain policies to every memory table
+CREATE SECURITY POLICY security.memory_isolation_policy
+    ADD FILTER PREDICATE security.fn_user_filter(user_id) ON dbo.messages,
+    ADD FILTER PREDICATE security.fn_user_filter(user_id) ON dbo.chat_sessions,
+    ADD FILTER PREDICATE security.fn_user_filter(user_id) ON dbo.long_term_memories,
+    ADD FILTER PREDICATE security.fn_user_filter(user_id) ON dbo.user_preferences,
+    ADD FILTER PREDICATE security.fn_user_filter(user_id) ON dbo.conversation_embeddings,
+    ADD FILTER PREDICATE security.fn_tenant_filter(tenant_id) ON dbo.document_chunks,
+    ADD FILTER PREDICATE security.fn_tenant_filter(tenant_id) ON dbo.documents
+    WITH (STATE = ON);
+GO</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Note the two grains: user-grain for personal memory tables, tenant-grain for the shared knowledge corpus. Support staff who need cross-user visibility get a separate login whose session context carries an <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">is_support</code> flag checked by a second predicate — never by disabling the policy.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">12.3 Session Binding: Tying Every Turn to Its Identity</h3>
+
+<p class="text-gray-300 leading-relaxed">RLS enforces the database boundary, but the application must still bind each request to the right identity before the first query. The binding check runs at the top of every chat request:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Validate that the session belongs to the authenticated user
+-- AND the conversation belongs to that session, in one query.
+-- Returns the tenant for SESSION_CONTEXT; raises if anything mismatches.
+CREATE OR ALTER PROCEDURE dbo.usp_bind_session
+    @session_id UNIQUEIDENTIFIER,
+    @auth_user_id UNIQUEIDENTIFIER
+AS
+BEGIN
+    SET NOCOUNT ON;
+    DECLARE @tenant_id UNIQUEIDENTIFIER;
+
+    SELECT @tenant_id = s.tenant_id
+    FROM dbo.chat_sessions AS s
+    WHERE s.session_id = @session_id
+      AND s.user_id = @auth_user_id      -- the binding check
+      AND s.status &lt;&gt; N'closed';
+
+    IF @tenant_id IS NULL
+        THROW 50002, 'Session binding failed: session does not belong to user.', 1;
+
+    -- Stamp BOTH identities for the RLS predicates
+    EXEC sp_set_session_context 'tenant_id', @tenant_id;
+    EXEC sp_set_session_context 'user_id', @auth_user_id;
+
+    -- Return conversation for the caller
+    SELECT s.conversation_id, s.model, s.system_prompt_version,
+           s.status, s.turn_count
+    FROM dbo.chat_sessions AS s
+    WHERE s.session_id = @session_id;
+END;
+GO</code></pre>
+
+<p class="text-gray-300 leading-relaxed">This procedure is the choke point: every turn calls it first, and no database work happens before it succeeds. The JWT's subject claim supplies <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">@auth_user_id</code> — never a client-supplied user ID from the request body.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">12.4 The Application Layer: Belt and Suspenders</h3>
+
+<p class="text-gray-300 leading-relaxed">RLS is the enforcement layer, but application code should still pass explicit predicates — not because RLS might fail, but because explicit predicates make queries sargable and intent obvious. The rule: <strong>every query includes the identity predicate AND relies on RLS as the backstop.</strong> Code review rejects any data-access query missing the explicit <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">user_id</code>/<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">tenant_id</code> filter, even though RLS would technically enforce it.</p>
+
+<p class="text-gray-300 leading-relaxed">Additionally, separate database principals by role: the API's login gets only EXECUTE on procedures and the RLS-filtered table access it needs; the background workers get their own login; human support staff get a third with the support predicate. A compromised API credential then cannot disable policies or read across users — it lacks the permissions.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Least-privilege roles: the API login cannot touch RLS or other users' rows
+CREATE ROLE api_role;
+GRANT EXECUTE ON SCHEMA::dbo TO api_role;
+-- Table access is filtered by the security policy automatically;
+-- DENY direct writes to memory tables so all writes go through procedures:
+DENY INSERT, UPDATE, DELETE ON dbo.long_term_memories TO api_role;
+DENY INSERT, UPDATE, DELETE ON dbo.user_preferences TO api_role;
+-- Writes flow through usp_append_message / usp_set_preference, which
+-- re-validate identity. The API login cannot bypass them.</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">12.5 Proving Isolation: The Adversarial Test Suite</h3>
+
+<p class="text-gray-300 leading-relaxed">Isolation is a claim; tests make it a fact. The adversarial suite runs in CI against a realistic seed dataset:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Cross-user read attempts.</strong> For every memory procedure, call it as User A with User B's IDs — expect zero rows or an error, never User B's data. Parameterize over all procedures.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Missing-context simulation.</strong> Open a connection, deliberately skip <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">usp_bind_session</code>, and query memory tables — RLS must return zero rows (NULL context matches nothing).</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Vector-search isolation.</strong> Seed two tenants with similar documents; verify <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">usp_hybrid_search</code> as Tenant A never returns Tenant B's chunks, even for near-identical query vectors.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Session-fixation attempts.</strong> Present User B's session ID with User A's token — <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">usp_bind_session</code> must throw.</li>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- T-SQL smoke test: no session context → RLS returns nothing
+-- (run as the api_role login in CI)
+EXEC sp_set_session_context 'tenant_id', NULL;
+EXEC sp_set_session_context 'user_id', NULL;
+SELECT COUNT(*) AS rows_visible FROM dbo.long_term_memories;
+-- Expected: 0. If this ever returns nonzero, the policy is broken.
+SELECT COUNT(*) AS chunks_visible FROM dbo.document_chunks;
+-- Expected: 0.</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Run the full suite on every migration that touches a memory table or a security policy. Isolation regressions are silent — no error, just wrong rows — so only tests catch them.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Treat memory leakage as a data breach, and defend in four layers:</strong> RLS policies (enforcement), session binding (identity), explicit application predicates (intent + sargability), and least-privilege roles (blast radius).</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Use two RLS grains:</strong> user-grain for personal memory tables, tenant-grain for the shared corpus — with a separate support predicate rather than policy exceptions.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Make usp_bind_session the choke point of every turn:</strong> validate session ownership from the JWT subject, stamp both identities into SESSION_CONTEXT, and do no database work before it succeeds.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Prove isolation with an adversarial CI suite</strong> covering cross-user reads, missing context, vector-search tenant separation, and session fixation — because isolation regressions are silent.</li>
+
+    </article>
+
+      <nav class="flex items-center justify-center gap-3 mt-12 mb-4 text-sm">
+        <a href="chapter-11.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">← Chapter 11</a>
+        <a href="index.html" class="px-4 py-2 rounded-lg bg-gray-800 text-gray-300 hover:bg-gray-700 transition">All Chapters</a>
+        <a href="chapter-13.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">Chapter 13 →</a>
+      </nav>
+<div class="bg-gradient-to-r from-blue-900/40 to-indigo-900/40 border border-blue-800/50 rounded-2xl p-6 mt-10">
+        <p class="text-gray-300 text-sm leading-relaxed"><strong class="text-white">Keep going.</strong> You're reading <em class="text-blue-300">AI-Native Apps on SQL Server</em> — one of seven free deep-dives in the DBA Library, covering SQL Server performance tuning, high availability, security, automation, and more. <a href="../index.html" class="text-blue-400 hover:text-blue-300 underline">Browse the full library →</a></p>
+      </div>
+    <footer class="text-center text-gray-600 text-xs mt-10 pb-6">DBA Library · AI-Native Apps on SQL Server · Free for the SQL Server community</footer>
+  </div>
+</body>
+</html>

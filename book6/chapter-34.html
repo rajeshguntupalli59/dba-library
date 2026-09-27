@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 34: Caching Strategies for AI Workloads — AI-Native Apps on SQL Server</title>
+<meta name="description" content="Semantic cache, embedding cache, result cache — and proving each one earns its keep.">
+<script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-200">
+  <div class="max-w-3xl mx-auto px-6 py-10">
+    <p class="text-blue-400 text-sm font-semibold tracking-wide uppercase mb-2">AI-Native Apps on SQL Server</p>
+    <p class="text-gray-500 text-sm mb-1">Chapter 34 of 40</p>
+    <h1 class="text-3xl font-bold text-white mb-8">Caching Strategies for AI Workloads</h1>
+    <article class="space-y-5">
+<p class="text-gray-300 leading-relaxed">Every cache in an AI application saves one of three expensive things: an LLM call (semantic cache), an embedding computation (embedding cache), or a database round-trip (result cache). But caching AI outputs is subtler than caching web pages — similarity is fuzzy, staleness is semantic, and the wrong cache hit is worse than a miss. This chapter builds the three caches in SQL Server, the invalidation discipline from Chapters 27–28, and the measurement that proves each cache earns its keep.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">34.1 Semantic Cache: Answering from Memory</h3>
+
+<p class="text-gray-300 leading-relaxed">The semantic cache stores question→answer pairs and serves near-duplicate questions without calling the LLM. The lookup is a vector search over cached questions (§15.2's procedure), with a similarity threshold that trades hit rate against correctness:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE dbo.semantic_cache (
+    cache_id      UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWID(),
+    tenant_id     UNIQUEIDENTIFIER NOT NULL,
+    question      NVARCHAR(MAX) NOT NULL,
+    question_vec  VECTOR(1536) NOT NULL,      -- embedding of the question
+    answer        NVARCHAR(MAX) NOT NULL,
+    answer_model  NVARCHAR(100) NOT NULL,     -- which model produced it
+    prompt_tokens INT NOT NULL,               -- what it cost to produce
+    completion_tokens INT NOT NULL,
+    hits          INT NOT NULL DEFAULT 0,
+    created_at    DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+    expires_at    DATETIME2 NOT NULL
+);
+CREATE INDEX IX_semcache_vec ON dbo.semantic_cache(question_vec)
+    WITH (DISTANCE_FUNCTION = COSINE);        -- vector index (§3.2)
+
+-- Lookup: cosine-similar cached question above threshold?
+-- Threshold 0.97+ for factual answers; lower only for creative tasks.
+-- On hit: return answer, increment hits, SKIP the LLM call entirely.
+-- On miss: generate, then INSERT the pair for future questions.
+-- Tenant-scoped always (§18.1): never serve one tenant's cache to another.</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Populate the cache selectively: cache answers to expensive models and stable questions (documentation Q&A), not cheap models or time-sensitive questions ("what's the status of my order"). Track hit rate and the estimated tokens saved — the cache's ROI in one number.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">34.2 Embedding Cache: Never Embed Twice</h3>
+
+<p class="text-gray-300 leading-relaxed">Embeddings are deterministic: the same text through the same model always yields the same vector. There is no reason to ever pay for the same embedding twice:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE dbo.embedding_cache (
+    text_hash  CHAR(64) PRIMARY KEY,          -- SHA2_256 of (model + text)
+    model      NVARCHAR(100) NOT NULL,
+    embedding  VECTOR(1536) NOT NULL,
+    created_at DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
+);
+-- Lookup before every embedding call:
+--   SELECT embedding FROM dbo.embedding_cache WHERE text_hash = @h
+-- Hit → use it. Miss → call the API, INSERT, then use it.
+-- The hash includes the model name: same text, different model = different row.
+-- Retention: embeddings don't go stale (deterministic), so keep them until
+-- storage pressure — then evict least-recently-used via a last_hit_at column.
+-- Expected hit rate on document re-ingestion (§17.1's unchanged chunks): ~90%.</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The embedding cache is the highest-ROI cache in the system: near-100% correctness (deterministic), trivial invalidation (none needed), and it compounds with the incremental indexer — unchanged chunks across re-ingests never touch the API again.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">34.3 Result Cache: Database Round-Trips</h3>
+
+<p class="text-gray-300 leading-relaxed">The third cache is conventional: expensive query results (dashboard aggregations, text-to-SQL answers, retrieval result sets) cached with invalidation. SQL Server gives two invalidation mechanisms from earlier chapters:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Query Notifications (§28.3)</strong> for result sets whose defining query is notification-compatible — automatic invalidation on change.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Change Tracking (§27.2)</strong> for everything else — the cache worker's poll loop doubles as the invalidation sweep.</li>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE dbo.result_cache (
+    cache_key   NVARCHAR(400) PRIMARY KEY,    -- hash of (tenant + query + params)
+    tenant_id   UNIQUEIDENTIFIER NOT NULL,
+    payload     JSON NOT NULL,                -- the cached result set
+    depends_on  NVARCHAR(MAX) NULL,           -- JSON array of table names
+    created_at  DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+    expires_at  DATETIME2 NOT NULL
+);
+-- Invalidation worker: for each expired-or-dirtied key...
+--   depends_on lists source tables; the CT poll (§27.2) reports changed
+--   tables; any key depending on a changed table is deleted.
+-- TTL as backstop: even without change signals, keys expire (5 min default
+-- for dashboards, 1 hour for text-to-SQL answers over stable data).</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">34.4 Measuring Cache Effectiveness</h3>
+
+<p class="text-gray-300 leading-relaxed">Every cache reports three numbers, computed from the tables above:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Hit rate:</strong> hits / (hits + misses). Below 20%: the cache isn't earning its complexity — remove it.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Tokens/money saved:</strong> sum of (prompt_tokens + completion_tokens) on semantic-cache hits × price; embedding API calls avoided × price. This is the cache's budget justification.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Staleness incidents:</strong> user complaints or eval failures traced to a stale cache hit. Above zero for the semantic cache: raise the similarity threshold or shorten TTLs.</li>
+
+<p class="text-gray-300 leading-relaxed">Review quarterly. Caches that don't pay for themselves in tokens saved get deleted — every cache is a correctness liability (staleness) and an operational cost (invalidation machinery) that must be justified by measured savings.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">34.5 Cache Warming and Cold Starts</h3>
+
+<p class="text-gray-300 leading-relaxed">A cache is useless until it's warm, and every deployment, failover, or scale-out event starts cold. Plan for it. <strong>Warming:</strong> after a deployment, replay the top-N cached queries from the last 24 hours (the semantic cache's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">hits</code> column tells you exactly which entries matter most) through the normal lookup path — misses regenerate and repopulate naturally. Automate this as a post-deploy job, not a manual step someone forgets at 3 AM. <strong>Cold-start behavior:</strong> the application must treat every cache as optional — a cold cache means slower responses, never errors. This falls out naturally if the lookup path is "check cache, on miss compute" (§34.1–34.3), but verify it: integration tests should run with empty caches and assert correctness, just slower. <strong>Stampede protection:</strong> the dangerous cold-start moment is when 1,000 requests miss simultaneously and all 1,000 call the LLM. Use a singleflight pattern — the first miss for a key takes a lightweight lock (sp_getapplock on the cache key hash, §7.2's primitive reused), computes, and populates; concurrent misses wait on the lock and read the warmed entry. Without singleflight, every cold start is a self-inflicted DDoS on your own model provider — and the bill to prove it.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<p class="text-gray-300 leading-relaxed">Finally, treat the caches as a portfolio, not isolated features. The embedding cache (§34.2) feeds the ingestion pipeline, the semantic cache (§34.1) short-circuits the chat path, and the result cache (§34.3) absorbs dashboard load — together they determine the system's effective cost per request. Report one blended number monthly: total tokens that would have been spent without caches versus actual spend. When that number stops improving, the caching work is done and engineering attention belongs elsewhere. Caches are a means to a margin, not an end in themselves.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+<p class="text-gray-300 leading-relaxed">Start every new AI feature with the caches <em>off</em>, measure the uncached baseline for a week, then enable them one at a time. The before/after comparison is the only honest measurement of what each cache contributes — and it occasionally reveals that the feature was fast enough without caching at all.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Cache three things:</strong> LLM answers (semantic cache, vector lookup, high similarity threshold), embeddings (deterministic — never compute twice), and query results (with CT/notification invalidation).</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Scope every cache by tenant</strong> and populate selectively — expensive models and stable questions earn caching; cheap models and time-sensitive questions don't.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Invalidation is the cache's real cost:</strong> Query Notifications where compatible, Change Tracking polling otherwise, TTLs as the backstop.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Measure hit rate, money saved, and staleness incidents</strong> — and delete caches that don't earn their complexity.</li>
+
+    </article>
+
+      <nav class="flex items-center justify-center gap-3 mt-12 mb-4 text-sm">
+        <a href="chapter-33.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">← Chapter 33</a>
+        <a href="index.html" class="px-4 py-2 rounded-lg bg-gray-800 text-gray-300 hover:bg-gray-700 transition">All Chapters</a>
+        <a href="chapter-35.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">Chapter 35 →</a>
+      </nav>
+<div class="bg-gradient-to-r from-blue-900/40 to-indigo-900/40 border border-blue-800/50 rounded-2xl p-6 mt-10">
+        <p class="text-gray-300 text-sm leading-relaxed"><strong class="text-white">Keep going.</strong> You're reading <em class="text-blue-300">AI-Native Apps on SQL Server</em> — one of seven free deep-dives in the DBA Library, covering SQL Server performance tuning, high availability, security, automation, and more. <a href="../index.html" class="text-blue-400 hover:text-blue-300 underline">Browse the full library →</a></p>
+      </div>
+    <footer class="text-center text-gray-600 text-xs mt-10 pb-6">DBA Library · AI-Native Apps on SQL Server · Free for the SQL Server community</footer>
+  </div>
+</body>
+</html>

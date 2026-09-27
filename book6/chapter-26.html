@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 26: Multi-Agent Coordination via Shared SQL Server State — AI-Native Apps on SQL Server</title>
+<meta name="description" content="Blackboards, task queues, coordinator election, conflict resolution, and termination.">
+<script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-200">
+  <div class="max-w-3xl mx-auto px-6 py-10">
+    <p class="text-blue-400 text-sm font-semibold tracking-wide uppercase mb-2">AI-Native Apps on SQL Server</p>
+    <p class="text-gray-500 text-sm mb-1">Chapter 26 of 40</p>
+    <h1 class="text-3xl font-bold text-white mb-8">Multi-Agent Coordination via Shared SQL Server State</h1>
+    <article class="space-y-5">
+<p class="text-gray-300 leading-relaxed">One agent is a tool user; many agents are a system. Multi-agent architectures split work across specialized agents — a researcher, a writer, a critic, a coder — that must coordinate: divide tasks, share intermediate results, avoid duplicating work, and converge on a final answer. SQL Server is the coordination substrate: a shared blackboard every agent reads and writes, with the transactional guarantees that keep concurrent agents consistent. This chapter builds the coordination patterns — blackboard, task queues, leader election, and conflict resolution — that turn a crowd of agents into a team.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">26.1 The Blackboard Pattern</h3>
+
+<p class="text-gray-300 leading-relaxed">The blackboard is a shared workspace where agents post hypotheses, evidence, and partial results. Every agent sees everything; coordination emerges from the shared state rather than direct messaging:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- The blackboard: shared, versioned, attributed workspace per run
+CREATE TABLE dbo.blackboard (
+    entry_id      UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWID(),
+    run_id        UNIQUEIDENTIFIER NOT NULL,   -- the multi-agent run
+    agent_name    NVARCHAR(100) NOT NULL,      -- 'researcher', 'critic', ...
+    entry_type    NVARCHAR(30) NOT NULL
+                  CONSTRAINT CK_bb_type CHECK (entry_type IN
+                      (N'hypothesis', N'evidence', N'partial_result',
+                       N'critique', N'decision', N'note')),
+    content       NVARCHAR(MAX) NOT NULL,
+    confidence    DECIMAL(3,2) NULL,
+    supersedes_id UNIQUEIDENTIFIER NULL       -- refinement chain
+                  CONSTRAINT FK_bb_supersedes REFERENCES dbo.blackboard(entry_id),
+    created_at    DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
+);
+CREATE INDEX IX_bb_run ON dbo.blackboard(run_id, created_at);
+
+-- Agents read the current state: latest non-superseded entries by type
+CREATE OR ALTER PROCEDURE dbo.usp_blackboard_snapshot
+    @run_id UNIQUEIDENTIFIER
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SELECT agent_name, entry_type, content, confidence, created_at
+    FROM dbo.blackboard
+    WHERE run_id = @run_id
+      AND NOT EXISTS (SELECT 1 FROM dbo.blackboard AS s
+                      WHERE s.supersedes_id = blackboard.entry_id)
+    ORDER BY created_at;
+END;
+GO</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The refinement chain (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">supersedes_id</code>) is what keeps the blackboard from becoming an append-only swamp: agents improve each other's entries rather than piling contradictions, and the snapshot always shows the current best understanding.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">26.2 Task Distribution: The Work Queue</h3>
+
+<p class="text-gray-300 leading-relaxed">For divisible work (research these 20 questions, review these 50 documents), a task queue with claim semantics distributes work across agents — the same pattern as §13.2's ingest queue, extended with dependencies:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE dbo.agent_tasks (
+    task_id       UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWID(),
+    run_id        UNIQUEIDENTIFIER NOT NULL,
+    parent_task_id UNIQUEIDENTIFIER NULL      -- dependency: run after parent
+                  CONSTRAINT FK_at_parent REFERENCES dbo.agent_tasks(task_id),
+    task_type     NVARCHAR(100) NOT NULL,
+    payload       JSON NOT NULL,
+    status        NVARCHAR(20) NOT NULL DEFAULT N'pending'
+                  CONSTRAINT CK_at_status CHECK (status IN
+                      (N'pending',N'claimed',N'done',N'failed')),
+    claimed_by    NVARCHAR(100) NULL,         -- agent name
+    claimed_at    DATETIME2 NULL,
+    result        JSON NULL,
+    attempts      INT NOT NULL DEFAULT 0,
+    created_at    DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
+);
+
+-- Claim only tasks whose parents are done (dependency-aware scheduling)
+CREATE OR ALTER PROCEDURE dbo.usp_claim_agent_task
+    @run_id UNIQUEIDENTIFIER, @agent_name NVARCHAR(100)
+AS
+BEGIN
+    SET NOCOUNT ON;
+    UPDATE TOP (1) dbo.agent_tasks WITH (READPAST, UPDLOCK)
+    SET status = N'claimed', claimed_by = @agent_name,
+        claimed_at = SYSUTCDATETIME(), attempts = attempts + 1
+    OUTPUT INSERTED.task_id, INSERTED.task_type, INSERTED.payload
+    WHERE run_id = @run_id AND status = N'pending'
+      AND (parent_task_id IS NULL OR EXISTS (
+              SELECT 1 FROM dbo.agent_tasks AS p
+              WHERE p.task_id = agent_tasks.parent_task_id
+                AND p.status = N'done'))
+      OR (status = N'claimed' AND claimed_at &lt; DATEADD(minute, -10, SYSUTCDATETIME())
+          AND run_id = @run_id);
+END;
+GO</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Dependencies turn the queue into a DAG scheduler: the planner agent decomposes the goal into tasks with parent links, and worker agents claim whatever is ready. Failed tasks return to pending for retry (with attempt counts bounding infinite loops).</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">26.3 Leader Election and the Coordinator Agent</h3>
+
+<p class="text-gray-300 leading-relaxed">Some decisions need a single decider: final answer synthesis, conflict resolution, run termination. Elect a coordinator with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sp_getapplock</code> — the same primitive as §7.2's turn lock:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Coordinator election: first agent to grab the run-scoped lock leads.
+-- Others proceed as workers; if the coordinator dies, its connection drops
+-- and the lock releases for re-election.
+CREATE OR ALTER PROCEDURE dbo.usp_elect_coordinator
+    @run_id UNIQUEIDENTIFIER, @agent_name NVARCHAR(100)
+AS
+BEGIN
+    SET NOCOUNT ON;
+    DECLARE @rc INT;
+    EXEC @rc = sp_getapplock
+        @Resource = @run_id, @LockMode = 'Exclusive',
+        @LockOwner = 'Session', @LockTimeout = 0;  -- no wait: election, not queue
+    IF @rc = 0
+        UPDATE dbo.agent_runs
+        SET status = N'running'
+        OUTPUT INSERTED.run_id
+        WHERE run_id = @run_id;
+    -- Caller: @rc = 0 → you are the coordinator (hold the connection!).
+    -- @rc = -1 → someone else leads; work as a regular agent.
+END;
+GO</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The coordinator's job is convergence: watch the blackboard, detect when the evidence supports a decision, resolve contradictions (next section), and terminate the run. Keep coordinator logic simple — it is the hardest agent to debug because its failures look like everyone else's confusion.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">26.4 Conflict Resolution Between Agents</h3>
+
+<p class="text-gray-300 leading-relaxed">Agents disagree: the researcher says the refund window is 30 days, the critic's document search says 60. Resolution strategies, escalating:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Evidence-weighted voting.</strong> Each hypothesis carries confidence and citations; the coordinator picks the best-supported one. Works when disagreement is about facts with sources.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Adversarial round.</strong> The coordinator posts the conflict to the blackboard as a critique entry and tasks one agent with steelmanning each side. The stronger argument wins — recorded for audit.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Human escalation.</strong> Unresolvable conflicts (or high-stakes ones) become approval requests (§20.4). The run pauses with the conflict context attached.</li>
+
+<p class="text-gray-300 leading-relaxed">Record every resolution as a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">decision</code> entry on the blackboard with the losing hypothesis preserved — the decision log is what makes multi-agent behavior explainable after the fact.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">26.5 Termination: Knowing When to Stop</h3>
+
+<p class="text-gray-300 leading-relaxed">Agent runs must terminate. The coordinator checks three conditions after each blackboard update:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Goal satisfied:</strong> a decision entry addresses the run's goal with confidence above threshold → complete.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Budget exhausted:</strong> step count, token spend, or wall-clock time exceeds the run's budget → stop with partial results (a partial answer beats an infinite run).</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Stagnation:</strong> no new non-superseded entries in N consecutive checks → the agents are going in circles; terminate and report.</li>
+
+<p class="text-gray-300 leading-relaxed">Budgets are set at run creation and enforced by the coordinator querying <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">agent_actions</code> counts and the audit log's token sums. Every run gets a budget — unbounded agent runs are a billing incident with extra steps.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">26.6 Run Telemetry: Debugging the Team</h3>
+
+<p class="text-gray-300 leading-relaxed">Multi-agent runs are the hardest thing in this book to debug — five agents, dozens of tool calls, emergent behavior. Make every run self-describing: the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">agent_runs</code> table records the goal, the plan DAG, the coordinator's decisions, and the termination reason; the blackboard preserves the full reasoning trace; the audit log prices it. Build one run-timeline view that interleaves blackboard entries, tool calls, and coordinator decisions chronologically — the equivalent of a distributed trace for agents. When a run goes wrong, the timeline answers the three debugging questions in order: what did each agent believe (blackboard), what did each agent do (actions), and why did the coordinator decide what it decided (decisions). Without this, multi-agent debugging is reading tea leaves.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Coordinate through shared SQL Server state, not direct messaging:</strong> a versioned blackboard for shared understanding, a dependency-aware task queue for divisible work, sp_getapplock for coordinator election.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Refine, don't pile:</strong> the supersedes chain keeps the blackboard snapshot at the current best understanding instead of an append-only swamp.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Resolve conflicts by evidence-weighted voting, then adversarial rounds, then human escalation</strong> — and record every decision with the losing hypothesis preserved.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Terminate on goal satisfaction, budget exhaustion, or stagnation.</strong> Every run gets a budget; unbounded runs are billing incidents.</li>
+
+    </article>
+
+      <nav class="flex items-center justify-center gap-3 mt-12 mb-4 text-sm">
+        <a href="chapter-25.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">← Chapter 25</a>
+        <a href="index.html" class="px-4 py-2 rounded-lg bg-gray-800 text-gray-300 hover:bg-gray-700 transition">All Chapters</a>
+        <a href="chapter-27.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">Chapter 27 →</a>
+      </nav>
+<div class="bg-gradient-to-r from-blue-900/40 to-indigo-900/40 border border-blue-800/50 rounded-2xl p-6 mt-10">
+        <p class="text-gray-300 text-sm leading-relaxed"><strong class="text-white">Keep going.</strong> You're reading <em class="text-blue-300">AI-Native Apps on SQL Server</em> — one of seven free deep-dives in the DBA Library, covering SQL Server performance tuning, high availability, security, automation, and more. <a href="../index.html" class="text-blue-400 hover:text-blue-300 underline">Browse the full library →</a></p>
+      </div>
+    <footer class="text-center text-gray-600 text-xs mt-10 pb-6">DBA Library · AI-Native Apps on SQL Server · Free for the SQL Server community</footer>
+  </div>
+</body>
+</html>

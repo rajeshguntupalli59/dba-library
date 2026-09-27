@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 27: Change Tracking for Real-Time AI Triggers — AI-Native Apps on SQL Server</title>
+<meta name="description" content="Reacting to data changes with Change Tracking: triggers, cursors, and column-aware reactions.">
+<script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-200">
+  <div class="max-w-3xl mx-auto px-6 py-10">
+    <p class="text-blue-400 text-sm font-semibold tracking-wide uppercase mb-2">AI-Native Apps on SQL Server</p>
+    <p class="text-gray-500 text-sm mb-1">Chapter 27 of 40</p>
+    <h1 class="text-3xl font-bold text-white mb-8">Change Tracking for Real-Time AI Triggers</h1>
+    <article class="space-y-5">
+<p class="text-gray-300 leading-relaxed">AI applications need to react to data changes: a new support ticket arrives → draft a response; a document is updated → re-embed it; a user's plan changes → adjust their quotas. Polling the database every few seconds is the naive answer — wasteful, latent, and blind to what actually changed. SQL Server's Change Tracking tells you exactly which rows changed since a version number, with minimal overhead. This chapter builds real-time AI triggers on Change Tracking: the enablement pattern, the poll-and-react worker, change-driven re-embedding, and when to graduate to Change Data Capture (Chapter 30) instead.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">27.1 Enabling Change Tracking</h3>
+
+<p class="text-gray-300 leading-relaxed">Change Tracking is a database-level feature with per-table opt-in. It records, per table, the primary keys of changed rows and the change version — not the changed data itself, which keeps overhead minimal:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Enable at the database level (retention: how long change metadata is kept)
+ALTER DATABASE aiapp
+SET CHANGE_TRACKING = ON
+(CHANGE_RETENTION = 2 DAYS, AUTO_CLEANUP = ON);
+GO
+
+-- Opt in the tables AI triggers care about
+ALTER TABLE dbo.documents ENABLE CHANGE_TRACKING
+WITH (TRACK_COLUMNS_UPDATED = ON);
+ALTER TABLE dbo.users ENABLE CHANGE_TRACKING;
+ALTER TABLE dbo.orders ENABLE CHANGE_TRACKING
+WITH (TRACK_COLUMNS_UPDATED = ON);
+GO
+
+-- What changed since version @last_version? The core query pattern.
+DECLARE @last_version BIGINT = 12345;  -- persisted by the worker (see §27.2)
+SELECT d.document_id,
+       ct.SYS_CHANGE_OPERATION AS op,       -- I, U, D
+       ct.SYS_CHANGE_COLUMNS AS changed_cols,
+       ct.SYS_CHANGE_VERSION AS ver
+FROM CHANGETABLE(CHANGES dbo.documents, @last_version) AS ct
+LEFT JOIN dbo.documents AS d ON d.document_id = ct.document_id;
+-- For deletes (op = 'D'), the LEFT JOIN yields NULLs — the key comes from ct.</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">TRACK_COLUMNS_UPDATED = ON</code> records which columns changed — essential for triggers that only care about specific columns (re-embed when <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">content</code> changes, ignore <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">updated_at</code> touches). Without it, every update looks the same.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">27.2 The Poll-and-React Worker</h3>
+
+<p class="text-gray-300 leading-relaxed">Change Tracking is poll-based: a worker asks "what changed since my last version?" on a loop. The version cursor is the worker's state — persisted in a table so restarts resume without gaps or replays:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE dbo.change_cursors (
+    cursor_name   NVARCHAR(200) PRIMARY KEY,  -- 'doc_reembed', 'ticket_triage'
+    last_version  BIGINT NOT NULL,
+    updated_at    DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
+);
+
+# Worker loop (Python): poll, react, advance cursor — all transactional
+def run_trigger(cursor_name, poll_interval_s=5):
+    while True:
+        with db() as conn:
+            cur = conn.cursor()
+            last = cur.execute(
+                "SELECT last_version FROM dbo.change_cursors WHERE cursor_name = ?",
+                cursor_name).fetchone()[0]
+            current = cur.execute(
+                "SELECT CHANGE_TRACKING_CURRENT_VERSION()").fetchone()[0]
+
+            # Guard: if retention expired our version, resync from scratch
+            min_valid = cur.execute(
+                "SELECT CHANGE_TRACKING_MIN_VALID_VERSION("
+                "OBJECT_ID('dbo.documents'))").fetchone()[0]
+            if last &lt; min_valid:
+                last = min_valid  # some changes may be missed: log + alert
+                log_resync(cursor_name, last)
+
+            changes = cur.execute("""
+                SELECT ct.document_id, ct.SYS_CHANGE_OPERATION AS op
+                FROM CHANGETABLE(CHANGES dbo.documents, ?) AS ct
+            """, last).fetchall()
+
+            for doc_id, op in changes:
+                react_to_change(cursor_name, doc_id, op)  # enqueue work
+
+            cur.execute(
+                "UPDATE dbo.change_cursors SET last_version = ?, "
+                "updated_at = SYSUTCDATETIME() WHERE cursor_name = ?",
+                current, cursor_name)
+            conn.commit()
+        time.sleep(poll_interval_s)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The retention guard is the critical correctness detail: if the worker is down longer than <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CHANGE_RETENTION</code>, change metadata is cleaned up and the cursor is invalid. The worker must detect this (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CHANGE_TRACKING_MIN_VALID_VERSION</code>) and resynchronize — for the document trigger, that means a full hash-comparison sweep (§17.1).</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">27.3 Trigger Patterns for AI Workflows</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Document changed → re-embed.</strong> The worker enqueues modified documents to the ingest queue (§13.2). Column tracking ensures only content changes trigger re-embedding — metadata edits don't waste API budget.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>New ticket/order → agentic triage.</strong> An insert into the tickets table starts an agent run (§20.1) that classifies, drafts a response, and requests approval — the real-time support copilot.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>User plan changed → quota refresh.</strong> A plan upgrade updates <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">tenant_config</code> and resets buckets immediately, instead of waiting for the next billing cycle job.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Feedback received → eval signal.</strong> A down-vote insert triggers the promotion-to-golden-set review queue (§19.5) — the feedback loop reacting in minutes, not weeks.</li>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Column-aware reaction: only re-embed when content actually changed
+-- (SYS_CHANGE_COLUMNS bitmask → check the content column's bit)
+DECLARE @content_col_id INT = COLUMNPROPERTY(
+    OBJECT_ID('dbo.documents'), 'content', 'ColumnId');
+
+SELECT ct.document_id
+FROM CHANGETABLE(CHANGES dbo.documents, @last_version) AS ct
+WHERE ct.SYS_CHANGE_OPERATION IN ('I', 'U')
+  AND (ct.SYS_CHANGE_COLUMNS IS NULL  -- NULL = all columns (bulk ops)
+       OR CHANGE_TRACKING_IS_COLUMN_IN_MASK(@content_col_id,
+                                            ct.SYS_CHANGE_COLUMNS) = 1);</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">27.4 Change Tracking vs. Change Data Capture</h3>
+
+<p class="text-gray-300 leading-relaxed">Change Tracking answers "which rows changed"; Change Data Capture (Chapter 30) answers "what did the rows look like before and after." Choose by the question:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Change Tracking:</strong> lightweight, synchronous, minimal storage. Right when the reaction re-reads the current row anyway (re-embed reads the document; triage reads the ticket). This chapter's triggers.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Change Data Capture:</strong> asynchronous log-based capture of before/after images. Right when the reaction needs the old values (audit diffs, feature pipelines computing deltas, syncing to a warehouse). Chapter 30.</li>
+
+<p class="text-gray-300 leading-relaxed">They compose: Change Tracking for the low-latency trigger ("something changed, go look"), CDC for the analytical consumption ("here's exactly what changed"). Enable both on the tables that need both — the overheads are independent.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">27.5 Fan-Out: One Change, Many Reactions</h3>
+
+<p class="text-gray-300 leading-relaxed">Real systems rarely have one trigger per table — a document change should re-embed the document, invalidate the semantic cache, notify the query-notification subscribers, and update the tenant's search analytics. The naive approach (one poll loop per reaction) multiplies database load; the better pattern is a single change-feed worker that fans out. The worker polls Change Tracking once per table, then publishes the change set to Service Broker (§28.1) — one message per reaction type — and each activated handler processes its own concern independently. Reactions become independently scalable (add queue readers to the slow one), independently retryable (a failed cache invalidation doesn't block re-embedding), and independently observable (queue depth per reaction type shows exactly which downstream is struggling). The fan-out also decouples producers from consumers: adding a fifth reaction to document changes means adding a handler, not touching the poll loop. Keep the fan-out mapping in a table (table → reaction → enabled) so reactions can be toggled without deployments — the on-call will thank you when they need to pause re-embedding during an incident without stopping triage.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Use Change Tracking for "which rows changed" triggers</strong> — minimal overhead, synchronous, with TRACK_COLUMNS_UPDATED so reactions fire only on relevant column changes.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Persist the version cursor per trigger and guard against retention expiry</strong> with CHANGE_TRACKING_MIN_VALID_VERSION — a worker down longer than retention must resynchronize, not resume blindly.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Reactions enqueue work; they don't do work.</strong> The poll loop stays fast and transactional; the ingest queue, agent runs, and quota procedures do the heavy lifting.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Choose Change Tracking vs. CDC by the question:</strong> "which rows" → CT; "what did they look like before/after" → CDC. Enable both where both questions matter.</li>
+
+    </article>
+
+      <nav class="flex items-center justify-center gap-3 mt-12 mb-4 text-sm">
+        <a href="chapter-26.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">← Chapter 26</a>
+        <a href="index.html" class="px-4 py-2 rounded-lg bg-gray-800 text-gray-300 hover:bg-gray-700 transition">All Chapters</a>
+        <a href="chapter-28.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">Chapter 28 →</a>
+      </nav>
+<div class="bg-gradient-to-r from-blue-900/40 to-indigo-900/40 border border-blue-800/50 rounded-2xl p-6 mt-10">
+        <p class="text-gray-300 text-sm leading-relaxed"><strong class="text-white">Keep going.</strong> You're reading <em class="text-blue-300">AI-Native Apps on SQL Server</em> — one of seven free deep-dives in the DBA Library, covering SQL Server performance tuning, high availability, security, automation, and more. <a href="../index.html" class="text-blue-400 hover:text-blue-300 underline">Browse the full library →</a></p>
+      </div>
+    <footer class="text-center text-gray-600 text-xs mt-10 pb-6">DBA Library · AI-Native Apps on SQL Server · Free for the SQL Server community</footer>
+  </div>
+</body>
+</html>

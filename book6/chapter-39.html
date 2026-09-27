@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 39: Testing AI Applications Backed by SQL Server — AI-Native Apps on SQL Server</title>
+<meta name="description" content="Transaction fixtures, record/replay cassettes, eval-gated deploys, and load testing.">
+<script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-200">
+  <div class="max-w-3xl mx-auto px-6 py-10">
+    <p class="text-blue-400 text-sm font-semibold tracking-wide uppercase mb-2">AI-Native Apps on SQL Server</p>
+    <p class="text-gray-500 text-sm mb-1">Chapter 39 of 40</p>
+    <h1 class="text-3xl font-bold text-white mb-8">Testing AI Applications Backed by SQL Server</h1>
+    <article class="space-y-5">
+<p class="text-gray-300 leading-relaxed">Testing AI applications is testing a probabilistic system with a deterministic database underneath — which is actually good news: the database half tests like any database, and the AI half can be pinned, replayed, and evaluated. This chapter builds the testing strategy: deterministic database tests with transactions and snapshots, LLM interaction testing with recorded replays, the evaluation harness from Chapter 19 as a regression suite, and load testing the vector-search and pooling layers before production does it for you.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">39.1 Database Tests: Transactions as Test Fixtures</h3>
+
+<p class="text-gray-300 leading-relaxed">Every procedure in this book is testable with the same pattern: begin a transaction, seed data, execute, assert, roll back. No test database restores, no cleanup scripts:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- tSQLt-style test without the framework: transaction + rollback
+BEGIN TRAN;
+BEGIN TRY
+    -- Arrange: seed a tenant, user, conversation
+    DECLARE @t UNIQUEIDENTIFIER = NEWID(), @u UNIQUEIDENTIFIER = NEWID();
+    INSERT INTO dbo.tenants (tenant_id, name) VALUES (@t, N'test');
+    INSERT INTO dbo.users (user_id, tenant_id) VALUES (@u, @t);
+
+    -- Act: consume rate tokens twice the capacity
+    EXEC dbo.usp_consume_rate_tokens @t, @u, N'chat', 1000000;
+
+    -- Assert: second consume fails (@@ROWCOUNT = 0 path)
+    DECLARE @rc INT;
+    EXEC @rc = dbo.usp_consume_rate_tokens @t, @u, N'chat', 1;
+    IF @rc = 0 PRINT 'PASS: bucket exhausted correctly'
+    ELSE THROW 50001, 'FAIL: overspend allowed', 1;
+END TRY
+BEGIN CATCH
+    PRINT ERROR_MESSAGE();
+END CATCH
+ROLLBACK;  -- the test never touched real data
+-- For heavier fixtures: database snapshots (CREATE DATABASE ... AS SNAPSHOT)
+-- give a read-only restore point the test suite reverts to between runs.</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Test the security-critical procedures hardest: RLS predicate functions (attempt cross-tenant reads), the text-to-SQL validators (feed them DROP TABLE and UNION attacks), the erasure procedure (verify every inventory table). These are the tests that prevent incidents.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">39.2 LLM Interaction Tests: Record and Replay</h3>
+
+<p class="text-gray-300 leading-relaxed">LLM calls are non-deterministic and expensive — both fatal for a test suite. The answer is the cassette pattern: record real provider responses once, replay them in tests:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Record:</strong> run the golden-question set (§19.1) against the live model; store (prompt hash → response) in a test cassette table.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Replay:</strong> tests inject the cassette transport — the application code is identical, but LLM calls return recorded responses keyed by prompt hash.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Re-record on purpose:</strong> when prompts change intentionally, regenerate the cassettes and diff the responses — unexpected diffs are regressions, expected diffs are the change working.</li>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE dbo.test_cassettes (
+    cassette_set NVARCHAR(100) NOT NULL,     -- 'golden_v3', 'regression_2026_09'
+    prompt_hash  CHAR(64) NOT NULL,          -- SHA2_256 of the full prompt
+    model        NVARCHAR(100) NOT NULL,
+    response_json JSON NOT NULL,             -- recorded provider response
+    recorded_at  DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+    CONSTRAINT PK_cassette PRIMARY KEY (cassette_set, prompt_hash)
+);
+-- Test setup: point the LLM client at the cassette transport for the set.
+-- Test asserts on APPLICATION behavior (which tools were called, what SQL
+-- was generated, what the audit rows contain) — not on the model's words,
+// which are pinned by the cassette.</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">39.3 The Evaluation Suite as Regression Tests</h3>
+
+<p class="text-gray-300 leading-relaxed">Chapter 19's evaluation harness doubles as the regression suite: every prompt change, model change, or retrieval change runs the golden set, and the scores must not regress beyond a threshold:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Gate deployments</strong> on eval scores: the CI pipeline runs the golden set against the candidate build; a faithfulness drop &gt; 3 points blocks the deploy.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Track score history</strong> in the eval tables — the trend line distinguishes a real regression from judge noise (§19.2's calibrated judges).</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Adversarial regression set:</strong> the injection attempts from §37, the text-to-SQL attacks from §22.3, the cross-tenant probes from §12 — every fixed vulnerability becomes a permanent regression test.</li>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">39.4 Load Testing: Vector Search and Pool Saturation</h3>
+
+<p class="text-gray-300 leading-relaxed">Two load tests matter before launch:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Vector-search concurrency:</strong> replay production-like query vectors at increasing concurrency and watch <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">avg_cpu_ms</code> (§36.1) and p95 latency. The knee in the curve sets the per-replica concurrency limit (§35.1) and the autoscale trigger.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Pool saturation:</strong> simulate peak streaming concurrency (§29.2's held connections) plus burst chat traffic; watch for THREADPOOL waits (§36.1) and pool timeouts. Size the pool (§5.1) at 130% of the measured saturation point.</li>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Load-test harness sketch (driver in your load tool of choice):
+-- 1. Seed: 1M vectors across 50 tenants (production-shaped distribution).
+-- 2. Workload A: vector search at 10 → 200 concurrent (step +20 every 2 min).
+--    Capture: p50/p95/p99 latency, avg_cpu_ms, errors.
+-- 3. Workload B: mixed chat (history replay + insert + search) at peak.
+--    Capture: pool wait time, THREADPOOL waits, blocked sessions.
+-- 4. Pass criteria: p95 search &lt; 300ms at 150 concurrent; zero pool
+--    timeouts at 2× expected peak streams.
+-- Store every run's measurements in dbo.load_test_runs for trend comparison.</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Load-test against a production-shaped database (data volume, index state, statistics) — a 10k-row test database proves nothing about a 100M-row production one. Restore a sanitized production backup to the load environment.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">39.5 Chaos Testing for AI Pipelines</h3>
+
+<p class="text-gray-300 leading-relaxed">Unit tests (§39.1) and load tests (§39.4) verify the expected; chaos testing verifies the unexpected — the failure modes unique to AI pipelines. Run these experiments in staging monthly:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Kill the model provider mid-run:</strong> agent runs in flight, streams half-written. Verify: the orphan reaper (§29.3) marks streams abandoned, agent runs record failure with partial state, no user is charged for the failed tokens (§33.1's status filter), and resume works (§29.5).</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Corrupt the vector index:</strong> drop the index mid-traffic. Verify: searches degrade to the fallback path (or fail loudly — never silently wrong), the alert fires (§36.3), and rebuild (§15.3) restores service.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Expire the Change Tracking retention:</strong> stop the worker for 3 days. Verify: the resync path (§27.2) triggers, the alert fires before data loss, and the full hash-comparison sweep (§17.1) converges.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Poison the queue:</strong> inject a malformed Service Broker message. Verify: it lands in dead letters (§28.2), the queue keeps moving, and the alert names the message type.</li>
+
+<p class="text-gray-300 leading-relaxed">Each experiment gets a hypothesis ("the reaper marks the stream abandoned within 10 minutes"), a blast-radius limit (staging only, or 1% of production traffic with a kill switch), and a written result. The first chaos run always finds something the unit tests missed — usually a missing alert, not a missing feature. That missing alert is the real deliverable.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<p class="text-gray-300 leading-relaxed">Don't forget the human side of testing: run usability sessions where real users try to break the chat — ambiguous questions, contradictory follow-ups, pasted error dumps, questions in mixed languages. Log every session as a potential golden-set addition (§19.1): the questions users actually ask are always stranger than the ones engineers invent. A quarterly "break the bot" session with support staff produces more valuable test cases than a month of synthetic test generation, because it samples the real distribution.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Test database logic with transaction-scoped fixtures</strong> — arrange, act, assert, roll back — and test the security-critical procedures (RLS, validators, erasure) hardest.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Pin the LLM with record/replay cassettes</strong> keyed by prompt hash; assert on application behavior, and treat cassette diffs on re-record as regression signals.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Gate deployments on the evaluation suite:</strong> golden-set scores must not regress, and every fixed vulnerability becomes a permanent adversarial test.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Load-test vector search concurrency and pool saturation</strong> against production-shaped data — the knee in the curve sets your scaling triggers.</li>
+
+    </article>
+
+      <nav class="flex items-center justify-center gap-3 mt-12 mb-4 text-sm">
+        <a href="chapter-38.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">← Chapter 38</a>
+        <a href="index.html" class="px-4 py-2 rounded-lg bg-gray-800 text-gray-300 hover:bg-gray-700 transition">All Chapters</a>
+        <a href="chapter-40.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">Chapter 40 →</a>
+      </nav>
+<div class="bg-gradient-to-r from-blue-900/40 to-indigo-900/40 border border-blue-800/50 rounded-2xl p-6 mt-10">
+        <p class="text-gray-300 text-sm leading-relaxed"><strong class="text-white">Keep going.</strong> You're reading <em class="text-blue-300">AI-Native Apps on SQL Server</em> — one of seven free deep-dives in the DBA Library, covering SQL Server performance tuning, high availability, security, automation, and more. <a href="../index.html" class="text-blue-400 hover:text-blue-300 underline">Browse the full library →</a></p>
+      </div>
+    <footer class="text-center text-gray-600 text-xs mt-10 pb-6">DBA Library · AI-Native Apps on SQL Server · Free for the SQL Server community</footer>
+  </div>
+</body>
+</html>

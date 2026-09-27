@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 14: Document Ingestion and Chunking Pipelines — AI-Native Apps on SQL Server</title>
+<meta name="description" content="Chunking strategies, batch embedding, queue-driven ingestion, and idempotent pipelines.">
+<script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-200">
+  <div class="max-w-3xl mx-auto px-6 py-10">
+    <p class="text-blue-400 text-sm font-semibold tracking-wide uppercase mb-2">AI-Native Apps on SQL Server</p>
+    <p class="text-gray-500 text-sm mb-1">Chapter 14 of 40</p>
+    <h1 class="text-3xl font-bold text-white mb-8">Document Ingestion and Chunking Pipelines</h1>
+    <article class="space-y-5">
+<p class="text-gray-300 leading-relaxed">Ingestion is where RAG quality is won or lost. The embedding model and vector index get the glory, but retrieval can only find what chunking preserved: split a document badly and the answer becomes unretrievable no matter how good the search. This chapter goes deep on the ingestion pipeline sketched in Chapters 1 and 13 — chunking strategies for different document types, embedding hygiene (batching, retries, model pinning), transactional storage patterns in SQL Server, and the observability that tells you ingestion is healthy. By the end, your pipeline will handle PDFs, HTML, markdown, and structured exports with per-type strategies.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">14.1 Chunking Strategies by Document Type</h3>
+
+<p class="text-gray-300 leading-relaxed">One chunking strategy does not fit all documents. Match the strategy to the structure:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Prose (docs, wikis, articles): recursive character splitting.</strong> Split on paragraph → sentence → word boundaries, targeting 400–600 tokens with 10–15% overlap. Overlap preserves context across boundaries — the sentence that completes a thought often starts the next chunk.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Markdown / structured docs: header-aware splitting.</strong> Never split inside a section if you can avoid it; prepend the header path ("Refund Policy › Enterprise › Time limits") to each chunk so retrieved chunks carry their context.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Code: function/class boundaries.</strong> Split on syntactic units, include the file path and symbol name as metadata. A half-function chunk is worse than useless — it retrieves confidently and answers wrong.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Tables and structured data: row groups with headers.</strong> Keep the header row with every chunk; a table chunk without headers is uninterpretable. For wide tables, transpose to "attribute: value" sentences.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>PDFs: layout-aware extraction first.</strong> Strip headers/footers/page numbers before chunking — they pollute every chunk with repeated noise. Multi-column layouts need reading-order reconstruction.</li>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Header-aware markdown chunking: context travels with the chunk
+import re
+
+def chunk_markdown(text: str, max_tokens: int = 500) -&gt; list[dict]:
+    chunks, header_stack, buf, buf_tokens = [], [], [], 0
+    for line in text.splitlines():
+        m = re.match(r"^(#{1,4})\s+(.*)", line)
+        if m:
+            level = len(m.group(1))
+            header_stack = header_stack[:level - 1] + [m.group(2).strip()]
+            continue
+        toks = len(line.split())  # rough; use tiktoken in production
+        if buf_tokens + toks &gt; max_tokens and buf:
+            context = " › ".join(header_stack)
+            chunks.append({"header_path": context,
+                           "content": f"[{context}]\n" + "\n".join(buf)})
+            # overlap: carry the last 2 lines into the next chunk
+            buf, buf_tokens = buf[-2:], sum(len(l.split()) for l in buf[-2:])
+        buf.append(line); buf_tokens += toks
+    if buf:
+        context = " › ".join(header_stack)
+        chunks.append({"header_path": context,
+                       "content": f"[{context}]\n" + "\n".join(buf)})
+    return chunks</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Store the chunking strategy and parameters in the document's metadata JSON — when you later discover that 800-token chunks outperform 500-token chunks, you need to know which documents used which strategy to re-ingest selectively.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">14.2 Embedding Hygiene</h3>
+
+<p class="text-gray-300 leading-relaxed">The embedding API is the most failure-prone step in ingestion. Harden it:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Batch aggressively.</strong> Up to 100+ texts per call (provider-dependent). Batching is the difference between 10,000 API calls and 100 for a large corpus.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Retry with backoff and jitter</strong> on rate limits (429) and 5xx errors. Never retry on 400s — the input is bad, fix the chunk.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Pin the model version.</strong> <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-3-small</code> is not a version — providers update models behind names. Record the exact model version returned by the API in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">embedding_model</code>.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Validate dimensions on receipt.</strong> Assert <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">len(vec) == 1536</code> before insert — a truncated response that slips into the VECTOR column poisons the index silently.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Normalize text before embedding.</strong> Strip excessive whitespace, normalize unicode, remove boilerplate. The embedding should represent content, not formatting accidents.</li>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">14.3 Transactional Storage: The Atomic Unit</h3>
+
+<p class="text-gray-300 leading-relaxed">The atomic unit of ingestion is the document: either all of its chunks are stored or none are. Chapter 1's pipeline does this with a single transaction around MERGE + DELETE + bulk INSERT. Three refinements for production:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Bulk insert with Table-Valued Parameters or fast_executemany.</strong> Row-by-row inserts of 500 chunks take seconds; batched inserts take milliseconds. For very large documents, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SqlBulkCopy</code> (or pyodbc <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">fast_executemany</code>) into a staging table followed by a set-based INSERT…SELECT keeps the transaction short.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Keep transactions short.</strong> Do embedding API calls <em>before</em> opening the transaction, not inside it. The transaction should cover only database writes — seconds of API latency inside a transaction holds locks and bloats the log.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Record ingestion metadata.</strong> Chunk count, strategy, model version, duration, worker ID — in the document row. When retrieval quality regresses, this metadata is the first place you look.</li>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Ingestion metadata lives on the document row
+ALTER TABLE dbo.documents
+    ADD chunk_strategy   NVARCHAR(100) NULL,  -- 'markdown-headers/500t/15%'
+        chunk_count      INT NULL,
+        ingest_duration_ms INT NULL,
+        ingested_by      NVARCHAR(200) NULL,
+        ingest_batch_id  UNIQUEIDENTIFIER NULL;  -- group a re-ingest run
+GO
+-- "Which documents still use the old 800-token strategy?"
+SELECT document_id, title, chunk_strategy, chunk_count
+FROM dbo.documents
+WHERE tenant_id = @tenant_id
+  AND chunk_strategy &lt;&gt; N'markdown-headers/500t/15%';</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">14.4 Ingestion Observability</h3>
+
+<p class="text-gray-300 leading-relaxed">Instrument the pipeline with a dedicated ingestion log — separate from the LLM audit log, because the questions differ:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE dbo.ingest_log (
+    log_id          UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWID(),
+    tenant_id       UNIQUEIDENTIFIER NOT NULL,
+    document_id     UNIQUEIDENTIFIER NULL,
+    batch_id        UNIQUEIDENTIFIER NULL,
+    stage           NVARCHAR(30) NOT NULL   -- extract/chunk/embed/store
+                    CONSTRAINT CK_il_stage CHECK (stage IN
+                        (N'extract',N'chunk',N'embed',N'store',N'complete',N'failed')),
+    chunks_produced INT NULL,
+    duration_ms     INT NULL,
+    error_message   NVARCHAR(MAX) NULL,
+    created_at      DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
+);
+CREATE INDEX IX_il_batch ON dbo.ingest_log(batch_id, created_at);
+
+-- Pipeline health dashboard queries:
+-- 1. Failure rate by stage, last 24h
+SELECT stage,
+       SUM(CASE WHEN stage = 'failed' THEN 1 ELSE 0 END) AS failures,
+       COUNT(*) AS total
+FROM dbo.ingest_log
+WHERE created_at &gt;= DATEADD(day, -1, SYSUTCDATETIME())
+GROUP BY stage;
+
+-- 2. Embed-stage p95 latency trending (catches provider slowdowns)
+SELECT CAST(created_at AS DATE) AS day,
+       AVG(CAST(duration_ms AS FLOAT)) AS avg_ms,
+       MAX(duration_ms) AS max_ms
+FROM dbo.ingest_log
+WHERE stage = 'embed' AND created_at &gt;= DATEADD(day, -14, SYSUTCDATETIME())
+GROUP BY CAST(created_at AS DATE)
+ORDER BY day;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Alert on: failure rate above 1% in any stage, embed p95 latency doubling week-over-week (provider degradation), and queue depth growth (workers not keeping up). Ingestion failures are silent data gaps — nobody complains until the missing document is the one they needed.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">14.5 Handling Poison Documents</h3>
+
+<p class="text-gray-300 leading-relaxed">Some documents break pipelines: a 2 GB log file someone uploaded "for the AI to read," a PDF with 50,000 pages, a corrupted file that crashes the parser, a document that is 99% base64-encoded images. The ingestion pipeline needs circuit breakers before these become outages:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Size and page caps</strong> enforced at upload: reject files over the limit with a clear message, don't discover the limit mid-parse.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Parse timeouts</strong> per document — a parser that hasn't finished in 5 minutes gets killed and the document marked <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">failed_parse</code>, not retried forever.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Content-type sniffing:</strong> verify the magic bytes match the extension before parsing — a renamed executable is not a PDF.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Quarantine, don't delete:</strong> poison documents land in a quarantine view with the failure reason, so the user understands why their document isn't searchable and support has something concrete to investigate.</li>
+
+<p class="text-gray-300 leading-relaxed">Track poison-document rates per tenant in the observability dashboard (§14.4): a sudden spike usually means a broken export from the tenant's side, and a proactive "your last 200 uploads failed to parse — here's why" message beats 200 support tickets.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Match chunking strategy to document structure</strong> — recursive splitting for prose, header-aware for markdown, syntactic units for code, header-carrying row groups for tables — and record the strategy per document for selective re-ingestion.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Harden the embedding step:</strong> large batches, backoff with jitter, pinned model versions, dimension validation, and text normalization before the API call.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>The document is the atomic unit — but keep API calls outside the transaction.</strong> Embed first, then open a short transaction for MERGE + DELETE + bulk INSERT.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Log every ingestion stage separately from LLM audit.</strong> Alert on stage failure rates, embed latency trends, and queue depth — ingestion gaps are silent until they are critical.</li>
+
+    </article>
+
+      <nav class="flex items-center justify-center gap-3 mt-12 mb-4 text-sm">
+        <a href="chapter-13.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">← Chapter 13</a>
+        <a href="index.html" class="px-4 py-2 rounded-lg bg-gray-800 text-gray-300 hover:bg-gray-700 transition">All Chapters</a>
+        <a href="chapter-15.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">Chapter 15 →</a>
+      </nav>
+<div class="bg-gradient-to-r from-blue-900/40 to-indigo-900/40 border border-blue-800/50 rounded-2xl p-6 mt-10">
+        <p class="text-gray-300 text-sm leading-relaxed"><strong class="text-white">Keep going.</strong> You're reading <em class="text-blue-300">AI-Native Apps on SQL Server</em> — one of seven free deep-dives in the DBA Library, covering SQL Server performance tuning, high availability, security, automation, and more. <a href="../index.html" class="text-blue-400 hover:text-blue-300 underline">Browse the full library →</a></p>
+      </div>
+    <footer class="text-center text-gray-600 text-xs mt-10 pb-6">DBA Library · AI-Native Apps on SQL Server · Free for the SQL Server community</footer>
+  </div>
+</body>
+</html>

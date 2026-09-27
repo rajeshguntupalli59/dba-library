@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 25: Rate Limiting and Quota Tracking for AI Features — AI-Native Apps on SQL Server</title>
+<meta name="description" content="Token buckets, multi-window quotas, cost weighting, and communicating limits well.">
+<script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-200">
+  <div class="max-w-3xl mx-auto px-6 py-10">
+    <p class="text-blue-400 text-sm font-semibold tracking-wide uppercase mb-2">AI-Native Apps on SQL Server</p>
+    <p class="text-gray-500 text-sm mb-1">Chapter 25 of 40</p>
+    <h1 class="text-3xl font-bold text-white mb-8">Rate Limiting and Quota Tracking for AI Features</h1>
+    <article class="space-y-5">
+<p class="text-gray-300 leading-relaxed">Every AI feature has a marginal cost — tokens are money, and money needs limits. Rate limiting protects the system (no single user can drown the API), quota tracking protects the business (usage maps to plan tiers and invoices), and both protect users from runaway agents burning budget in a loop. This chapter builds the complete limiting layer in SQL Server: token-bucket rate limiting with atomic consumption, multi-window quotas (per-minute, per-day, per-month), per-feature cost weighting, and the UX of communicating limits to users and agents.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">25.1 Token Buckets in SQL Server</h3>
+
+<p class="text-gray-300 leading-relaxed">The token bucket is the right algorithm for AI rate limiting: it allows bursts (a user pasting five questions at once) while enforcing a sustained rate. The bucket state lives in a table; consumption is a single atomic statement:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE dbo.rate_buckets (
+    bucket_id     UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWID(),
+    tenant_id     UNIQUEIDENTIFIER NOT NULL,
+    user_id       UNIQUEIDENTIFIER NULL,      -- NULL = tenant-level bucket
+    feature       NVARCHAR(100) NOT NULL,     -- 'chat', 'embed', 'agent_run'
+    tokens        DECIMAL(12,2) NOT NULL,     -- current balance
+    capacity      DECIMAL(12,2) NOT NULL,     -- max burst
+    refill_rate   DECIMAL(12,4) NOT NULL,     -- tokens per second
+    last_refill_at DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+    CONSTRAINT UQ_bucket UNIQUE (tenant_id, user_id, feature)
+);
+
+-- Atomic consume: refill lazily, deduct, succeed/fail in ONE statement.
+-- Returns 1 row on success (with remaining balance), 0 rows when limited.
+CREATE OR ALTER PROCEDURE dbo.usp_consume_rate_tokens
+    @tenant_id UNIQUEIDENTIFIER,
+    @user_id   UNIQUEIDENTIFIER,
+    @feature   NVARCHAR(100),
+    @cost      DECIMAL(12,2) = 1
+AS
+BEGIN
+    SET NOCOUNT ON;
+    DECLARE @now DATETIME2 = SYSUTCDATETIME();
+    UPDATE dbo.rate_buckets
+    SET tokens = CASE
+                     WHEN tokens + DATEDIFF(millisecond, last_refill_at, @now)
+                                       / 1000.0 * refill_rate &gt; capacity
+                     THEN capacity ELSE tokens + DATEDIFF(millisecond, last_refill_at, @now)
+                                       / 1000.0 * refill_rate
+                 END - @cost,
+        last_refill_at = @now
+    OUTPUT INSERTED.tokens AS remaining
+    WHERE tenant_id = @tenant_id
+      AND ((@user_id IS NULL AND user_id IS NULL) OR user_id = @user_id)
+      AND feature = @feature
+      AND tokens + DATEDIFF(millisecond, last_refill_at, @now)
+                 / 1000.0 * refill_rate &gt;= @cost;
+    -- @@ROWCOUNT = 0 → rate limited. Caller reads remaining for the
+    -- Retry-After header: (cost - remaining) / refill_rate seconds.
+END;
+GO</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Lazy refill (computing accrued tokens at consume time rather than on a timer) means no background job and no write amplification — the bucket only writes when consumed. The single-statement UPDATE…WHERE…OUTPUT is atomic: concurrent requests cannot overspend the bucket.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">25.2 Multi-Window Quotas</h3>
+
+<p class="text-gray-300 leading-relaxed">Rate limits handle bursts; quotas handle budgets. Track three windows simultaneously — per-minute (abuse), per-day (fair use), per-month (billing):</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE dbo.usage_windows (
+    tenant_id     UNIQUEIDENTIFIER NOT NULL,
+    user_id       UNIQUEIDENTIFIER NULL,
+    window_start  DATETIME2 NOT NULL,        -- truncated to window grain
+    window_grain  NVARCHAR(10) NOT NULL      -- 'minute', 'day', 'month'
+                  CONSTRAINT CK_uw_grain CHECK (window_grain IN
+                      (N'minute', N'day', N'month')),
+    tokens_used   BIGINT NOT NULL DEFAULT 0,
+    requests      INT NOT NULL DEFAULT 0,
+    CONSTRAINT PK_usage_windows PRIMARY KEY (tenant_id, user_id, window_grain, window_start)
+);
+
+-- Increment all three windows atomically (MERGE per grain, one transaction)
+CREATE OR ALTER PROCEDURE dbo.usp_record_usage
+    @tenant_id UNIQUEIDENTIFIER, @user_id UNIQUEIDENTIFIER, @tokens BIGINT
+AS
+BEGIN
+    SET NOCOUNT ON;
+    DECLARE @now DATETIME2 = SYSUTCDATETIME();
+    BEGIN TRAN;
+    MERGE dbo.usage_windows AS t
+    USING (VALUES
+        (N'minute', DATEADD(minute, DATEDIFF(minute, 0, @now), 0)),
+        (N'day',    CAST(@now AS DATE)),
+        (N'month',  DATEFROMPARTS(YEAR(@now), MONTH(@now), 1))
+    ) AS s (grain, wstart)
+      ON t.tenant_id = @tenant_id AND t.user_id = @user_id
+     AND t.window_grain = s.grain AND t.window_start = s.wstart
+    WHEN MATCHED THEN UPDATE SET tokens_used = t.tokens_used + @tokens,
+                                 requests = t.requests + 1
+    WHEN NOT MATCHED THEN INSERT (tenant_id, user_id, window_start, window_grain,
+                                   tokens_used, requests)
+                           VALUES (@tenant_id, @user_id, s.wstart, s.grain,
+                                   @tokens, 1);
+    COMMIT;
+END;
+GO
+-- Cleanup job: drop minute windows older than 2 hours, day windows older
+-- than 90 days. Month windows persist for billing history.</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">25.3 Per-Feature Cost Weighting</h3>
+
+<p class="text-gray-300 leading-relaxed">Not all tokens cost the same: GPT-4o output tokens cost more than input tokens, embeddings are nearly free, and agent tool calls have their own pricing. Weight consumption by feature so one unit of quota means one unit of cost:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE dbo.feature_costs (
+    feature       NVARCHAR(100) PRIMARY KEY,  -- 'chat_input', 'chat_output',
+                                             -- 'embedding', 'rerank', 'agent_tool'
+    cost_per_1k   DECIMAL(10,4) NOT NULL,     -- in quota units per 1k tokens/calls
+    updated_at    DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
+);
+-- Example weights (quota units per 1k):
+--   chat_input 1.0, chat_output 4.0, embedding 0.05, rerank 0.5, agent_tool 2.0
+-- The chat path computes: cost = (in_tokens/1000)*1.0 + (out_tokens/1000)*4.0
+-- and consumes that from the bucket — so a long answer costs proportionally
+-- more quota than a short one. Update weights when provider pricing changes;
+-- keep history in a versioned table for invoice disputes.</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Cost weighting is what makes quotas fair across features: without it, users arbitrage the cheapest feature, and your margin evaporates on the expensive ones.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">25.4 Communicating Limits: Headers, Errors, and Agent Behavior</h3>
+
+<p class="text-gray-300 leading-relaxed">A rate limit the user does not understand is a support ticket. Every limited response carries machine-readable headers:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>HTTP 429</strong> with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Retry-After</code> (seconds until the bucket affords the request) and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">X-RateLimit-Remaining</code>.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Quota exhaustion (monthly) is HTTP 402</strong> (payment required), not 429 — it needs a plan upgrade, not a retry. The response includes the upgrade URL.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Agents get structured limit signals</strong> in tool results, not HTTP codes: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">{"limited": true, "retry_after_s": 12, "quota_resets_at": "…"}</code> — so the agent loop can back off intelligently instead of erroring the run (§20.1).</li>
+
+<p class="text-gray-300 leading-relaxed">Also expose a quota-status endpoint backed by the usage_windows table — "you've used 62% of your monthly tokens" in the UI prevents most limit surprises. Transparency about limits is a retention feature.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">25.5 Quota Borrowing and Grace Periods</h3>
+
+<p class="text-gray-300 leading-relaxed">Hard quota walls create terrible user experiences: a customer mid-demo hits their monthly cap and the product stops working in front of their prospect. Soften the wall without removing it. <strong>Grace periods:</strong> when a tenant exhausts their monthly quota, allow a configurable overage (say 10%) while notifying both the tenant admin and your billing team — the overage is invoiced, and the notification starts the upsell conversation with evidence of need. <strong>Borrowing:</strong> let tenants borrow against next month's quota up to a limit, recorded as a negative carryover in the ledger (§33.2) so accounting stays exact. <strong>Never</strong> extend grace to the per-minute abuse bucket (§25.2) — grace is a billing feature, not a security feature, and abuse limits stay absolute. The policy table that configures grace per plan tier is a business decision; the enforcement stays in the same atomic consume procedures, so grace can't be bypassed by calling a different code path.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Implement token buckets with lazy refill and single-statement atomic consumption</strong> — no background jobs, no overspend under concurrency, bursts allowed with sustained-rate enforcement.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Track minute/day/month windows simultaneously</strong> with MERGE-based atomic increments; each window serves a different purpose (abuse, fair use, billing).</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Weight quota consumption by feature cost</strong> so one quota unit equals one cost unit — update weights when provider pricing changes and version them for invoice disputes.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Communicate limits precisely:</strong> 429 + Retry-After for rate limits, 402 + upgrade URL for exhausted quotas, structured signals for agents, and a visible quota-status UI to prevent surprises.</li>
+
+    </article>
+
+      <nav class="flex items-center justify-center gap-3 mt-12 mb-4 text-sm">
+        <a href="chapter-24.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">← Chapter 24</a>
+        <a href="index.html" class="px-4 py-2 rounded-lg bg-gray-800 text-gray-300 hover:bg-gray-700 transition">All Chapters</a>
+        <a href="chapter-26.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">Chapter 26 →</a>
+      </nav>
+<div class="bg-gradient-to-r from-blue-900/40 to-indigo-900/40 border border-blue-800/50 rounded-2xl p-6 mt-10">
+        <p class="text-gray-300 text-sm leading-relaxed"><strong class="text-white">Keep going.</strong> You're reading <em class="text-blue-300">AI-Native Apps on SQL Server</em> — one of seven free deep-dives in the DBA Library, covering SQL Server performance tuning, high availability, security, automation, and more. <a href="../index.html" class="text-blue-400 hover:text-blue-300 underline">Browse the full library →</a></p>
+      </div>
+    <footer class="text-center text-gray-600 text-xs mt-10 pb-6">DBA Library · AI-Native Apps on SQL Server · Free for the SQL Server community</footer>
+  </div>
+</body>
+</html>

@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 19: Evaluating RAG: Metrics and Feedback Loops — AI-Native Apps on SQL Server</title>
+<meta name="description" content="Faithfulness, relevance, golden sets, LLM judges, and the feedback flywheel.">
+<script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-200">
+  <div class="max-w-3xl mx-auto px-6 py-10">
+    <p class="text-blue-400 text-sm font-semibold tracking-wide uppercase mb-2">AI-Native Apps on SQL Server</p>
+    <p class="text-gray-500 text-sm mb-1">Chapter 19 of 40</p>
+    <h1 class="text-3xl font-bold text-white mb-8">Evaluating RAG: Metrics and Feedback Loops</h1>
+    <article class="space-y-5">
+<p class="text-gray-300 leading-relaxed">"The assistant feels worse this week" is not a diagnosable statement. RAG evaluation turns that feeling into numbers: retrieval recall, answer groundedness, citation precision, user satisfaction — measured continuously, stored in SQL Server, and wired into feedback loops that improve the system. This chapter builds the evaluation harness: the golden dataset, the metrics that matter, LLM-as-judge scoring, user feedback capture, and the closed loop from measurement to prompt/config change. If you cannot measure it, you cannot ship changes to it safely.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">19.1 The Golden Dataset</h3>
+
+<p class="text-gray-300 leading-relaxed">Evaluation starts with a dataset of questions with known-good answers, stored as tables — versioned, reviewable, and queryable:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE dbo.eval_sets (
+    eval_set_id   UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWID(),
+    name          NVARCHAR(200) NOT NULL,
+    description   NVARCHAR(MAX) NULL,
+    version       INT NOT NULL DEFAULT 1,
+    is_active     BIT NOT NULL DEFAULT 1,
+    created_at    DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
+);
+
+CREATE TABLE dbo.eval_questions (
+    question_id     UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWID(),
+    eval_set_id     UNIQUEIDENTIFIER NOT NULL
+                    CONSTRAINT FK_eq_set REFERENCES dbo.eval_sets(eval_set_id),
+    question        NVARCHAR(MAX) NOT NULL,
+    -- What a good answer must contain (judged semantically, not string-matched)
+    expected_points JSON NOT NULL,      -- ["mentions 30-day window", "cites policy §4.2"]
+    -- Chunks that SHOULD be retrieved for this question
+    expected_chunk_ids JSON NULL,       -- ["guid1", "guid2"]
+    category        NVARCHAR(50) NULL,  -- 'factual', 'multi-hop', 'adversarial'
+    difficulty      INT NULL            -- 1-5, for stratified sampling
+);
+CREATE INDEX IX_eq_set ON dbo.eval_questions(eval_set_id);</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Build the golden set from real user questions: sample production queries (anonymized), have domain experts write the expected points, and review quarterly. A golden set of 100–200 questions beats a synthetic set of 10,000 — it measures what users actually ask.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">19.2 The Metrics That Matter</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Retrieval recall@k.</strong> Fraction of <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">expected_chunk_ids</code> present in the top-k retrieved. Measures the retrieval path in isolation — chunking, embeddings, index, filters.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Answer groundedness.</strong> Does the answer's every factual claim trace to a cited chunk? Scored by an LLM judge (next section). The single most important quality metric for RAG.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Citation precision/recall.</strong> Of the cited chunks, how many were relevant (precision)? Of the relevant chunks, how many were cited (recall)? Catches both over-citation (padding) and under-citation (missing support).</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Expected-point coverage.</strong> Fraction of <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">expected_points</code> present in the answer. Measures end-to-end usefulness.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>User feedback rate.</strong> Thumbs up/down per answer in production. Noisy but real — the only metric measured on actual usage.</li>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE dbo.eval_runs (
+    run_id          UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWID(),
+    eval_set_id     UNIQUEIDENTIFIER NOT NULL,
+    -- What changed in this run: prompt version, k, model, flags...
+    config_snapshot JSON NOT NULL,
+    started_at      DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+    completed_at    DATETIME2 NULL,
+    status          NVARCHAR(20) NOT NULL DEFAULT N'running'
+);
+
+CREATE TABLE dbo.eval_results (
+    result_id       UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWID(),
+    run_id          UNIQUEIDENTIFIER NOT NULL
+                    CONSTRAINT FK_er_run REFERENCES dbo.eval_runs(run_id),
+    question_id     UNIQUEIDENTIFIER NOT NULL,
+    retrieved_chunk_ids JSON NULL,
+    answer          NVARCHAR(MAX) NULL,
+    -- Metrics, all 0..1 unless noted
+    retrieval_recall_at_k  DECIMAL(4,3) NULL,
+    groundedness           DECIMAL(4,3) NULL,
+    citation_precision     DECIMAL(4,3) NULL,
+    citation_recall        DECIMAL(4,3) NULL,
+    point_coverage         DECIMAL(4,3) NULL,
+    latency_ms             INT NULL,
+    judge_model            NVARCHAR(100) NULL,
+    judged_at              DATETIME2 NULL
+);
+CREATE INDEX IX_er_run ON dbo.eval_results(run_id);</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">19.3 LLM-as-Judge Scoring</h3>
+
+<p class="text-gray-300 leading-relaxed">Human grading does not scale; LLM judges do, with known biases. The discipline that makes judges trustworthy:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Judge with a different model than the generator</strong> (or at least a different prompt) to avoid self-preference bias.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Calibrate against humans quarterly:</strong> grade 50 answers both ways; if judge-human agreement drops below 85%, rewrite the judge prompt.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Score with rubrics, not vibes:</strong> the judge gets the expected points and scores each as present/absent with a quote — structured output, auditable.</li>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Judge prompt (Python): structured, quotable, auditable
+JUDGE_PROMPT = """You are grading a RAG answer. Be strict and literal.
+
+Question: {question}
+
+Expected points (each must be addressed for full marks):
+{expected_points}
+
+Retrieved chunks (the ONLY allowed sources):
+{chunks}
+
+Answer to grade:
+{answer}
+
+Return JSON:
+{{
+  "points_covered": [{{"point": "...", "covered": true, "quote": "..."}}],
+  "ungrounded_claims": ["claim with no chunk support", ...],
+  "citations_valid": true/false,
+  "notes": "..."
+}}"""</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Store the judge's raw JSON in the result row. When a metric moves unexpectedly, the raw judgments are the first place you look — and they are the evidence you show stakeholders who question the numbers.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">19.4 User Feedback Capture</h3>
+
+<p class="text-gray-300 leading-relaxed">Production feedback is the ground truth that eval sets approximate. Capture it frictionlessly and store it richly:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE dbo.answer_feedback (
+    feedback_id   UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWID(),
+    message_id    UNIQUEIDENTIFIER NOT NULL
+                  CONSTRAINT FK_fb_message REFERENCES dbo.messages(message_id),
+    tenant_id     UNIQUEIDENTIFIER NOT NULL,
+    user_id       UNIQUEIDENTIFIER NOT NULL,
+    rating        NVARCHAR(20) NOT NULL
+                  CONSTRAINT CK_fb_rating CHECK (rating IN
+                      (N'up', N'down', N'regenerated')),
+    category      NVARCHAR(50) NULL,   -- 'wrong', 'incomplete', 'hallucinated', ...
+    comment       NVARCHAR(MAX) NULL,
+    created_at    DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
+);
+CREATE INDEX IX_fb_message ON dbo.answer_feedback(message_id);
+
+-- Feedback analytics: where is quality actually failing?
+SELECT f.category, COUNT(*) AS n,
+       AVG(CAST(er.groundedness AS FLOAT)) AS avg_groundedness
+FROM dbo.answer_feedback AS f
+LEFT JOIN dbo.messages AS m ON m.message_id = f.message_id
+-- join to eval-style judgments if the message was graded
+GROUP BY f.category ORDER BY n DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Treat "regenerated" as an implicit down-vote — the user rejected the answer strongly enough to ask again. And mine down-voted answers for golden-set additions: every real failure is a future regression test.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">19.5 Closing the Loop</h3>
+
+<p class="text-gray-300 leading-relaxed">Metrics without action are dashboard decoration. The weekly quality loop:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Run the eval set on every prompt/config change</strong> before deploy — the config_snapshot column makes every run reproducible and comparable.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Diff metrics between runs</strong> with a simple query: which questions got worse, which got better? A change that improves 80 questions and regresses 20 needs investigation, not celebration.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Promote production failures into the golden set.</strong> Down-voted answers with clear expected points become new eval questions — the set grows with real usage.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Track metric trends, not snapshots.</strong> A dashboard of groundedness and recall over time, annotated with deploy markers, shows whether the system is improving or drifting.</li>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Regression diff between two eval runs: what got worse?
+SELECT cur.question_id, q.question,
+       prev.point_coverage AS before_cov, cur.point_coverage AS after_cov,
+       prev.groundedness    AS before_grd, cur.groundedness    AS after_grd
+FROM dbo.eval_results AS cur
+JOIN dbo.eval_results AS prev
+  ON prev.question_id = cur.question_id AND prev.run_id = @prev_run
+JOIN dbo.eval_questions AS q ON q.question_id = cur.question_id
+WHERE cur.run_id = @cur_run
+  AND (cur.point_coverage &lt; prev.point_coverage
+       OR cur.groundedness &lt; prev.groundedness)
+ORDER BY (prev.point_coverage - cur.point_coverage) DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Build the golden set from real user questions with expert-written expected points</strong> — 100 real questions beat 10,000 synthetic ones. Version the set and review it quarterly.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Measure retrieval recall, groundedness, citation precision/recall, point coverage, and user feedback</strong> — and store every run with its config snapshot for reproducibility.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Judge with rubrics and structured output, calibrate against humans quarterly, and keep the raw judgments</strong> as auditable evidence.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong>Close the loop weekly:</strong> eval every config change before deploy, diff runs for regressions, and promote production failures into the golden set.</li>
+
+    </article>
+
+      <nav class="flex items-center justify-center gap-3 mt-12 mb-4 text-sm">
+        <a href="chapter-18.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">← Chapter 18</a>
+        <a href="index.html" class="px-4 py-2 rounded-lg bg-gray-800 text-gray-300 hover:bg-gray-700 transition">All Chapters</a>
+        <a href="chapter-20.html" class="px-4 py-2 rounded-lg bg-gray-800 text-blue-300 hover:bg-gray-700 transition">Chapter 20 →</a>
+      </nav>
+<div class="bg-gradient-to-r from-blue-900/40 to-indigo-900/40 border border-blue-800/50 rounded-2xl p-6 mt-10">
+        <p class="text-gray-300 text-sm leading-relaxed"><strong class="text-white">Keep going.</strong> You're reading <em class="text-blue-300">AI-Native Apps on SQL Server</em> — one of seven free deep-dives in the DBA Library, covering SQL Server performance tuning, high availability, security, automation, and more. <a href="../index.html" class="text-blue-400 hover:text-blue-300 underline">Browse the full library →</a></p>
+      </div>
+    <footer class="text-center text-gray-600 text-xs mt-10 pb-6">DBA Library · AI-Native Apps on SQL Server · Free for the SQL Server community</footer>
+  </div>
+</body>
+</html>
