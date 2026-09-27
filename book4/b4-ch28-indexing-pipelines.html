@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Chapter 28: Indexing Pipelines: Keeping Vectors Fresh — Vector Databases & AI</title>
-  <meta name="description" content="Vector Databases & AI Chapter 28: Indexing Pipelines: Keeping Vectors Fresh. pgvector, Pinecone, Weaviate, RAG pipelines — by Rajesh Guntupalli." />
+  <title>Chapter 28: Indexing Pipelines — Vector Databases & AI</title>
+  <meta name="description" content="Vector Databases & AI Chapter 28: Indexing pipelines — the vector indexing lifecycle, embedding generation, Change Data Capture for continuous indexing, DiskANN management, and backfill strategies on SQL Server. By Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
   <script type="module">
     import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
@@ -41,917 +41,240 @@
       <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">Vector Databases & AI</span>
     </div>
     <div class="space-y-4 text-sm">
-<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 28: Indexing Pipelines: Keeping Vectors Fresh</h2>
-
-<p class="text-gray-300 leading-relaxed">Vector search breaks down the moment your index falls out of sync with your data. Unlike a B-tree index that updates atomically with every INSERT or UPDATE, most vector indexes are built in bulk, degrade under heavy write load, and require explicit maintenance to stay performant. For DBAs accustomed to indexes that maintain themselves, this behavioral difference is one of the sharpest adjustments when moving into vector infrastructure. This chapter covers the full lifecycle of vector indexing pipelines: how vectors get generated, how they land in the index, what happens to freshness under write pressure, how to detect and recover from drift, and how to architect pipelines that keep production systems current without disrupting query performance.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 28: Indexing Pipelines</h2>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">The Vector Indexing Lifecycle</h3>
 
-<p class="text-gray-300 leading-relaxed">Before building a pipeline, you need a clear model of what a "vector indexing pipeline" actually does and where it differs from classical index maintenance.</p>
+<p class="text-gray-300 leading-relaxed">A vector index is not a fire-and-forget artifact — it has a lifecycle driven by the data underneath it:</p>
 
-<p class="text-gray-300 leading-relaxed">In a relational system, an index is a derived structure built from column values that already exist in the row. The database engine manages it transparently. When you INSERT a row, the B-tree updates. When you UPDATE a column, the old entry is removed and a new one inserted. This is synchronous and transactional by default.</p>
+<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Source data changes</strong> — a document is added, updated, or deleted in your primary store (SQL Server tables, S3, a CMS, a product catalog).</p>
+<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Change detected</strong> — CDC, a trigger-based outbox, or a polling watermark picks up the change.</p>
+<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Embedding generated</strong> — the changed text is chunked and embedded.</p>
+<p class="text-gray-300 leading-relaxed">4. <strong class="text-white">Index updated</strong> — vectors are written; the DiskANN index absorbs or is rebuilt around them.</p>
+<p class="text-gray-300 leading-relaxed">5. <strong class="text-white">Quality verified</strong> — recall checks confirm the index still serves correctly.</p>
 
-<p class="text-gray-300 leading-relaxed">Vector indexing has a different shape:</p>
-
-<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Source data changes</strong> — a document is added, updated, or deleted in your primary store (PostgreSQL, S3, a CMS, a product catalog).</p>
-<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Chunking</strong> — the document is split into semantic units. This is a non-trivial transformation with real parameters: chunk size, overlap, split strategy.</p>
-<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Embedding generation</strong> — each chunk is sent to an embedding model (OpenAI, Cohere, a local sentence-transformer). This takes time and costs money.</p>
-<p class="text-gray-300 leading-relaxed">4. <strong class="text-white">Upsert to vector store</strong> — the resulting vector and its metadata are written to the vector database.</p>
-<p class="text-gray-300 leading-relaxed">5. <strong class="text-white">Index rebuild or incremental update</strong> — depending on the vector store, the ANN index may need to be explicitly rebuilt or optimized after writes accumulate.</p>
-
-<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph LR
-    A[Source data change] --> B[Chunking]
-    B --> C[Embedding generation]
-    C --> D[Upsert to vector store]
-    D --> E[Index rebuild /<br/>incremental update]
-    E --> F[Query-ready]
-    style A fill:#e8e8e8
-    style F fill:#c8e6c9</pre></div>
-<p class="text-gray-300 leading-relaxed">*Steps 2–5 run asynchronously in most production systems; the gap between the source write (A) and a query-ready index (F) is the indexing latency you must actively manage.*</p>
-
-<p class="text-gray-300 leading-relaxed">Steps 2 through 5 are asynchronous in most production systems. The gap between step 1 and step 5 defines your indexing latency — and for freshness-sensitive applications, this gap is what you must actively manage.</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">The freshness-performance tradeoff</strong> mirrors something DBAs already know from materialized views: the more aggressively you refresh, the closer to current your results, but the higher the maintenance overhead. HNSW indexes, for example, are typically immutable after construction in Milvus and Qdrant's older modes. Pinecone handles upserts incrementally but merges them in background compaction. pgvector's HNSW implementation accepts live inserts but degrades in graph quality as the unsorted segment grows.</p>
-
-<p class="text-gray-300 leading-relaxed">Think of the unindexed buffer in a vector store the way you'd think of the unmerged delta in a columnstore index. Queries still work — they just fall back to brute force for that segment, which costs performance.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">The freshness-performance tradeoff</strong> mirrors something DBAs already know from indexed views: the more aggressively you refresh, the closer to current your results, but the higher the maintenance overhead. SQL Server's DiskANN index in preview favors an index-after-load pattern — bulk ingest first, build the index once — over continuous trickle writes against an existing vector index. Design your pipeline around that constraint: buffer writes, then rebuild or refresh on a schedule your freshness SLA actually requires, not on every row change.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Building the Embedding Generation Pipeline</h3>
 
-<p class="text-gray-300 leading-relaxed">The first step toward fresh vectors is an efficient, reliable embedding pipeline. Whether you're using a managed API or a local model, the architecture patterns are the same.</p>
+<p class="text-gray-300 leading-relaxed">Here is a complete pipeline using OpenAI embeddings, writing into SQL Server native <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR</code> with idempotent upserts:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Chunking strategy matters more than most teams realize.</strong> The semantic unit you index determines the granularity of retrieval. Too large: you dilute signal and waste tokens. Too small: you lose context and increase index size. A good starting heuristic for RAG applications is 256–512 tokens per chunk with a 10–20% overlap. For structured content like product descriptions or database rows, you often skip chunking entirely.</p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python — chunk, embed, and upsert documents into SQL Server
+import hashlib, openai, pyodbc
 
-<p class="text-gray-300 leading-relaxed">Here is a complete pipeline using LangChain with OpenAI embeddings, writing into pgvector:</p>
+openai_client = openai.OpenAI()
+conn = pyodbc.connect("DRIVER={ODBC Driver 18 for SQL Server};"
+                      "SERVER=localhost;DATABASE=ragdb;Trusted_Connection=yes;"
+                      "Encrypt=yes;TrustServerCertificate=yes")
+MODEL_ID = "text-embedding-3-small"
+DIM = 1536
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
-import os
-import psycopg2
-from psycopg2.extras import execute_values
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_openai import OpenAIEmbeddings
-from langchain.docstore.document import Document
+def vec_lit(emb):
+    return "[" + ",".join(str(v) for v in emb) + "]"
 
-# Configuration
-DB_CONN = os.environ["PG_CONN_STRING"]
-OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
-EMBEDDING_MODEL = "text-embedding-3-small"
-CHUNK_SIZE = 400
-CHUNK_OVERLAP = 40
+def chunk_text(text, size=512, overlap=64):
+    # Simple word-based chunking; replace with tiktoken for production
+    words = text.split()
+    step = size - overlap
+    return [" ".join(words[i:i + size])
+            for i in range(0, len(words), step) if words[i:i + size]]
 
-embeddings_client = OpenAIEmbeddings(
-    model=EMBEDDING_MODEL,
-    openai_api_key=OPENAI_API_KEY
-)
-
-splitter = RecursiveCharacterTextSplitter(
-    chunk_size=CHUNK_SIZE,
-    chunk_overlap=CHUNK_OVERLAP,
-    separators=["\n\n", "\n", ".", " ", ""]
-)
-
-
-def index_document(doc_id: str, content: str, metadata: dict, conn) -&gt; int:
-    """
-    Chunk, embed, and upsert a document into pgvector.
-    Returns the number of chunks written.
-    """
-    # 1. Chunk
-    chunks = splitter.split_text(content)
-    if not chunks:
-        return 0
-
-    # 2. Embed — batch call to reduce API round trips
-    vectors = embeddings_client.embed_documents(chunks)
-
-    # 3. Upsert — delete old chunks, insert new ones atomically
-    with conn.cursor() as cur:
-        # Remove stale chunks from a previous version of this document
-        cur.execute(
-            "DELETE FROM document_chunks WHERE doc_id = %s",
-            (doc_id,)
-        )
-
-        rows = [
-            (
-                doc_id,
-                i,
-                chunks[i],
-                vectors[i],          # pgvector accepts Python lists directly
-                metadata.get("source", ""),
-                metadata.get("updated_at", None)
-            )
-            for i in range(len(chunks))
-        ]
-
-        execute_values(
-            cur,
-            """
-            INSERT INTO document_chunks
-                (doc_id, chunk_index, chunk_text, embedding, source, updated_at)
-            VALUES %s
-            """,
-            rows,
-            template="(%s, %s, %s, %s::vector, %s, %s)"
-        )
-
+def upsert_document(doc_id, text, tenant_id):
+    """Chunk, embed, and upsert a document into SQL Server."""
+    chunks = chunk_text(text)
+    resp = openai_client.embeddings.create(input=chunks, model=MODEL_ID)
+    content_hash = hashlib.sha256(text.encode()).hexdigest()
+    cur = conn.cursor()
+    for idx, (chunk, e) in enumerate(zip(chunks, resp.data)):
+        cur.execute("""MERGE dbo.DocumentChunks AS t
+            USING (SELECT ? AS DocId, ? AS ChunkIndex, ? AS ChunkText,
+                          CAST(? AS VECTOR(1536)) AS Embedding,
+                          ? AS ModelId, ? AS TenantId,
+                          ? AS ContentHash) AS s
+            ON t.DocId = s.DocId AND t.ChunkIndex = s.ChunkIndex
+            WHEN MATCHED AND t.ContentHash &lt;&gt; s.ContentHash THEN
+                UPDATE SET ChunkText = s.ChunkText, Embedding = s.Embedding,
+                           ContentHash = s.ContentHash,
+                           UpdatedAt = SYSUTCDATETIME()
+            WHEN NOT MATCHED THEN
+                INSERT (DocId, ChunkIndex, ChunkText, Embedding,
+                        ModelId, TenantId, ContentHash)
+                VALUES (s.DocId, s.ChunkIndex, s.ChunkText, s.Embedding,
+                        s.ModelId, s.TenantId, s.ContentHash);""",
+            (doc_id, idx, chunk, vec_lit(e.embedding),
+             MODEL_ID, tenant_id, content_hash))
     conn.commit()
     return len(chunks)
+</code></pre>
 
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ContentHash</code> guard is the pipeline's idempotency key: re-running the pipeline on an unchanged document updates nothing, so the job is safely re-runnable and the embedding API is never billed twice for the same text.</p>
 
-# Example invocation
-conn = psycopg2.connect(DB_CONN)
-
-doc_count = index_document(
-    doc_id="product-42",
-    content="The Apex Pro running shoe features carbon fiber plate technology...",
-    metadata={"source": "product_catalog", "updated_at": "2024-11-01"},
-    conn=conn
-)
-
-print(f"Indexed {doc_count} chunks for product-42")
-conn.close()</code></pre>
-
-<p class="text-gray-300 leading-relaxed">The schema to support this pipeline:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
-CREATE EXTENSION IF NOT EXISTS vector;
-
-CREATE TABLE document_chunks (
-    id          BIGSERIAL PRIMARY KEY,
-    doc_id      TEXT        NOT NULL,
-    chunk_index INT         NOT NULL,
-    chunk_text  TEXT        NOT NULL,
-    embedding   vector(1536),           -- text-embedding-3-small dimension
-    source      TEXT,
-    updated_at  TIMESTAMPTZ,
-    indexed_at  TIMESTAMPTZ DEFAULT NOW(),
-    UNIQUE (doc_id, chunk_index)
-);
-
--- HNSW index for ANN search
-CREATE INDEX idx_chunks_embedding_hnsw
-    ON document_chunks
-    USING hnsw (embedding vector_cosine_ops)
-    WITH (m = 16, ef_construction = 64);
-
--- Supporting indexes for metadata filtering
-CREATE INDEX idx_chunks_doc_id ON document_chunks (doc_id);
-CREATE INDEX idx_chunks_source ON document_chunks (source);
-CREATE INDEX idx_chunks_indexed_at ON document_chunks (indexed_at);</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Batching is the single biggest performance lever in the embedding step.</strong> The OpenAI <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-3-small</code> model accepts up to 2048 inputs per API call. Calling it one chunk at a time for a 10,000-document backfill is roughly 100x slower than batching at 100 chunks per call and also drives your cost per token higher due to request overhead. LangChain's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">embed_documents()</code> handles batching internally, but if you're writing direct API calls, batch explicitly.</p>
-
-<p class="text-gray-300 leading-relaxed">For high-volume pipelines, the embedding step is also where you want a retry layer with exponential backoff. Rate limits from OpenAI at tier 1 are 500 RPM for embeddings. Tier 3 raises this to 5,000 RPM. Design your pipeline with configurable concurrency limits so you can tune throughput as your API tier changes.</p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: chunks table with content-hash idempotency
+CREATE TABLE dbo.DocumentChunks (
+    ChunkId    BIGINT IDENTITY(1,1) NOT NULL
+        CONSTRAINT PK_DocumentChunks PRIMARY KEY,
+    DocId      NVARCHAR(100) NOT NULL,
+    ChunkIndex INT NOT NULL,
+    ChunkText  NVARCHAR(MAX) NOT NULL,
+    Embedding  VECTOR(1536) NOT NULL,
+    ModelId    NVARCHAR(100) NOT NULL,
+    TenantId   INT NOT NULL,
+    ContentHash CHAR(64) NOT NULL,
+    UpdatedAt  DATETIME2(0) NOT NULL
+        CONSTRAINT DF_DocumentChunks_Updated DEFAULT SYSUTCDATETIME(),
+    CONSTRAINT UQ_DocumentChunks_Doc_Chunk UNIQUE (DocId, ChunkIndex)
+);</code></pre>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Change Data Capture for Continuous Indexing</h3>
 
-<p class="text-gray-300 leading-relaxed">Backfill pipelines handle the initial load. The harder problem is keeping the index current as source data changes continuously. The right pattern here is Change Data Capture — a technique DBAs know well from replication, adapted for vector pipeline use.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Approach 1: Watermark polling.</strong> For freshness SLAs measured in minutes, a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ROWVERSION</code> or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">UpdatedAt</code> watermark on the source table is the simplest reliable trigger. A scheduled job selects rows newer than the last watermark, runs them through the embedding pipeline, and advances the watermark in the same transaction.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Approach 1: Polling with a watermark column.</strong> The simplest approach. Maintain a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">last_indexed_at</code> watermark, and on each pipeline run, fetch rows where <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">updated_at > last_indexed_at</code>. This works well when your source system has a reliable <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">updated_at</code> column and deletes are handled via soft delete (a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">deleted_at</code> column rather than physical removal).</p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: watermark table + polling query
+CREATE TABLE dbo.IndexWatermarks (
+    PipelineName NVARCHAR(100) NOT NULL
+        CONSTRAINT PK_IndexWatermarks PRIMARY KEY,
+    LastWatermark DATETIME2(0) NOT NULL
+);
+-- Poller (runs every N minutes via SQL Server Agent):
+-- SELECT DocId FROM dbo.SourceDocuments
+-- WHERE UpdatedAt &gt; (SELECT LastWatermark FROM dbo.IndexWatermarks
+--                     WHERE PipelineName = 'doc-embeddings')
+-- ORDER BY UpdatedAt;
+-- ... embed each, upsert chunks, then:
+-- UPDATE dbo.IndexWatermarks
+-- SET LastWatermark = @maxSeen WHERE PipelineName = 'doc-embeddings';
+</code></pre>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
-import time
-import psycopg2
-from datetime import datetime, timezone
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Approach 2: SQL Server Change Data Capture.</strong> For sub-minute freshness requirements, polling does not cut it. Enable CDC on the source table and have the embedding consumer read the change tables — every insert/update/delete arrives as a row in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">cdc.dbo_SourceDocuments_CT</code> with an operation code, no triggers required on the source table itself.</p>
 
-SOURCE_CONN = os.environ["SOURCE_PG_CONN"]
-VECTOR_CONN = os.environ["VECTOR_PG_CONN"]
-POLL_INTERVAL_SECONDS = 30
-BATCH_SIZE = 200
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: enable CDC on the source database and table
+-- EXEC sys.sp_cdc_enable_db;
+-- EXEC sys.sp_cdc_enable_table
+--     @source_schema = 'dbo',
+--     @source_name   = 'SourceDocuments',
+--     @role_name     = NULL;
+--
+-- Consumer query: net changes since last LSN
+-- DECLARE @from_lsn BINARY(10) = ...; -- persisted per pipeline
+-- DECLARE @to_lsn   BINARY(10) = sys.fn_cdc_get_max_lsn();
+-- SELECT __$operation, DocId FROM cdc.dbo_SourceDocuments_CT
+-- WHERE __$start_lsn &gt; @from_lsn AND __$start_lsn &lt;= @to_lsn;
+--   __$operation: 1 = delete, 2 = insert, 3 = update (before), 4 = update (after)
+</code></pre>
 
-
-def get_watermark(vector_conn) -&gt; datetime:
-    """Read the last successfully indexed timestamp from a state table."""
-    with vector_conn.cursor() as cur:
-        cur.execute(
-            "SELECT last_indexed_at FROM indexer_state WHERE pipeline_id = 'products'"
-        )
-        row = cur.fetchone()
-        if row:
-            return row[0]
-        # First run: index everything from the beginning
-        return datetime(2000, 1, 1, tzinfo=timezone.utc)
-
-
-def save_watermark(vector_conn, ts: datetime):
-    with vector_conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO indexer_state (pipeline_id, last_indexed_at)
-            VALUES ('products', %s)
-            ON CONFLICT (pipeline_id)
-            DO UPDATE SET last_indexed_at = EXCLUDED.last_indexed_at
-            """,
-            (ts,)
-        )
-    vector_conn.commit()
-
-
-def poll_and_index(source_conn, vector_conn):
-    watermark = get_watermark(vector_conn)
-    batch_start = datetime.now(timezone.utc)
-
-    with source_conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT product_id, description, category, updated_at
-            FROM products
-            WHERE updated_at &gt; %s
-              AND deleted_at IS NULL
-            ORDER BY updated_at ASC
-            LIMIT %s
-            """,
-            (watermark, BATCH_SIZE)
-        )
-        rows = cur.fetchall()
-
-    if not rows:
-        return 0
-
-    processed = 0
-    for product_id, description, category, updated_at in rows:
-        index_document(
-            doc_id=f"product-{product_id}",
-            content=description,
-            metadata={"source": "products", "category": category,
-                      "updated_at": updated_at.isoformat()},
-            conn=vector_conn
-        )
-        processed += 1
-
-    # Advance watermark to the latest timestamp we processed
-    latest_ts = rows[-1][3]
-    save_watermark(vector_conn, latest_ts)
-    return processed
-
-
-# Continuous poll loop
-source_conn = psycopg2.connect(SOURCE_CONN)
-vector_conn = psycopg2.connect(VECTOR_CONN)
-
-while True:
-    n = poll_and_index(source_conn, vector_conn)
-    print(f"{datetime.now().isoformat()} — indexed {n} documents")
-    time.sleep(POLL_INTERVAL_SECONDS)</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Approach 2: PostgreSQL logical replication via Debezium.</strong> For sub-minute freshness requirements, polling every 30 seconds doesn't cut it. Logical replication captures every row-level change as an event and can drive your embedding pipeline in near-real-time. The standard production setup is: PostgreSQL WAL → Debezium → Kafka → vector indexing consumer.</p>
-
-<p class="text-gray-300 leading-relaxed">The vector indexing consumer listens to Kafka topics and processes INSERT, UPDATE, and DELETE events:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python — Kafka consumer for CDC-driven vector indexing
-from kafka import KafkaConsumer
-import json
-import logging
-
-KAFKA_BROKER = os.environ["KAFKA_BROKER"]
-KAFKA_TOPIC = "postgres.public.products"   # Debezium topic naming convention
-
-consumer = KafkaConsumer(
-    KAFKA_TOPIC,
-    bootstrap_servers=KAFKA_BROKER,
-    value_deserializer=lambda m: json.loads(m.decode("utf-8")),
-    group_id="vector-indexer-products",
-    auto_offset_reset="earliest",
-    enable_auto_commit=False          # Manual commit for exactly-once semantics
-)
-
-vector_conn = psycopg2.connect(VECTOR_CONN)
-
-for message in consumer:
-    event = message.value
-    op = event.get("op")             # 'c' = create, 'u' = update, 'd' = delete
-
-    try:
-        if op in ("c", "u"):
-            after = event["after"]
-            index_document(
-                doc_id=f"product-{after['product_id']}",
-                content=after["description"],
-                metadata={
-                    "source": "products",
-                    "category": after.get("category", ""),
-                    "updated_at": after.get("updated_at", "")
-                },
-                conn=vector_conn
-            )
-            logging.info(f"Indexed product {after['product_id']} (op={op})")
-
-        elif op == "d":
-            before = event["before"]
-            doc_id = f"product-{before['product_id']}"
-            with vector_conn.cursor() as cur:
-                cur.execute(
-                    "DELETE FROM document_chunks WHERE doc_id = %s",
-                    (doc_id,)
-                )
-            vector_conn.commit()
-            logging.info(f"Deleted product {before['product_id']} from index")
-
-        consumer.commit()
-
-    except Exception as e:
-        logging.error(f"Failed to process message offset {message.offset}: {e}")
-        # Do not commit — will reprocess on restart
-        # Add to dead-letter queue for inspection</code></pre>
-
-<p class="text-gray-300 leading-relaxed">The Debezium/Kafka approach gives you sub-5-second indexing latency from source commit to vector availability. The polling approach gives you 30–90 seconds depending on your interval. Choose based on what freshness lag your application can tolerate, and on your operational budget — Kafka adds meaningful infrastructure overhead.</p>
+<p class="text-gray-300 leading-relaxed">Deletes need explicit handling in both approaches: a deleted source document must delete its chunks, or the vector index will keep serving ghost content. The CDC operation code makes this natural — map operation 1 to a chunk delete; with watermark polling, use soft deletes (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">IsDeleted</code> flag) on the source so the poller can see them.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Index Optimization and Segment Management</h3>
 
-<p class="text-gray-300 leading-relaxed">Writing vectors into the database is only half the work. The other half is making sure the ANN index structure stays efficient as data accumulates.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">DiskANN behavior under writes.</strong> In SQL Server 2025 preview, the pragmatic pattern is index-after-load: bulk ingest into the heap or clustered table first, then <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE VECTOR INDEX</code> once. For ongoing trickle writes, accumulate them in a staging table and rebuild the vector index on a schedule — nightly for most workloads, hourly only if the freshness SLA demands it.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">pgvector HNSW behavior under writes.</strong> pgvector's HNSW index is a live-update structure, unlike some vector stores that require full rebuilds. But it does not rebalance itself. Every new insert adds a node to the graph, which is correct but suboptimal compared to a graph built from the full dataset in bulk. After heavy write loads, it's common to see a 10–15% degradation in recall at ef_search=40 compared to a freshly built index. You can detect this by running recall benchmarks against a known ground-truth set.</p>
+<p class="text-gray-300 leading-relaxed">The production pattern is to <strong class="text-white">rebuild the vector index during a low-traffic window</strong> after bulk ingestion:</p>
 
-<p class="text-gray-300 leading-relaxed">The production pattern for pgvector is to <strong class="text-white">rebuild the index during a low-traffic window</strong> after bulk ingestion:</p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: scheduled DiskANN rebuild after bulk ingestion
+-- 1. Ingest into the base table (no vector index yet, or staged separately)
+-- 2. Drop the stale vector index if one exists:
+-- DROP INDEX IX_DocumentChunks_Embedding ON dbo.DocumentChunks;
+-- 3. Rebuild:
+CREATE VECTOR INDEX IX_DocumentChunks_Embedding
+    ON dbo.DocumentChunks (Embedding)
+    WITH (METRIC = 'cosine', TYPE = 'DiskANN', MAXDOP = 8);
+-- 4. Verify with DMVs before serving traffic:
+SELECT i.name, i.type_desc, p.rows
+FROM sys.indexes AS i
+JOIN sys.partitions AS p
+  ON p.object_id = i.object_id AND p.index_id = i.index_id
+WHERE i.object_id = OBJECT_ID('dbo.DocumentChunks');
+</code></pre>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
--- Check current index bloat and tuple counts
-SELECT
-    schemaname,
-    tablename,
-    n_live_tup,
-    n_dead_tup,
-    last_vacuum,
-    last_analyze
-FROM pg_stat_user_tables
-WHERE tablename = 'document_chunks';
-
--- Check index size
-SELECT
-    indexname,
-    pg_size_pretty(pg_relation_size(indexrelid)) AS index_size
-FROM pg_stat_user_indexes
-WHERE tablename = 'document_chunks';
-
--- Rebuild HNSW index with updated ef_construction for larger datasets
--- This acquires ShareUpdateExclusiveLock — queries continue during build
--- Note: CONCURRENTLY statements cannot run inside an explicit transaction
--- block, so issue these as separate top-level statements, not wrapped
--- in BEGIN/COMMIT.
-
-DROP INDEX CONCURRENTLY idx_chunks_embedding_hnsw;
-
-CREATE INDEX CONCURRENTLY idx_chunks_embedding_hnsw
-    ON document_chunks
-    USING hnsw (embedding vector_cosine_ops)
-    WITH (m = 16, ef_construction = 128);   -- Increased for better recall
-
--- Run VACUUM to reclaim space from deleted chunks
-VACUUM ANALYZE document_chunks;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE INDEX CONCURRENTLY</code> in pgvector allows the index rebuild to run while queries continue against the old index — this is the same behavior as standard PostgreSQL CONCURRENTLY index builds. Plan for the rebuild to take roughly 1–2 seconds per 10,000 vectors on modern hardware with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">m=16</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ef_construction=128</code>.</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Pinecone's pod-based freshness behavior.</strong> In Pinecone, vectors written with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">upsert()</code> are available for query within a few seconds, but they may not be included in the optimized ANN graph immediately. Pinecone uses an internal freshed-segment architecture where new vectors are added to a "fresh" buffer that is searched with brute force while the background optimizer integrates them into the main index. This is transparent to the client but means your effective recall can be slightly lower in the minutes after a large bulk upsert.</p>
-
-<p class="text-gray-300 leading-relaxed">For Pinecone, the key operational lever is the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">describe_index_stats()</code> call, which tells you how many vectors are "fresh" (unmerged):</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python — Pinecone freshness monitoring
-from pinecone import Pinecone
-import os
-
-pc = Pinecone(api_key=os.environ["PINECONE_API_KEY"])
-index = pc.Index("product-embeddings")
-
-stats = index.describe_index_stats()
-print(f"Total vectors: {stats['total_vector_count']}")
-
-for ns, ns_stats in stats.get("namespaces", {}).items():
-    print(f"Namespace '{ns}': {ns_stats['vector_count']} vectors")
-
-# Pinecone does not expose fresh/merged split directly via API
-# Monitor query latency as a proxy: latency spike after bulk upsert
-# indicates fresh buffer search overhead
-# A reasonable freshness SLA: &lt; 5 minutes to full index integration
-# for upserts under 100K vectors</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Weaviate segment management.</strong> Weaviate uses an HNSW index with an internal segment-and-memtable architecture similar to an LSM tree. New objects enter a memtable, which is flushed to immutable segments. Segments are periodically compacted. You can monitor this via the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">/v1/nodes</code> endpoint:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># shell — Weaviate node and segment health check
-curl -s http://localhost:8080/v1/nodes | python3 -m json.tool
-
-# Check HNSW index statistics for a specific class
-curl -s "http://localhost:8080/v1/schema/ProductChunk" | \
-    python3 -c "import sys, json; d=json.load(sys.stdin); \
-    print(json.dumps(d.get('vectorIndexConfig', {}), indent=2))"
-
-# Force a sync (useful after bulk imports before running benchmarks)
-curl -X POST http://localhost:8080/v1/schema/ProductChunk/tenants \
-    -H "Content-Type: application/json"</code></pre>
-
-<p class="text-gray-300 leading-relaxed">For Weaviate batch imports, the key parameter is <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">batch_size</code>. Imports above 1,000 objects per batch begin to slow down due to HNSW graph lock contention. The recommended production batch size is 200–500 objects, with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">num_workers=4</code> to pipeline the HTTP requests.</p>
+<p class="text-gray-300 leading-relaxed">Plan the rebuild window from measured build times on your hardware and vector counts — DiskANN builds are CPU-intensive and parallelize with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">MAXDOP</code>. Until the index exists or while it is being rebuilt, the exact <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_DISTANCE</code> scan path still serves correct (if slower) results, so schedule the rebuild like any other maintenance: off-peak, monitored, with a rollback plan.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Handling Embedding Model Changes</h3>
 
-<p class="text-gray-300 leading-relaxed">One scenario that catches teams off guard: you upgrade your embedding model. Maybe you move from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-ada-002</code> (1536 dimensions) to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-3-large</code> (3072 dimensions), or you switch from OpenAI to a self-hosted <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">bge-large-en-v1.5</code> (1024 dimensions) to reduce costs. This is the vector database equivalent of changing a column's data type — it invalidates every existing index entry.</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">You cannot mix embeddings from different models in the same vector index.</strong> The vector spaces are incompatible. A cosine similarity score between an ada-002 vector and a bge-large vector is meaningless. This is a hard constraint with no workaround.</p>
-
-<p class="text-gray-300 leading-relaxed">The migration pattern is a blue-green reindex:</p>
-
-<p class="text-gray-300 leading-relaxed">1. Create a new table or collection with the target model's dimension.</p>
-<p class="text-gray-300 leading-relaxed">2. Reindex all existing documents into the new collection.</p>
-<p class="text-gray-300 leading-relaxed">3. Dual-write new changes to both old and new collections during migration.</p>
-<p class="text-gray-300 leading-relaxed">4. Cut over queries to the new collection once reindexing is complete and validated.</p>
-<p class="text-gray-300 leading-relaxed">5. Decommission the old collection.</p>
-
-<p class="text-gray-300 leading-relaxed">Here is the dual-write layer:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python — dual-write adapter for embedding model migration
-from dataclasses import dataclass
-from typing import List, Optional
-import logging
-
-@dataclass
-class VectorWriteTarget:
-    name: str
-    dimension: int
-    embeddings_client: object    # OpenAIEmbeddings or similar
-    write_fn: callable           # Function that accepts (doc_id, chunks, vectors, metadata)
-    is_primary: bool             # Primary target is queried; secondary is written-only
-
-
-class DualWriteIndexer:
-    """
-    Writes to two vector targets simultaneously during a migration window.
-    Failures on the secondary target are logged but do not fail the operation.
-    """
-
-    def __init__(self, primary: VectorWriteTarget, secondary: VectorWriteTarget):
-        self.primary = primary
-        self.secondary = secondary
-
-    def index_document(self, doc_id: str, content: str, metadata: dict) -&gt; bool:
-        # Always embed separately — models have different vector spaces
-        for target in [self.primary, self.secondary]:
-            try:
-                chunks = splitter.split_text(content)
-                vectors = target.embeddings_client.embed_documents(chunks)
-                target.write_fn(doc_id, chunks, vectors, metadata)
-                logging.info(f"Wrote {len(chunks)} chunks to {target.name} for {doc_id}")
-            except Exception as e:
-                if target.is_primary:
-                    # Primary failure is fatal — propagate up
-                    raise RuntimeError(
-                        f"Primary index write failed for {doc_id}: {e}"
-                    ) from e
-                else:
-                    # Secondary failure is non-fatal — log and continue
-                    logging.warning(
-                        f"Secondary index write failed for {doc_id} "
-                        f"(target={target.name}): {e}"
-                    )
-
-        return True
-
-
-# Validation: compare top-10 results between old and new index
-# before cutting over queries
-def validate_retrieval_parity(
-    query: str,
-    old_embeddings_client,
-    new_embeddings_client,
-    old_query_fn,
-    new_query_fn,
-    top_k: int = 10
-) -&gt; float:
-    """
-    Returns Jaccard similarity of the doc_id sets returned by each index.
-    A score above 0.7 generally indicates the new index is ready for cutover.
-    """
-    old_vec = old_embeddings_client.embed_query(query)
-    new_vec = new_embeddings_client.embed_query(query)
-
-    old_results = set(r["doc_id"] for r in old_query_fn(old_vec, top_k))
-    new_results = set(r["doc_id"] for r in new_query_fn(new_vec, top_k))
-
-    intersection = len(old_results & new_results)
-    union = len(old_results | new_results)
-
-    return intersection / union if union &gt; 0 else 0.0</code></pre>
-
-<p class="text-gray-300 leading-relaxed">For large indexes — tens of millions of vectors — the reindex operation can take hours to days. At 1,000 embeddings per second (aggressive batching, high API tier), a 10M-vector index takes about 2.8 hours just for the embedding API calls, not counting write latency. Plan the migration window accordingly, and track progress with a simple counter against your document count.</p>
-
-<p class="text-gray-300 leading-relaxed">---### Monitoring Index Freshness in Production</p>
-
-<p class="text-gray-300 leading-relaxed">A pipeline that ingests without monitoring is a pipeline that silently drifts. You need instrumentation at every stage: how far behind is the indexer, how many documents are waiting, and whether the index quality has degraded.</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">The core metrics to track:</strong></p>
-
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Indexing lag** — time between `updated_at` on the source record and `indexed_at` on the corresponding chunk. This is your pipeline latency.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Queue depth** — how many source records have `updated_at > last_indexed_at`. This tells you whether the pipeline is keeping up with the write rate.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Index-to-source count ratio** — the number of distinct `doc_id` values in your vector table divided by the number of documents in your source. A ratio below 1.0 means documents are missing from the index.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Recall over time** — periodic sampling against a held-out evaluation set. This catches both index degradation and embedding quality regressions.</li>
-
-<p class="text-gray-300 leading-relaxed">Here is a monitoring query set for the pgvector pipeline:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
-
--- 1. Indexing lag: average and 99th-percentile delay between
---    source update and vector write
-SELECT
-    AVG(EXTRACT(EPOCH FROM (dc.indexed_at - dc.updated_at))) AS avg_lag_seconds,
-    PERCENTILE_CONT(0.99) WITHIN GROUP (
-        ORDER BY EXTRACT(EPOCH FROM (dc.indexed_at - dc.updated_at))
-    ) AS p99_lag_seconds,
-    MAX(EXTRACT(EPOCH FROM (dc.indexed_at - dc.updated_at))) AS max_lag_seconds
-FROM document_chunks dc
-WHERE dc.indexed_at &gt; NOW() - INTERVAL '1 hour';
-
--- 2. Queue depth: source records not yet reflected in the vector table.
---    Run against your source database (adjust table/column names as needed)
-SELECT COUNT(*) AS unindexed_count
-FROM products p
-WHERE p.updated_at &gt; (
-    SELECT last_indexed_at
-    FROM indexer_state
-    WHERE pipeline_id = 'products'
-)
-AND p.deleted_at IS NULL;
-
--- 3. Coverage ratio: distinct indexed doc_ids vs. source document count
-SELECT
-    (SELECT COUNT(DISTINCT doc_id) FROM document_chunks WHERE source = 'products')
-        AS indexed_docs,
-    (SELECT COUNT(*) FROM products WHERE deleted_at IS NULL)
-        AS source_docs,
-    ROUND(
-        (SELECT COUNT(DISTINCT doc_id) FROM document_chunks WHERE source = 'products')::numeric
-        / NULLIF((SELECT COUNT(*) FROM products WHERE deleted_at IS NULL), 0),
-        4
-    ) AS coverage_ratio;
-
--- 4. Orphaned chunks: chunks for doc_ids that no longer exist in the source.
---    These represent delete events that the pipeline missed.
-SELECT dc.doc_id, COUNT(*) AS chunk_count
-FROM document_chunks dc
-LEFT JOIN products p
-    ON dc.doc_id = 'product-' || p.product_id::text
-WHERE dc.source = 'products'
-  AND p.product_id IS NULL
-GROUP BY dc.doc_id
-ORDER BY chunk_count DESC
-LIMIT 50;
-
--- 5. Recent indexing throughput: chunks written per minute over the last hour
-SELECT
-    DATE_TRUNC('minute', indexed_at) AS minute_bucket,
-    COUNT(*) AS chunks_written
-FROM document_chunks
-WHERE indexed_at &gt; NOW() - INTERVAL '1 hour'
-GROUP BY 1
-ORDER BY 1;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Equivalent queries for SQL Server</strong> (if your source system is SQL Server and you're monitoring the pipeline state table there):</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server
-
--- 1. Indexing lag
-SELECT
-    AVG(DATEDIFF(SECOND, dc.updated_at, dc.indexed_at)) AS avg_lag_seconds,
-    MAX(DATEDIFF(SECOND, dc.updated_at, dc.indexed_at)) AS max_lag_seconds
-FROM document_chunks dc
-WHERE dc.indexed_at &gt; DATEADD(HOUR, -1, GETUTCDATE());
-
--- 2. Queue depth
-SELECT COUNT(*) AS unindexed_count
-FROM products p
-WHERE p.updated_at &gt; (
-    SELECT last_indexed_at
-    FROM indexer_state
-    WHERE pipeline_id = 'products'
-)
-AND p.deleted_at IS NULL;
-
--- 3. Coverage ratio
-SELECT
-    indexed_docs,
-    source_docs,
-    ROUND(CAST(indexed_docs AS DECIMAL(18,4)) / NULLIF(source_docs, 0), 4)
-        AS coverage_ratio
-FROM (
-    SELECT
-        (SELECT COUNT(DISTINCT doc_id)
-         FROM document_chunks WHERE source = 'products') AS indexed_docs,
-        (SELECT COUNT(*)
-         FROM products WHERE deleted_at IS NULL) AS source_docs
-) t;
-
--- 4. Recent throughput: chunks written per minute
-SELECT
-    DATEADD(MINUTE,
-        DATEDIFF(MINUTE, '2000-01-01', indexed_at),
-        '2000-01-01') AS minute_bucket,
-    COUNT(*) AS chunks_written
-FROM document_chunks
-WHERE indexed_at &gt; DATEADD(HOUR, -1, GETUTCDATE())
-GROUP BY DATEADD(MINUTE,
-    DATEDIFF(MINUTE, '2000-01-01', indexed_at),
-    '2000-01-01')
-ORDER BY 1;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Alerting thresholds to establish:</strong></p>
-
-<p class="text-gray-300 leading-relaxed">| Metric | Warning | Critical |</p>
-<p class="text-gray-300 leading-relaxed">|---|---|---|</p>
-<p class="text-gray-300 leading-relaxed">| P99 indexing lag | > 5 minutes | > 30 minutes |</p>
-<p class="text-gray-300 leading-relaxed">| Queue depth | > 500 documents | > 5,000 documents |</p>
-<p class="text-gray-300 leading-relaxed">| Coverage ratio | < 0.98 | < 0.95 |</p>
-<p class="text-gray-300 leading-relaxed">| Orphaned chunk count | > 100 | > 1,000 |</p>
-
-<p class="text-gray-300 leading-relaxed">Set these as time-series alerts in whatever observability stack you already operate — Prometheus with Grafana, Datadog, CloudWatch. The queries above can be wrapped in a metrics scraper that runs every minute and emits gauge values.</p>
+<p class="text-gray-300 leading-relaxed">A model change invalidates every vector in the index — the pipeline must re-embed the full corpus, not just new documents. This is the heaviest workload the indexing pipeline will ever run: full-corpus embedding API spend plus a full table rewrite plus a DiskANN rebuild. Treat it as a planned migration (Chapter 23), not a routine pipeline run: side-by-side column, throttled backfill, eval-gated cutover.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Recall Degradation Detection</h3>
 
-<p class="text-gray-300 leading-relaxed">Lag metrics tell you about pipeline health. They do not tell you about index quality. A pipeline can be fully current — zero lag, perfect coverage — but the HNSW graph can still have degraded recall if it was built under heavy write pressure or with parameters that were too small for the current dataset size.</p>
+<p class="text-gray-300 leading-relaxed">Indexes degrade silently — recall drops a point a month and nobody notices until users complain. Detect it with a canary: a fixed set of eval questions with known-good chunks (Chapter 27), run on a schedule against production, with results trended in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dbo.EvalScores</code>. A falling recall@k trend after heavy ingest periods is the signal to rebuild the DiskANN index; a falling trend with no ingest correlation points at corpus drift — new topics the chunking or model handles poorly.</p>
 
-<p class="text-gray-300 leading-relaxed">The way to detect recall degradation is to maintain a <strong class="text-white">golden evaluation set</strong>: a small collection of queries with known ground-truth results, determined by brute-force exact search over a snapshot of the dataset. You then periodically run these queries through the ANN index and measure how many of the ground-truth results appear in the top-k.</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python — recall benchmark against a golden evaluation set
-import psycopg2
-import numpy as np
-from typing import List, Tuple
-
-def brute_force_top_k(
-    query_vector: List[float],
-    conn,
-    top_k: int = 10
-) -&gt; List[str]:
-    """
-    Exact nearest neighbors using sequential scan.
-    Used only for evaluation, not for production queries.
-    """
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT doc_id
-            FROM document_chunks
-            ORDER BY embedding &lt;=&gt; %s::vector
-            LIMIT %s
-            """,
-            (query_vector, top_k)
-        )
-        return [row[0] for row in cur.fetchall()]
-
-
-def ann_top_k(
-    query_vector: List[float],
-    conn,
-    top_k: int = 10,
-    ef_search: int = 40
-) -&gt; List[str]:
-    """
-    Approximate nearest neighbors using HNSW index.
-    """
-    with conn.cursor() as cur:
-        cur.execute(f"SET hnsw.ef_search = {ef_search}")
-        cur.execute(
-            """
-            SELECT doc_id
-            FROM document_chunks
-            ORDER BY embedding &lt;=&gt; %s::vector
-            LIMIT %s
-            """,
-            (query_vector, top_k)
-        )
-        return [row[0] for row in cur.fetchall()]
-
-
-def measure_recall(
-    evaluation_set: List[Tuple[List[float], List[str]]],
-    conn,
-    top_k: int = 10,
-    ef_search: int = 40
-) -&gt; float:
-    """
-    evaluation_set: list of (query_vector, ground_truth_doc_ids) pairs.
-    Returns mean recall@top_k across all evaluation queries.
-    """
-    recalls = []
-    for query_vector, ground_truth in evaluation_set:
-        ann_results = set(ann_top_k(query_vector, conn, top_k, ef_search))
-        ground_truth_set = set(ground_truth[:top_k])
-        if not ground_truth_set:
-            continue
-        hit_count = len(ann_results & ground_truth_set)
-        recalls.append(hit_count / len(ground_truth_set))
-
-    return float(np.mean(recalls)) if recalls else 0.0
-
-
-# Build the evaluation set once (or refresh monthly)
-def build_evaluation_set(
-    sample_queries: List[str],
-    embeddings_client,
-    conn,
-    top_k: int = 10
-) -&gt; List[Tuple[List[float], List[str]]]:
-    evaluation_set = []
-    vectors = embeddings_client.embed_documents(sample_queries)
-    for vec in vectors:
-        ground_truth = brute_force_top_k(vec, conn, top_k)
-        evaluation_set.append((vec, ground_truth))
-    return evaluation_set
-
-
-# Periodic recall check — run this in a scheduled job (e.g., daily)
-conn = psycopg2.connect(DB_CONN)
-# evaluation_set loaded from persistent storage (pickle, JSON, etc.)
-# evaluation_set = load_evaluation_set("eval_set.pkl")
-
-# recall = measure_recall(evaluation_set, conn, top_k=10, ef_search=40)
-# if recall &lt; 0.85:
-#     trigger_index_rebuild_alert(recall)
-# print(f"Recall@10 (ef_search=40): {recall:.4f}")</code></pre>
-
-<p class="text-gray-300 leading-relaxed">A recall below 0.85 at <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ef_search=40</code> with an HNSW index built at <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">m=16, ef_construction=64</code> is a signal that either the index parameters need adjustment for the current dataset size, or the index has accumulated enough write-induced graph distortion to warrant a rebuild. Neither situation is an emergency, but both warrant scheduled maintenance.</p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: canary recall check (scheduled, trended)
+-- EvalCanary(QuestionId, QuestionEmbedding VECTOR(1536), GoldChunkId)
+-- For each canary question: is GoldChunkId in the top-10?
+-- Log the hit rate per run into dbo.EvalScores with Metric = 'canary_recall@10'.
+-- Alert when the 7-day rolling average drops &gt; 3 points below baseline.
+</code></pre>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Backfill Strategies for Large Datasets</h3>
 
-<p class="text-gray-300 leading-relaxed">When you first deploy a vector index on an existing dataset, or when you perform a full reindex after a model migration, you need a controlled backfill that does not overwhelm your embedding API, your database write capacity, or your operational budget.</p>
+<p class="text-gray-300 leading-relaxed">The initial load — or a full re-embed after a model change — is a bulk operation, not a trickle. The pattern that works:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Parallel worker pattern with a work queue:</strong></p>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Stage, then swap.</strong> Backfill into a staging table (or a new table version), build the DiskANN index on the staging table, validate recall on the canary set, then switch the application to the new table — via synonym repointing or a view — in one transaction. The old table is the instant rollback.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Throttle the write side.</strong> Batch embedding API calls at the provider's rate limits, commit the database writes in bounded batches (10–50K rows), and checkpoint progress so an interrupted backfill resumes, not restarts.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Mind the log.</strong> A full-corpus rewrite generates transaction log proportional to the data. Size log growth, consider batch commits with log backups between them, and never run the first full backfill unmonitored.</li>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python — parallel backfill with a work queue
-import concurrent.futures
-import queue
-import threading
-import time
-import psycopg2
-import logging
-from typing import Iterator
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python — resumable backfill with checkpoints
+import pyodbc
 
-MAX_WORKERS = 8          # Number of concurrent embedding+write workers
-EMBED_BATCH_SIZE = 100   # Documents per embedding API call
-WRITE_BATCH_SIZE = 500   # Chunks per database write batch
-RATE_LIMIT_RPS = 50      # Target requests per second to embedding API
+conn = pyodbc.connect("DRIVER={ODBC Driver 18 for SQL Server};"
+                      "SERVER=localhost;DATABASE=ragdb;Trusted_Connection=yes;"
+                      "Encrypt=yes;TrustServerCertificate=yes")
 
-
-def iter_source_documents(source_conn, batch_size: int = 1000) -&gt; Iterator[list]:
-    """
-    Yield batches of (product_id, description, category) rows
-    from the source database.
-    """
-    offset = 0
-    while True:
-        with source_conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT product_id, description, category
-                FROM products
-                WHERE deleted_at IS NULL
-                ORDER BY product_id
-                LIMIT %s OFFSET %s
-                """,
-                (batch_size, offset)
-            )
-            rows = cur.fetchall()
-        if not rows:
-            break
-        yield rows
-        offset += len(rows)
-        if len(rows) &lt; batch_size:
-            break
-
-
-def backfill_worker(
-    work_queue: queue.Queue,
-    vector_conn_string: str,
-    worker_id: int,
-    counter: list,   # Shared mutable counter [total_processed]
-    counter_lock: threading.Lock
-):
-    """
-    Worker thread: dequeues document batches, embeds, and writes.
-    """
-    conn = psycopg2.connect(vector_conn_string)
-    processed = 0
-
-    while True:
-        try:
-            batch = work_queue.get(timeout=5)
-        except queue.Empty:
-            break
-
-        try:
-            for product_id, description, category in batch:
-                index_document(
-                    doc_id=f"product-{product_id}",
-                    content=description or "",
-                    metadata={"source": "products", "category": category or ""},
-                    conn=conn
-                )
-                processed += 1
-
-            work_queue.task_done()
-
-            with counter_lock:
-                counter[0] += len(batch)
-                if counter[0] % 1000 == 0:
-                    logging.info(f"Backfill progress: {counter[0]} documents indexed")
-
-        except Exception as e:
-            logging.error(f"Worker {worker_id} failed on batch: {e}")
-            work_queue.task_done()
-
-    conn.close()
-    logging.info(f"Worker {worker_id} finished, processed {processed} documents locally")
-
-
-def run_backfill(source_conn_string: str, vector_conn_string: str):
-    source_conn = psycopg2.connect(source_conn_string)
-    work_queue = queue.Queue(maxsize=MAX_WORKERS * 4)
-    counter = [0]
-    counter_lock = threading.Lock()
-
-    workers = []
-    for i in range(MAX_WORKERS):
-        t = threading.Thread(
-            target=backfill_worker,
-            args=(work_queue, vector_conn_string, i, counter, counter_lock),
-            daemon=True
-        )
-        t.start()
-        workers.append(t)
-
-    # Feed the queue from the source
-    for batch in iter_source_documents(source_conn, batch_size=50):
-        work_queue.put(batch)
-        # Throttle producer to avoid overwhelming the queue
-        time.sleep(len(batch) / (RATE_LIMIT_RPS * MAX_WORKERS))
-
-    work_queue.join()
-    for t in workers:
-        t.join()
-
-    source_conn.close()
-    logging.info(f"Backfill complete. Total documents: {counter[0]}")</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Checkpointing the backfill.</strong> Large backfills fail partway through. Always checkpoint progress so a restart picks up where it left off rather than starting over. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">UNIQUE (doc_id, chunk_index)</code> constraint on the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">document_chunks</code> table combined with the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ON CONFLICT DO UPDATE</code> upsert semantics means re-processing already-indexed documents is safe — it overwrites without creating duplicates. The only cost is the redundant embedding API call, which is wasteful but not dangerous.</p>
-
-<p class="text-gray-300 leading-relaxed">For extra safety, maintain an explicit checkpoint table:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
-CREATE TABLE backfill_checkpoint (
-    backfill_id     TEXT PRIMARY KEY,
-    last_product_id BIGINT NOT NULL,
-    total_indexed   BIGINT NOT NULL DEFAULT 0,
-    started_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
--- Update checkpoint after each batch
-INSERT INTO backfill_checkpoint (backfill_id, last_product_id, total_indexed)
-VALUES ('migration-2024-11', 42000, 42000)
-ON CONFLICT (backfill_id)
-DO UPDATE SET
-    last_product_id = EXCLUDED.last_product_id,
-    total_indexed   = EXCLUDED.total_indexed,
-    updated_at      = NOW();
-
--- Resume from checkpoint
-SELECT last_product_id FROM backfill_checkpoint
-WHERE backfill_id = 'migration-2024-11';</code></pre>
+BATCH = 20000
+cur = conn.cursor()
+while True:
+    rows = cur.execute(f"""SELECT TOP ({BATCH}) DocId, BodyText
+                           FROM dbo.BackfillQueue
+                           WHERE Status = 'pending'
+                           ORDER BY DocId""").fetchall()
+    if not rows:
+        break
+    for doc_id, body in rows:
+        upsert_document(doc_id, body, tenant_id=1)  # from Section 28.2
+        cur.execute("UPDATE dbo.BackfillQueue SET Status = 'done' "
+                    "WHERE DocId = ?", (doc_id,))
+    conn.commit()   # checkpoint per batch: kill-safe and resumable
+print("Backfill complete.")
+</code></pre>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Vector index freshness is not automatic.** Unlike B-tree indexes that update transactionally, vector indexes require an explicit pipeline that runs chunking, embedding generation, and upsert as separate asynchronous steps. The gap between a source write and its vector representation is a design choice you must actively manage.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Design around index-after-load.</strong> SQL Server's DiskANN preview favors bulk ingest followed by index build over trickle writes against a live vector index. Buffer writes, then rebuild on a schedule your freshness SLA requires.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Choose your CDC approach based on your freshness SLA.** Watermark polling (30–90 second lag) is simple and sufficient for most applications. Debezium-to-Kafka CDC (sub-5-second lag) is appropriate when stale results are directly harmful — live inventory, breaking news, or customer-facing personalization. Do not add Kafka complexity unless you genuinely need sub-minute freshness.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Make ingestion idempotent.</strong> Content-hash guards and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">MERGE</code> upserts mean the pipeline is safely re-runnable and never double-bills the embedding API.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **HNSW indexes degrade under write pressure and need periodic rebuilds.** pgvector accepts live inserts but accumulates graph distortion over time. Use `CREATE INDEX CONCURRENTLY` to rebuild during low-traffic windows without blocking queries. Treat this as scheduled maintenance, not an emergency procedure.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Match change capture to the SLA.</strong> Watermark polling for minutes-level freshness, SQL Server CDC for sub-minute — and handle deletes explicitly in both, or the index serves ghost content.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Embedding model migrations require blue-green reindexing.** Vectors from different models occupy incompatible spaces. When upgrading models, dual-write to both old and new indexes during the transition, validate retrieval parity with Jaccard similarity checks across a representative query set, and only cut over query traffic after the new index meets your recall threshold.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Backfill by stage-and-swap.</strong> New table, new index, canary-validated, synonym-switched — with the old table as instant rollback and checkpointed batches throughout.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Instrument both pipeline health and index quality as separate concerns.** Lag metrics, queue depth, and coverage ratios tell you whether documents are reaching the index. Periodic recall benchmarks against a golden evaluation set tell you whether the index itself is returning accurate results. You need both — a current but degraded index fails users just as much as a high-quality but stale one.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Detect degradation with a canary.</strong> Trend recall@k on a fixed question set in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dbo.EvalScores</code>; falling recall after heavy ingest means rebuild the index, falling recall without ingest means corpus drift.</li>
     </div>
     <div class="mt-14 bg-cyan-950/40 border border-cyan-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
-        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · SQL Server</p>
       </div>
       <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
          class="shrink-0 px-6 py-3 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold rounded-xl text-sm transition">
         Download Free
       </a>
     </div>
-    <div class="mt-8 text-xs">
-      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a>
+    <div class="mt-10 flex items-center justify-between text-xs">
+      <a href="b4-ch27-evaluating-rag.html" class="text-gray-500 hover:text-gray-300 transition">← Previous Chapter</a>
+      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">All Chapters</a>
+      <a href="b4-ch29-realtime-vs-batch.html" class="text-cyan-400 hover:text-cyan-300 transition">Next Chapter →</a>
     </div>
   </article>
   <footer class="border-t border-gray-800/50 px-6 py-8">

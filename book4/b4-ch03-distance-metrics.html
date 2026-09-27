@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Chapter 3: Distance Metrics: Cosine, Euclidean, Dot Product — Vector Databases & AI</title>
-  <meta name="description" content="Vector Databases & AI Chapter 3: Distance Metrics: Cosine, Euclidean, Dot Product. pgvector, Pinecone, Weaviate, RAG pipelines — by Rajesh Guntupalli." />
+  <meta name="description" content="Vector Databases & AI Chapter 3: Distance metrics — cosine, Euclidean, dot product in SQL Server 2025 VECTOR_DISTANCE, with index metric matching and production pitfalls. By Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
   <script type="module">
     import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
@@ -43,1001 +43,203 @@
     <div class="space-y-4 text-sm">
 <h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 3: Distance Metrics: Cosine, Euclidean, Dot Product</h2>
 
-<p class="text-gray-300 leading-relaxed">Every vector search query asks the same fundamental question: how similar is this vector to that one? The answer depends entirely on how you measure similarity — and that choice is not arbitrary. The three dominant distance metrics in production vector systems — cosine similarity, Euclidean distance, and dot product — each make different mathematical assumptions about what "closeness" means, and each is optimized for different embedding types, storage architectures, and query patterns. Getting this wrong means your semantic search returns irrelevant results, your recommendation engine surfaces stale content, and your RAG pipeline retrieves the wrong context — all while your vector index silently operates on numbers that look reasonable but mean nothing useful. This chapter gives you a precise, production-grounded understanding of all three metrics: the math behind them, how they behave with real embeddings, and how to configure them correctly in pgvector, Pinecone, Weaviate, Qdrant, and other systems.</p>
+<p class="text-gray-300 leading-relaxed">Every vector search query asks the same fundamental question: how similar is this vector to that one? The answer depends entirely on how you measure similarity — and that choice is not arbitrary. The three dominant distance metrics in production vector systems — cosine similarity, Euclidean distance, and dot product — each make different mathematical assumptions about what "closeness" means, and each is optimized for different embedding types, storage architectures, and query patterns. Getting this wrong means your semantic search returns irrelevant results, your recommendation engine surfaces stale content, and your RAG pipeline retrieves the wrong context — all while your vector index silently operates on numbers that look reasonable but mean nothing useful. This chapter gives you a precise, production-grounded understanding of all three metrics: the math behind them, how they behave with real embeddings, and how to configure them correctly in SQL Server 2025, Pinecone, Weaviate, and Qdrant.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">3.1 What Distance Metrics Actually Measure (And Why It's Not Just Geometry)</h3>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Cosine: Angle, Not Length</h3>
 
-<p class="text-gray-300 leading-relaxed">Before writing a single line of SQL or configuration, you need to understand what these metrics are computing and why the choice matters at the embedding layer.</p>
+<p class="text-gray-300 leading-relaxed">Cosine similarity measures the angle between two vectors, ignoring their lengths. Two documents that say the same thing in different amounts of detail point in the same direction — cosine treats them as similar. This is why cosine is the default metric for text embeddings: most text models produce vectors whose magnitude carries little semantic meaning, and discarding it removes noise.</p>
 
-<p class="text-gray-300 leading-relaxed">An embedding is a dense numerical vector — typically 768 to 3072 dimensions for modern language models — that encodes semantic meaning as a position in high-dimensional space. The embedding model learns to position semantically similar inputs near each other and dissimilar inputs far apart. "Near" and "far" are defined by the distance metric used during training. This is the point most database engineers miss: <strong class="text-white">the metric you use at query time must match or be compatible with the metric the model was optimized for during training.</strong> Using the wrong metric against an embedding trained with a different objective function degrades search quality measurably.</p>
+<p class="text-gray-300 leading-relaxed">In SQL Server, cosine distance is a first argument to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_DISTANCE</code> and the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">METRIC</code> of your vector index. Note the convention: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_DISTANCE</code> returns <strong class="text-white">distance</strong>, where 0 means identical and smaller is more similar. Cosine similarity, the thing humans talk about, is <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">1 - distance</code>, ranging from 1 (identical direction) through 0 (orthogonal) to −1 (opposite).</p>
 
-<p class="text-gray-300 leading-relaxed">Think of it in database terms. An embedding is like a computed column that encodes a complex function of the source data. The distance metric is the comparison operator used in the WHERE clause. Just as you would not use a string inequality comparison on a numeric column and expect meaningful results, you should not use Euclidean distance on embeddings trained with cosine objectives and expect meaningful ranking.</p>
-
-<p class="text-gray-300 leading-relaxed">The three metrics differ in what they ignore and what they emphasize:</p>
-
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Cosine similarity** measures the angle between two vectors, ignoring their magnitudes. Two vectors pointing in the same direction score 1.0 regardless of how long they are.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Euclidean distance** (L2) measures the straight-line distance between two vector endpoints in space. It is sensitive to both direction and magnitude.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Dot product** (inner product) measures both angle and magnitude together. It rewards vectors that are both directionally aligned and large.</li>
-
-<p class="text-gray-300 leading-relaxed">This means cosine similarity treats a document with 10 mentions of "database" identically to a document with 100 mentions, as long as the relative proportions of all terms are the same. Euclidean distance would treat those documents differently. Dot product would actively prefer the document with more signal — which is exactly the behavior you want in some recommendation scenarios.</p>
-
-<p class="text-gray-300 leading-relaxed">Here is a concrete Python example showing all three computed on the same pair of vectors:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python example — computing all three distance metrics from scratch
-import numpy as np
-
-def cosine_similarity(a: np.ndarray, b: np.ndarray) -&gt; float:
-    """
-    Measures angle between vectors. Range: -1.0 to 1.0.
-    1.0 = identical direction, 0.0 = orthogonal, -1.0 = opposite.
-    """
-    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
-
-def euclidean_distance(a: np.ndarray, b: np.ndarray) -&gt; float:
-    """
-    Measures straight-line distance. Range: 0.0 to infinity.
-    Lower = more similar.
-    """
-    return np.linalg.norm(a - b)
-
-def dot_product(a: np.ndarray, b: np.ndarray) -&gt; float:
-    """
-    Measures both direction and magnitude. Range: -infinity to infinity.
-    Higher = more similar (for normalized vectors, equals cosine similarity).
-    """
-    return np.dot(a, b)
-
-# Two 4-dimensional vectors for illustration
-# In production these would be 768–3072 dimensional embeddings
-vec_a = np.array([0.2, 0.5, 0.1, 0.8])
-vec_b = np.array([0.4, 1.0, 0.2, 1.6])  # vec_b = 2 * vec_a — same direction, 2x magnitude
-
-print(f"Cosine similarity:   {cosine_similarity(vec_a, vec_b):.6f}")   # 1.000000 — identical angle
-print(f"Euclidean distance:  {euclidean_distance(vec_a, vec_b):.6f}")  # 0.969536 — sees the difference
-print(f"Dot product:         {dot_product(vec_a, vec_b):.6f}")         # 1.880000 — vec_b amplifies the signal
-
-# Now normalize both to unit length and compare again
-vec_a_norm = vec_a / np.linalg.norm(vec_a)
-vec_b_norm = vec_b / np.linalg.norm(vec_b)
-
-print("\n--- After L2 normalization ---")
-print(f"Cosine similarity:   {cosine_similarity(vec_a_norm, vec_b_norm):.6f}")  # 1.000000
-print(f"Euclidean distance:  {euclidean_distance(vec_a_norm, vec_b_norm):.6f}") # 0.000000 — identical after norm
-print(f"Dot product:         {dot_product(vec_a_norm, vec_b_norm):.6f}")        # 1.000000 — equals cosine</code></pre>
-
-<p class="text-gray-300 leading-relaxed">This last block is the key mathematical insight you need to internalize: <strong class="text-white">when all vectors are L2-normalized to unit length, cosine similarity and dot product are mathematically equivalent, and the Euclidean distance between them is a monotonic transformation of the cosine distance.</strong> Many embedding models — including OpenAI's text-embedding-3-small and all-MiniLM-L6-v2 — output normalized or near-normalized vectors. In those cases, all three metrics produce the same ranking order, and the choice between them becomes a question of computational efficiency rather than mathematical correctness.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
-
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">3.2 Cosine Similarity in Practice: When Angle Is All That Matters</h3>
-
-<p class="text-gray-300 leading-relaxed">Cosine similarity is the dominant metric for text embeddings and the default choice in most RAG pipelines. Its strength is scale invariance: the length of the vector does not affect the similarity score, only the direction. This property naturally handles documents of different lengths, embedding outputs from different batch sizes, and representations that might vary in norm due to quantization or compression.</p>
-
-<p class="text-gray-300 leading-relaxed">The cosine distance (1 - cosine similarity) is used when you need a proper distance metric that satisfies the triangle inequality, which is required by some index structures. Most vector databases accept configuration for both.</p>
-
-<p class="text-gray-300 leading-relaxed">In pgvector, cosine distance is expressed with the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs"><=></code> operator:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
--- Create a table for document embeddings (e.g., from OpenAI text-embedding-3-small, 1536 dims)
-CREATE TABLE documents (
-    id          BIGSERIAL PRIMARY KEY,
-    content     TEXT NOT NULL,
-    source_url  TEXT,
-    embedding   VECTOR(1536)
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server 2025: cosine distance for text embeddings
+CREATE TABLE dbo.Documents (
+    DocId     INT IDENTITY(1,1) NOT NULL CONSTRAINT PK_Documents PRIMARY KEY,
+    Content   NVARCHAR(MAX) NOT NULL,
+    SourceUrl NVARCHAR(500) NULL,
+    Embedding VECTOR(1536) NULL      -- e.g. text-embedding-3-small
 );
 
--- Create an HNSW index optimized for cosine distance
--- HNSW is preferred over IVFFlat for cosine when dataset &lt; 5M rows
-CREATE INDEX ON documents USING hnsw (embedding vector_cosine_ops)
-    WITH (m = 16, ef_construction = 64);
+-- DiskANN index with cosine metric
+CREATE VECTOR INDEX IX_Documents_Embedding
+ON dbo.Documents (Embedding)
+WITH (METRIC = 'cosine', TYPE = 'DiskANN', MAXDOP = 4);
 
--- Semantic search: find the 5 most similar documents to a query embedding
--- The :query_embedding parameter is your 1536-dimensional query vector
-SELECT
-    id,
-    content,
-    source_url,
-    1 - (embedding &lt;=&gt; :query_embedding) AS cosine_similarity
-FROM documents
-ORDER BY embedding &lt;=&gt; :query_embedding
-LIMIT 5;
+-- Semantic search: TOP 5 by cosine distance
+DECLARE @q VECTOR(1536) = '[0.12, 0.87, 0.34, ...]';
 
--- Note: pgvector uses cosine DISTANCE (&lt;=&gt;), not similarity
--- cosine_distance = 1 - cosine_similarity
--- Range of cosine distance: 0.0 (identical) to 2.0 (opposite)
--- For normalized vectors it ranges 0.0 to 2.0, practical range is usually 0.0 to 1.0</code></pre>
+SELECT TOP (5)
+       DocId, Content, SourceUrl,
+       1 - VECTOR_DISTANCE('cosine', Embedding, @q) AS CosineSimilarity
+FROM dbo.Documents
+WHERE Embedding IS NOT NULL
+ORDER BY VECTOR_DISTANCE('cosine', Embedding, @q);</code></pre>
 
-<p class="text-gray-300 leading-relaxed">The same operation in Pinecone uses cosine as the index-level setting — you cannot change the metric after index creation:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python example — creating a Pinecone index with cosine metric and querying it
-from pinecone import Pinecone, ServerlessSpec
-import openai
-
-pc = Pinecone(api_key="YOUR_PINECONE_API_KEY")
-
-# Metric is set at index creation and cannot be changed afterward
-# This is the key operational difference from a traditional database — plan ahead
-pc.create_index(
-    name="documents-cosine",
-    dimension=1536,                      # matches OpenAI text-embedding-3-small
-    metric="cosine",                     # options: cosine, euclidean, dotproduct
-    spec=ServerlessSpec(cloud="aws", region="us-east-1")
-)
-
-index = pc.Index("documents-cosine")
-
-# Generate a query embedding using OpenAI
-client = openai.OpenAI(api_key="YOUR_OPENAI_API_KEY")
-
-query_text = "how do I optimize PostgreSQL for write-heavy workloads?"
-response = client.embeddings.create(
-    input=query_text,
-    model="text-embedding-3-small"
-)
-query_embedding = response.data[0].embedding  # list of 1536 floats
-
-# Query the index — Pinecone returns cosine similarity scores (higher = more similar)
-# Note: Pinecone inverts the cosine distance so 1.0 = identical, 0.0 = unrelated
-results = index.query(
-    vector=query_embedding,
-    top_k=5,
-    include_metadata=True
-)
-
-for match in results.matches:
-    print(f"ID: {match.id:30s}  Score: {match.score:.4f}  Title: {match.metadata.get('title', 'N/A')}")</code></pre>
-
-<p class="text-gray-300 leading-relaxed">One production pattern worth establishing early: normalize your embeddings before storing them if your embedding model does not guarantee unit-length output. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sentence-transformers</code> library normalizes by default when you use <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">encode(normalize_embeddings=True)</code>. OpenAI's text-embedding-3 models output vectors that are already close to unit norm but not exactly 1.0 due to floating-point precision. For strict cosine implementations, explicit normalization costs little at write time and eliminates a class of subtle ranking errors.</p>
+<p class="text-gray-300 leading-relaxed">Cosine is the correct default when: your embedding model outputs normalized or near-normalized vectors (most modern text models do), document length varies, or you are doing semantic text search. Practically speaking, if your embeddings come from an OpenAI, Cohere, or sentence-transformer text model, start with cosine.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">3.3 Euclidean Distance: When Magnitude Carries Meaning</h3>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Euclidean (L2): Straight-Line Distance</h3>
 
-<p class="text-gray-300 leading-relaxed">Euclidean distance (L2 distance) is the default metric for many image embedding models, multimodal systems, and any domain where the magnitude of an embedding encodes meaningful information. In text applications it is less common, but in computer vision, audio, and scientific data contexts it often outperforms cosine.</p>
+<p class="text-gray-300 leading-relaxed">Euclidean distance measures the straight-line distance between two points in vector space — the ruler measurement. Unlike cosine, it cares about magnitude. Two vectors pointing the same direction but with very different lengths are far apart in L2. This makes L2 the right metric when magnitude carries meaning: image embeddings where brightness and contrast encode into vector length, audio embeddings where energy matters, or scientific sensor data where the actual values are the point.</p>
 
-<p class="text-gray-300 leading-relaxed">The intuition: if your embedding model is trained to place embeddings in a space where both direction and length encode distinct properties — for example, where longer vectors represent more "intense" or "prominent" concepts — then cosine similarity throws away half the information. Euclidean distance preserves it.</p>
-
-<p class="text-gray-300 leading-relaxed">In pgvector, Euclidean distance uses the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs"><-></code> operator:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
--- Image similarity search using Euclidean distance
--- e.g., embeddings from CLIP (512 dims) or ResNet features (2048 dims)
-CREATE TABLE product_images (
-    id           BIGSERIAL PRIMARY KEY,
-    product_id   UUID NOT NULL,
-    image_url    TEXT NOT NULL,
-    embedding    VECTOR(512)             -- CLIP ViT-B/32 output dimension
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server 2025: L2 distance for image embeddings
+CREATE TABLE dbo.ProductImages (
+    ImageId   INT IDENTITY(1,1) NOT NULL CONSTRAINT PK_ProductImages PRIMARY KEY,
+    ProductId UNIQUEIDENTIFIER NOT NULL,
+    ImageUrl  NVARCHAR(500) NOT NULL,
+    Embedding VECTOR(512) NULL        -- e.g. CLIP ViT-B/32 output
 );
 
--- HNSW with L2 operator class
-CREATE INDEX ON product_images USING hnsw (embedding vector_l2_ops)
-    WITH (m = 16, ef_construction = 64);
+-- Same index DDL, different metric
+CREATE VECTOR INDEX IX_ProductImages_Embedding
+ON dbo.ProductImages (Embedding)
+WITH (METRIC = 'euclidean', TYPE = 'DiskANN', MAXDOP = 4);
 
--- Find visually similar products to a given query image
--- Lower L2 distance = more similar
-SELECT
-    p.id,
-    p.product_id,
-    p.image_url,
-    p.embedding &lt;-&gt; :query_image_embedding AS l2_distance
-FROM product_images p
-ORDER BY p.embedding &lt;-&gt; :query_image_embedding
-LIMIT 10;
+-- Visual similarity: smaller L2 distance = more similar
+DECLARE @qi VECTOR(512) = '[0.05, 0.41, ...]';
 
--- IVFFlat alternative for larger datasets (&gt; 1M rows)
--- Requires ANALYZE after load; less accurate but faster at scale
-CREATE INDEX ON product_images USING ivfflat (embedding vector_l2_ops)
-    WITH (lists = 100);
--- Rule of thumb: lists = sqrt(total_rows) for balanced speed/recall
--- After loading data: ANALYZE product_images;</code></pre>
+SELECT TOP (10)
+       ImageId, ProductId, ImageUrl,
+       VECTOR_DISTANCE('euclidean', Embedding, @qi) AS L2Distance
+FROM dbo.ProductImages
+WHERE Embedding IS NOT NULL
+ORDER BY VECTOR_DISTANCE('euclidean', Embedding, @qi);</code></pre>
 
-<p class="text-gray-300 leading-relaxed">The critical operational difference between IVFFlat and HNSW becomes concrete with Euclidean distance. IVFFlat clusters the vector space using k-means centroids, and L2 distance is the natural clustering objective. HNSW builds a hierarchical graph and works well with any metric. For datasets under roughly 1 million vectors on PostgreSQL, HNSW with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">vector_l2_ops</code> gives better recall with less tuning. Above that scale — or on machines with limited RAM for the HNSW graph — IVFFlat is more memory-efficient.</p>
-
-<p class="text-gray-300 leading-relaxed">Here is a comparison that shows the recall and latency tradeoffs you should test against your actual data before committing to an index type:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python example — benchmarking IVFFlat vs HNSW recall for L2 distance using pgvector
-import psycopg2
-import numpy as np
-import time
-
-conn = psycopg2.connect("host=localhost dbname=vectordb user=postgres password=secret")
-cur = conn.cursor()
-
-def run_ann_query(query_vector: list, index_type: str, k: int = 10) -&gt; tuple[list, float]:
-    """Run an ANN query and return (result_ids, latency_ms)."""
-    vec_str = "[" + ",".join(str(v) for v in query_vector) + "]"
-    
-    # Set ef_search for HNSW (higher = better recall, slower)
-    if index_type == "hnsw":
-        cur.execute("SET hnsw.ef_search = 100")
-    elif index_type == "ivfflat":
-        cur.execute("SET ivfflat.probes = 10")  # probes ≈ sqrt(lists) is a common starting point
-    
-    start = time.perf_counter()
-    cur.execute(
-        f"SELECT id FROM product_images ORDER BY embedding &lt;-&gt; %s::vector LIMIT %s",
-        (vec_str, k)
-    )
-    elapsed_ms = (time.perf_counter() - start) * 1000
-    result_ids = [row[0] for row in cur.fetchall()]
-    return result_ids, elapsed_ms
-
-# Load 100 random query vectors for benchmarking
-np.random.seed(42)
-query_vectors = [np.random.rand(512).tolist() for _ in range(100)]
-
-# Run benchmark
-latencies = []
-for qvec in query_vectors:
-    _, latency = run_ann_query(qvec, index_type="hnsw", k=10)
-    latencies.append(latency)
-
-print(f"HNSW L2 — p50: {np.percentile(latencies, 50):.1f}ms  "
-      f"p95: {np.percentile(latencies, 95):.1f}ms  "
-      f"p99: {np.percentile(latencies, 99):.1f}ms")
-
-cur.close()
-conn.close()</code></pre>
-
-<p class="text-gray-300 leading-relaxed">In Weaviate, Euclidean distance is configured at the collection level under <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">vectorizer</code> settings and requires the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">l2-squared</code> distance metric parameter. Weaviate calls it <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">l2-squared</code> because it omits the square root for computational efficiency — the square root is a monotonic function, so it does not change the ranking order. You will see this optimization in several production vector databases: they compute L2-squared internally but report the API documentation in terms of standard L2.</p>
+<p class="text-gray-300 leading-relaxed">A subtle but important relationship: for unit-normalized vectors, cosine distance and L2 distance produce identical rankings — the two metrics are monotonically related. This means if you normalize all embeddings at ingest time, you can use either metric and get the same top-k results. If you do not normalize, the choice genuinely changes results. Pick deliberately and document the decision next to the ingest code.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">3.4 Dot Product: Maximum Throughput for Recommendation and Ranking Systems</h3>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Dot Product: Magnitude-Aware Similarity</h3>
 
-<p class="text-gray-300 leading-relaxed">The dot product (also called inner product) is the most computationally efficient of the three metrics because it avoids the normalization step required by cosine similarity. On modern hardware with SIMD instructions, this matters at scale: skipping normalization measurably reduces per-query CPU cost under high query volume, though the exact savings depend on hardware and vector dimensionality — benchmark it on your own workload rather than assuming a fixed percentage.</p>
+<p class="text-gray-300 leading-relaxed">Dot product combines direction and magnitude: large dot products mean vectors point the same way <em>and</em> are long. Recommendation systems love it because magnitude often encodes a signal the model learned — popular or high-quality items get longer vectors in two-tower models, and dot product ranking surfaces them naturally. Dense Passage Retrieval (DPR) and many recommender architectures are trained with dot product as the scoring function, and switching metrics at serving time breaks the ranking the model learned.</p>
 
-<p class="text-gray-300 leading-relaxed">Beyond performance, dot product is the correct metric for specific problem categories:</p>
-
-<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Recommendation systems with popularity signals</strong>: If your embedding model is trained with a two-tower architecture (common in large-scale recommendation at companies like Google, Meta, and Spotify), the item embedding magnitudes are deliberately trained to encode relevance intensity. Using cosine would strip that signal away.</p>
-<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Dense retrieval models trained with in-batch negatives</strong>: Models like DPR (Dense Passage Retrieval) and BGE-M3 with specific training configurations expect inner product similarity at inference time to match their training objective.</p>
-<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Maximum Inner Product Search (MIPS) problems</strong>: A well-studied class of problems in recommendation, where the goal is to find the item with the highest dot product against a query embedding.</p>
-
-<p class="text-gray-300 leading-relaxed">In pgvector, dot product similarity uses the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs"><#></code> operator. Note the sign convention: pgvector returns the <strong class="text-white">negative</strong> inner product because all of its operators follow the "lower is more similar" convention:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
--- Recommendation system using dot product (inner product)
--- Assumes item embeddings are NOT normalized — magnitude encodes popularity/quality signal
-CREATE TABLE item_embeddings (
-    item_id      BIGINT PRIMARY KEY,
-    item_type    TEXT NOT NULL,          -- 'article', 'product', 'video'
-    embedding    VECTOR(256)             -- two-tower model, 256-dimensional item tower
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server 2025: dot product for recommendation embeddings
+-- Item embeddings are NOT normalized here — magnitude encodes the quality signal
+CREATE TABLE dbo.ItemEmbeddings (
+    ItemId    BIGINT NOT NULL CONSTRAINT PK_ItemEmbeddings PRIMARY KEY,
+    ItemType  NVARCHAR(20) NOT NULL,   -- 'article', 'product', 'video'
+    Embedding VECTOR(256) NULL         -- two-tower model, 256-dim item tower
 );
 
--- HNSW with inner product operator class
-CREATE INDEX ON item_embeddings USING hnsw (embedding vector_ip_ops)
-    WITH (m = 32, ef_construction = 128);
--- Higher m (32 vs default 16) improves recall for dot product
--- because the HNSW graph needs more connections to navigate non-Euclidean topology
+CREATE VECTOR INDEX IX_ItemEmbeddings_Embedding
+ON dbo.ItemEmbeddings (Embedding)
+WITH (METRIC = 'dot', TYPE = 'DiskANN', MAXDOP = 4);
 
--- Get top-10 recommendations for a user embedding
--- &lt;#&gt; returns NEGATIVE dot product — ORDER BY ascending to get highest dot product first
-SELECT
-    item_id,
-    item_type,
-    (embedding &lt;#&gt; :user_embedding) * -1 AS dot_product_score
-FROM item_embeddings
-WHERE item_type = 'article'
-ORDER BY embedding &lt;#&gt; :user_embedding   -- ascending negative = descending positive
-LIMIT 10;</code></pre>
+-- VECTOR_DISTANCE('dot', ...) returns the NEGATIVE dot product:
+-- ORDER BY ascending retrieves the highest dot product first
+DECLARE @user VECTOR(256) = '[0.21, 0.03, ...]';
 
-<p class="text-gray-300 leading-relaxed">The sign inversion is a common source of bugs when engineers first switch from cosine to dot product in pgvector. Cosine distance is inherently non-negative (0.0 to 2.0), so "ORDER BY embedding <=> query ASC" feels natural. With <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs"><#></code>, which returns a negative value, you must either remember to sort ascending (which retrieves the most negative negated dot product, i.e., the highest actual dot product) or multiply by -1 in a subquery. Both approaches work; consistency in your codebase matters more than which pattern you choose.</p>
+SELECT TOP (10)
+       ItemId, ItemType,
+       -VECTOR_DISTANCE('dot', Embedding, @user) AS DotProductScore
+FROM dbo.ItemEmbeddings
+WHERE ItemType = 'article'
+  AND Embedding IS NOT NULL
+ORDER BY VECTOR_DISTANCE('dot', Embedding, @user);   -- ascending = most similar</code></pre>
 
-<p class="text-gray-300 leading-relaxed">In Qdrant, dot product is a first-class metric with clean semantics — no sign inversion:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python example — Qdrant collection with dot product metric for a recommendation system
-from qdrant_client import QdrantClient
-from qdrant_client.models import (
-    Distance, VectorParams, PointStruct, Filter, FieldCondition, MatchValue
-)
-import numpy as np
-
-client = QdrantClient(host="localhost", port=6333)
-
-# Create collection with dot product distance
-# Qdrant uses "Dot" — returns higher scores for more similar vectors (no sign inversion)
-client.create_collection(
-    collection_name="item_recommendations",
-    vectors_config=VectorParams(
-        size=256,
-        distance=Distance.DOT       # also available: COSINE, EUCLID, MANHATTAN
-    )
-)
-
-# Upsert item embeddings (simulating a two-tower model output)
-np.random.seed(42)
-items = [
-    PointStruct(
-        id=i,
-        vector=np.random.randn(256).tolist(),   # NOT normalized — magnitude matters
-        payload={
-            "title": f"Article {i}",
-            "category": "technology" if i % 2 == 0 else "science",
-            "engagement_score": float(np.random.uniform(0.1, 5.0))
-        }
-    )
-    for i in range(1, 10001)   # 10,000 items
-]
-client.upsert(collection_name="item_recommendations", points=items)
-
-# Query: find top items for a user embedding, filtered by category
-user_embedding = np.random.randn(256).tolist()
-
-results = client.search(
-    collection_name="item_recommendations",
-    query_vector=user_embedding,
-    query_filter=Filter(
-        must=[FieldCondition(key="category", match=MatchValue(value="technology"))]
-    ),
-    limit=10,
-    with_payload=True
-)
-
-for result in results:
-    print(f"ID: {result.id:5d}  Score: {result.score:.4f}  "
-          f"Title: {result.payload['title']:12s}  "
-          f"Engagement: {result.payload['engagement_score']:.2f}")</code></pre>
-
-<p class="text-gray-300 leading-relaxed">One warning about dot product at scale: HNSW index quality degrades more noticeably with dot product than with cosine when vectors have highly variable magnitudes. The HNSW graph is built using the dot product as the proximity function during construction, and if your training data has very large magnitude variance, the graph can develop poor connectivity in regions of the embedding space. Monitor your recall metrics in production and consider normalizing embeddings if recall drops below acceptable thresholds.</p>
+<p class="text-gray-300 leading-relaxed">The sign convention is the classic source of dot-product bugs: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">'dot'</code> returns the negative dot product so the "smaller distance = more similar" convention holds across all three metrics. Negate it in the SELECT list for a human-readable score, but always <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ORDER BY</code> the raw distance ascending. Mixing the two — sorting by the negated score ascending — silently inverts your recommendations, and the results look plausible enough that nobody notices for weeks.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">3.5 Choosing the Right Metric for Your Embedding Model and Use Case</h3>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">The Metric Must Match Everywhere: Index, Query, and Model</h3>
 
-<p class="text-gray-300 leading-relaxed">The theoretical distinctions between metrics only matter if they translate into measurable differences in your system. Here is a framework for making the decision systematically rather than guessing.</p>
+<p class="text-gray-300 leading-relaxed">Here is the production rule that prevents the worst metric bugs: the metric declared in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE VECTOR INDEX ... WITH (METRIC = ...)</code>, the metric argument in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_DISTANCE</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_SEARCH</code>, and the metric your embedding model was trained with must all agree. If the index was built with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">'cosine'</code> and your query asks for <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">'euclidean'</code>, the optimizer cannot use the index for ranking — it falls back to a full scan, and latency jumps from milliseconds to seconds with no error, no warning. The query is "correct" in the sense that it returns rows, and silently slow.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Step 1: Check the embedding model documentation.</strong> This is non-negotiable. Every major embedding model specifies its recommended similarity function:</p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Index built for cosine ...
+CREATE VECTOR INDEX IX_Documents_Embedding
+ON dbo.Documents (Embedding)
+WITH (METRIC = 'cosine', TYPE = 'DiskANN');
 
-<p class="text-gray-300 leading-relaxed">| Embedding Model | Recommended Metric | Normalized Output |</p>
-<p class="text-gray-300 leading-relaxed">|---|---|---|</p>
-<p class="text-gray-300 leading-relaxed">| OpenAI text-embedding-3-small/large | cosine | Near-unit (use cosine or dot product) |</p>
-<p class="text-gray-300 leading-relaxed">| OpenAI text-embedding-ada-002 | cosine | Near-unit |</p>
-<p class="text-gray-300 leading-relaxed">| Cohere embed-english-v3.0 | cosine | Yes (unit norm) |</p>
-<p class="text-gray-300 leading-relaxed">| sentence-transformers/all-MiniLM-L6-v2 | cosine | Yes (with normalize=True) |</p>
-<p class="text-gray-300 leading-relaxed">| CLIP (OpenAI) | cosine | Yes |</p>
-<p class="text-gray-300 leading-relaxed">| Google textembedding-gecko | dot product | No — magnitude is meaningful |</p>
-<p class="text-gray-300 leading-relaxed">| BGE-M3 (BAAI) | cosine or dot product (depends on mode) | Depends on usage |</p>
-<p class="text-gray-300 leading-relaxed">| DPR (Facebook) | dot product | No |</p>
+-- ... then someone queries with euclidean: index NOT used, full scan
+DECLARE @q VECTOR(1536) = '[0.12, 0.87, ...]';
+SELECT TOP (10) DocId,
+       VECTOR_DISTANCE('euclidean', Embedding, @q) AS D   -- metric mismatch!
+FROM dbo.Documents
+ORDER BY D;
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Step 2: Test whether normalization changes your results.</strong> If an embedding model outputs nearly-normalized vectors, cosine and dot product will produce nearly identical rankings. You can verify this quickly:</p>
+-- Confirm which path the plan takes (Chapter 14 covers vector plan analysis):
+-- check sys.dm_exec_query_stats for CPU regression after any metric change</code></pre>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python example — checking embedding magnitude distribution and metric correlation
-from sentence_transformers import SentenceTransformer
-import numpy as np
-from scipy.stats import spearmanr
-
-model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-
-sentences = [
-    "How do I create an index in PostgreSQL?",
-    "What is the difference between HNSW and IVFFlat?",
-    "Python machine learning frameworks comparison",
-    "Vector database performance benchmarks",
-    "Database normalization and denormalization tradeoffs",
-    "Kubernetes pod scheduling and resource limits",
-    "Natural language processing with transformer models",
-    "B-tree vs hash index performance",
-]
-
-# encode with normalization (default for sentence-transformers)
-embeddings_norm = model.encode(sentences, normalize_embeddings=True)
-# encode without normalization
-embeddings_raw  = model.encode(sentences, normalize_embeddings=False)
-
-# Check magnitude distribution
-norms = np.linalg.norm(embeddings_raw, axis=1)
-print(f"Raw embedding norms — min: {norms.min():.4f}  max: {norms.max():.4f}  mean: {norms.mean():.4f}")
-# For all-MiniLM-L6-v2, these are very close to 1.0, confirming near-unit output
-
-# Compute cosine similarity and dot product rankings for the first query against all others
-query_idx = 0
-query_norm = embeddings_norm[query_idx]
-query_raw  = embeddings_raw[query_idx]
-
-cosine_scores = [
-    np.dot(query_norm, embeddings_norm[i]) for i in range(len(sentences))
-]
-dot_scores = [
-    np.dot(query_raw, embeddings_raw[i]) for i in range(len(sentences))
-]
-l2_distances = [
-    np.linalg.norm(query_raw - embeddings_raw[i]) for i in range(len(sentences))
-]
-
-# Rank correlation between cosine and dot product — should be ~1.0 for near-normalized models
-rho_cosine_dot, _ = spearmanr(cosine_scores, dot_scores)
-# Rank correlation between cosine similarity and negative L2 distance
-rho_cosine_l2, _  = spearmanr(cosine_scores, [-d for d in l2_distances])
-
-print(f"Spearman rank correlation — cosine vs dot product: {rho_cosine_dot:.4f}")
-print(f"Spearman rank correlation — cosine vs -L2:         {rho_cosine_l2:.4f}")
-# Values near 1.0 confirm the metrics produce equivalent rankings for this model</code></pre>
-
-<p class="text-gray-300 leading-relaxed">If the Spearman correlation between metrics is above 0.99, you can choose whichever metric your infrastructure makes cheapest without sacrificing search quality. If the correlation is lower — especially between cosine and L2 — it signals that magnitudes vary meaningfully and the choice of metric genuinely changes which documents you retrieve.</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Step 3: Match the metric to the task type.</strong></p>
-
-<p class="text-gray-300 leading-relaxed">| Task | Recommended Metric | Reason |</p>
-<p class="text-gray-300 leading-relaxed">|---|---|---|</p>
-<p class="text-gray-300 leading-relaxed">| Semantic text search / RAG | cosine | Scale-invariant; works with any document length |</p>
-<p class="text-gray-300 leading-relaxed">| Question answering retrieval (DPR-style) | dot product | Training objective uses inner product |</p>
-<p class="text-gray-300 leading-relaxed">| Image/audio similarity | euclidean | Magnitude-sensitive models are common |</p>
-<p class="text-gray-300 leading-relaxed">| Recommendation (two-tower) | dot product | Item magnitude encodes quality signal |</p>
-<p class="text-gray-300 leading-relaxed">| Clustering / anomaly detection | euclidean | Centroid-based algorithms assume L2 geometry |</p>
-<p class="text-gray-300 leading-relaxed">| Deduplication / near-duplicate detection | cosine | Direction-only comparison handles length variation |</p>
-<p class="text-gray-300 leading-relaxed">| Cross-modal retrieval (text→image) | cosine | CLIP and similar models output normalized vectors |</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Step 4: Measure, don't assume.</strong> Build a small evaluation harness with labeled query-document pairs and compute recall@K for each metric against your actual data. The framework below works with any embedding model and vector store:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python example — evaluation harness for comparing distance metrics
-# Requires: a set of queries, a document corpus, and ground-truth relevant document IDs
-import numpy as np
-from sentence_transformers import SentenceTransformer
-from typing import Callable
-
-def compute_recall_at_k(
-    query_embeddings: np.ndarray,
-    doc_embeddings: np.ndarray,
-    ground_truth: list[set[int]],   # ground_truth[i] = set of relevant doc indices for query i
-    similarity_fn: Callable[[np.ndarray, np.ndarray], np.ndarray],
-    k: int = 10
-) -&gt; float:
-    """
-    Computes Recall@K: fraction of relevant documents found in the top-K results.
-    similarity_fn takes (query_embedding, all_doc_embeddings) and returns similarity scores.
-    """
-    total_recall = 0.0
-    for i, query_emb in enumerate(query_embeddings):
-        scores = similarity_fn(query_emb, doc_embeddings)
-        top_k_indices = set(np.argsort(scores)[::-1][:k])   # descending — higher score = more similar
-        relevant = ground_truth[i]
-        if len(relevant) &gt; 0:
-            recall = len(top_k_indices & relevant) / len(relevant)
-            total_recall += recall
-    return total_recall / len(query_embeddings)
-
-# Define similarity functions for each metric (all return higher = more similar)
-def cosine_sim_fn(query: np.ndarray, docs: np.ndarray) -&gt; np.ndarray:
-    query_norm = query / np.linalg.norm(query)
-    doc_norms  = docs / np.linalg.norm(docs, axis=1, keepdims=True)
-    return doc_norms @ query_norm
-
-def dot_product_fn(query: np.ndarray, docs: np.ndarray) -&gt; np.ndarray:
-    return docs @ query
-
-def neg_l2_fn(query: np.ndarray, docs: np.ndarray) -&gt; np.ndarray:
-    # Negate so that lower distance = higher score (consistent with other fns)
-    return -np.linalg.norm(docs - query, axis=1)
-
-# Example usage — plug in your own queries, docs, and ground_truth labels
-model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-
-# In a real evaluation, these would be your actual queries and corpus
-sample_queries = ["PostgreSQL index types", "vector search algorithms", "recommendation systems"]
-sample_docs    = [
-    "B-tree indexes in PostgreSQL are used for ordered data.",
-    "HNSW is a graph-based approximate nearest neighbor algorithm.",
-    "IVFFlat partitions the vector space into Voronoi cells.",
-    "Collaborative filtering is a common recommendation technique.",
-    "Two-tower models learn user and item representations separately.",
-    "Cosine similarity measures the angle between two vectors.",
-]
-# ground_truth[i] = indices of docs relevant to query i
-ground_truth = [
-    {0, 1, 2},      # docs relevant to "PostgreSQL index types"
-    {1, 2, 5},      # docs relevant to "vector search algorithms"
-    {3, 4},         # docs relevant to "recommendation systems"
-]
-
-query_embs = model.encode(sample_queries, normalize_embeddings=False)
-doc_embs   = model.encode(sample_docs,   normalize_embeddings=False)
-
-for metric_name, fn in [("cosine", cosine_sim_fn), ("dot_product", dot_product_fn), ("neg_l2", neg_l2_fn)]:
-    recall = compute_recall_at_k(query_embs, doc_embs, ground_truth, fn, k=3)
-    print(f"Recall@3 — {metric_name:15s}: {recall:.4f}")</code></pre>
-
-<p class="text-gray-300 leading-relaxed">Run this against a representative slice of your production query distribution — at least a few hundred labeled pairs — before committing to an index configuration. The cost of rebuilding a Pinecone index or recreating a pgvector index with a different operator class is non-trivial once you have millions of vectors stored.</p>
+<p class="text-gray-300 leading-relaxed">Encode the metric in infrastructure-as-code alongside the index definition, and treat any metric change as a schema migration: it means dropping and rebuilding the vector index (and possibly re-embedding with a different model). The same discipline applies across systems with different names for the same math — Pinecone calls it <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dotproduct</code>, Qdrant calls it <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DOT</code>, Weaviate uses <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">L2_SQUARED</code> for Euclidean. Build a reference table for your team so nobody has to guess across a system boundary.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">3.6 Metric Configuration Across Vector Databases: A Practical Reference</h3>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Normalization: Decide It at Ingest Time</h3>
 
-<p class="text-gray-300 leading-relaxed">Each vector database exposes the distance metric configuration differently, and the naming conventions are not consistent across systems. This section documents the exact configuration syntax for each major platform so you can translate your metric choice into working infrastructure.</p>
+<p class="text-gray-300 leading-relaxed">A decision that quietly interacts with everything above: whether vectors are L2-normalized before storage. SQL Server has no built-in normalize function for vectors, so normalization happens in your ingest pipeline (a one-liner in numpy or in the embedding client). Normalizing at ingest makes cosine and dot product rankings equivalent, makes Euclidean rankings equal to cosine rankings, and lets you store one representation that serves all three metrics. The cost is losing magnitude information — exactly the signal dot-product recommenders rely on. So the rule is simple: normalize at ingest for search and RAG workloads; keep raw magnitudes for recommender and retrieval models trained on dot product.</p>
 
-<p class="text-gray-300 leading-relaxed">#### pgvector (PostgreSQL extension)</p>
+<p class="text-gray-300 leading-relaxed">If you normalize at ingest, switching metrics later only requires rebuilding the index with the new <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">METRIC</code> — the stored data is already compatible. If you stored raw vectors, switching from dot product to cosine changes rankings and demands revalidation of your evaluation set. This is why the metric decision belongs in the same design review as chunking and the embedding model, not as a query-time afterthought.</p>
 
-<p class="text-gray-300 leading-relaxed">pgvector exposes three operator classes and three corresponding query operators:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector — complete operator class reference
-
--- 1. COSINE DISTANCE: vector_cosine_ops / &lt;=&gt;
--- Returns cosine distance (0.0 = identical, 2.0 = opposite)
--- Use for: text embeddings, CLIP, most sentence-transformer models
-CREATE INDEX idx_docs_cosine ON documents USING hnsw (embedding vector_cosine_ops);
-SELECT id, 1 - (embedding &lt;=&gt; '[0.1,0.2,0.3]') AS cosine_similarity FROM documents
-ORDER BY embedding &lt;=&gt; '[0.1,0.2,0.3]' LIMIT 5;
-
--- 2. EUCLIDEAN (L2) DISTANCE: vector_l2_ops / &lt;-&gt;
--- Returns L2 distance (0.0 = identical, unbounded above)
--- Use for: image embeddings, audio, scientific / sensor data
-CREATE INDEX idx_images_l2 ON product_images USING hnsw (embedding vector_l2_ops);
-SELECT id, embedding &lt;-&gt; '[0.1,0.2,0.3]' AS l2_distance FROM product_images
-ORDER BY embedding &lt;-&gt; '[0.1,0.2,0.3]' LIMIT 5;
-
--- 3. INNER PRODUCT (DOT PRODUCT): vector_ip_ops / &lt;#&gt;
--- Returns NEGATIVE inner product — ORDER BY ASC to retrieve highest dot product
--- Use for: recommendation systems, DPR, two-tower models
-CREATE INDEX idx_items_ip ON item_embeddings USING hnsw (embedding vector_ip_ops);
-SELECT id, (embedding &lt;#&gt; '[0.1,0.2,0.3]') * -1 AS dot_product FROM item_embeddings
-ORDER BY embedding &lt;#&gt; '[0.1,0.2,0.3]' LIMIT 5;
-
--- Additional operator classes added in pgvector 0.7+:
--- vector_l1_ops / &lt;+&gt;  (L1 / Manhattan distance)
--- bit_hamming_ops / &lt;~&gt; (Hamming distance for binary vectors)
--- bit_jaccard_ops / &lt;%&gt; (Jaccard distance for binary vectors)
--- sparsevec_l2_ops      (L2 for sparse vectors stored in sparsevec type)</code></pre>
-
-<p class="text-gray-300 leading-relaxed">#### Pinecone</p>
-
-<p class="text-gray-300 leading-relaxed">Pinecone's metric is set once at index creation and is immutable. The API naming maps directly to the three primary metrics:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python example — Pinecone metric configuration reference
-from pinecone import Pinecone, ServerlessSpec
-
-pc = Pinecone(api_key="YOUR_API_KEY")
-
-# COSINE — default for most text embedding use cases
-pc.create_index(
-    name="my-cosine-index",
-    dimension=1536,
-    metric="cosine",                # scores: 1.0=identical, 0.0=orthogonal, -1.0=opposite
-    spec=ServerlessSpec(cloud="aws", region="us-east-1")
-)
-
-# EUCLIDEAN — for image embeddings and magnitude-sensitive models
-pc.create_index(
-    name="my-euclidean-index",
-    dimension=512,
-    metric="euclidean",             # scores: 0.0=identical, larger=more distant
-    spec=ServerlessSpec(cloud="aws", region="us-east-1")
-)
-
-# DOT PRODUCT — for two-tower recommendation models
-pc.create_index(
-    name="my-dotproduct-index",
-    dimension=256,
-    metric="dotproduct",            # scores: higher=more similar (no sign inversion)
-    spec=ServerlessSpec(cloud="aws", region="us-east-1")
-)
-
-# IMPORTANT: changing the metric requires creating a new index and migrating data
-# Plan this decision before populating the index with production data</code></pre>
-
-<p class="text-gray-300 leading-relaxed">#### Weaviate</p>
-
-<p class="text-gray-300 leading-relaxed">Weaviate configures the distance metric per collection in the schema definition. Starting with Weaviate v4, the Python client uses a fluent builder pattern:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python example — Weaviate v4 client metric configuration
-import weaviate
-import weaviate.classes as wvc
-
-client = weaviate.connect_to_local()   # or connect_to_weaviate_cloud(cluster_url=...)
-
-# COSINE — for text/NLP collections
-client.collections.create(
-    name="Documents",
-    vectorizer_config=wvc.config.Configure.Vectorizer.none(),   # bring your own vectors
-    vector_index_config=wvc.config.Configure.VectorIndex.hnsw(
-        distance_metric=wvc.config.VectorDistances.COSINE
-    ),
-    properties=[
-        wvc.config.Property(name="content",    data_type=wvc.config.DataType.TEXT),
-        wvc.config.Property(name="source_url", data_type=wvc.config.DataType.TEXT),
-    ]
-)
-
-# L2 (EUCLIDEAN SQUARED) — for image/multimodal collections
-client.collections.create(
-    name="ProductImages",
-    vectorizer_config=wvc.config.Configure.Vectorizer.none(),
-    vector_index_config=wvc.config.Configure.VectorIndex.hnsw(
-        distance_metric=wvc.config.VectorDistances.L2_SQUARED   # note: squared L2, not L2
-    ),
-    properties=[
-        wvc.config.Property(name="product_id", data_type=wvc.config.DataType.TEXT),
-        wvc.config.Property(name="image_url",  data_type=wvc.config.DataType.TEXT),
-    ]
-)
-
-# DOT PRODUCT — for recommendation models
-client.collections.create(
-    name="ItemRecommendations",
-    vectorizer_config=wvc.config.Configure.Vectorizer.none(),
-    vector_index_config=wvc.config.Configure.VectorIndex.hnsw(
-        distance_metric=wvc.config.VectorDistances.DOT
-    ),
-    properties=[
-        wvc.config.Property(name="title",    data_type=wvc.config.DataType.TEXT),
-        wvc.config.Property(name="category", data_type=wvc.config.DataType.TEXT),
-    ]
-)
-
-# Weaviate also supports: MANHATTAN, HAMMING
-# All metrics other than COSINE are returned as raw distances (lower=more similar)
-# COSINE in Weaviate returns cosine DISTANCE (0=identical), not cosine similarity
-
-client.close()</code></pre>
-
-<p class="text-gray-300 leading-relaxed">#### Qdrant</p>
-
-<p class="text-gray-300 leading-relaxed">Qdrant uses a clean enum-based API with consistent sign conventions — higher score always means more similar, regardless of the underlying distance function:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python example — Qdrant distance metric configuration reference
-from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams
-
-client = QdrantClient(host="localhost", port=6333)
-
-# All four standard metrics are available
-# Qdrant normalizes scores so that higher always means more similar
-
-# COSINE
-client.create_collection(
-    collection_name="text_search",
-    vectors_config=VectorParams(size=1536, distance=Distance.COSINE)
-)
-
-# EUCLIDEAN (L2)
-client.create_collection(
-    collection_name="image_search",
-    vectors_config=VectorParams(size=512, distance=Distance.EUCLID)
-)
-
-# DOT PRODUCT (inner product)
-client.create_collection(
-    collection_name="recommendations",
-    vectors_config=VectorParams(size=256, distance=Distance.DOT)
-)
-
-# MANHATTAN (L1) — available in Qdrant, less common in other databases
-client.create_collection(
-    collection_name="sparse_features",
-    vectors_config=VectorParams(size=1024, distance=Distance.MANHATTAN)
-)</code></pre>
-
-<p class="text-gray-300 leading-relaxed">#### Chroma</p>
-
-<p class="text-gray-300 leading-relaxed">Chroma uses a string parameter called <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">space</code> in the HNSW configuration:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python example — Chroma metric configuration
-import chromadb
-
-client = chromadb.PersistentClient(path="/path/to/chroma/data")
-
-# COSINE — default and most common for text embeddings
-collection = client.create_collection(
-    name="documents_cosine",
-    metadata={"hnsw:space": "cosine"}  # options: "cosine", "l2", "ip"
-)
-
-# L2 (Euclidean)
-collection_l2 = client.create_collection(
-    name="images_l2",
-    metadata={"hnsw:space": "l2"}
-)
-
-# Inner product / dot product
-collection_ip = client.create_collection(
-    name="recommendations_ip",
-    metadata={"hnsw:space": "ip"}
-)</code></pre>
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
+    A[Choose your metric] --> B{Embedding type?}
+    B -->|Text / normalized| C[cosine<br/>VECTOR_DISTANCE 'cosine']
+    B -->|Image / audio / sensor| D[euclidean<br/>VECTOR_DISTANCE 'euclidean']
+    B -->|Recommender / DPR| E[dot<br/>VECTOR_DISTANCE 'dot'<br/>keep raw magnitudes]
+    C --> F[METRIC = 'cosine'<br/>in CREATE VECTOR INDEX]
+    D --> G[METRIC = 'euclidean'<br/>in CREATE VECTOR INDEX]
+    E --> H[METRIC = 'dot'<br/>in CREATE VECTOR INDEX]
+    F --> I[Query with the same metric string<br/>or the index silently goes unused]</pre></div>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">3.7 Distance Metrics and HNSW Index Quality: The Hidden Interaction</h3>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Evaluating Metrics on Your Data, Not on Intuition</h3>
 
-<p class="text-gray-300 leading-relaxed">An aspect of metric selection that rarely appears in documentation but consistently affects production systems is how the distance metric interacts with HNSW graph construction quality.</p>
+<p class="text-gray-300 leading-relaxed">When two metrics both seem plausible — cosine vs dot product for a new recommender, L2 vs cosine for image search — decide empirically. The evaluation harness pattern is the same regardless of system: a few hundred labeled query-document pairs, a recall@k or precision@k computation per metric, and the winner documented in the runbook.</p>
 
-<p class="text-gray-300 leading-relaxed">HNSW (Hierarchical Navigable Small World) builds a layered proximity graph during index construction. At each layer, nodes are connected to their nearest neighbors according to the index's distance function. When traversing the graph at query time, the algorithm greedily follows edges toward the query in the same metric space. The underlying mathematical guarantee — that the graph is navigable — relies on the metric satisfying the triangle inequality.</p>
-
-<p class="text-gray-300 leading-relaxed">Cosine distance and Euclidean distance both satisfy the triangle inequality. Dot product does <strong class="text-white">not</strong>. This means HNSW with dot product is operating outside its formal convergence guarantees. In practice this still works well, but it requires higher values of <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">m</code> (the number of neighbors per node) and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ef_construction</code> (the candidate queue size during graph construction) to achieve the same recall as cosine or Euclidean configurations on the same data:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
--- HNSW parameter tuning for dot product vs cosine
--- For the same recall target, dot product typically needs higher m and ef_construction
-
--- Cosine — standard parameters work well
-CREATE INDEX idx_docs_cosine ON documents USING hnsw (embedding vector_cosine_ops)
-    WITH (m = 16, ef_construction = 64);
-
--- Dot product — increase m and ef_construction to compensate for non-metric space
-CREATE INDEX idx_items_ip ON item_embeddings USING hnsw (embedding vector_ip_ops)
-    WITH (m = 32, ef_construction = 128);
-
--- At query time, also increase ef_search for dot product if recall is low
--- Default ef_search is 40 in pgvector; for dot product, try 80-200
-SET hnsw.ef_search = 100;
-
--- Monitor recall with pg_stat_statements or application-level logging
--- A recall drop of more than 5-10% relative to brute-force is worth investigating</code></pre>
-
-<p class="text-gray-300 leading-relaxed">The exact parameter values needed depend on your data distribution. Embeddings from models with high magnitude variance tend to require more aggressive HNSW parameters under dot product. If you find that recall is degrading despite tuning, consider whether normalizing your embeddings and switching to cosine would be semantically equivalent for your model — and if so, that switch is almost always worth making for index reliability.</p>
-
-<p class="text-gray-300 leading-relaxed">Another hidden interaction: <strong class="text-white">IVFFlat and L2 distance.</strong> IVFFlat works by clustering the vector space with k-means at index build time. K-means minimizes within-cluster variance, which is defined in terms of Euclidean distance. When you create an IVFFlat index with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">vector_cosine_ops</code>, pgvector internally normalizes all vectors before clustering, so the clusters are built in the unit-norm subspace — this is correct behavior but it means that if your input vectors are not normalized, the cluster assignment at query time uses the normalized version of your query. The practical implication is that IVFFlat with cosine ops works correctly without any special handling on your part, but understanding this behavior matters when debugging recall issues.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
-
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">3.8 Normalization Strategies: Write-Time vs Query-Time vs None</h3>
-
-<p class="text-gray-300 leading-relaxed">The normalization decision interacts with every other choice in this chapter. There are three practical strategies, each with different tradeoffs:</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Strategy 1: Normalize at write time (recommended for most applications)</strong></p>
-
-<p class="text-gray-300 leading-relaxed">Store normalized vectors in the database. The embedding is divided by its L2 norm before insertion:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python example — write-time normalization pipeline
-import numpy as np
-import psycopg2
-
-def normalize_l2(vec: np.ndarray) -&gt; np.ndarray:
-    norm = np.linalg.norm(vec)
-    if norm == 0:
-        return vec   # handle zero vectors gracefully — avoid division by zero
-    return vec / norm
-
-def insert_document_with_normalized_embedding(
-    conn: psycopg2.extensions.connection,
-    content: str,
-    raw_embedding: np.ndarray
-) -&gt; int:
-    """Normalize the embedding at write time before storing."""
-    normalized = normalize_l2(raw_embedding)
-    vec_str = "[" + ",".join(f"{v:.8f}" for v in normalized) + "]"
-    
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO documents (content, embedding) VALUES (%s, %s::vector) RETURNING id",
-        (content, vec_str)
-    )
-    doc_id = cur.fetchone()[0]
-    conn.commit()
-    cur.close()
-    return doc_id
-
-# Benefits of write-time normalization:
-# 1. Dot product becomes equivalent to cosine — no sign inversion needed in queries
-# 2. IVFFlat and HNSW behave predictably — the metric space is well-defined
-# 3. You can switch between cosine and dot product operators in queries without rebuilding the index
-# 4. Simplifies query code — no special handling needed at read time</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Strategy 2: Normalize at query time only</strong></p>
-
-<p class="text-gray-300 leading-relaxed">Store raw vectors. Normalize only the query vector before issuing the similarity search. This is implicit when using <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">vector_cosine_ops</code> — pgvector normalizes both the stored vectors and the query internally. The stored vectors on disk are still raw:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
--- Query-time normalization is implicit in the cosine operator
--- The stored embedding is raw; pgvector computes cosine using the normalized form internally
--- This means switching to vector_ip_ops later will NOT give cosine-equivalent results
--- unless you rebuild the index with pre-normalized vectors
-
--- To normalize a query vector explicitly in SQL (useful for debugging):
-SELECT
-    id,
-    content,
-    1 - (embedding &lt;=&gt; (
-        -- Normalize the query vector in-place using pgvector's l2_normalize function
-        l2_normalize('[0.3, 0.8, 0.5, 0.2, ...]'::vector)
-    )) AS cosine_similarity
-FROM documents
-ORDER BY embedding &lt;=&gt; l2_normalize('[0.3, 0.8, 0.5, 0.2, ...]'::vector)
-LIMIT 5;
-
--- l2_normalize() was added in pgvector 0.5.0
--- For older versions: (v / sqrt(v &lt;#&gt; v)) is equivalent but verbose</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Strategy 3: No normalization (dot product or Euclidean with raw embeddings)</strong></p>
-
-<p class="text-gray-300 leading-relaxed">Keep vectors raw when magnitude is semantically meaningful and your metric is explicitly dot product or Euclidean. This is appropriate for two-tower recommendation models and image embedding systems. There is no special infrastructure required — just insert vectors as-is and configure the index with the appropriate operator class.</p>
-
-<p class="text-gray-300 leading-relaxed">The risk: if a code change somewhere in your pipeline (an updated embedding model, a library version bump that changes normalization behavior, a preprocessing step added upstream) silently changes the magnitude distribution of incoming vectors, your similarity scores shift without any database error. Build magnitude monitoring into your data pipeline:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python example — embedding magnitude monitoring in a data pipeline
-import numpy as np
-from dataclasses import dataclass
-
-@dataclass
-class EmbeddingHealthMetrics:
-    count: int
-    mean_norm: float
-    std_norm: float
-    min_norm: float
-    max_norm: float
-    zero_vector_count: int
-
-def check_embedding_batch_health(embeddings: np.ndarray) -&gt; EmbeddingHealthMetrics:
-    """
-    Run before inserting a batch of embeddings into the vector database.
-    Alert if norms deviate significantly from historical baseline.
-    """
-    norms = np.linalg.norm(embeddings, axis=1)
-    zero_count = int(np.sum(norms == 0))
-    
-    metrics = EmbeddingHealthMetrics(
-        count=len(embeddings),
-        mean_norm=float(np.mean(norms)),
-        std_norm=float(np.std(norms)),
-        min_norm=float(np.min(norms)),
-        max_norm=float(np.max(norms)),
-        zero_vector_count=zero_count
-    )
-    
-    # Alert conditions — tune thresholds to your baseline
-    if zero_count &gt; 0:
-        print(f"WARNING: {zero_count} zero vectors detected — these will cause NaN in cosine similarity")
-    if metrics.std_norm &gt; 0.5 * metrics.mean_norm:
-        print(f"WARNING: High norm variance (std/mean = {metrics.std_norm/metrics.mean_norm:.2f}) "
-              f"— check for mixed embedding model outputs or preprocessing changes")
-    if abs(metrics.mean_norm - 1.0) &gt; 0.1:
-        print(f"INFO: Mean norm {metrics.mean_norm:.4f} deviates from unit norm "
-              f"— cosine and dot product may give different rankings")
-    
-    return metrics
-
-# Usage in a batch insert pipeline:
-# raw_embeddings = model.encode(batch_texts, normalize_embeddings=False)
-# health = check_embedding_batch_health(raw_embeddings)
-# log_to_monitoring_system(health)
-# if health.zero_vector_count == 0 and health.std_norm &lt; threshold:
-#     insert_to_vector_db(raw_embeddings)</code></pre>
-
-<p class="text-gray-300 leading-relaxed">---</p>
-
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">3.9 Distance Metrics in Multi-Vector and Sparse+Dense Hybrid Systems</h3>
-
-<p class="text-gray-300 leading-relaxed">Production retrieval systems increasingly use multiple representations per document: a dense embedding for semantic similarity, a sparse BM25-style vector for lexical matching, and sometimes additional dense vectors for different semantic aspects (e.g., one for the document title, one for the body). Each representation can use a different distance metric, and the final score is a weighted combination.</p>
-
-<p class="text-gray-300 leading-relaxed">Qdrant natively supports multiple named vectors per point, each with its own distance metric:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python example — Qdrant multi-vector collection with per-vector distance metrics
-from qdrant_client import QdrantClient
-from qdrant_client.models import (
-    Distance, VectorParams, SparseVectorParams, SparseIndexParams,
-    NamedVector, NamedSparseVector, PointStruct, SparseVector
-)
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python — comparing metrics offline before committing to an index config
 import numpy as np
 
-client = QdrantClient(host="localhost", port=6333)
+def recall_at_k(query_emb, doc_embs, relevant_ids, k=10, sim_fn=None):
+    scores = sim_fn(query_emb, doc_embs)
+    top_k = set(np.argsort(scores)[-k:])      # highest scores = most similar
+    return len(top_k & relevant_ids) / len(relevant_ids)
 
-# Collection with three vector types:
-# 1. Dense title embedding (cosine) — short, context-specific
-# 2. Dense body embedding (cosine) — full document semantics
-# 3. Sparse BM25 vector (dot product) — lexical matching
-client.create_collection(
-    collection_name="hybrid_documents",
-    vectors_config={
-        "title_dense": VectorParams(size=384, distance=Distance.COSINE),
-        "body_dense":  VectorParams(size=1536, distance=Distance.COSINE),
-    },
-    sparse_vectors_config={
-        "body_sparse": SparseVectorParams(
-            index=SparseIndexParams(on_disk=False)
-        )
-    }
-)
+def cosine_sim(q, docs):
+    q = q / np.linalg.norm(q)
+    docs = docs / np.linalg.norm(docs, axis=1, keepdims=True)
+    return docs @ q
 
-# Insert a document with all three representations
-client.upsert(
-    collection_name="hybrid_documents",
-    points=[
-        PointStruct(
-            id=1,
-            vector={
-                "title_dense": np.random.rand(384).tolist(),
-                "body_dense":  np.random.rand(1536).tolist(),
-                "body_sparse": SparseVector(
-                    indices=[102, 445, 891, 2034, 5511],    # BM25 term IDs
-                    values=[0.82, 0.61, 0.44, 0.38, 0.21]  # TF-IDF weights
-                )
-            },
-            payload={"title": "Understanding HNSW Index Construction", "category": "database"}
-        )
-    ]
-)
+def dot_sim(q, docs):
+    return docs @ q
 
-# Hybrid query: combine dense body semantic search with sparse lexical matching
-# Qdrant supports RRF (Reciprocal Rank Fusion) and linear combination for hybrid fusion
-from qdrant_client.models import Query, FusionQuery, Fusion, Prefetch
+def neg_l2(q, docs):                          # negate so higher = more similar
+    return -np.linalg.norm(docs - q, axis=1)
 
-results = client.query_points(
-    collection_name="hybrid_documents",
-    prefetch=[
-        Prefetch(
-            query=np.random.rand(1536).tolist(),
-            using="body_dense",
-            limit=20
-        ),
-        Prefetch(
-            query=SparseVector(
-                indices=[102, 891, 5511],
-                values=[0.75, 0.42, 0.18]
-            ),
-            using="body_sparse",
-            limit=20
-        )
-    ],
-    query=FusionQuery(fusion=Fusion.RRF),   # Reciprocal Rank Fusion combines the two result lists
-    limit=5,
-    with_payload=True
-)</code></pre>
+# Run all three against your labeled set, pick the metric with the best
+# recall@10, then build the DiskANN index with that METRIC value</code></pre>
 
-<p class="text-gray-300 leading-relaxed">In pgvector, multi-vector hybrid search requires a different approach — combining multiple distance computations in a single SQL query with explicit weight parameters:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
--- Hybrid search: combining dense cosine similarity with a BM25-style score stored as a column
--- For true sparse+dense, consider pg_sparse (a separate extension) or pre-compute BM25 scores
-
--- Schema supporting hybrid scoring
-CREATE TABLE hybrid_documents (
-    id              BIGSERIAL PRIMARY KEY,
-    title           TEXT NOT NULL,
-    body            TEXT NOT NULL,
-    title_embedding VECTOR(384),        -- dense, cosine
-    body_embedding  VECTOR(1536),       -- dense, cosine
-    bm25_score_col  REAL                -- pre-computed BM25 score for specific query context
-                                        -- (in practice, computed dynamically using ts_rank)
-);
-
-CREATE INDEX ON hybrid_documents USING hnsw (title_embedding vector_cosine_ops);
-CREATE INDEX ON hybrid_documents USING hnsw (body_embedding  vector_cosine_ops);
-
--- Hybrid query combining body semantic similarity and full-text relevance
--- Alpha controls the weight: 1.0 = pure semantic, 0.0 = pure BM25
-SELECT
-    id,
-    title,
-    :alpha * (1 - (body_embedding &lt;=&gt; :query_dense_embedding)) +
-    (1 - :alpha) * ts_rank(to_tsvector('english', body), plainto_tsquery('english', :query_text))
-        AS hybrid_score
-FROM hybrid_documents
-WHERE to_tsvector('english', body) @@ plainto_tsquery('english', :query_text)
-   OR (body_embedding &lt;=&gt; :query_dense_embedding) &lt; :cosine_distance_threshold
-ORDER BY hybrid_score DESC
-LIMIT 10;
-
--- Note: this query does NOT use the vector index efficiently if the WHERE clause is too broad.
--- For production hybrid search in PostgreSQL, partition the problem:
--- 1. Retrieve top-N by dense similarity using the HNSW index
--- 2. Retrieve top-N by BM25 using the GIN full-text index
--- 3. Merge and re-rank in application code or a CTE</code></pre>
+<p class="text-gray-300 leading-relaxed">Run this against a representative slice of your production query distribution — at least a few hundred labeled pairs — before committing to an index configuration. Rebuilding a DiskANN index with a different metric is non-trivial once millions of vectors are stored, and if the metric change also implies a different normalization policy, the re-ingest cost dwarfs the index rebuild.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Match the metric to the model's training objective**: using cosine similarity against a model trained with dot product objectives — or vice versa — degrades search quality silently. Always consult the embedding model documentation before configuring your vector index.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Cosine ignores vector length and suits text embeddings; Euclidean measures straight-line distance for images, audio, and sensor data; dot product preserves magnitude signals for recommenders and DPR. Choose based on what the embedding model learned, not on habit.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **When vectors are L2-normalized to unit length, cosine similarity, dot product, and Euclidean distance all produce identical ranking order**: many popular text embedding models (including sentence-transformers and OpenAI's text-embedding-3 series) output near-unit-norm vectors, making the metric choice primarily a question of computational cost rather than result quality for those models.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> In SQL Server, the metric is a string — <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">'cosine'</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">'euclidean'</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">'dot'</code> — used in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_DISTANCE</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_SEARCH</code>, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE VECTOR INDEX ... WITH (METRIC = ...)</code>. <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">'dot'</code> returns the negative dot product: negate for display, sort ascending.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Dot product is the most computationally efficient metric but the most fragile at index construction time**: because dot product does not satisfy the triangle inequality, HNSW graphs built on dot product require higher `m` and `ef_construction` parameters to achieve equivalent recall compared to cosine or Euclidean configurations. Monitor recall in production when using dot product with HNSW.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> The index metric, the query metric, and the model's training metric must all match — a mismatch silently disables the DiskANN index and drops you to a full scan. Treat metric changes as schema migrations and encode them in infrastructure-as-code.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Normalize embeddings at write time rather than relying on query-time operator behavior**: write-time normalization makes cosine and dot product equivalent, simplifies query code, reduces the risk of silent accuracy regressions when embedding models are updated, and enables monitoring of the magnitude distribution as a pipeline health signal.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Decide normalization at ingest time: normalized vectors make all three metrics rank identically and keep your options open; raw magnitudes are required when the model uses magnitude as a signal. SQL Server has no built-in normalize function — do it in the ingest pipeline.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Every major vector database uses a different naming convention and sign convention for the same underlying metric**: pgvector's `<#>` operator returns negative dot product; Weaviate uses `L2_SQUARED` rather than L2; Pinecone calls the metric `dotproduct` while Qdrant calls it `DOT`; Chroma uses `ip` for inner product. Build a reference table for your team and encode the metric configuration in infrastructure-as-code to prevent mismatches between the embedding model, the stored vectors, and the index operator class.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> When two metrics both seem plausible, evaluate empirically with recall@k on labeled pairs before committing. Rebuilding a DiskANN index with a different metric after millions of vectors are stored is expensive — deciding up front is cheap.</li>
     </div>
     <div class="mt-14 bg-cyan-950/40 border border-cyan-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
-        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · SQL Server</p>
       </div>
       <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
          class="shrink-0 px-6 py-3 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold rounded-xl text-sm transition">
         Download Free
       </a>
     </div>
-    <div class="mt-8 text-xs">
-      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a>
+    <div class="mt-10 flex items-center justify-between text-xs">
+      <a href="b4-ch02-how-vector-search-works.html" class="text-gray-500 hover:text-gray-300 transition">← Previous Chapter</a>
+      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">All Chapters</a>
+      <a href="b4-ch04-vector-db-landscape-sql-server.html" class="text-cyan-400 hover:text-cyan-300 transition">Next Chapter →</a>
     </div>
   </article>
   <footer class="border-t border-gray-800/50 px-6 py-8">

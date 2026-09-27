@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Chapter 31: Multi-Modal Search: Text and Image Together — Vector Databases & AI</title>
-  <meta name="description" content="Vector Databases & AI Chapter 31: Multi-Modal Search: Text and Image Together. pgvector, Pinecone, Weaviate, RAG pipelines — by Rajesh Guntupalli." />
+  <meta name="description" content="Vector Databases & AI Chapter 31: Multi-Modal Search: Text and Image Together — native SQL Server VECTOR, DiskANN, CLIP embeddings, and late fusion in T-SQL — by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
   <script type="module">
     import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
@@ -79,7 +79,7 @@
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Dimensionality and Distance Metrics</strong></p>
 
-<p class="text-gray-300 leading-relaxed">CLIP vectors use cosine similarity as the natural distance metric because the encoders produce unit-normalized vectors by default. In pgvector terms, that means using the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">vector</code> type with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs"><=></code> (cosine distance) rather than <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs"><-></code> (L2). Pinecone, Weaviate, and Qdrant all support cosine similarity natively and it should be your default for CLIP-family embeddings.</p>
+<p class="text-gray-300 leading-relaxed">CLIP vectors use cosine similarity as the natural distance metric because the encoders produce unit-normalized vectors by default. In SQL Server terms, that means the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR</code> type with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_DISTANCE('cosine', ...)</code> rather than <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">'euclidean'</code>. Pinecone, Weaviate, and Qdrant all support cosine similarity natively and it should be your default for CLIP-family embeddings.</p>
 
 <p class="text-gray-300 leading-relaxed">One architectural decision that often surprises DBAs: you can store text embeddings and image embeddings in the *same* column when they share the same model and dimensionality. There is no type system distinction between "image vector" and "text vector" at the database level. The distinction is carried by your application logic and metadata columns. This is similar to storing both customer and product records in a single <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">entities</code> table — possible, but you need a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">type</code> discriminator column to avoid joining apples with oranges in business queries.</p>
 
@@ -93,76 +93,68 @@
 
 <p class="text-gray-300 leading-relaxed">All embeddings live in one table. A <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">modality</code> column distinguishes text from image. This works well when text and image documents are genuinely interchangeable from a business perspective — a product catalog where each item has both a description text and one or more product images.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server 2025
 -- Single-table multi-modal schema for a product catalog
-
-CREATE EXTENSION IF NOT EXISTS vector;
-
-CREATE TABLE product_embeddings (
-    id              BIGSERIAL PRIMARY KEY,
-    product_id      BIGINT NOT NULL REFERENCES products(id),
-    modality        TEXT NOT NULL CHECK (modality IN ('text', 'image')),
-    source_ref      TEXT NOT NULL,   -- field name or image URL/path
-    embedding       VECTOR(512),     -- CLIP ViT-B/32 dimensions
-    created_at      TIMESTAMPTZ DEFAULT NOW(),
-    metadata        JSONB
+CREATE TABLE dbo.ProductEmbeddings (
+    Id          BIGINT IDENTITY(1,1) NOT NULL
+        CONSTRAINT PK_ProductEmbeddings PRIMARY KEY,
+    ProductId   BIGINT NOT NULL
+        CONSTRAINT FK_ProductEmbeddings_Products
+        REFERENCES dbo.Products (Id),
+    Modality    NVARCHAR(10) NOT NULL
+        CONSTRAINT CK_ProductEmbeddings_Modality
+        CHECK (Modality IN ('text', 'image')),
+    SourceRef   NVARCHAR(500) NOT NULL,   -- field name or image URL/path
+    Embedding   VECTOR(512) NOT NULL,     -- CLIP ViT-B/32 dimensions
+    CreatedAt   DATETIME2(0) NOT NULL
+        CONSTRAINT DF_ProductEmbeddings_Created DEFAULT SYSUTCDATETIME(),
+    MetadataJson NVARCHAR(MAX) NULL
+        CONSTRAINT CK_ProductEmbeddings_Json CHECK (ISJSON(MetadataJson) = 1)
 );
-
--- Separate HNSW indexes per modality for query efficiency
-CREATE INDEX idx_product_emb_text
-    ON product_embeddings
-    USING hnsw (embedding vector_cosine_ops)
-    WHERE modality = 'text';
-
-CREATE INDEX idx_product_emb_image
-    ON product_embeddings
-    USING hnsw (embedding vector_cosine_ops)
-    WHERE modality = 'image';
-
+-- One DiskANN index over the shared column; modality is a query-time filter
+CREATE VECTOR INDEX IX_ProductEmbeddings_Embedding
+    ON dbo.ProductEmbeddings (Embedding)
+    WITH (METRIC = 'cosine', TYPE = 'DiskANN', MAXDOP = 8);
 -- Composite index for filtered product lookups
-CREATE INDEX idx_product_emb_product_modality
-    ON product_embeddings (product_id, modality);</code></pre>
+CREATE INDEX IX_ProductEmbeddings_Product_Modality
+    ON dbo.ProductEmbeddings (ProductId, Modality);</code></pre>
 
-<p class="text-gray-300 leading-relaxed">The partial HNSW indexes on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">modality</code> are a pgvector-specific optimization: when a query filters by modality before applying the nearest-neighbor scan, a partial index prevents the planner from scanning irrelevant rows. Without them, a text query would still traverse image vectors in the HNSW graph before filtering — wasting both I/O and compute.</p>
+<p class="text-gray-300 leading-relaxed">On the single-table pattern, keep one DiskANN index over the shared <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Embedding</code> column and pass <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Modality = 'text'</code> as a query-time predicate (SQL Server has no partial vector indexes). The modality filter narrows candidates before the similarity ranking is applied; the composite index on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">(ProductId, Modality)</code> covers the filtered product lookups. If text and image pipelines diverge in update rate or dimensionality, prefer Pattern 2 instead of fighting one shared index.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Pattern 2: Separate Tables per Modality</strong></p>
 
 <p class="text-gray-300 leading-relaxed">More explicit and easier to maintain independently. Use this when text and image pipelines have very different update rates or when the embedding models differ in dimensionality.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server 2025
 -- Separate tables for text and image embeddings
-
-CREATE TABLE document_text_embeddings (
-    id          BIGSERIAL PRIMARY KEY,
-    doc_id      BIGINT NOT NULL,
-    chunk_index INT NOT NULL DEFAULT 0,
-    content     TEXT NOT NULL,
-    embedding   VECTOR(1536),   -- OpenAI text-embedding-3-small
-    metadata    JSONB,
-    UNIQUE (doc_id, chunk_index)
+CREATE TABLE dbo.DocumentTextEmbeddings (
+    Id         BIGINT IDENTITY(1,1) NOT NULL
+        CONSTRAINT PK_DocumentTextEmbeddings PRIMARY KEY,
+    DocId      BIGINT NOT NULL,
+    ChunkIndex INT NOT NULL CONSTRAINT DF_DTE_ChunkIndex DEFAULT (0),
+    Content    NVARCHAR(MAX) NOT NULL,
+    Embedding  VECTOR(1536) NOT NULL,   -- OpenAI text-embedding-3-small
+    MetadataJson NVARCHAR(MAX) NULL,
+    CONSTRAINT UQ_DTE_Doc_Chunk UNIQUE (DocId, ChunkIndex)
 );
-
-CREATE TABLE document_image_embeddings (
-    id          BIGSERIAL PRIMARY KEY,
-    doc_id      BIGINT NOT NULL,
-    image_index INT NOT NULL DEFAULT 0,
-    image_path  TEXT NOT NULL,
-    embedding   VECTOR(512),    -- CLIP ViT-B/32
-    metadata    JSONB,
-    UNIQUE (doc_id, image_index)
+CREATE TABLE dbo.DocumentImageEmbeddings (
+    Id         BIGINT IDENTITY(1,1) NOT NULL
+        CONSTRAINT PK_DocumentImageEmbeddings PRIMARY KEY,
+    DocId      BIGINT NOT NULL,
+    ImageIndex INT NOT NULL CONSTRAINT DF_DIE_ImageIndex DEFAULT (0),
+    ImagePath  NVARCHAR(500) NOT NULL,
+    Embedding  VECTOR(512) NOT NULL,    -- CLIP ViT-B/32
+    MetadataJson NVARCHAR(MAX) NULL,
+    CONSTRAINT UQ_DIE_Doc_Image UNIQUE (DocId, ImageIndex)
 );
+CREATE VECTOR INDEX IX_DTE_Embedding
+    ON dbo.DocumentTextEmbeddings (Embedding)
+    WITH (METRIC = 'cosine', TYPE = 'DiskANN', MAXDOP = 8);
+CREATE VECTOR INDEX IX_DIE_Embedding
+    ON dbo.DocumentImageEmbeddings (Embedding)
+    WITH (METRIC = 'cosine', TYPE = 'DiskANN', MAXDOP = 8);</code></pre>
 
-CREATE INDEX idx_text_emb_hnsw
-    ON document_text_embeddings
-    USING hnsw (embedding vector_cosine_ops)
-    WITH (m = 16, ef_construction = 64);
-
-CREATE INDEX idx_image_emb_hnsw
-    ON document_image_embeddings
-    USING hnsw (embedding vector_cosine_ops)
-    WITH (m = 16, ef_construction = 64);</code></pre>
-
-<p class="text-gray-300 leading-relaxed">The tradeoff: two tables means two search queries per multi-modal lookup, and you need an application-layer fusion step. The benefit is that you can update the image embedding model without touching the text pipeline, and you can set different HNSW parameters (m, ef_construction) appropriate to each vector space's geometry.</p>
+<p class="text-gray-300 leading-relaxed">The tradeoff: two tables means two search queries per multi-modal lookup, and you need an application-layer fusion step. The benefit is that you can update the image embedding model without touching the text pipeline, and each table gets its own DiskANN index tuned (via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">MAXDOP</code> and build scheduling) to its vector space's geometry and update rate.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Pattern 3: Weaviate Multi-Modal Collections</strong></p>
 
@@ -637,7 +629,7 @@ def late_fusion_search(
         })
 
     fused.sort(key=lambda x: x["combined_score"], reverse=True)
-    return fused[:top_k]</code></pre>
+    return fused[@top_k]</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The late fusion pattern deserves a closer look, because it is the right choice whenever text and image embeddings come from *different* models with *different* dimensionalities. When you have a 1536-dimension OpenAI text embedding alongside a 512-dimension CLIP image embedding, you cannot average them — the vector spaces are unrelated. Late fusion avoids that requirement: each modality gets its own search against its own index, and scores are combined numerically after the fact. The cost is two round-trips to the database and a merge step in application memory.</p>
 
@@ -645,101 +637,47 @@ def late_fusion_search(
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">Multi-Modal Search in pgvector: The SQL Perspective</h3>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Multi-Modal Search in SQL Server: The T-SQL Perspective</h3>
 
-<p class="text-gray-300 leading-relaxed">For teams operating in PostgreSQL with pgvector, the fusion logic moves into SQL rather than application code. This has advantages for teams that want to keep retrieval logic auditable and version-controlled as migrations.</p>
+<p class="text-gray-300 leading-relaxed">For teams operating on SQL Server 2025, the fusion logic moves into T-SQL rather than application code. This has advantages for teams that want to keep retrieval logic auditable and version-controlled as migrations.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
--- Late fusion multi-modal search using two CTEs
-
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server 2025: late fusion multi-modal search using two CTEs
 -- Assumes:
---   product_text_embeddings (product_id, embedding VECTOR(1536))
---   product_image_embeddings (product_id, embedding VECTOR(512))
--- Each has its own HNSW index.
-
--- Parameters passed as session variables or substituted by the application:
---   :text_query_vector   — 1536-dim OpenAI embedding of the query string
---   :image_query_vector  — 512-dim CLIP embedding of the reference image
---   :text_weight         — e.g. 0.5
---   :image_weight        — e.g. 0.5
---   :candidate_k         — e.g. 100
---   :top_k               — e.g. 20
-
+--   dbo.ProductTextEmbeddings (ProductId, Embedding VECTOR(1536))
+--   dbo.ProductImageEmbeddings (ProductId, Embedding VECTOR(512))
+-- Each has its own DiskANN index.
+-- Parameters (DECLAREd or passed by the application):
+--   @text_query_vector  VECTOR(1536) — OpenAI embedding of the query string
+--   @image_query_vector VECTOR(512)  — CLIP embedding of the reference image
+--   @text_weight, @image_weight      — e.g. 0.5 / 0.5
+--   @candidate_k, @top_k             — e.g. 100 / 20
 WITH text_candidates AS (
-    SELECT
+    SELECT TOP (@candidate_k)
         product_id,
-        1 - (embedding &lt;=&gt; :text_query_vector::VECTOR(1536)) AS text_score
-    FROM product_text_embeddings
-    ORDER BY embedding &lt;=&gt; :text_query_vector::VECTOR(1536)
-    LIMIT :candidate_k
-),
-image_candidates AS (
-    SELECT
-        product_id,
-        1 - (embedding &lt;=&gt; :image_query_vector::VECTOR(512)) AS image_score
-    FROM product_image_embeddings
-    ORDER BY embedding &lt;=&gt; :image_query_vector::VECTOR(512)
-    LIMIT :candidate_k
-),
-fused AS (
-    SELECT
-        COALESCE(t.product_id, i.product_id) AS product_id,
-        COALESCE(t.text_score, 0.0)  * :text_weight
-            + COALESCE(i.image_score, 0.0) * :image_weight  AS combined_score,
-        COALESCE(t.text_score, 0.0)  AS text_score,
-        COALESCE(i.image_score, 0.0) AS image_score
-    FROM text_candidates t
-    FULL OUTER JOIN image_candidates i USING (product_id)
-)
-SELECT
-    f.product_id,
-    p.name,
-    p.category,
-    p.price,
-    f.combined_score,
-    f.text_score,
-    f.image_score
-FROM fused f
-JOIN products p ON p.id = f.product_id
-ORDER BY f.combined_score DESC
-LIMIT :top_k;</code></pre>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server equivalent
--- SQL Server does not have a native vector type in older versions;
--- assuming the vector extension or a FLOAT column workaround is not available,
--- the pattern below uses SQL Server 2025+ vector type (VECTOR) where supported,
--- or a stored-proc approach calling an external scoring service.
--- For teams on SQL Server 2022 and below, the recommended path is to perform
--- the HNSW search outside SQL Server and use SQL Server only for the metadata JOIN.
-
--- SQL Server 2025+ with native VECTOR type:
-WITH text_candidates AS (
-    SELECT TOP (:candidate_k)
-        product_id,
-        1.0 - VECTOR_DISTANCE('cosine', embedding, CAST(:text_query_vector AS VECTOR(1536)))
+        1.0 - VECTOR_DISTANCE('cosine', embedding, CAST(@text_query_vector AS VECTOR(1536)))
             AS text_score
     FROM product_text_embeddings
-    ORDER BY VECTOR_DISTANCE('cosine', embedding, CAST(:text_query_vector AS VECTOR(1536)))
+    ORDER BY VECTOR_DISTANCE('cosine', embedding, CAST(@text_query_vector AS VECTOR(1536)))
 ),
 image_candidates AS (
-    SELECT TOP (:candidate_k)
+    SELECT TOP (@candidate_k)
         product_id,
-        1.0 - VECTOR_DISTANCE('cosine', embedding, CAST(:image_query_vector AS VECTOR(512)))
+        1.0 - VECTOR_DISTANCE('cosine', embedding, CAST(@image_query_vector AS VECTOR(512)))
             AS image_score
     FROM product_image_embeddings
-    ORDER BY VECTOR_DISTANCE('cosine', embedding, CAST(:image_query_vector AS VECTOR(512)))
+    ORDER BY VECTOR_DISTANCE('cosine', embedding, CAST(@image_query_vector AS VECTOR(512)))
 ),
 fused AS (
     SELECT
         COALESCE(t.product_id, i.product_id) AS product_id,
-        COALESCE(t.text_score, 0.0) * :text_weight
-            + COALESCE(i.image_score, 0.0) * :image_weight  AS combined_score,
+        COALESCE(t.text_score, 0.0) * @text_weight
+            + COALESCE(i.image_score, 0.0) * @image_weight  AS combined_score,
         COALESCE(t.text_score, 0.0)  AS text_score,
         COALESCE(i.image_score, 0.0) AS image_score
     FROM text_candidates t
     FULL OUTER JOIN image_candidates i ON t.product_id = i.product_id
 )
-SELECT TOP (:top_k)
+SELECT TOP (@top_k)
     f.product_id,
     p.name,
     p.category,
@@ -810,7 +748,7 @@ def late_fusion_with_normalization(
         for pid, data in score_map.items()
     ]
     fused.sort(key=lambda x: x["combined_score"], reverse=True)
-    return fused[:top_k]</code></pre>
+    return fused[@top_k]</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Reciprocal Rank Fusion (RRF)</strong>: An alternative that is rank-based rather than score-based, and therefore inherently distribution-agnostic.</p>
 
@@ -1071,10 +1009,10 @@ def multimodal_query_pinecone(
         return reciprocal_rank_fusion_pinecone(results_text, results_image, top_n=top_k)
     elif results_text:
         return [{"product_id": m.metadata["product_id"], "name": m.metadata["name"], "score": m.score}
-                for m in results_text[:top_k]]
+                for m in results_text[@top_k]]
     elif results_image:
         return [{"product_id": m.metadata["product_id"], "name": m.metadata["name"], "score": m.score}
-                for m in results_image[:top_k]]
+                for m in results_image[@top_k]]
     return []
 
 def reciprocal_rank_fusion_pinecone(
@@ -1213,15 +1151,17 @@ async def health():
     <div class="mt-14 bg-cyan-950/40 border border-cyan-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
-        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · SQL Server</p>
       </div>
       <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
          class="shrink-0 px-6 py-3 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold rounded-xl text-sm transition">
         Download Free
       </a>
     </div>
-    <div class="mt-8 text-xs">
-      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a>
+    <div class="mt-10 flex items-center justify-between text-xs">
+      <a href="b4-ch30-embedding-model-versioning.html" class="text-gray-500 hover:text-gray-300 transition">← Previous Chapter</a>
+      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">All Chapters</a>
+      <a href="b4-ch32-graph-vector.html" class="text-cyan-400 hover:text-cyan-300 transition">Next Chapter →</a>
     </div>
   </article>
   <footer class="border-t border-gray-800/50 px-6 py-8">

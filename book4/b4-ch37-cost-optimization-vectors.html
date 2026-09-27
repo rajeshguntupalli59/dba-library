@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Chapter 37: Cost Optimization: Dimensionality Reduction and Quantization — Vector Databases & AI</title>
-  <meta name="description" content="Vector Databases & AI Chapter 37: Cost Optimization: Dimensionality Reduction and Quantization. pgvector, Pinecone, Weaviate, RAG pipelines — by Rajesh Guntupalli." />
+  <meta name="description" content="Vector Databases & AI Chapter 37: Cost Optimization: Dimensionality Reduction and Quantization — MRL truncation, two-phase retrieval, and DiskANN tuning on SQL Server — by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
   <script type="module">
     import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
@@ -245,80 +245,42 @@ print(f"Retrieved {len(results)} results")
 for r in results:
     print(f"  id={r.id}, score={r.score:.4f}")</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">pgvector's quantization</strong> arrived in version 0.7.0 with halfvec (float16) support and binary quantization:</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Quantization on SQL Server.</strong> The native <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR</code> type in SQL Server 2025 stores float32 — there is no built-in float16 or binary-quantized column type. Your compression levers are (a) storing fewer dimensions via MRL truncation (Section 37.2), (b) quantizing at the application layer before insert, and (c) the two-phase pattern: a compact representation for candidate selection, full float32 for rescoring.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
-
--- Option 1: halfvec — stores float16, halves storage vs float32
--- Requires pgvector &gt;= 0.7.0
-
-CREATE TABLE documents_half (
-    id          BIGSERIAL PRIMARY KEY,
-    content     TEXT,
-    embedding   HALFVEC(1536)   -- 2 bytes per dim instead of 4
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server 2025: two-phase pattern — compact candidates, exact rescore
+-- Phase 1 storage: truncated 512-dim vectors in a smaller VECTOR column
+CREATE TABLE dbo.DocumentsCompact (
+    ChunkId   BIGINT IDENTITY(1,1) NOT NULL
+        CONSTRAINT PK_DocumentsCompact PRIMARY KEY,
+    ChunkText NVARCHAR(MAX) NOT NULL,
+    Emb512    VECTOR(512) NOT NULL   -- 512 x 4 bytes = 2 KB vs 6 KB for 1536
 );
-
--- HNSW index on halfvec — same syntax as VECTOR
-CREATE INDEX ON documents_half
-USING hnsw (embedding halfvec_cosine_ops)
-WITH (m = 16, ef_construction = 64);
-
--- Query: cast your float32 query to halfvec at search time
-SELECT id, content, embedding &lt;=&gt; $1::HALFVEC AS distance
-FROM documents_half
-ORDER BY distance
-LIMIT 10;
-
--- Option 2: Binary quantization with BIT type
--- Each dimension becomes 1 bit: positive float → 1, negative → 0
--- Requires pgvector &gt;= 0.7.0
-
-CREATE TABLE documents_binary (
-    id              BIGSERIAL PRIMARY KEY,
-    content         TEXT,
-    embedding_full  VECTOR(1536),    -- keep original for rescoring
-    embedding_bin   BIT(1536)        -- binary quantized
+CREATE VECTOR INDEX IX_DocCompact_Emb512
+    ON dbo.DocumentsCompact (Emb512)
+    WITH (METRIC = 'cosine', TYPE = 'DiskANN', MAXDOP = 4);
+-- Phase 2: full 1536-dim vectors for exact rescoring of the candidates
+CREATE TABLE dbo.DocumentsFull (
+    ChunkId   BIGINT NOT NULL
+        CONSTRAINT PK_DocumentsFull PRIMARY KEY,
+    EmbFull   VECTOR(1536) NOT NULL
 );
-
--- Function to binarize a vector
-CREATE OR REPLACE FUNCTION binarize(v VECTOR) RETURNS BIT AS $$
-DECLARE
-    result BIT;
-    i      INT;
-    arr    FLOAT[];
-    bits   TEXT := '';
-BEGIN
-    arr := ARRAY(SELECT unnest(v::FLOAT[]));
-    FOR i IN 1..array_length(arr, 1) LOOP
-        IF arr[i] &gt;= 0 THEN
-            bits := bits || '1';
-        ELSE
-            bits := bits || '0';
-        END IF;
-    END LOOP;
-    RETURN bits::BIT(1536);
-END;
-$$ LANGUAGE plpgsql IMMUTABLE;
-
--- Index on binary vectors using Hamming distance
-CREATE INDEX ON documents_binary
-USING hnsw (embedding_bin bit_hamming_ops)
-WITH (m = 16, ef_construction = 64);
-
--- Two-phase search: binary for candidate selection, float32 for rescoring
-WITH binary_candidates AS (
-    SELECT id, embedding_full,
-           bit_count(embedding_bin # $2::BIT(1536)) AS hamming_dist
-    FROM documents_binary
-    ORDER BY hamming_dist
-    LIMIT 100   -- oversample: get 100 via binary search
+GO
+-- Two-phase search: DiskANN over compact vectors, exact rescore over full
+DECLARE @q512  VECTOR(512)  = '[0.1, ...]';   -- truncated query embedding
+DECLARE @qfull VECTOR(1536) = '[0.1, ...]';   -- full query embedding
+WITH CompactCandidates AS (
+    SELECT TOP (100) ChunkId,
+           VECTOR_DISTANCE('cosine', Emb512, @q512) AS approx_dist
+    FROM dbo.DocumentsCompact
+    ORDER BY approx_dist
 )
-SELECT id, embedding_full &lt;=&gt; $1::VECTOR AS cosine_dist
-FROM binary_candidates
-ORDER BY cosine_dist
-LIMIT 10;      -- rerank top 100 by exact cosine, return 10
-
--- $1 = float32 query vector, $2 = binary query vector (same query, both forms)</code></pre>
+SELECT TOP (10) c.ChunkId,
+       VECTOR_DISTANCE('cosine', f.EmbFull, @qfull) AS exact_dist
+FROM CompactCandidates AS c
+JOIN dbo.DocumentsFull AS f ON f.ChunkId = c.ChunkId
+ORDER BY exact_dist;
+-- 3x storage reduction on the indexed column, recall within 1-3% of full
+-- float32 search when validated on your eval set (Section 37.5).</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The two-phase pattern — coarse binary search, exact float32 reranking — is the same pattern Qdrant calls "rescoring." It's the standard production approach for binary quantization and delivers recall within 1–3% of full float32 search at a fraction of the memory cost.</p>
 
@@ -697,105 +659,82 @@ def search_optimized(query_text: str, top_k: int = 10) -&gt; list[dict]:
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">pgvector Optimization Workflow</h3>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">SQL Server Optimization Workflow</h3>
 
-<p class="text-gray-300 leading-relaxed">For teams running vector search inside PostgreSQL via pgvector, the optimization path looks different from managed vector databases but the principles are identical.</p>
+<p class="text-gray-300 leading-relaxed">For teams running vector search inside SQL Server 2025 via native <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR</code> and DiskANN, the optimization path uses the same principles as managed vector databases but expressed in T-SQL and DMVs.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector — full optimization workflow
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server 2025 — full optimization workflow
 
--- Step 1: Baseline — full float32, HNSW
-CREATE TABLE documents (
-    id          BIGSERIAL PRIMARY KEY,
-    content     TEXT,
-    source      TEXT,
-    embedding   VECTOR(1536)
+-- Step 1: Baseline — full float32, DiskANN
+CREATE TABLE dbo.Documents (
+    DocId     INT IDENTITY(1,1) NOT NULL
+        CONSTRAINT PK_Documents PRIMARY KEY,
+    Content   NVARCHAR(MAX) NOT NULL,
+    Source    NVARCHAR(200) NOT NULL,
+    Embedding VECTOR(1536) NOT NULL
 );
+CREATE VECTOR INDEX IX_Documents_Embedding
+    ON dbo.Documents (Embedding)
+    WITH (METRIC = 'cosine', TYPE = 'DiskANN', MAXDOP = 4);
 
-CREATE INDEX idx_docs_embedding ON documents
-USING hnsw (embedding vector_cosine_ops)
-WITH (m = 16, ef_construction = 64);
+-- Step 2: Add a truncated-dimension column for 3x storage savings
+-- (populate from the application with MRL-truncated 512-dim embeddings)
+ALTER TABLE dbo.Documents ADD Embedding512 VECTOR(512) NULL;
+GO
+-- Backfill in batches in production (UPDATE TOP ... in a loop);
+-- single statement shown for clarity:
+-- UPDATE dbo.Documents SET Embedding512 = <truncated vector>;
+CREATE VECTOR INDEX IX_Documents_Embedding512
+    ON dbo.Documents (Embedding512)
+    WITH (METRIC = 'cosine', TYPE = 'DiskANN', MAXDOP = 4);
+-- Storage: 512 x 4 bytes = 2 KB vs 1536 x 4 = 6 KB per row -> 3x reduction
 
--- Step 2: Migrate to halfvec for 2× storage savings
--- (pgvector &gt;= 0.7.0)
-ALTER TABLE documents ADD COLUMN embedding_half HALFVEC(1536);
-
--- Backfill: cast existing vectors (batch this in production)
-UPDATE documents SET embedding_half = embedding::HALFVEC;
-
--- Create HNSW on halfvec
-CREATE INDEX idx_docs_half ON documents
-USING hnsw (embedding_half halfvec_cosine_ops)
-WITH (m = 16, ef_construction = 64);
-
--- Test: compare result sets between full and half precision
-WITH full_results AS (
-    SELECT id, embedding &lt;=&gt; '[0.1, ...]'::VECTOR AS dist_full
-    FROM documents ORDER BY dist_full LIMIT 20
+-- Step 3: Validate recall parity between full and truncated columns
+DECLARE @q VECTOR(1536) = '[0.1, ...]';
+DECLARE @q512 VECTOR(512) = '[0.1, ...]';
+WITH FullResults AS (
+    SELECT TOP (20) DocId,
+           VECTOR_DISTANCE('cosine', Embedding, @q) AS dist_full
+    FROM dbo.Documents ORDER BY dist_full
 ),
-half_results AS (
-    SELECT id, embedding_half &lt;=&gt; '[0.1, ...]'::HALFVEC AS dist_half
-    FROM documents ORDER BY dist_half LIMIT 20
+HalfResults AS (
+    SELECT TOP (20) DocId,
+           VECTOR_DISTANCE('cosine', Embedding512, @q512) AS dist_half
+    FROM dbo.Documents ORDER BY dist_half
 )
-SELECT
-    COALESCE(f.id, h.id) AS id,
-    f.dist_full,
-    h.dist_half,
-    CASE WHEN f.id IS NULL THEN 'only in half'
-         WHEN h.id IS NULL THEN 'only in full'
-         ELSE 'in both' END AS status
-FROM full_results f
-FULL OUTER JOIN half_results h USING (id)
+SELECT COALESCE(f.DocId, h.DocId) AS DocId,
+       f.dist_full, h.dist_half,
+       CASE WHEN f.DocId IS NULL THEN 'only in truncated'
+            WHEN h.DocId IS NULL THEN 'only in full'
+            ELSE 'in both' END AS status
+FROM FullResults AS f
+FULL OUTER JOIN HalfResults AS h ON h.DocId = f.DocId
 ORDER BY COALESCE(f.dist_full, h.dist_half);
 
--- Step 3: Dimension reduction at the application layer + halfvec
--- If using MRL truncation, store 512-dim halfvec directly
-ALTER TABLE documents ADD COLUMN embedding_512h HALFVEC(512);
+-- Step 4: Measure index sizes via DMVs
+SELECT i.name AS IndexName,
+       SUM(s.used_page_count) * 8 / 1024 AS IndexMB
+FROM sys.indexes AS i
+JOIN sys.dm_db_partition_stats AS s
+  ON s.object_id = i.object_id AND s.index_id = i.index_id
+WHERE i.object_id = OBJECT_ID(N'dbo.Documents')
+GROUP BY i.name
+ORDER BY IndexMB DESC;
 
--- This column gets populated from the application with 512-dim embeddings
--- Storage: 512 × 2 bytes = 1024 bytes vs 1536 × 4 = 6144 bytes → 6× reduction
+-- Step 5: Tune query-time recall via TOP_N over-fetch
+-- DiskANN has no session-level ef_search equivalent; control the
+-- recall/latency tradeoff by over-fetching candidates and rescoring:
+DECLARE @q2 VECTOR(512) = '[0.1, ...]';
+SELECT TOP (10) DocId, exact_dist
+FROM (
+    SELECT TOP (100) DocId,                     -- over-fetch 10x
+           VECTOR_DISTANCE('cosine', Embedding512, @q2) AS exact_dist
+    FROM dbo.Documents
+) AS candidates
+ORDER BY exact_dist;
+-- Increase the inner TOP_N for better recall, decrease for lower latency.</code></pre>
 
-CREATE INDEX idx_docs_512h ON documents
-USING hnsw (embedding_512h halfvec_cosine_ops)
-WITH (m = 16, ef_construction = 64);
-
--- HNSW query-time recall tuning via session parameter
-SET hnsw.ef_search = 100;    -- default is 40; increase for better recall
-                              -- tune per query if needed
-
-SELECT id, content,
-       embedding_512h &lt;=&gt; $1::HALFVEC AS distance
-FROM documents
-ORDER BY distance
-LIMIT 10;
-
--- Step 4: Measure index sizes
-SELECT
-    indexname,
-    pg_size_pretty(pg_relation_size(indexrelid)) AS index_size,
-    pg_size_pretty(pg_total_relation_size(indexrelid)) AS total_size
-FROM pg_stat_user_indexes
-WHERE relname = 'documents'
-ORDER BY pg_relation_size(indexrelid) DESC;
-
--- Step 5: IVFFlat as lower-memory alternative to HNSW
--- HNSW has better recall-latency tradeoff but uses more memory for the graph
--- IVFFlat uses less memory, needs lists tuning
-
-CREATE INDEX idx_docs_ivfflat ON documents
-USING ivfflat (embedding_512h halfvec_cosine_ops)
-WITH (lists = 200);         -- rule of thumb: sqrt(n_rows) for up to 1M rows
-                            -- use 10*sqrt(n_rows) for larger datasets
-
--- IVFFlat requires probes at query time:
-SET ivfflat.probes = 20;    -- check 20 of 200 lists (10%); tune for recall/speed
-
-SELECT id, content,
-       embedding_512h &lt;=&gt; $1::HALFVEC AS distance
-FROM documents
-ORDER BY distance
-LIMIT 10;</code></pre>
-
-<p class="text-gray-300 leading-relaxed">The SQL Server pairing for pgvector doesn't have a native equivalent — SQL Server does not include a production-grade vector index type as of 2024. For teams standardized on SQL Server who need vector search, the practical options are Azure AI Search (a managed service with its own vector index support) or a sidecar vector database alongside SQL Server for the embedding workload.</p>
+<p class="text-gray-300 leading-relaxed">SQL Server 2025 includes a production-grade vector story natively: the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR</code> type, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_DISTANCE</code>, and DiskANN indexes ship in the engine. For teams standardized on SQL Server, that means vector search lives in the same database as the operational data — one backup story, one security model, one monitoring stack — with Azure AI Search or a sidecar vector database (Qdrant, Weaviate) as the option when you need quantization or scale the in-engine index doesn't cover.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
@@ -828,21 +767,23 @@ LIMIT 10;</code></pre>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Storage and memory costs scale with both vector count and vector size**: the two primary levers for controlling cost are dimensionality reduction (fewer dimensions) and quantization (fewer bits per dimension), and they can be stacked for compounding savings.</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **MRL-trained models (OpenAI text-embedding-3-*, Cohere v3) enable native truncation**: you can reduce from 1536 to 512 dimensions by setting a single API parameter, with better quality than PCA projection because the model was explicitly trained for it.</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Scalar quantization (int8) with rescoring is the lowest-risk compression step**: it delivers 4× memory reduction with recall loss typically under 3%, using the original float32 vectors stored on disk for rescoring top candidates identified by the compressed index.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The practical production optimum for most RAG systems is 512-dim MRL + int8 quantization**: this combination achieves roughly 12× memory reduction versus full float32 HNSW while preserving approximately 95% Recall@10, and it is straightforward to implement in both Qdrant and pgvector.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The practical production optimum for most RAG systems is 512-dim MRL + int8 quantization**: this combination achieves roughly 12× memory reduction versus full float32 HNSW while preserving approximately 95% Recall@10, and it is straightforward to implement with SQL Server DiskANN (MRL-truncated columns) and Qdrant (native quantization).</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Recall benchmarking must use real queries and must track the P10 recall, not just the mean**: a high average recall can hide systematically poor retrieval on specific query categories, and those failures are the ones that degrade downstream LLM response quality in production.</li>
     </div>
     <div class="mt-14 bg-cyan-950/40 border border-cyan-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
-        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · SQL Server</p>
       </div>
       <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
          class="shrink-0 px-6 py-3 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold rounded-xl text-sm transition">
         Download Free
       </a>
     </div>
-    <div class="mt-8 text-xs">
-      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a>
+    <div class="mt-10 flex items-center justify-between text-xs">
+      <a href="b4-ch36-backup-embeddings.html" class="text-gray-500 hover:text-gray-300 transition">← Previous Chapter</a>
+      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">All Chapters</a>
+      <a href="b4-ch38-edge-vector-search.html" class="text-cyan-400 hover:text-cyan-300 transition">Next Chapter →</a>
     </div>
   </article>
   <footer class="border-t border-gray-800/50 px-6 py-8">

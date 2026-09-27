@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 24: Building a RAG Pipeline on SQL Server — Vector Databases & AI</title>
+  <meta name="description" content="Vector Databases & AI Chapter 24: Building a RAG Pipeline on SQL Server — chunk storage, embedding ingestion, DiskANN retrieval, hybrid search, and prompt assembly in T-SQL. By Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-cyan-500 to-cyan-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-cyan-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 4 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6">
+      <a href="index.html" class="text-xs text-cyan-400 hover:text-cyan-300 transition">← All Chapters</a>
+    </div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-cyan-900/40 border border-cyan-800/40 text-cyan-300 text-xs rounded-full font-medium">Chapter 24 of 40</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">Vector Databases & AI</span>
+    </div>
+    <div class="space-y-4 text-sm">
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 24: Building a RAG Pipeline on SQL Server</h2>
+
+<p class="text-gray-300 leading-relaxed">Retrieval-augmented generation is the workload that made vector databases famous: instead of trusting a language model to recall facts from its training data, you retrieve the relevant documents from your own corpus and put them in the prompt. The model's job shrinks from "know everything" to "reason over this provided context" — hallucinations drop, answers become citable, and private data never needs to enter model training. When the corpus lives in SQL Server, the entire RAG pipeline — chunk storage, embedding ingestion, similarity retrieval, permission filtering, and prompt assembly — can run inside the database engine, with the LLM call as the only external step. This chapter builds that pipeline end to end.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Pipeline Architecture: Five Stages, One Database</h3>
+
+<p class="text-gray-300 leading-relaxed">A production RAG pipeline has five stages. Four of them belong in SQL Server; only the last one leaves it:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">1. Ingest and chunk.</strong> Source documents land in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">RagDocuments</code>; a chunking process splits them into retrievable units in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">RagChunks</code> (schema from Chapter 8, strategies from Chapter 22).</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">2. Embed.</strong> An ingestion pipeline generates embeddings and stores them in the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR(1536)</code> column — batched, with the staging-and-quarantine pattern from Chapter 8.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">3. Retrieve.</strong> At query time, embed the user's question, run similarity search (exact or DiskANN), apply permission and tenant filters, and return the top-k chunks. This is a stored procedure — the heart of the chapter.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">4. Assemble.</strong> Format the retrieved chunks into a prompt with citations, staying within the model's context window. Also a stored procedure — or application code, depending on taste.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">5. Generate.</strong> Send the prompt to the LLM (Azure OpenAI, or any model endpoint) and return the answer with its citations. This is the only stage that leaves the database.</li>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph LR
+    A[Documents] --> B[Chunk<br/>T-SQL / app]
+    B --> C[Embed<br/>batched pipeline]
+    C --> D[(RagChunks<br/>VECTOR column)]
+    E[User question] --> F[Embed question]
+    F --> G[Retrieve<br/>usp_RetrieveChunks]
+    D --> G
+    G --> H[Assemble prompt<br/>+ citations]
+    H --> I[LLM call<br/>external]
+    I --> J[Answer + sources]</pre></div>
+
+<p class="text-gray-300 leading-relaxed">Keeping stages 1–4 in SQL Server is not just convenience — it is correctness. Permission filtering inside the retrieval procedure means the LLM never sees chunks the user is not allowed to see; there is no post-generation filtering step to forget. Transactional ingestion means a document and its chunks are never half-present. And the audit trail — which chunks grounded which answer — is a query away.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">The Retrieval Procedure: Similarity Plus Permission Filtering</h3>
+
+<p class="text-gray-300 leading-relaxed">The retrieval procedure is the load-bearing wall of the pipeline. It takes an embedded question and a user context, and returns ranked, permission-filtered chunks with their source metadata. Here is the production shape — DiskANN approximate search with over-fetch, joined back for enrichment and filtered by document permissions:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- The heart of RAG: permission-filtered vector retrieval in one procedure
+CREATE OR ALTER PROCEDURE dbo.usp_RetrieveChunks
+    @QuestionEmbedding VECTOR(1536),
+    @UserId            INT,
+    @TopK              INT = 8
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    -- 1. Approximate retrieval: over-fetch 5x to survive permission filtering
+    -- 2. Join back for document metadata + permission check
+    -- 3. Trim to TopK AFTER filtering (never before)
+    SELECT TOP (@TopK)
+           c.ChunkId, c.ChunkText, d.Title, d.SourceUri,
+           s.distance AS Distance
+    FROM VECTOR_SEARCH(
+             TABLE = dbo.RagChunks AS t,
+             COLUMN = Embedding,
+             SIMILAR_TO = @QuestionEmbedding,
+             METRIC = 'cosine',
+             TOP_N = @TopK * 5
+         ) AS s
+    JOIN dbo.RagChunks AS c    ON c.ChunkId = s.ChunkId
+    JOIN dbo.RagDocuments AS d ON d.DocumentId = c.DocumentId
+    WHERE d.IsPublished = 1
+      AND EXISTS (SELECT 1 FROM dbo.DocumentPermissions AS p
+                  WHERE p.DocumentId = d.DocumentId
+                    AND p.UserId = @UserId)   -- row-level permission check
+    ORDER BY s.distance;
+END;
+GO</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Three details make this production-grade rather than demo-grade. <strong class="text-white">Over-fetch before filtering:</strong> <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">TOP_N = @TopK * 5</code> because permission and publication filters consume candidates — fetching exactly 8 and filtering to 3 is the classic RAG recall bug. <strong class="text-white">Filter after retrieval, rank after filtering:</strong> the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ORDER BY s.distance</code> applies to the filtered set, so the final ranking reflects what the user may actually see. <strong class="text-white">Permissions as data, not as application logic:</strong> the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">EXISTS</code> check against a permissions table means access control is enforced by the same query that retrieves — auditable, testable, and impossible for a future application rewrite to bypass. (Row-level security from Chapter 12 can enforce this even more strongly.)</p>
+
+<p class="text-gray-300 leading-relaxed">For corpora under ~50K vectors, replace the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_SEARCH</code> call with exact <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_DISTANCE</code> ranking — same procedure shape, same filters, 100% recall, no index to maintain.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Hybrid Retrieval: Vector Plus Full-Text in One Query</h3>
+
+<p class="text-gray-300 leading-relaxed">Pure vector search misses exact-term matches ("error 0x80070005" is a string, not a concept), and pure full-text search misses paraphrases. Production RAG uses both. SQL Server composes them naturally — run the full-text predicate and the vector ranking in one statement and fuse the scores:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Hybrid retrieval: full-text candidates UNION vector candidates, fused
+DECLARE @q VECTOR(1536) = '...';
+DECLARE @keywords NVARCHAR(4000) = '"password reset" OR "account recovery"';
+
+WITH VectorHits AS (
+    SELECT TOP (20) c.ChunkId, s.distance AS VecDist,
+           ROW_NUMBER() OVER (ORDER BY s.distance) AS VecRank
+    FROM VECTOR_SEARCH(TABLE = dbo.RagChunks AS t, COLUMN = Embedding,
+                       SIMILAR_TO = @q, METRIC = 'cosine', TOP_N = 20) AS s
+    JOIN dbo.RagChunks AS c ON c.ChunkId = s.ChunkId
+),
+TextHits AS (
+    SELECT TOP (20) c.ChunkId,
+           ROW_NUMBER() OVER (ORDER BY k.RANK DESC) AS TextRank
+    FROM CONTAINSTABLE(dbo.RagChunks, ChunkText, @keywords) AS k
+    JOIN dbo.RagChunks AS c ON c.ChunkId = k.[KEY]
+)
+-- Reciprocal rank fusion: 1/(60+rank) per list, summed
+SELECT TOP (10) c.ChunkId, c.ChunkText,
+       SUM(1.0 / (60 + COALESCE(v.VecRank, 1000))
+         + 1.0 / (60 + COALESCE(t.TextRank, 1000))) AS RRFScore
+FROM dbo.RagChunks AS c
+LEFT JOIN VectorHits AS v ON v.ChunkId = c.ChunkId
+LEFT JOIN TextHits   AS t ON t.ChunkId = c.ChunkId
+WHERE v.ChunkId IS NOT NULL OR t.ChunkId IS NOT NULL
+GROUP BY c.ChunkId, c.ChunkText
+ORDER BY RRFScore DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Reciprocal rank fusion (RRF) needs no score normalization between the two lists — it works purely on ranks, which is why it is the standard fusion method. The constant 60 dampens the influence of very high ranks; the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">COALESCE(..., 1000)</code> gives chunks appearing in only one list a small participation score rather than zero. This is Chapter 11's hybrid search applied to the RAG retrieval path.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Prompt Assembly and the Generation Call</h3>
+
+<p class="text-gray-300 leading-relaxed">With chunks retrieved, prompt assembly is string formatting with a budget: the model's context window. Number each chunk, include its source, and instruct the model to cite chunk numbers — citations are what make RAG answers trustworthy and debuggable:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Assemble a cited prompt from retrieved chunks (application or T-SQL)
+-- Prompt template:
+--   "Answer the question using ONLY the context below. Cite sources like [1], [2].
+--    If the context does not contain the answer, say so explicitly.
+--
+--    Context:
+--    [1] (Password reset procedure — https://intranet/help/password-reset)
+--    To reset your password, open Settings > Security > ...
+--    [2] (Account recovery FAQ — https://intranet/help/account-faq)
+--    If you are locked out, contact the service desk at ...
+--
+--    Question: How do I reset my password?"</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The generation call itself goes to the LLM — Azure OpenAI via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sp_invoke_external_rest_endpoint</code> for in-database orchestration, or from application code for production scale. Either way, log the answer alongside the chunk IDs that grounded it: that log is your evaluation dataset (Chapter 27), your audit trail, and your debugging lifeline when a user reports a wrong answer. "Which chunks did the model see?" should always be a query away, never a mystery.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Keeping the Pipeline Honest: Freshness and Evaluation Hooks</h3>
+
+<p class="text-gray-300 leading-relaxed">A RAG pipeline rots in two ways: stale content and degrading retrieval quality. Build the countermeasures into the pipeline rather than bolting them on later. For freshness, the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DocHash</code> change detection from Chapter 8 drives incremental re-chunking, and the embedding backlog query tells you whether ingestion is keeping up. For quality, the recall history table from Chapter 14 trends retrieval health, and the answer log feeds the evaluation metrics in Chapter 27.</p>
+
+<p class="text-gray-300 leading-relaxed">One more practice that pays for itself: a <strong class="text-white">golden question set</strong> — twenty to fifty representative questions with known-good answers, run through the full pipeline on a schedule, with answer quality scored (by an LLM judge or by human spot-check). It is the end-to-end test of the entire system: chunking, embeddings, index, retrieval procedure, prompt template, and model. When the golden set degrades, you know something changed; the per-stage metrics tell you where.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> A SQL Server RAG pipeline keeps four of five stages in the database — chunking, embedding ingestion, retrieval, and prompt assembly — with only the LLM generation call external. Permission filtering inside the retrieval procedure means the model never sees unauthorized chunks.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> The retrieval procedure over-fetches from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_SEARCH</code> (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">TOP_N = @TopK * 5</code>), joins back for metadata, applies publication and permission filters, then trims to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">@TopK</code> — filtering before trimming is what keeps recall intact.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Hybrid retrieval combines <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_SEARCH</code> with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CONTAINSTABLE</code> full-text results fused by reciprocal rank fusion — no score normalization needed, and exact-term matches stop falling through the cracks.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Assemble prompts with numbered, sourced chunks and explicit cite-or-abstain instructions; log every answer with the chunk IDs that grounded it — that log is your evaluation dataset, audit trail, and debugging record.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Fight the two rots with built-in countermeasures: hash-based change detection and backlog monitoring for freshness, recall history plus a scheduled golden-question set for end-to-end retrieval quality.</li>
+    </div>
+    <div class="mt-14 bg-cyan-950/40 border border-cyan-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · SQL Server</p>
+      </div>
+      <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
+         class="shrink-0 px-6 py-3 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold rounded-xl text-sm transition">
+        Download Free
+      </a>
+    </div>
+    <div class="mt-10 flex items-center justify-between text-xs">
+      <a href="b4-ch23-embedding-model-selection.html" class="text-gray-500 hover:text-gray-300 transition">← Previous Chapter</a>
+      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">All Chapters</a>
+      <a href="b4-ch25-reranking.html" class="text-cyan-400 hover:text-cyan-300 transition">Next Chapter →</a>
+    </div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · Vector Databases & AI</div>
+  </footer>
+</body>
+</html>

@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Chapter 38: Edge Deployment of Vector Search — Vector Databases & AI</title>
-  <meta name="description" content="Vector Databases & AI Chapter 38: Edge Deployment of Vector Search. pgvector, Pinecone, Weaviate, RAG pipelines — by Rajesh Guntupalli." />
+  <meta name="description" content="Vector Databases & AI Chapter 38: Edge Deployment of Vector Search — choosing engines for constrained environments, sync patterns, and offline-first architecture with SQL Server — by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
   <script type="module">
     import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
@@ -65,8 +65,8 @@
 <p class="text-gray-300 leading-relaxed">|---|---|---|---|---|</p>
 <p class="text-gray-300 leading-relaxed">| Browser/mobile | 256MB–2GB | Flash | Intermittent | SQLite-vec, Chroma (tiny) |</p>
 <p class="text-gray-300 leading-relaxed">| CDN edge worker | 128–512MB | None (ephemeral) | Always-on | Static index shard |</p>
-<p class="text-gray-300 leading-relaxed">| On-premise gateway | 4–16GB | NVMe | Intermittent WAN | Qdrant, SQLite-vec, pgvector (lite) |</p>
-<p class="text-gray-300 leading-relaxed">| Regional near-edge | 32–256GB | NVMe/SAN | Reliable | Full Qdrant, Weaviate, pgvector |</p>
+<p class="text-gray-300 leading-relaxed">| On-premise gateway | 4–16GB | NVMe | Intermittent WAN | Qdrant, SQLite-vec, SQL Server Express |</p>
+<p class="text-gray-300 leading-relaxed">| Regional near-edge | 32–256GB | NVMe/SAN | Reliable | Full Qdrant, Weaviate, SQL Server Standard |</p>
 
 <p class="text-gray-300 leading-relaxed">Understanding which tier you're targeting determines almost every subsequent decision: which engine to use, how to handle index updates, and how to write application code that degrades gracefully.</p>
 
@@ -277,7 +277,7 @@ curl -X PUT http://localhost:6333/collections/products \
 
 echo "Qdrant edge node ready. Check RAM: $(free -h | awk '/^Mem/{print $3}')"</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">pgvector on lightweight PostgreSQL</strong> is viable for Tier 3 when you already have PostgreSQL embedded in your application stack (common in retail and healthcare edge deployments). The tradeoff: PostgreSQL's baseline RAM footprint (~100MB shared_buffers minimum) plus pgvector's HNSW index consumes more memory than Qdrant, but you get full SQL expressivity and can join vector search with transactional data in the same engine.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server Express on a gateway box</strong> is viable for Tier 3 when you already run SQL Server in your application stack (common in retail and healthcare edge deployments). SQL Server 2025 Express supports the native <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR</code> type, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_DISTANCE</code>, and DiskANN indexes — you get full T-SQL expressivity and can join vector search with transactional data in the same engine, within Express's resource limits. The tradeoff is a larger baseline footprint than Qdrant, but a single engine for everything.</p>
 
 <p class="text-gray-300 leading-relaxed">For Tier 1 (browser/mobile), the realistic options narrow further: <strong class="text-white">Transformers.js</strong> (WebAssembly port of ONNX Runtime) handles embedding generation in-browser, and <strong class="text-white">SQLite-vec compiled to WASM</strong> handles the search. Both fit in a browser tab with no server round-trip.</p>
 
@@ -300,7 +300,7 @@ echo "Qdrant edge node ready. Check RAM: $(free -h | awk '/^Mem/{print $3}')"</c
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">1. Snapshot-and-replace.</strong> Periodically export the full collection from the central store as a binary snapshot, ship it to edge nodes, and hot-swap the index. Qdrant supports snapshots natively via its REST API. This is appropriate when the dataset is stable (changes fewer than 5% of vectors per day) and the snapshot fits within your transfer window.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">2. Delta sync with a changelog.</strong> Maintain a changelog table (or Kafka topic) of vectors inserted, updated, or deleted since the last sync. The edge node consumes the changelog and applies individual upserts. This works well with Qdrant's point upsert API and pgvector's standard INSERT/UPDATE/DELETE. The index degrades in search quality as individual points are added outside the bulk-build path, but HNSW handles online insertions reasonably—quality remains acceptable until the index is 30–40% updated, at which point a full rebuild improves recall by 3–8%.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">2. Delta sync with a changelog.</strong> Maintain a changelog table (or Kafka topic) of vectors inserted, updated, or deleted since the last sync. The edge node consumes the changelog and applies individual upserts. This works well with Qdrant's point upsert API and SQL Server's standard INSERT/UPDATE/DELETE against the vector table (rebuild or reorganize the DiskANN index after heavy delta application — quality remains acceptable until the index is 30–40% updated, at which point a rebuild improves recall by 3–8%).</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">3. Versioned read-only snapshots.</strong> Treat the edge index as immutable. Build a new snapshot for every major data version, push it to edge nodes, and switch a symlink atomically. No online mutation. This is operationally simple and eliminates index drift, at the cost of requiring full rebuilds for every update cycle.</p>
 
@@ -1065,15 +1065,17 @@ cat "$RESULTS_DIR/report.txt"</code></pre>
     <div class="mt-14 bg-cyan-950/40 border border-cyan-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
-        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · SQL Server</p>
       </div>
       <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
          class="shrink-0 px-6 py-3 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold rounded-xl text-sm transition">
         Download Free
       </a>
     </div>
-    <div class="mt-8 text-xs">
-      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a>
+    <div class="mt-10 flex items-center justify-between text-xs">
+      <a href="b4-ch37-cost-optimization-vectors.html" class="text-gray-500 hover:text-gray-300 transition">← Previous Chapter</a>
+      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">All Chapters</a>
+      <a href="b4-ch39-future-hybrid-relational-vector.html" class="text-cyan-400 hover:text-cyan-300 transition">Next Chapter →</a>
     </div>
   </article>
   <footer class="border-t border-gray-800/50 px-6 py-8">

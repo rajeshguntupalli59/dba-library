@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 12: Multi-Tenant Vector Storage in SQL Server — Vector Databases & AI</title>
+  <meta name="description" content="Vector Databases & AI Chapter 12: Multi-Tenant Vector Storage in SQL Server — tenant_id filtering, row-level security, schema-per-tenant, and database-per-tenant patterns. By Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-cyan-500 to-cyan-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-cyan-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 4 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6">
+      <a href="index.html" class="text-xs text-cyan-400 hover:text-cyan-300 transition">← All Chapters</a>
+    </div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-cyan-900/40 border border-cyan-800/40 text-cyan-300 text-xs rounded-full font-medium">Chapter 12 of 40</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">Vector Databases & AI</span>
+    </div>
+    <div class="space-y-4 text-sm">
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 12: Multi-Tenant Vector Storage in SQL Server</h2>
+
+<p class="text-gray-300 leading-relaxed">Multi-tenancy turns every vector decision up a notch. One tenant's support tickets must never surface in another tenant's RAG answers; a noisy tenant's indexing burst must not starve everyone else's retrieval latency; onboarding tenant number ten thousand should be a row insert, not a migration project. SQL Server's tenancy toolkit — shared tables with tenant keys, row-level security, separate schemas, separate databases, elastic pools — maps cleanly onto vector workloads, with one vector-specific wrinkle: the approximate vector index does not understand tenants, so filtered search quality needs deliberate design. This chapter walks through the four tenancy patterns, their vector implications, and how to keep retrieval both isolated and fast.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Pattern 1: Shared Tables with tenant_id (Pooled Tenancy)</h3>
+
+<p class="text-gray-300 leading-relaxed">The default pattern: every vector row carries a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">TenantId</code>, every query filters on it, and tenants share tables, indexes, and the buffer pool. It is the cheapest to operate and the fastest to onboard — a new tenant is an <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">INSERT</code> into a tenants table, not a provisioning event.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Pooled tenancy: TenantId on every vector row, filtered at query time
+CREATE TABLE dbo.TenantChunks (
+    ChunkId     INT IDENTITY(1,1) NOT NULL CONSTRAINT PK_TenantChunks PRIMARY KEY,
+    TenantId    INT NOT NULL,
+    DocumentId  INT NOT NULL,
+    ChunkText   NVARCHAR(MAX) NOT NULL,
+    Embedding   VECTOR(1536) NULL,
+    CONSTRAINT FK_TenantChunks_Tenants FOREIGN KEY (TenantId)
+        REFERENCES dbo.Tenants (TenantId)
+);
+-- Tenant-keyed access path: every retrieval seeks here first
+CREATE INDEX IX_TenantChunks_Tenant ON dbo.TenantChunks (TenantId, ChunkId);
+
+-- Tenant-scoped exact retrieval
+DECLARE @tenantId INT = 101, @q VECTOR(1536) = '...';
+SELECT TOP (10) ChunkId, ChunkText,
+       VECTOR_DISTANCE('cosine', Embedding, @q) AS Distance
+FROM dbo.TenantChunks
+WHERE TenantId = @tenantId AND Embedding IS NOT NULL
+ORDER BY Distance;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">For exact search this pattern is flawless: the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">TenantId</code> predicate seeks the tenant's slice and ranks only within it — perfect isolation, perfect recall. For DiskANN approximate search, the wrinkle appears: the vector index is built over all tenants' vectors together, and a tenant-scoped query is a filtered ANN search. With moderate tenant counts and reasonably balanced data volumes this works well — the relational filter narrows candidates and the graph walk stays efficient. It degrades when one tenant dominates the corpus (their vectors saturate the graph neighborhoods) or when a tenant's data is a tiny fraction of a huge shared index (the walk wastes effort on other tenants' vectors). Mitigations: over-fetch <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">TOP_N</code> aggressively for small tenants, and monitor per-tenant recall with the Chapter 9 spot-check pattern parameterized by tenant.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Enforcing Isolation: Row-Level Security</h3>
+
+<p class="text-gray-300 leading-relaxed">A <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WHERE TenantId = @tenantId</code> clause is a convention; row-level security (RLS) makes it a guarantee. With RLS, the database itself filters every query — including ad-hoc queries, reporting tools, and that one stored procedure someone wrote at 2 AM without the tenant predicate:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- RLS: the database enforces tenant isolation, not application discipline
+CREATE SCHEMA Security;
+GO
+CREATE FUNCTION Security.fn_TenantAccessPredicate(@TenantId INT)
+RETURNS TABLE
+WITH SCHEMABINDING
+AS RETURN SELECT 1 AS AccessResult
+           WHERE @TenantId = CAST(SESSION_CONTEXT(N'TenantId') AS INT)
+              OR IS_MEMBER('db_owner') = 1;
+GO
+CREATE SECURITY POLICY Security.TenantFilter
+ADD FILTER PREDICATE Security.fn_TenantAccessPredicate(TenantId)
+    ON dbo.TenantChunks,
+ADD BLOCK PREDICATE Security.fn_TenantAccessPredicate(TenantId)
+    ON dbo.TenantChunks AFTER INSERT;
+GO
+-- Application sets the tenant once per session/pooled connection reset
+EXEC sp_set_session_context @key = N'TenantId', @value = 101;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Two operational notes. First, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SESSION_CONTEXT</code> must be set whenever a pooled connection is reused for a different tenant — reset it on connection checkout or set it at the start of every retrieval procedure; a stale tenant context is a data leak. Second, the security predicate composes with vector queries transparently: the optimizer applies it as part of the plan, so <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_SEARCH</code> results joined back to the secured table are filtered before they reach the caller. Test this explicitly — write a test that sets a tenant context and asserts zero rows from other tenants leak through the full retrieval procedure, not just the base table.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Pattern 2: Schema per Tenant</h3>
+
+<p class="text-gray-300 leading-relaxed">When tenants need stronger isolation — per-tenant backup/restore, per-tenant index maintenance windows, or regulatory boundaries that shared tables cannot satisfy — schema-per-tenant gives each tenant their own set of tables (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">tenant_101.RagChunks</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">tenant_102.RagChunks</code>) inside one database. Each tenant gets their own DiskANN vector index, which eliminates the filtered-ANN recall concern entirely: every index is single-tenant by construction.</p>
+
+<p class="text-gray-300 leading-relaxed">The cost is operational multiplicity: schema migrations must roll across every tenant schema (script it — never hand-apply), and the preview vector index's drop-and-recreate refresh cycle now runs per tenant. This pattern fits tens to low hundreds of tenants with meaningful per-tenant data volumes. Past that, the migration fan-out becomes the dominant operational burden.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Pattern 3: Database per Tenant (with Elastic Pools)</h3>
+
+<p class="text-gray-300 leading-relaxed">Database-per-tenant is the strongest isolation SQL Server offers short of separate instances: per-tenant backups, per-tenant restores, per-tenant performance tuning, and a blast radius limited to one tenant when something goes wrong. Each database holds its own vector tables and its own DiskANN index — the cleanest possible vector story, since every index is single-tenant and sized to that tenant's corpus.</p>
+
+<p class="text-gray-300 leading-relaxed">On Azure SQL Database, elastic pools make this economically sane: hundreds of tenant databases share a pool of DTUs or vCores, with per-database min/max limits preventing noisy-neighbor starvation. The tradeoff is management surface — provisioning, connection routing (a tenant-to-database catalog), and cross-tenant schema upgrades across hundreds of databases demand automation from day one. This is the pattern for SaaS products where tenants pay enough to justify per-tenant infrastructure and where compliance requires hard boundaries.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Pattern 4: Separate Instances (Rare, and Usually Wrong)</h3>
+
+<p class="text-gray-300 leading-relaxed">Instance-per-tenant — separate SQL Server instances or separate managed servers per tenant — appears in RFP responses more often than in sensible architectures. It gives absolute noisy-neighbor isolation at the cost of multiplying every operational burden by the tenant count: patching, monitoring, backups, and licensing. Reserve it for the handful of tenants whose contracts genuinely demand dedicated infrastructure, and run everyone else on one of the first three patterns.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
+    A[Choose tenancy pattern] --> B{Tenant count?}
+    B -->|Thousands+| C[Pooled: tenant_id<br/>+ RLS]
+    B -->|Tens to hundreds| D{Isolation needs?}
+    D -->|Standard| C
+    D -->|Per-tenant backup/<br/>regulatory| E[Schema per tenant]
+    D -->|Hard boundaries,<br/>SaaS at scale| F[Database per tenant<br/>elastic pool]
+    C --> G[Watch filtered-ANN<br/>recall per tenant]
+    E --> H[Per-tenant DiskANN<br/>index each]
+    F --> H</pre></div>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Noisy Neighbors and Resource Governance</h3>
+
+<p class="text-gray-300 leading-relaxed">In pooled and schema-per-tenant patterns, tenants share compute, and vector workloads are disproportionately capable of hogging it — a single tenant's million-vector backfill or a burst of concurrent similarity searches can saturate CPU and evict other tenants' hot pages from the buffer pool. Two controls keep the peace. On-premises, Resource Governor with per-tenant workload groups (classified by login or session context) caps CPU and memory grants per tenant. On Azure SQL Database elastic pools, per-database max vCore/DTU settings provide the same isolation with less configuration. Either way, the principle is the same: decide the noisy-neighbor policy before the first incident, not during it.</p>
+
+<p class="text-gray-300 leading-relaxed">Monitor per-tenant vector health with the same queries you use globally, parameterized by tenant: un-embedded backlog per tenant (Chapter 8's query with a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">TenantId</code> group-by), recall spot-checks per tenant for filtered ANN search, and query-store wait statistics broken out by tenant context. Tenancy problems announce themselves in per-tenant metrics long before they show up in global ones.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Pooled tenancy (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">TenantId</code> on every vector row) is the default: cheapest to operate, instant onboarding, perfect for exact search — but watch filtered-ANN recall for tiny tenants in huge shared indexes and over-fetch <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">TOP_N</code> to compensate.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Row-level security turns tenant filtering from application convention into database guarantee — set <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SESSION_CONTEXT</code> on every pooled connection checkout and test the full retrieval procedure for cross-tenant leaks, not just the base table.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Schema-per-tenant gives each tenant their own DiskANN index (no filtered-search recall concerns) at the cost of migration fan-out; database-per-tenant on elastic pools gives hard boundaries and per-tenant backup/restore for SaaS scale.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Govern the noisy neighbor before the first incident: Resource Governor workload groups on-premises, per-database caps in elastic pools — vector workloads are disproportionately capable of hogging shared CPU and buffer pool.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Monitor tenancy in per-tenant metrics — embedding backlog, recall spot-checks, and Query Store waits broken out by tenant — because tenancy problems show up there long before they move global dashboards.</li>
+    </div>
+    <div class="mt-14 bg-cyan-950/40 border border-cyan-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · SQL Server</p>
+      </div>
+      <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
+         class="shrink-0 px-6 py-3 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold rounded-xl text-sm transition">
+        Download Free
+      </a>
+    </div>
+    <div class="mt-10 flex items-center justify-between text-xs">
+      <a href="b4-ch11-hybrid-search.html" class="text-gray-500 hover:text-gray-300 transition">← Previous Chapter</a>
+      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">All Chapters</a>
+      <a href="b4-ch13-vector-support-azure-sql-rds.html" class="text-cyan-400 hover:text-cyan-300 transition">Next Chapter →</a>
+    </div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · Vector Databases & AI</div>
+  </footer>
+</body>
+</html>

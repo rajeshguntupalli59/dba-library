@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 10: Tuning Vector Workloads in SQL Server — Vector Databases & AI</title>
+  <meta name="description" content="Vector Databases & AI Chapter 10: Tuning Vector Workloads in SQL Server — DiskANN index design, query patterns, memory sizing, concurrency, and Automatic Tuning. By Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-cyan-500 to-cyan-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-cyan-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 4 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6">
+      <a href="index.html" class="text-xs text-cyan-400 hover:text-cyan-300 transition">← All Chapters</a>
+    </div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-cyan-900/40 border border-cyan-800/40 text-cyan-300 text-xs rounded-full font-medium">Chapter 10 of 40</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">Vector Databases & AI</span>
+    </div>
+    <div class="space-y-4 text-sm">
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 10: Tuning Vector Workloads in SQL Server</h2>
+
+<p class="text-gray-300 leading-relaxed">Vector workloads have a performance profile unlike anything else on a SQL Server instance: large sequential scans for exact search, random graph-walk I/O for DiskANN queries, and memory pressure from multi-kilobyte rows that dwarf typical OLTP rows. The good news is that the tuning toolkit is the one you already own — index design, query patterns, memory configuration, concurrency management, and Automatic Tuning. This chapter applies each of them to vector workloads specifically: when to choose exact versus approximate search, how to design the DiskANN index, how to write retrieval queries the optimizer loves, how to size memory, and how to keep hundreds of concurrent similarity searches from stepping on each other.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Choose the Search Path Deliberately</h3>
+
+<p class="text-gray-300 leading-relaxed">The first tuning decision is architectural, not knobs: exact search or approximate search. Exact search — <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ORDER BY VECTOR_DISTANCE(...)</code> over the table — scans every vector and computes every distance. It needs no index, gives 100% recall, and performs well up to roughly 50,000 vectors. Approximate search through a DiskANN vector index and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_SEARCH</code> trades a few percent of recall for logarithmic scaling into the millions.</p>
+
+<p class="text-gray-300 leading-relaxed">The mistake to avoid is defaulting to one path for everything. A support-ticket search over 20,000 historical tickets does not need a vector index — the build time and the preview write-path constraints buy nothing. A product catalog with 2 million embeddings and a 100ms p99 SLA cannot live on exact search no matter how much hardware you add. Measure your corpus size, set the path explicitly per table, and revisit the decision as the corpus grows — the crossover is a function of data volume, not of ambition.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">DiskANN Index Design</h3>
+
+<p class="text-gray-300 leading-relaxed">When the approximate path is warranted, the index design has exactly three decisions, and only one of them is subtle.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">1. The metric must match the model and the queries.</strong> <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">METRIC = 'cosine'</code> for normalized text embeddings (the common case), <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">'euclidean'</code> where magnitude matters, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">'dot'</code> for inner-product-trained models. The index does not validate this for you — a mismatched metric returns confidently wrong rankings. Standardize the metric per table in a data dictionary and assert it in deployment scripts.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">2. Build with parallelism, then leave it alone.</strong> Index builds over millions of vectors are CPU-bound graph construction. <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">MAXDOP</code> in the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WITH</code> clause controls build parallelism — size it to what the instance can spare during the maintenance window, since a build competes with everything else for CPU and buffer pool. Schedule builds in low-traffic windows; there is no online build for vector indexes in the current preview.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">3. Plan the write path around drop-and-recreate.</strong> In the current preview, the table is read-only while the vector index exists, and new data requires dropping and rebuilding the index. Do not fight this — design for it. The production pattern is a staging-table swap: bulk-load new embeddings into a staging table, build the vector index there, then switch it into production with a metadata operation (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALTER SCHEMA ... TRANSFER</code> or partition switching where applicable). Retrieval queries see either the old or the new index, never a half-built one.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Production refresh pattern: build on staging, swap into production
+-- 1. Load new embeddings into staging (ordinary table, same schema)
+-- 2. Build the vector index on staging during the maintenance window
+CREATE VECTOR INDEX IX_Stage_Embedding
+ON dbo.RagChunks_Stage (Embedding)
+WITH (METRIC = 'cosine', TYPE = 'DiskANN', MAXDOP = 8);
+
+-- 3. Atomic swap: staging becomes production
+BEGIN TRAN;
+    EXEC sp_rename 'dbo.RagChunks', 'RagChunks_Old';
+    EXEC sp_rename 'dbo.RagChunks_Stage', 'RagChunks';
+COMMIT;
+-- 4. Drop the old table after validation</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Write Retrieval Queries the Optimizer Loves</h3>
+
+<p class="text-gray-300 leading-relaxed">Vector retrieval queries have a shape, and writing to that shape keeps plans stable. For exact search, the canonical pattern filters relationally first, then ranks:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Exact search: relational pre-filter, then rank by distance
+DECLARE @q VECTOR(1536) = '...';
+
+SELECT TOP (20)
+       c.ChunkId, c.ChunkText,
+       VECTOR_DISTANCE('cosine', c.Embedding, @q) AS Distance
+FROM dbo.RagChunks AS c
+JOIN dbo.RagDocuments AS d ON d.DocumentId = c.DocumentId
+WHERE c.Embedding IS NOT NULL
+  AND d.SourceUri LIKE 'https://intranet/%'   -- relational pre-filter
+ORDER BY Distance;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">For approximate search, keep the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_SEARCH</code> call clean and do relational work around it — join its results back to dimension tables for display columns and permission checks rather than stuffing predicates inside the TVF call:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Approximate search: ANN retrieval, then relational enrichment
+DECLARE @q VECTOR(1536) = '...';
+
+SELECT TOP (20)
+       c.ChunkId, c.ChunkText, d.Title, s.distance
+FROM VECTOR_SEARCH(
+         TABLE = dbo.RagChunks AS t,
+         COLUMN = Embedding,
+         SIMILAR_TO = @q,
+         METRIC = 'cosine',
+         TOP_N = 50            -- over-fetch, then trim
+     ) AS s
+JOIN dbo.RagChunks AS c   ON c.ChunkId = s.ChunkId
+JOIN dbo.RagDocuments AS d ON d.DocumentId = c.DocumentId
+WHERE d.IsPublished = 1   -- relational post-filter on the small result set
+ORDER BY s.distance;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Two techniques in that query deserve names. <strong class="text-white">Over-fetch and trim:</strong> request more candidates from the index (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">TOP_N = 50</code>) than you display (20), because post-filters and reranking consume candidates — asking for exactly 20 and filtering down to 12 is the most common recall bug in production RAG. <strong class="text-white">Parameterize the query vector</strong> like any other parameter: ad-hoc embedding literals in dynamic SQL pollute the plan cache with single-use plans. Pass <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">@q</code> as a parameter from SqlClient or a stored procedure argument.</p>
+
+<p class="text-gray-300 leading-relaxed">Watch for plan-cache bloat from embedding literals the way you would watch for any non-parameterized workload: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_cached_plans</code> grouped by query hash will show it immediately. And enable Query Store on vector databases — vector queries are exactly the kind of workload where a plan regression (say, the optimizer abandoning the vector index path after a statistics update) is worth catching automatically rather than discovering from user complaints.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Memory: Vectors Are Hungry</h3>
+
+<p class="text-gray-300 leading-relaxed">A 1536-dimension float32 vector is about 6 KB — roughly a thousand times the size of a typical OLTP row. That changes the memory math. Ten thousand hot vectors fit comfortably in any buffer pool; ten million need ~60 GB before the DiskANN graph overhead. Size accordingly:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Keep the working set in the buffer pool.</strong> DiskANN is designed for SSD-backed operation and tolerates buffer-pool misses better than HNSW-style in-memory indexes tolerate RAM exhaustion — but every physical read adds latency to the p99. Monitor <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_os_buffer_descriptors</code> for the vector database to see how much of the corpus is actually resident, and size max server memory so the hot portion stays cached.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Do not starve the rest of the instance.</strong> On shared instances, cap the vector database's appetite with Resource Governor: a workload group limiting memory grants for the retrieval login prevents a burst of concurrent similarity searches from evicting everyone else's hot pages. Vector queries are the classic noisy neighbor because each one touches so much data.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Mind the distance-computation CPU.</strong> Exact search is a CPU burn — billions of multiply-adds per query. Track <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_query_stats</code> total worker time for your retrieval procedures; if CPU, not I/O, dominates, the answer is the DiskANN index (fewer distance computations), not a bigger VM.</li>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Concurrency: Pooling, Isolation, and Automatic Tuning</h3>
+
+<p class="text-gray-300 leading-relaxed">Vector search endpoints are typically chatty — a RAG application issues a retrieval query per user question, and user questions arrive concurrently. Three settings carry most of the weight.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Connection pooling is not optional.</strong> Establishing a new SQL Server connection costs milliseconds you do not have in a 100ms retrieval budget, and embedding JSON parameters are large enough that you want them flowing over warm connections. Use SqlClient connection pooling (enabled by default in .NET — do not disable it), size <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Max Pool Size</code> for your actual concurrency rather than leaving the default 100 to be discovered under load, and keep the retrieval queries on a dedicated connection string so pool exhaustion in the OLTP workload cannot starve vector search (and vice versa).</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Read committed snapshot for retrieval.</strong> Vector retrieval is overwhelmingly read-only, and it should never block on — or be blocked by — the embedding ingestion writes. Enable <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">READ_COMMITTED_SNAPSHOT</code> on vector databases so readers get row versions from tempdb instead of taking shared locks. Size tempdb accordingly; version-store pressure from a heavy backfill running alongside production retrieval is a real phenomenon.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Let Automatic Tuning watch the plans.</strong> SQL Server's Automatic Tuning (automatic plan correction) is well suited to vector workloads because retrieval queries are highly repetitive — the same parameterized shape executed thousands of times. When a plan regression appears (for example, after statistics update on a rapidly growing chunk table), automatic plan correction can force the last known good plan while you investigate. It is not a substitute for understanding the plans (Chapter 14), but it is a safety net that costs nothing to enable:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Safety net for repetitive retrieval queries: automatic plan correction
+ALTER DATABASE VectorRag SET AUTOMATIC_TUNING (FORCE_LAST_GOOD_PLAN = ON);
+
+-- Verify what it has done lately
+SELECT reason, score, details
+FROM sys.dm_db_tuning_recommendations;</code></pre>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
+    A[Vector workload tuning] --> B{Corpus size?}
+    B -->|Under ~50K| C[Exact search<br/>no vector index]
+    B -->|Over ~50K| D[DiskANN index<br/>MAXDOP build]
+    C --> E[Parameterized queries<br/>Query Store on]
+    D --> E
+    E --> F[Buffer pool sized<br/>for hot vectors]
+    F --> G[SqlClient pooling<br/>RCSI reads]
+    G --> H[Automatic Tuning<br/>plan correction]</pre></div>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Choose the search path by corpus size: exact <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_DISTANCE</code> under ~50K vectors with no index to maintain; DiskANN plus <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_SEARCH</code> above it. Revisit the decision as the corpus grows.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> DiskANN design is three decisions: metric matching the model (cosine default), parallel builds in maintenance windows, and a staging-swap refresh pattern that respects the preview drop-and-recreate write path.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Write retrieval queries to a stable shape: relational pre-filter then rank for exact search; clean <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_SEARCH</code> with over-fetch (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">TOP_N</code> above display count) and relational enrichment after. Parameterize the query vector and enable Query Store.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Vectors are memory-hungry (~6 KB per 1536-dim vector): size the buffer pool for the hot set, use Resource Governor on shared instances, and read <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_query_stats</code> CPU to distinguish compute-bound exact search (needs the index) from I/O-bound retrieval (needs memory).</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> For concurrency: SqlClient connection pooling on a dedicated connection string, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">READ_COMMITTED_SNAPSHOT</code> so readers never block writers, and Automatic Tuning's plan correction as a safety net for the highly repetitive retrieval shapes.</li>
+    </div>
+    <div class="mt-14 bg-cyan-950/40 border border-cyan-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · SQL Server</p>
+      </div>
+      <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
+         class="shrink-0 px-6 py-3 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold rounded-xl text-sm transition">
+        Download Free
+      </a>
+    </div>
+    <div class="mt-10 flex items-center justify-between text-xs">
+      <a href="b4-ch09-diskann-indexing.html" class="text-gray-500 hover:text-gray-300 transition">← Previous Chapter</a>
+      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">All Chapters</a>
+      <a href="b4-ch11-hybrid-search.html" class="text-cyan-400 hover:text-cyan-300 transition">Next Chapter →</a>
+    </div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · Vector Databases & AI</div>
+  </footer>
+</body>
+</html>

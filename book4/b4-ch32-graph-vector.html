@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Chapter 32: Graph and Vector: Combining Relationship and Semantic Search — Vector Databases & AI</title>
-  <meta name="description" content="Vector Databases & AI Chapter 32: Graph and Vector: Combining Relationship and Semantic Search. pgvector, Pinecone, Weaviate, RAG pipelines — by Rajesh Guntupalli." />
+  <meta name="description" content="Vector Databases & AI Chapter 32: Graph and Vector: Combining Relationship and Semantic Search — adjacency tables, native VECTOR, DiskANN, and recursive T-SQL on SQL Server — by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
   <script type="module">
     import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
@@ -190,119 +190,93 @@ driver.close()</code></pre>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">pgvector Meets Recursive CTEs: Graph-Vector Hybrid in PostgreSQL</h3>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">SQL Server Graph Tables Meet VECTOR: Graph-Vector Hybrid in T-SQL</h3>
 
-<p class="text-gray-300 leading-relaxed">If your stack is already on PostgreSQL, you may not need a dedicated graph database for moderate-complexity relationship modeling. PostgreSQL's recursive CTEs provide graph traversal over adjacency tables, and pgvector handles the vector similarity layer. The combination is not as expressive as Cypher or Gremlin for deep traversal, but for depth-limited graph queries it is entirely production-viable and keeps your stack consolidated.</p>
+<p class="text-gray-300 leading-relaxed">If your stack is already on SQL Server, you may not need a dedicated graph database for moderate-complexity relationship modeling. SQL Server's native graph tables (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE TABLE AS NODE</code> / <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">AS EDGE</code>, since 2017) handle traversal via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">MATCH</code> predicates, and the 2025 <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR</code> type handles the similarity layer. The combination is not as expressive as Cypher for deep traversal, but for depth-limited graph queries it is entirely production-viable and keeps your stack consolidated.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server 2025
 -- Schema: documents with embeddings, plus a relationship graph
-
-CREATE EXTENSION IF NOT EXISTS vector;
-
-CREATE TABLE documents (
-    doc_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    title       TEXT NOT NULL,
-    content     TEXT,
-    embedding   vector(1536),
-    created_at  TIMESTAMPTZ DEFAULT now()
+CREATE TABLE dbo.Documents (
+    DocId     UNIQUEIDENTIFIER NOT NULL
+        CONSTRAINT PK_Documents PRIMARY KEY
+        DEFAULT NEWSEQUENTIALID(),
+    Title     NVARCHAR(300) NOT NULL,
+    Content   NVARCHAR(MAX) NULL,
+    Embedding VECTOR(1536) NULL,
+    CreatedAt DATETIME2(0) NOT NULL
+        CONSTRAINT DF_Documents_Created DEFAULT SYSUTCDATETIME()
 );
-
-CREATE TABLE doc_relationships (
-    source_id   UUID REFERENCES documents(doc_id),
-    target_id   UUID REFERENCES documents(doc_id),
-    rel_type    TEXT NOT NULL,  -- 'CITES', 'AUTHORED_BY_SAME', 'PART_OF_SERIES'
-    weight      FLOAT DEFAULT 1.0,
-    PRIMARY KEY (source_id, target_id, rel_type)
+CREATE TABLE dbo.DocRelationships (
+    SourceId UNIQUEIDENTIFIER NOT NULL
+        CONSTRAINT FK_DR_Source REFERENCES dbo.Documents (DocId),
+    TargetId UNIQUEIDENTIFIER NOT NULL
+        CONSTRAINT FK_DR_Target REFERENCES dbo.Documents (DocId),
+    RelType  NVARCHAR(40) NOT NULL,  -- 'CITES', 'AUTHORED_BY_SAME', 'PART_OF_SERIES'
+    Weight   FLOAT NOT NULL CONSTRAINT DF_DR_Weight DEFAULT (1.0),
+    CONSTRAINT PK_DocRelationships PRIMARY KEY (SourceId, TargetId, RelType)
 );
-
-CREATE INDEX ON documents USING hnsw (embedding vector_cosine_ops)
-    WITH (m = 16, ef_construction = 64);
-
-CREATE INDEX ON doc_relationships (source_id);
-CREATE INDEX ON doc_relationships (target_id);
+CREATE VECTOR INDEX IX_Documents_Embedding
+    ON dbo.Documents (Embedding)
+    WITH (METRIC = 'cosine', TYPE = 'DiskANN', MAXDOP = 8);
+CREATE INDEX IX_DocRelationships_Source ON dbo.DocRelationships (SourceId);
+CREATE INDEX IX_DocRelationships_Target ON dbo.DocRelationships (TargetId);
 
 -- Graph-vector hybrid query:
 -- 1. Find top-10 semantically similar documents (vector layer)
 -- 2. Traverse 2 hops of the citation graph from those seeds (graph layer)
 -- 3. Re-rank the expanded set by a combined score
+DECLARE @q VECTOR(1536) = '[0.1, 0.2, ...]';  -- embedded query
 
-WITH query_embedding AS (
-    -- In production, this comes from your embedding service
-    -- Here represented as a placeholder cast
-    SELECT '[0.1, 0.2, ...]'::vector(1536) AS emb
-),
-
+WITH
 -- Step 1: Vector similarity search - seed nodes
-vector_seeds AS (
-    SELECT
-        d.doc_id,
-        d.title,
-        d.embedding,
-        1 - (d.embedding &lt;=&gt; q.emb) AS cosine_similarity,
-        1 AS hop_distance
-    FROM documents d, query_embedding q
-    ORDER BY d.embedding &lt;=&gt; q.emb
-    LIMIT 10
+VectorSeeds AS (
+    SELECT TOP (10) d.DocId, d.Title,
+        1 - VECTOR_DISTANCE('cosine', d.Embedding, @q) AS CosineSimilarity
+    FROM dbo.Documents AS d
+    WHERE d.Embedding IS NOT NULL
+    ORDER BY VECTOR_DISTANCE('cosine', d.Embedding, @q)
 ),
-
 -- Step 2: Graph traversal from seed nodes (up to 2 hops)
-graph_expansion AS (
-    -- Anchor: the seed nodes
-    SELECT doc_id, doc_id AS origin_id, 0 AS hops
-    FROM vector_seeds
-
+GraphExpansion AS (
+    SELECT DocId, DocId AS OriginId, 0 AS Hops FROM VectorSeeds
     UNION ALL
-
-    -- Recursive: follow citation relationships
-    SELECT
-        dr.target_id AS doc_id,
-        ge.origin_id,
-        ge.hops + 1
-    FROM graph_expansion ge
-    JOIN doc_relationships dr
-        ON dr.source_id = ge.doc_id
-        AND dr.rel_type = 'CITES'
-    WHERE ge.hops &lt; 2
+    SELECT dr.TargetId AS DocId, ge.OriginId, ge.Hops + 1
+    FROM GraphExpansion AS ge
+    JOIN dbo.DocRelationships AS dr
+      ON dr.SourceId = ge.DocId AND dr.RelType = 'CITES'
+    WHERE ge.Hops &lt; 2
 ),
-
--- Deduplicate expanded graph nodes
-expanded_candidates AS (
-    SELECT DISTINCT doc_id, MIN(hops) AS min_hops
-    FROM graph_expansion
-    GROUP BY doc_id
+ExpandedCandidates AS (
+    SELECT DocId, MIN(Hops) AS MinHops
+    FROM GraphExpansion
+    GROUP BY DocId
 ),
-
--- Step 3: Compute combined score for the expanded candidate set
-final_ranking AS (
-    SELECT
-        d.doc_id,
-        d.title,
-        1 - (d.embedding &lt;=&gt; q.emb) AS cosine_similarity,
-        ec.min_hops,
-        -- Graph proximity penalty: penalize nodes found only through traversal
-        -- Seeds (hop=0) get full score; each hop reduces score by 15%
-        (1 - (d.embedding &lt;=&gt; q.emb)) * POWER(0.85, ec.min_hops) AS combined_score,
-        CASE WHEN vs.doc_id IS NOT NULL THEN true ELSE false END AS is_seed_node
-    FROM expanded_candidates ec
-    JOIN documents d ON d.doc_id = ec.doc_id
-    JOIN query_embedding q ON true
-    LEFT JOIN vector_seeds vs ON vs.doc_id = ec.doc_id
+FinalRanking AS (
+    SELECT d.DocId, d.Title,
+        1 - VECTOR_DISTANCE('cosine', d.Embedding, @q) AS CosineSimilarity,
+        ec.MinHops,
+        -- Graph proximity penalty: seeds (hop=0) get full score;
+        -- each hop reduces score by 15%
+        (1 - VECTOR_DISTANCE('cosine', d.Embedding, @q))
+            * POWER(0.85, ec.MinHops) AS CombinedScore,
+        CASE WHEN vs.DocId IS NOT NULL THEN 1 ELSE 0 END AS IsSeedNode
+    FROM ExpandedCandidates AS ec
+    JOIN dbo.Documents AS d ON d.DocId = ec.DocId
+    LEFT JOIN VectorSeeds AS vs ON vs.DocId = ec.DocId
+    WHERE d.Embedding IS NOT NULL
 )
-
-SELECT
-    doc_id,
-    title,
-    ROUND(cosine_similarity::numeric, 4) AS semantic_score,
-    min_hops AS graph_hops,
-    ROUND(combined_score::numeric, 4) AS combined_score,
-    is_seed_node
-FROM final_ranking
-ORDER BY combined_score DESC
-LIMIT 20;</code></pre>
+SELECT TOP (20) DocId, Title,
+    ROUND(CAST(CosineSimilarity AS FLOAT), 4) AS SemanticScore,
+    MinHops AS GraphHops,
+    ROUND(CAST(CombinedScore AS FLOAT), 4) AS CombinedScore,
+    IsSeedNode
+FROM FinalRanking
+ORDER BY CombinedScore DESC
+OPTION (MAXRECURSION 10);</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The hop penalty (0.85 per hop) is a tunable parameter. In citation networks where relevance decays sharply with distance, values between 0.75 and 0.85 work well. In social graphs where second-degree connections are highly relevant, you might use 0.95 or no penalty at all. Benchmark this against your human-labeled relevance set before deploying.</p>
 
-<p class="text-gray-300 leading-relaxed">Performance characteristics to expect: with 1M documents and an HNSW index, the vector seed retrieval runs in ~5ms. The recursive CTE traversal over 10 seeds at depth 2 with average branching factor 5 will generate ~250 candidate nodes, and the secondary embedding lookups add ~1ms. Total query time is typically 10–30ms for this pattern at this scale — well within interactive response time budgets.</p>
+<p class="text-gray-300 leading-relaxed">Performance characteristics to expect: with 1M documents and a DiskANN index, the vector seed retrieval runs in ~5ms. The recursive CTE traversal over 10 seeds at depth 2 with average branching factor 5 will generate ~250 candidate nodes, and the secondary embedding lookups add ~1ms. Total query time is typically 10–30ms for this pattern at this scale — well within interactive response time budgets.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
@@ -315,17 +289,20 @@ LIMIT 20;</code></pre>
 <p class="text-gray-300 leading-relaxed">A more immediately deployable pattern is entity-linked RAG: extract named entities from the query, look up those entities in a knowledge graph to gather structured context, then combine that structured context with vector-retrieved chunks.</p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
-# Entity-linked Graph-aware RAG with Neo4j + pgvector + OpenAI
+# Entity-linked Graph-aware RAG with Neo4j + SQL Server + OpenAI
 
 from neo4j import GraphDatabase
 from openai import OpenAI
-import psycopg2
+import pyodbc
 import json
 from typing import Optional
 
 openai_client = OpenAI()
 neo4j_driver = GraphDatabase.driver("bolt://localhost:7687", auth=("neo4j", "password"))
-pg_conn = psycopg2.connect("postgresql://user:pass@localhost/knowledge_db")
+sql_conn = pyodbc.connect("DRIVER={ODBC Driver 18 for SQL Server};"
+                         "SERVER=localhost;DATABASE=knowledge_db;"
+                         "Trusted_Connection=yes;Encrypt=yes;"
+                         "TrustServerCertificate=yes")
 
 def extract_entities_from_query(query: str) -&gt; list[str]:
     """Use LLM to extract named entities from the query."""
@@ -393,7 +370,7 @@ def vector_search_with_graph_filter(
     entity_ids: Optional[list[str]] = None,
     top_k: int = 5
 ) -&gt; list[dict]:
-    """Vector similarity search in pgvector, optionally filtered by entity graph."""
+    """Vector similarity search in SQL Server, optionally filtered by entity graph."""
     embedding = openai_client.embeddings.create(
         input=query,
         model="text-embedding-3-small"
@@ -401,35 +378,30 @@ def vector_search_with_graph_filter(
 
     embedding_str = "[" + ",".join(str(x) for x in embedding) + "]"
 
-    with pg_conn.cursor() as cur:
-        if entity_ids:
-            cur.execute("""
-                SELECT
-                    c.chunk_id,
-                    c.content,
-                    c.source_doc,
-                    c.section_title,
-                    1 - (c.embedding &lt;=&gt; %s::vector) AS similarity
-                FROM document_chunks c
-                JOIN chunk_entities ce ON ce.chunk_id = c.chunk_id
-                WHERE ce.entity_id = ANY(%s)
-                ORDER BY c.embedding &lt;=&gt; %s::vector
-                LIMIT %s
-            """, (embedding_str, entity_ids, embedding_str, top_k))
-        else:
-            cur.execute("""
-                SELECT
-                    chunk_id,
-                    content,
-                    source_doc,
-                    section_title,
-                    1 - (embedding &lt;=&gt; %s::vector) AS similarity
-                FROM document_chunks
-                ORDER BY embedding &lt;=&gt; %s::vector
-                LIMIT %s
-            """, (embedding_str, embedding_str, top_k))
+    vec_param = "[" + ",".join(str(x) for x in embedding) + "]"
+    cur = sql_conn.cursor()
+    if entity_ids:
+        placeholders = ",".join("?" for _ in entity_ids)
+        rows = cur.execute(f"""
+            SELECT TOP (?) c.ChunkId, c.Content, c.SourceDoc, c.SectionTitle,
+                1 - VECTOR_DISTANCE('cosine', c.Embedding,
+                        CAST(? AS VECTOR(1536))) AS Similarity
+            FROM dbo.DocumentChunks AS c
+            JOIN dbo.ChunkEntities AS ce ON ce.ChunkId = c.ChunkId
+            WHERE ce.EntityId IN ({placeholders})
+            ORDER BY VECTOR_DISTANCE('cosine', c.Embedding,
+                         CAST(? AS VECTOR(1536)))
+        """, (top_k, vec_param, *entity_ids, vec_param)).fetchall()
+    else:
+        rows = cur.execute("""
+            SELECT TOP (?) ChunkId, Content, SourceDoc, SectionTitle,
+                1 - VECTOR_DISTANCE('cosine', Embedding,
+                        CAST(? AS VECTOR(1536))) AS Similarity
+            FROM dbo.DocumentChunks
+            ORDER BY VECTOR_DISTANCE('cosine', Embedding,
+                         CAST(? AS VECTOR(1536)))
+        """, (top_k, vec_param, vec_param)).fetchall()
 
-        rows = cur.fetchall()
         return [
             {
                 "chunk_id": r[0],
@@ -513,7 +485,7 @@ print(answer)</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The decision tree for graph-vector architecture is driven by three factors: relationship depth, data volume, and team operational capacity.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Relationship depth</strong> is the primary driver. If your graph queries require more than three hops to answer meaningful questions, PostgreSQL recursive CTEs become slow and operationally awkward. Neo4j, Amazon Neptune, or ArangoDB handle this naturally. At one to two hops, PostgreSQL with a well-indexed adjacency table performs comparably to a dedicated graph database and eliminates operational complexity.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Relationship depth</strong> is the primary driver. If your graph queries require more than three hops to answer meaningful questions, T-SQL recursive CTEs become slow and operationally awkward. Neo4j, Amazon Neptune, or ArangoDB handle this naturally. At one to two hops, SQL Server with a well-indexed adjacency table performs comparably to a dedicated graph database and eliminates operational complexity.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Data volume</strong> determines whether you can afford native hybrid query engines or need to separate the systems. Weaviate performs well at 50M+ vectors with cross-references, but its graph capabilities are limited to direct object references — it is not a property graph database. Neo4j's vector index, as of version 5.x, handles tens of millions of vectors with HNSW but is not optimized for the billion-vector scale that Pinecone or Milvus serve. If you need billion-scale vectors with complex multi-hop graph traversal, you are building a hybrid architecture with two separate systems communicating at the application layer.</p>
 
@@ -523,7 +495,7 @@ print(answer)</code></pre>
 
 <p class="text-gray-300 leading-relaxed">| Scenario | Recommended Architecture |</p>
 <p class="text-gray-300 leading-relaxed">|---|---|</p>
-<p class="text-gray-300 leading-relaxed">| <10M vectors, shallow relationships (≤2 hops) | PostgreSQL + pgvector + recursive CTEs |</p>
+<p class="text-gray-300 leading-relaxed">| <10M vectors, shallow relationships (≤2 hops) | SQL Server native graph tables + VECTOR + recursive CTEs |</p>
 <p class="text-gray-300 leading-relaxed">| <50M vectors, moderate relationship complexity | Weaviate with cross-references |</p>
 <p class="text-gray-300 leading-relaxed">| Any scale, deep graph traversal (>3 hops) | Neo4j 5.x or Amazon Neptune Analytics |</p>
 <p class="text-gray-300 leading-relaxed">| >500M vectors + complex graphs |Separate vector DB (Pinecone/Milvus) + graph DB (Neo4j/Neptune), application-layer orchestration |</p>
@@ -795,7 +767,7 @@ orchestrator.close()</code></pre>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">SQL Server Compatibility: Graph Tables and Vector Search</h3>
 
-<p class="text-gray-300 leading-relaxed">SQL Server 2017 introduced native graph table support (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE TABLE AS NODE</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE TABLE AS EDGE</code>), and SQL Server 2025 (and Azure SQL Database's preview features) added vector similarity functions. This combination allows graph-vector hybrid queries within a single SQL Server instance, following the same pattern as the PostgreSQL + pgvector approach but using T-SQL syntax.</p>
+<p class="text-gray-300 leading-relaxed">SQL Server 2017 introduced native graph table support (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE TABLE AS NODE</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE TABLE AS EDGE</code>), and SQL Server 2025 (and Azure SQL Database's preview features) added vector similarity functions. This combination allows graph-vector hybrid queries within a single SQL Server instance, following the same graph-plus-vector pattern, expressed entirely in T-SQL.</p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server
 -- Graph tables combined with vector similarity search
@@ -1027,7 +999,7 @@ print(f"\nNDCG@10 improvement: {improvement:+.1f}%")</code></pre>
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Three integration patterns cover most production needs:** pre-filter by graph then rank by vector, post-retrieve by vector then expand by graph, and graph-guided RAG where entity relationships shape what context the LLM receives. Choose the pattern based on whether structural constraints are known before or after the semantic query.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **PostgreSQL + pgvector + recursive CTEs is a viable graph-vector stack** for shallow relationship graphs (one to two hops) and data volumes below the tens of millions. It eliminates operational complexity at the cost of expressiveness for deep traversal queries.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **SQL Server native graph tables + VECTOR + recursive CTEs is a viable graph-vector stack** for shallow relationship graphs (one to two hops) and data volumes below the tens of millions. It eliminates operational complexity at the cost of expressiveness for deep traversal queries.</li>
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Native graph-vector engines (Neo4j 5.x, Weaviate, Amazon Neptune Analytics) reduce application-layer complexity** but impose scale ceilings and operational learning curves. Evaluate them when your graph queries exceed two hops or when application-layer orchestration between two separate systems creates unacceptable latency or consistency challenges.</li>
 
@@ -1036,15 +1008,17 @@ print(f"\nNDCG@10 improvement: {improvement:+.1f}%")</code></pre>
     <div class="mt-14 bg-cyan-950/40 border border-cyan-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
-        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · SQL Server</p>
       </div>
       <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
          class="shrink-0 px-6 py-3 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold rounded-xl text-sm transition">
         Download Free
       </a>
     </div>
-    <div class="mt-8 text-xs">
-      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a>
+    <div class="mt-10 flex items-center justify-between text-xs">
+      <a href="b4-ch31-multimodal-search.html" class="text-gray-500 hover:text-gray-300 transition">← Previous Chapter</a>
+      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">All Chapters</a>
+      <a href="b4-ch33-semantic-caching.html" class="text-cyan-400 hover:text-cyan-300 transition">Next Chapter →</a>
     </div>
   </article>
   <footer class="border-t border-gray-800/50 px-6 py-8">

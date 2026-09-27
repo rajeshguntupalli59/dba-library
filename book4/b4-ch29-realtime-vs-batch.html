@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Chapter 29: Real-Time vs Batch Embedding Generation — Vector Databases & AI</title>
-  <meta name="description" content="Vector Databases & AI Chapter 29: Real-Time vs Batch Embedding Generation. pgvector, Pinecone, Weaviate, RAG pipelines — by Rajesh Guntupalli." />
+  <meta name="description" content="Vector Databases & AI Chapter 29: Real-time vs batch embedding generation — synchronous pipelines, SQL Server queue-based batch workers, hybrid architectures, cost optimization, and monitoring. By Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
   <script type="module">
     import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
@@ -16,7 +16,7 @@
     <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
       <a href="../index.html" class="flex items-center gap-2 group">
         <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-cyan-500 to-cyan-700 flex items-center justify-center">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
         </div>
         <span class="text-sm font-bold text-white group-hover:text-cyan-300 transition">Rajesh Guntupalli</span>
       </a>
@@ -43,1005 +43,258 @@
     <div class="space-y-4 text-sm">
 <h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 29: Real-Time vs Batch Embedding Generation</h2>
 
-<p class="text-gray-300 leading-relaxed">Embedding generation sits at the boundary between your application's request path and your vector database's indexing pipeline. Every vector in your store started as a raw document, image, or structured record that passed through a model to become a float array — and the decision about *when* that transformation happens shapes your latency profile, cost structure, operational complexity, and freshness guarantees in ways that compound at scale. This chapter maps out the two fundamental strategies — real-time and batch — examines where each breaks down, and shows the hybrid architectures that production systems almost always end up building.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">29.1 Understanding the Embedding Generation Pipeline</h3>
 
-<p class="text-gray-300 leading-relaxed">Before choosing a strategy, you need a clear model of what the pipeline actually does. Embedding generation is a compute-intensive inference step: a neural network reads tokens, runs a forward pass, and returns a fixed-size dense vector. That vector is then written to your vector store and becomes searchable.</p>
+<p class="text-gray-300 leading-relaxed">Every vector in your database was produced by an embedding call — an API request or a GPU inference — and that production step has its own architecture decisions: when embeddings are generated (at write time or in bulk later), how failures are retried, and how the pipeline scales with document volume. Get the timing wrong and you either pay synchronous latency on every write or serve stale search results for hours.</p>
 
-<p class="text-gray-300 leading-relaxed">Think of it like a computed column in a relational database. You have a source table of raw content and a derived representation stored separately for efficient retrieval. The question isn't whether to compute it — you must — it's whether you compute it synchronously during write operations or asynchronously in a scheduled or streaming process.</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">The pipeline stages:</strong></p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>Raw Content → Chunking/Preprocessing → Model Inference → Vector Storage → Index Build</code></pre>
-
-<p class="text-gray-300 leading-relaxed">Each stage introduces latency and can fail independently. In real-time mode, all of this sits in your request path. In batch mode, only the final query lookup is synchronous.</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Key parameters that drive strategy selection:</strong></p>
-
-<p class="text-gray-300 leading-relaxed">| Parameter | Favors Real-Time | Favors Batch |</p>
-<p class="text-gray-300 leading-relaxed">|---|---|---|</p>
-<p class="text-gray-300 leading-relaxed">| Content ingestion rate | Low to moderate | High volume |</p>
-<p class="text-gray-300 leading-relaxed">| Latency tolerance | < 500ms end-to-end | Minutes to hours acceptable |</p>
-<p class="text-gray-300 leading-relaxed">| Content update frequency | Continuous | Periodic |</p>
-<p class="text-gray-300 leading-relaxed">| Embedding model size | API-hosted, fast | Large local models |</p>
-<p class="text-gray-300 leading-relaxed">| Cost sensitivity | Bursty, pay-per-call | Predictable volume pricing |</p>
-<p class="text-gray-300 leading-relaxed">| Content at query time | Dynamic, user-generated | Stable corpus |</p>
-
-<p class="text-gray-300 leading-relaxed">The embedding model itself is the most constrained resource. OpenAI's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-3-small</code> processes roughly 1M tokens per minute on the API tier, costing $0.02 per 1M tokens. A local <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sentence-transformers/all-MiniLM-L6-v2</code> running on CPU processes approximately 500 sentences per second on a modern machine — fast enough for many real-time use cases, but it becomes a bottleneck as soon as content volume spikes.</p>
+<p class="text-gray-300 leading-relaxed">The two pure strategies are real-time (embed synchronously as documents arrive) and batch (queue documents, embed in bulk on a schedule). Most production systems end up hybrid. This chapter gives you the patterns for each, implemented against SQL Server, and a framework for choosing.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">29.2 Real-Time Embedding Generation</h3>
 
-<p class="text-gray-300 leading-relaxed">Real-time embedding generation means computing vectors synchronously as new content arrives — either during document ingestion or at query time for incoming search strings. The user or upstream system waits for the embedding to complete before the request continues.</p>
+<p class="text-gray-300 leading-relaxed">The following example shows a FastAPI endpoint that ingests documents and generates embeddings synchronously using the OpenAI API and SQL Server native <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR</code> for storage:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">When this approach works well:</strong></p>
-
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> A user submits a search query and you need the query embedding immediately</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> A chat application ingests user messages that must be retrievable within seconds</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> An API receives webhook events that feed a RAG pipeline with sub-minute freshness requirements</li>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">When it breaks:</strong></p>
-
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Document ingestion volume spikes (model API rate limits become throttling events)</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Embedding latency becomes the dominant term in your p95 response time</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Upstream content sources send batches disguised as streams (100 documents at once)</li>
-
-<p class="text-gray-300 leading-relaxed">The following example shows a FastAPI endpoint that ingests documents and generates embeddings synchronously using the OpenAI API and pgvector for storage:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
-import asyncio
-import time
-from typing import Optional
-
-import asyncpg
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python — FastAPI synchronous embedding ingestion into SQL Server
+import hashlib, openai, pyodbc
 from fastapi import FastAPI, HTTPException
-from openai import AsyncOpenAI
-from pydantic import BaseModel
 
 app = FastAPI()
-openai_client = AsyncOpenAI()
-
-# Connection pool — reuse across requests
-pool: Optional[asyncpg.Pool] = None
-
-
-async def get_pool() -&gt; asyncpg.Pool:
-    global pool
-    if pool is None:
-        pool = await asyncpg.create_pool(
-            dsn="postgresql://app_user:secret@localhost:5432/vectordb",
-            min_size=5,
-            max_size=20,
-        )
-    return pool
-
-
-class DocumentIngest(BaseModel):
-    document_id: str
-    content: str
-    metadata: dict = {}
-
-
-class SearchQuery(BaseModel):
-    query: str
-    top_k: int = 10
-
+openai_client = openai.OpenAI()
+conn = pyodbc.connect("DRIVER={ODBC Driver 18 for SQL Server};"
+                      "SERVER=localhost;DATABASE=ragdb;Trusted_Connection=yes;"
+                      "Encrypt=yes;TrustServerCertificate=yes;MARS_Connection=yes")
 
 @app.post("/documents")
-async def ingest_document(doc: DocumentIngest):
-    """Real-time ingestion: embed and store in a single synchronous operation."""
-    start = time.monotonic()
-
-    # Step 1: Generate embedding — this is the latency bottleneck
+def ingest_document(doc_id: str, text: str, tenant_id: int):
+    # Step 1: embed synchronously (caller waits for the API round-trip)
     try:
-        response = await openai_client.embeddings.create(
-            model="text-embedding-3-small",
-            input=doc.content,
-            encoding_format="float",
-        )
+        emb = openai_client.embeddings.create(
+            input=[text], model="text-embedding-3-small").data[0].embedding
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Embedding API error: {e}")
+        raise HTTPException(502, f"Embedding provider failed: {e}")
+    vec = "[" + ",".join(str(v) for v in emb) + "]"
+    content_hash = hashlib.sha256(text.encode()).hexdigest()
+    # Step 2: write to SQL Server
+    cur = conn.cursor()
+    cur.execute("""MERGE dbo.DocumentChunks AS t
+        USING (SELECT ? AS DocId, ? AS ChunkText,
+                      CAST(? AS VECTOR(1536)) AS Embedding,
+                      ? AS ContentHash, ? AS TenantId) AS s
+        ON t.DocId = s.DocId AND t.ChunkIndex = 0
+        WHEN MATCHED AND t.ContentHash &lt;&gt; s.ContentHash THEN
+            UPDATE SET ChunkText = s.ChunkText, Embedding = s.Embedding,
+                       ContentHash = s.ContentHash,
+                       UpdatedAt = SYSUTCDATETIME()
+        WHEN NOT MATCHED THEN
+            INSERT (DocId, ChunkIndex, ChunkText, Embedding,
+                    ModelId, TenantId, ContentHash)
+            VALUES (s.DocId, 0, s.ChunkText, s.Embedding,
+                    'text-embedding-3-small', s.TenantId, s.ContentHash);""",
+        (doc_id, text, vec, content_hash, tenant_id))
+    conn.commit()
+    return {"doc_id": doc_id, "status": "indexed"}
+</code></pre>
 
-    embedding = response.data[0].embedding
-    embed_latency_ms = (time.monotonic() - start) * 1000
+<p class="text-gray-300 leading-relaxed">Real-time is the right choice when freshness is the product: a support agent that must search a ticket the moment it is filed, a product catalog where new SKUs must be searchable immediately. The costs are synchronous latency (every write waits for the embedding API), coupled failure modes (embedding provider outage blocks your writes), and per-request API pricing with no batching discount.</p>
 
-    # Step 2: Write to pgvector
-    db = await get_pool()
-    try:
-        await db.execute(
-            """
-            INSERT INTO documents (document_id, content, embedding, metadata, embedded_at)
-            VALUES ($1, $2, $3::vector, $4, NOW())
-            ON CONFLICT (document_id) DO UPDATE
-              SET content = EXCLUDED.content,
-                  embedding = EXCLUDED.embedding,
-                  embedded_at = NOW()
-            """,
-            doc.document_id,
-            doc.content,
-            str(embedding),
-            doc.metadata,
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"DB write error: {e}")
-
-    total_latency_ms = (time.monotonic() - start) * 1000
-
-    return {
-        "document_id": doc.document_id,
-        "embed_latency_ms": round(embed_latency_ms, 2),
-        "total_latency_ms": round(total_latency_ms, 2),
-        "dimensions": len(embedding),
-    }
-
-
-@app.post("/search")
-async def search(query: SearchQuery):
-    """Query embedding is always real-time — there is no alternative."""
-    response = await openai_client.embeddings.create(
-        model="text-embedding-3-small",
-        input=query.query,
-        encoding_format="float",
-    )
-    query_vector = response.data[0].embedding
-
-    db = await get_pool()
-    rows = await db.fetch(
-        """
-        SELECT document_id, content, metadata,
-               1 - (embedding &lt;=&gt; $1::vector) AS cosine_similarity
-        FROM documents
-        ORDER BY embedding &lt;=&gt; $1::vector
-        LIMIT $2
-        """,
-        str(query_vector),
-        query.top_k,
-    )
-
-    return [dict(r) for r in rows]</code></pre>
-
-<p class="text-gray-300 leading-relaxed">The critical observation here: query embedding is *always* real-time. You cannot precompute embeddings for arbitrary user queries. The only decision is whether document embeddings are also real-time or handled separately.</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Concurrency and rate limit management</strong> become the primary operational concerns. A real-time pipeline that handles 50 concurrent document writes will fire 50 simultaneous API calls. OpenAI's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-3-small</code> has a default rate limit of 3,000 RPM (requests per minute) on paid tiers — roughly 50 per second. You need a semaphore or queue to stay within bounds:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
-import asyncio
-from openai import AsyncOpenAI
-
-client = AsyncOpenAI()
-
-# Limit concurrent embedding calls to avoid rate limit errors
-EMBED_SEMAPHORE = asyncio.Semaphore(20)
-
-
-async def safe_embed(text: str, model: str = "text-embedding-3-small") -&gt; list[float]:
-    """Rate-limited embedding call with exponential backoff."""
-    async with EMBED_SEMAPHORE:
-        for attempt in range(4):
-            try:
-                response = await client.embeddings.create(
-                    model=model,
-                    input=text,
-                    encoding_format="float",
-                )
-                return response.data[0].embedding
-            except Exception as e:
-                if "rate_limit" in str(e).lower() and attempt &lt; 3:
-                    wait = (2**attempt) + 0.1
-                    await asyncio.sleep(wait)
-                else:
-                    raise
-
-
-async def embed_batch_concurrent(texts: list[str], max_concurrency: int = 20) -&gt; list[list[float]]:
-    """Embed a list of texts with bounded concurrency."""
-    tasks = [safe_embed(t) for t in texts]
-    return await asyncio.gather(*tasks)</code></pre>
+<p class="text-gray-300 leading-relaxed">Harden the failure mode: never let an embedding failure lose the document. Write the raw text first with a NULL embedding and an <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">EmbeddingStatus = 'pending'</code> flag, then fill it in — synchronously in the fast path, or via the batch worker in Section 29.3 when the provider is down. The document is never lost; only its searchability is delayed.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">29.3 Batch Embedding Generation</h3>
 
-<p class="text-gray-300 leading-relaxed">Batch processing treats embedding generation as an offline transformation job — a scheduled or event-triggered pipeline that processes accumulated content and writes vectors to the store without blocking application writes. The source system records raw content immediately; embedding happens asynchronously.</p>
+<p class="text-gray-300 leading-relaxed">Batch generation decouples document arrival from embedding: writes land instantly with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">EmbeddingStatus = 'pending'</code>, and a worker fleet drains the queue in bulk. You get API batching discounts, retry isolation (provider outage delays searchability, not writes), and controllable load — at the cost of freshness measured in minutes instead of milliseconds.</p>
 
-<p class="text-gray-300 leading-relaxed">This maps directly to the ETL/ELT model that DBAs know well. The source table stores canonical data, and a separate process materializes the derived representation. You can think of it as a materialized view that refreshes on a schedule, except the "computation" is a neural network inference rather than a SQL aggregation.</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Architecture pattern:</strong></p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>Source Table (raw) → Embedding Worker → Vector Store
-     ↓ writes immediately               ↑ available after job completes
-     ↓ marks as embedding_status='pending'</code></pre>
-
-<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">embedding_status</code> column is the coordination mechanism. Writers insert content and mark it pending; the embedding worker polls or subscribes for pending records, processes them in optimized batches, and marks them complete.</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
-
--- Source table with embedding lifecycle tracking
-CREATE TABLE documents (
-    id             BIGSERIAL PRIMARY KEY,
-    document_id    TEXT UNIQUE NOT NULL,
-    content        TEXT NOT NULL,
-    content_hash   TEXT GENERATED ALWAYS AS (md5(content)) STORED,
-    embedding      vector(1536),
-    embed_model    TEXT,
-    embedding_status TEXT NOT NULL DEFAULT 'pending'
-                   CHECK (embedding_status IN ('pending', 'processing', 'complete', 'failed')),
-    retry_count    INT NOT NULL DEFAULT 0,
-    embedded_at    TIMESTAMPTZ,
-    created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: embedding work queue (status-driven, no SKIP LOCKED needed)
+CREATE TABLE dbo.EmbeddingQueue (
+    QueueId      BIGINT IDENTITY(1,1) NOT NULL
+        CONSTRAINT PK_EmbeddingQueue PRIMARY KEY,
+    DocId        NVARCHAR(100) NOT NULL,
+    ChunkIndex   INT NOT NULL,
+    ChunkText    NVARCHAR(MAX) NOT NULL,
+    TenantId     INT NOT NULL,
+    Status       NVARCHAR(20) NOT NULL
+        CONSTRAINT DF_EmbeddingQueue_Status DEFAULT ('pending'),
+    Attempts     INT NOT NULL CONSTRAINT DF_EmbeddingQueue_Attempts DEFAULT (0),
+    LastError    NVARCHAR(1000) NULL,
+    EnqueuedAt   DATETIME2(0) NOT NULL
+        CONSTRAINT DF_EmbeddingQueue_Enq DEFAULT SYSUTCDATETIME(),
+    CONSTRAINT UQ_EmbeddingQueue_Doc_Chunk UNIQUE (DocId, ChunkIndex)
 );
+CREATE INDEX IX_EmbeddingQueue_Status_Id
+    ON dbo.EmbeddingQueue (Status, QueueId);
+-- Workers claim batches with an atomic status transition:
+-- UPDATE TOP (100) dbo.EmbeddingQueue
+-- SET Status = 'processing', Attempts = Attempts + 1
+-- OUTPUT inserted.QueueId, inserted.DocId, inserted.ChunkText
+-- WHERE Status = 'pending';
+-- Dead-letter after N attempts: Status = 'failed' for manual review.
+</code></pre>
 
--- Index for the worker's polling query — only pending/failed rows
-CREATE INDEX idx_documents_embed_queue
-    ON documents (created_at)
-    WHERE embedding_status IN ('pending', 'failed') AND retry_count &lt; 3;
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">UPDATE TOP ... OUTPUT</code> claim pattern is SQL Server's answer to the queue-consumer problem: each worker atomically claims its batch, processes it, and writes results back. Multiple workers run in parallel without coordination — the status transition is the lock, and a crashed worker's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">'processing'</code> rows are reclaimed by a sweeper job after a timeout.</p>
 
--- Claim a batch atomically using SKIP LOCKED — prevents double-processing
--- across multiple worker instances
-CREATE OR REPLACE FUNCTION claim_embedding_batch(batch_size INT)
-RETURNS SETOF documents AS $$
-    UPDATE documents
-    SET embedding_status = 'processing',
-        updated_at = NOW()
-    WHERE id IN (
-        SELECT id FROM documents
-        WHERE embedding_status IN ('pending', 'failed')
-          AND retry_count &lt; 3
-        ORDER BY created_at
-        LIMIT batch_size
-        FOR UPDATE SKIP LOCKED
-    )
-    RETURNING *;
-$$ LANGUAGE sql;</code></pre>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python — batch embedding worker: claim, embed in bulk, write back
+import time, openai, pyodbc
 
-<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">FOR UPDATE SKIP LOCKED</code> pattern is the same technique used in job queue implementations like Sidekiq's PostgreSQL backend. Multiple embedding workers can run in parallel without coordination — each atomically claims its batch, processes it, and writes results back.</p>
+openai_client = openai.OpenAI()
+conn = pyodbc.connect("DRIVER={ODBC Driver 18 for SQL Server};"
+                      "SERVER=localhost;DATABASE=ragdb;Trusted_Connection=yes;"
+                      "Encrypt=yes;TrustServerCertificate=yes")
+BATCH = 100
+MAX_ATTEMPTS = 5
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
-import time
-from datetime import datetime
-from typing import Optional
+def claim_batch():
+    cur = conn.cursor()
+    rows = cur.execute("""UPDATE TOP (%d) dbo.EmbeddingQueue
+                          SET Status = 'processing',
+                              Attempts = Attempts + 1
+                          OUTPUT inserted.QueueId, inserted.DocId,
+                                 inserted.ChunkIndex, inserted.ChunkText,
+                                 inserted.TenantId, inserted.Attempts
+                          WHERE Status = 'pending'""" % BATCH).fetchall()
+    conn.commit()
+    return rows
 
-import psycopg2
-import psycopg2.extras
-from sentence_transformers import SentenceTransformer
-
-# Using a local model for batch processing — no API costs, full throughput control
-model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-MODEL_NAME = "all-MiniLM-L6-v2"
-BATCH_SIZE = 256  # Optimal for CPU inference; increase to 512+ with GPU
-
-
-def get_connection():
-    return psycopg2.connect(
-        dsn="postgresql://app_user:secret@localhost:5432/vectordb"
-    )
-
-
-def process_batch(conn) -&gt; int:
-    """Claim and process one batch of pending documents. Returns count processed."""
-    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        # Atomically claim a batch
-        cur.execute("SELECT * FROM claim_embedding_batch(%s)", (BATCH_SIZE,))
-        rows = cur.fetchall()
-        conn.commit()
-
-    if not rows:
-        return 0
-
-    ids = [r["id"] for r in rows]
-    texts = [r["content"] for r in rows]
-
-    start = time.monotonic()
-    # sentence-transformers handles internal batching efficiently
-    embeddings = model.encode(
-        texts,
-        batch_size=64,
-        show_progress_bar=False,
-        normalize_embeddings=True,  # Cosine similarity becomes dot product
-    )
-    inference_ms = (time.monotonic() - start) * 1000
-
-    # Bulk update — much faster than row-by-row
-    with conn.cursor() as cur:
-        update_data = [
-            (
-                embeddings[i].tolist(),
-                MODEL_NAME,
-                "complete",
-                datetime.utcnow(),
-                ids[i],
-            )
-            for i in range(len(ids))
-        ]
-        psycopg2.extras.execute_batch(
-            cur,
-            """
-            UPDATE documents
-            SET embedding = %s::vector,
-                embed_model = %s,
-                embedding_status = %s,
-                embedded_at = %s,
-                updated_at = NOW()
-            WHERE id = %s
-            """,
-            update_data,
-            page_size=100,
-        )
-        conn.commit()
-
-    throughput = len(ids) / (inference_ms / 1000)
-    print(
-        f"Processed {len(ids)} docs in {inference_ms:.0f}ms "
-        f"({throughput:.0f} docs/sec)"
-    )
-    return len(ids)
-
-
-def handle_failures(conn, failed_ids: list[int]):
-    """Mark failed rows for retry or permanent failure."""
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            UPDATE documents
-            SET embedding_status = CASE
-                WHEN retry_count &gt;= 2 THEN 'failed'
-                ELSE 'pending'
-            END,
-            retry_count = retry_count + 1,
-            updated_at = NOW()
-            WHERE id = ANY(%s)
-            """,
-            (failed_ids,),
-        )
-        conn.commit()
-
-
-def run_worker(idle_sleep_sec: float = 5.0):
-    """Continuous worker loop."""
-    conn = get_connection()
-    print(f"Embedding worker started. Model: {MODEL_NAME}, Batch size: {BATCH_SIZE}")
-    try:
-        while True:
-            processed = process_batch(conn)
-            if processed == 0:
-                time.sleep(idle_sleep_sec)
-    finally:
-        conn.close()
-
-
-if __name__ == "__main__":
-    run_worker()</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Throughput benchmarks with local models</strong> are worth establishing early. On a single CPU worker with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">all-MiniLM-L6-v2</code>:</p>
-
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Batch size 64: ~400 docs/sec</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Batch size 256: ~600 docs/sec</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Batch size 512: ~650 docs/sec (diminishing returns)</li>
-
-<p class="text-gray-300 leading-relaxed">On a single A10G GPU:</p>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Batch size 256: ~4,500 docs/sec</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Batch size 1024: ~8,000 docs/sec</li>
-
-<p class="text-gray-300 leading-relaxed">For comparison, OpenAI's batch embedding API (asynchronous, 50% cheaper than synchronous) processes up to 50,000 requests per batch with a 24-hour completion window.</p>
+def run_worker():
+    while True:
+        batch = claim_batch()
+        if not batch:
+            time.sleep(10); continue
+        try:
+            resp = openai_client.embeddings.create(
+                input=[r[3] for r in batch], model="text-embedding-3-small")
+            cur = conn.cursor()
+            for row, e in zip(batch, resp.data):
+                qid, doc_id, cidx, text, tenant, attempts = row
+                vec = "[" + ",".join(str(v) for v in e.embedding) + "]"
+                cur.execute("""MERGE dbo.DocumentChunks AS t
+                    USING (SELECT ? AS DocId, ? AS ChunkIndex, ? AS ChunkText,
+                                  CAST(? AS VECTOR(1536)) AS Embedding,
+                                  ? AS TenantId) AS s
+                    ON t.DocId = s.DocId AND t.ChunkIndex = s.ChunkIndex
+                    WHEN MATCHED THEN UPDATE SET ChunkText = s.ChunkText,
+                        Embedding = s.Embedding, UpdatedAt = SYSUTCDATETIME()
+                    WHEN NOT MATCHED THEN INSERT
+                        (DocId, ChunkIndex, ChunkText, Embedding,
+                         ModelId, TenantId, ContentHash)
+                        VALUES (s.DocId, s.ChunkIndex, s.ChunkText, s.Embedding,
+                                'text-embedding-3-small', s.TenantId, '');""",
+                    (doc_id, cidx, text, vec, tenant))
+                cur.execute("DELETE FROM dbo.EmbeddingQueue WHERE QueueId = ?",
+                            (qid,))
+            conn.commit()
+        except Exception as ex:
+            conn.rollback()
+            cur = conn.cursor()   # requeue or dead-letter per row
+            for row in batch:
+                status = ('failed' if row[5] &gt;= MAX_ATTEMPTS else 'pending')
+                cur.execute("""UPDATE dbo.EmbeddingQueue
+                               SET Status = ?, LastError = ?
+                               WHERE QueueId = ?""",
+                            (status, str(ex)[:1000], row[0]))
+            conn.commit()
+            time.sleep(30)   # back off on provider errors
+</code></pre>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">29.4 Hybrid Architectures: Combining Both Strategies</h3>
 
-<p class="text-gray-300 leading-relaxed">Production systems rarely use pure real-time or pure batch. The practical pattern is a <strong class="text-white">tiered architecture</strong> where query embeddings are always real-time, freshly ingested high-priority content uses real-time embedding with graceful degradation, and bulk content uses batch processing.</p>
+<p class="text-gray-300 leading-relaxed">Production reality is hybrid: a fast path for documents that must be searchable now, and a batch path for everything else. Route by document priority — user-uploaded content and tickets go synchronous; bulk imports, re-embeds, and backfills go through the queue. Both paths write through the same <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">MERGE</code> upsert, so ordering conflicts resolve to "last writer wins" and the content hash prevents redundant API calls when both paths touch the same document.</p>
 
-<p class="text-gray-300 leading-relaxed">A common pattern that works well: write the raw document to storage immediately (making it visible to the application), generate the embedding asynchronously, and return a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pending</code> state to callers that need to know embedding status. This is analogous to an eventually consistent write — your database accepts the write, your derived index catches up.</p>
-
-<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
-    A[Document ingested] --> B{Priority?}
-    B -->|HIGH<br/>SLA < 2s| C[Synchronous embed<br/>+ write inline]
-    B -->|NORMAL<br/>up to 30s| D[Enqueue to<br/>Redis Streams / Kafka]
-    B -->|LOW<br/>up to hours| D
-    D --> E[Async worker:<br/>batch embed + upsert]
-    C --> F[Vector store]
-    E --> F
-    G[Query embedding] -.always synchronous.-> F
-    style C fill:#ffe0b2
-    style D fill:#c8e6c9</pre></div>
-<p class="text-gray-300 leading-relaxed">*Query embedding always sits on the synchronous path; document embedding is routed by priority in a hybrid tiered architecture.*</p>
-
-<p class="text-gray-300 leading-relaxed">The following example shows this pattern using Pinecone as the vector store and a message queue (Redis Streams) for coordination:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
-import json
-import time
-import uuid
-from enum import Enum
-from typing import Optional
-
-import redis
-from openai import OpenAI
-from pinecone import Pinecone, ServerlessSpec
-
-# Configuration
-REDIS_URL = "redis://localhost:6379"
-PINECONE_API_KEY = "your-pinecone-key"
-PINECONE_INDEX = "documents-prod"
-EMBED_MODEL = "text-embedding-3-small"
-EMBED_DIMS = 1536
-STREAM_KEY = "embed:queue"
-CONSUMER_GROUP = "embed-workers"
-
-# Clients
-redis_client = redis.from_url(REDIS_URL, decode_responses=True)
-openai_client = OpenAI()
-pc = Pinecone(api_key=PINECONE_API_KEY)
-
-# Ensure index exists
-if PINECONE_INDEX not in [i.name for i in pc.list_indexes()]:
-    pc.create_index(
-        name=PINECONE_INDEX,
-        dimension=EMBED_DIMS,
-        metric="cosine",
-        spec=ServerlessSpec(cloud="aws", region="us-east-1"),
-    )
-
-index = pc.Index(PINECONE_INDEX)
-
-
-class EmbedPriority(str, Enum):
-    HIGH = "high"   # Real-time path: SLA &lt; 2 seconds
-    NORMAL = "normal"  # Async path: acceptable delay up to 30 seconds
-    LOW = "low"        # Batch path: delay up to hours acceptable
-
-
-def ingest_document(
-    document_id: str,
-    content: str,
-    metadata: dict,
-    priority: EmbedPriority = EmbedPriority.NORMAL,
-) -&gt; dict:
-    """
-    Write document to the queue. HIGH priority documents are embedded inline.
-    NORMAL/LOW are deferred to the async worker.
-    """
-    if priority == EmbedPriority.HIGH:
-        # Synchronous path — caller waits for embedding
-        embedding = _embed_text(content)
-        _write_to_pinecone(document_id, embedding, content, metadata)
-        return {"document_id": document_id, "status": "indexed", "priority": priority}
-    else:
-        # Async path — enqueue for worker
-        message = {
-            "document_id": document_id,
-            "content": content,
-            "metadata": json.dumps(metadata),
-            "priority": priority,
-            "enqueued_at": time.time(),
-        }
-        redis_client.xadd(STREAM_KEY, message, maxlen=100_000)
-        return {"document_id": document_id, "status": "pending", "priority": priority}
-
-
-def _embed_text(text: str) -&gt; list[float]:
-    response = openai_client.embeddings.create(
-        model=EMBED_MODEL,
-        input=text,
-        encoding_format="float",
-    )
-    return response.data[0].embedding
-
-
-def _write_to_pinecone(
-    document_id: str,
-    embedding: list[float],
-    content: str,
-    metadata: dict,
-):
-    index.upsert(
-        vectors=[{
-            "id": document_id,
-            "values": embedding,
-            "metadata": {**metadata, "content_preview": content[:500]},
-        }],
-        namespace="documents",
-    )
-
-
-def run_async_worker(batch_size: int = 50, idle_sleep: float = 1.0):
-    """
-    Redis Streams consumer that processes the embedding queue.
-    Multiple instances can run concurrently — each reads from the same group.
-    """
-    worker_id = f"worker-{uuid.uuid4().hex[:8]}"
-
-    # Create consumer group if it doesn't exist
-    try:
-        redis_client.xgroup_create(STREAM_KEY, CONSUMER_GROUP, id="0", mkstream=True)
-    except redis.exceptions.ResponseError:
-        pass  # Group already exists
-
-    print(f"Worker {worker_id} started, consuming from {STREAM_KEY}")
-
-    while True:
-        # Read up to batch_size messages, blocking for 1 second if queue is empty
-        messages = redis_client.xreadgroup(
-            groupname=CONSUMER_GROUP,
-            consumername=worker_id,
-            streams={STREAM_KEY: "&gt;"},
-            count=batch_size,
-            block=int(idle_sleep * 1000),
-        )
-
-        if not messages:
-            continue
-
-        stream_messages = messages[0][1]  # (stream_key, [(msg_id, fields), ...])
-        msg_ids = [m[0] for m in stream_messages]
-        payloads = [m[1] for m in stream_messages]
-
-        # Sort by priority — HIGH items get embedded first within the batch
-        payloads_with_ids = sorted(
-            zip(msg_ids, payloads),
-            key=lambda x: 0 if x[1]["priority"] == EmbedPriority.HIGH else 1,
-        )
-
-        texts = [p["content"] for _, p in payloads_with_ids]
-
-        # Batch embed — single API call for the whole batch
-        try:
-            response = openai_client.embeddings.create(
-                model=EMBED_MODEL,
-                input=texts,
-                encoding_format="float",
-            )
-            embeddings = [d.embedding for d in response.data]
-        except Exception as e:
-            print(f"Embedding batch failed: {e}")
-            # Messages remain in PEL (pending entries list) for reprocessing
-            time.sleep(5)
-            continue
-
-        # Upsert to Pinecone in a single batch call
-        vectors = []
-        for i, (msg_id, payload) in enumerate(payloads_with_ids):
-            vectors.append({
-                "id": payload["document_id"],
-                "values": embeddings[i],
-                "metadata": {
-                    **json.loads(payload["metadata"]),
-                    "content_preview": payload["content"][:500],
-                    "embedded_at": time.time(),
-                },
-            })
-
-        index.upsert(vectors=vectors, namespace="documents")
-
-        # Acknowledge successful processing
-        redis_client.xack(STREAM_KEY, CONSUMER_GROUP, *msg_ids)
-        print(f"Worker {worker_id}: processed {len(vectors)} documents")</code></pre>
-
-<p class="text-gray-300 leading-relaxed">This architecture gives you exactly three knobs to tune: the concurrency of async workers, the batch size per worker iteration, and the priority threshold for synchronous embedding. Most teams start with HIGH priority for user-generated content that needs immediate search availability and NORMAL/LOW for system-generated or bulk content.</p>
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph LR
+    A[Document arrives] --> B{Priority?}
+    B -->|urgent| C[Sync embed<br/>+ upsert]
+    B -->|bulk| D[Enqueue<br/>pending]
+    D --> E[Batch worker<br/>claim → embed → upsert]
+    C --> F[(dbo.DocumentChunks<br/>MERGE upsert)]
+    E --> F</pre></div>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">29.5 Cost Optimization and Model Selection</h3>
 
-<p class="text-gray-300 leading-relaxed">Embedding generation costs break down differently depending on your strategy. Real-time API calls are billed per token with no volume discount at standard tiers; batch jobs can qualify for discounted batch pricing or allow you to substitute cheaper local models where latency isn't constrained.</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Cost comparison for 100M tokens per month:</strong></p>
-
-<p class="text-gray-300 leading-relaxed">| Model | Mode | Cost (per 1M tokens) | Latency (p50) |</p>
-<p class="text-gray-300 leading-relaxed">|---|---|---|---|</p>
-<p class="text-gray-300 leading-relaxed">| OpenAI text-embedding-3-small | Synchronous API | Check current pricing | ~80ms |</p>
-<p class="text-gray-300 leading-relaxed">| OpenAI text-embedding-3-small | Batch API | Discounted tier | Up to 24h |</p>
-<p class="text-gray-300 leading-relaxed">| OpenAI text-embedding-ada-002 | Synchronous API | Check current pricing | ~100ms |</p>
-<p class="text-gray-300 leading-relaxed">| Cohere embed-v3 | Synchronous API | Check current pricing | ~120ms |</p>
-<p class="text-gray-300 leading-relaxed">| all-MiniLM-L6-v2 | Local CPU(384 dims) | Infrastructure cost only | ~2ms |</p>
-<p class="text-gray-300 leading-relaxed">| all-mpnet-base-v2 | Local CPU (768 dims) | Infrastructure cost only | ~8ms |</p>
-<p class="text-gray-300 leading-relaxed">| bge-large-en-v1.5 | Local GPU (1024 dims) | Infrastructure cost only | ~0.5ms |</p>
-
-<p class="text-gray-300 leading-relaxed">The cost calculus depends on your quality requirements. <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">all-MiniLM-L6-v2</code> achieves strong semantic retrieval performance on most English-language tasks; the quality gap versus OpenAI's models narrows significantly when your retrieval task is domain-specific and you fine-tune or use a retrieval-oriented model. For bulk batch processing where quality matters and cost is constrained, a local GPU-hosted model is typically the right answer once your volume justifies the infrastructure.</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Model selection decision tree:</strong></p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>Need multilingual support?
-  ├─ Yes → OpenAI text-embedding-3-large or Cohere embed-multilingual-v3
-  └─ No → Continue
-      │
-Need &lt; 200ms embedding latency (real-time path)?
-  ├─ Yes → OpenAI text-embedding-3-small (API) or all-MiniLM-L6-v2 (local)
-  └─ No (batch path) → any local model, batch API acceptable
-      │
-Volume &gt; 50M tokens/month?
-  ├─ Yes → Evaluate local GPU hosting vs. batch API pricing
-  └─ No → Synchronous API is likely cost-effective
-      │
-Offline / air-gapped / compliance-constrained?
-  └─ Always → Local model required</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Caching embeddings</strong> is an underutilized optimization in real-time pipelines. If your application re-embeds the same content (common in chat applications where system prompts are re-embedded on every session), a simple LRU cache keyed on content hash eliminates redundant API calls:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
-import hashlib
-from functools import lru_cache
-from openai import OpenAI
-
-client = OpenAI()
-
-
-def content_hash(text: str) -&gt; str:
-    return hashlib.sha256(text.encode()).hexdigest()
-
-
-# In-process LRU cache for embeddings — survives for the process lifetime
-# For cross-process caching, use Redis with TTL
-@lru_cache(maxsize=10_000)
-def _cached_embed(text_hash: str, text: str, model: str) -&gt; tuple[float, ...]:
-    """
-    LRU cache keyed by content hash. Returns tuple (hashable) rather than list.
-    text_hash is included in the key to force cache invalidation on content change,
-    but the actual hash computation happens outside this function.
-    """
-    response = client.embeddings.create(
-        model=model,
-        input=text,
-        encoding_format="float",
-    )
-    return tuple(response.data[0].embedding)
-
-
-def embed_with_cache(text: str, model: str = "text-embedding-3-small") -&gt; list[float]:
-    h = content_hash(text)
-    return list(_cached_embed(h, text, model))</code></pre>
-
-<p class="text-gray-300 leading-relaxed">For distributed caching across worker instances, use Redis with a content-hash key and an appropriate TTL:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
-import hashlib
-import json
-import redis
-from openai import OpenAI
-
-client = OpenAI()
-cache = redis.from_url("redis://localhost:6379", decode_responses=True)
-
-CACHE_TTL_SECONDS = 86_400 * 7  # 7 days
-
-
-def embed_with_redis_cache(
-    text: str,
-    model: str = "text-embedding-3-small",
-) -&gt; list[float]:
-    key = f"emb:{model}:{hashlib.sha256(text.encode()).hexdigest()}"
-    cached = cache.get(key)
-    if cached:
-        return json.loads(cached)
-
-    response = client.embeddings.create(
-        model=model,
-        input=text,
-        encoding_format="float",
-    )
-    embedding = response.data[0].embedding
-    cache.setex(key, CACHE_TTL_SECONDS, json.dumps(embedding))
-    return embedding</code></pre>
-
-<p class="text-gray-300 leading-relaxed">A cache hit rate of even 30–40% on a high-traffic real-time system meaningfully reduces both API costs and p95 latency, since cache reads are an order of magnitude faster than embedding API calls.</p>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Batch for the discount.</strong> Embedding APIs price per token regardless, but batching lets you use cheaper async tiers, avoid per-request overhead, and deduplicate via the content hash before spending a cent.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Deduplicate before embedding.</strong> The content-hash check in the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">MERGE</code> means re-ingested unchanged documents cost nothing. For near-duplicate detection at scale, hash normalized text (lowercased, whitespace-collapsed).</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Right-size the model.</strong> A 1,536-dimension model costs roughly 3x the tokens-per-dollar of aggressive truncation to 512 dimensions (Chapter 23). Run the eval delta before committing the corpus to the cheaper representation.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Local models for the query path.</strong> If per-question API cost dominates, embed questions locally with Sentence Transformers — provided the corpus was embedded with the same model.</li>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">29.6 Monitoring and Observability</h3>
 
-<p class="text-gray-300 leading-relaxed">Embedding pipelines have failure modes that are invisible to standard application monitoring. A real-time pipeline can silently degrade — API calls succeed but return nonsensical embeddings due to truncation, rate limiting, or model version drift — and you won't see it in error rates. A batch pipeline can fall arbitrarily far behind its queue without triggering obvious alerts.</p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: embedding pipeline health dashboard
+-- Queue depth and oldest pending item (freshness SLA signal):
+SELECT Status, COUNT(*) AS Items,
+       MIN(EnqueuedAt) AS OldestEnqueued,
+       AVG(Attempts) AS AvgAttempts
+FROM dbo.EmbeddingQueue
+GROUP BY Status;
+-- Dead letters needing attention:
+SELECT TOP (50) QueueId, DocId, Attempts, LastError, EnqueuedAt
+FROM dbo.EmbeddingQueue
+WHERE Status = 'failed'
+ORDER BY EnqueuedAt DESC;
+-- Ingest freshness: documents updated but not yet searchable
+-- (chunks missing or stale vs source watermark) — join against
+-- dbo.IndexWatermarks from Chapter 28 for the end-to-end lag number.
+</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Metrics to instrument for real-time pipelines:</strong></p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python — using prometheus_client for illustration
-from prometheus_client import Counter, Histogram, Gauge
-import time
-
-embed_latency = Histogram(
-    "embedding_generation_seconds",
-    "Time to generate an embedding",
-    buckets=[0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0],
-    labelnames=["model", "source"],  # source: realtime, cache, batch
-)
-
-embed_errors = Counter(
-    "embedding_errors_total",
-    "Embedding generation failures",
-    labelnames=["model", "error_type"],  # error_type: rate_limit, timeout, other
-)
-
-embed_cache_hits = Counter(
-    "embedding_cache_hits_total",
-    "Embedding cache hits",
-    labelnames=["model"],
-)
-
-embed_tokens = Counter(
-    "embedding_tokens_total",
-    "Total tokens sent for embedding",
-    labelnames=["model"],
-)
-
-
-def instrumented_embed(text: str, model: str = "text-embedding-3-small") -&gt; list[float]:
-    start = time.monotonic()
-    token_count = len(text.split())  # rough approximation
-
-    try:
-        embedding = embed_with_redis_cache(text, model)
-        embed_latency.labels(model=model, source="realtime").observe(
-            time.monotonic() - start
-        )
-        embed_tokens.labels(model=model).inc(token_count)
-        return embedding
-    except Exception as e:
-        error_type = "rate_limit" if "rate" in str(e).lower() else "other"
-        embed_errors.labels(model=model, error_type=error_type).inc()
-        raise</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Metrics to instrument for batch pipelines:</strong></p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL — queue depth monitoring view
--- Run this periodically and emit to your metrics system
-
-CREATE VIEW embedding_queue_health AS
-SELECT
-    embedding_status,
-    COUNT(*) AS document_count,
-    MIN(created_at) AS oldest_pending,
-    NOW() - MIN(created_at) AS max_lag_interval,
-    AVG(retry_count) AS avg_retries
-FROM documents
-GROUP BY embedding_status;</code></pre>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python — scrape the health view and emit metrics
-from prometheus_client import Gauge
-import psycopg2
-
-queue_depth = Gauge(
-    "embedding_queue_depth",
-    "Number of documents awaiting embedding",
-    labelnames=["status"],
-)
-
-queue_lag_seconds = Gauge(
-    "embedding_queue_lag_seconds",
-    "Age of oldest pending document in the embedding queue",
-)
-
-
-def scrape_queue_metrics(conn):
-    with conn.cursor() as cur:
-        cur.execute("SELECT * FROM embedding_queue_health")
-        rows = cur.fetchall()
-
-    for row in rows:
-        status, count, oldest, lag_interval, avg_retries = row
-        queue_depth.labels(status=status).set(count)
-        if status == "pending" and lag_interval is not None:
-            queue_lag_seconds.set(lag_interval.total_seconds())</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Alert thresholds that matter in practice:</strong></p>
-
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Real-time: p95 embedding latency > 1 second → likely rate limiting or network issue</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Real-time: error rate > 0.5% over 5 minutes → alert immediately</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Batch: queue lag (age of oldest pending) > 10 minutes for HIGH priority content → worker stalled</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Batch: `failed` status count growing monotonically → retry logic broken or content issue</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Both: embedding dimension mismatch → model version changed, index incompatible</li>
-
-<p class="text-gray-300 leading-relaxed">The dimension mismatch case deserves special attention. If you switch models (e.g., from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-ada-002</code> at 1536 dimensions to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-3-large</code> at 3072 dimensions), you cannot mix vectors in the same index. Your pipeline needs to track <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">embed_model</code> alongside each vector and either maintain separate indexes per model version or perform a full re-embedding pass during migration.</p>
+<p class="text-gray-300 leading-relaxed">Alert on three signals: queue depth growing faster than drain rate (workers under-provisioned or provider throttling), dead-letter growth (systematic failure, not transient), and oldest-pending age exceeding the freshness SLA. The end-to-end lag number — source change to searchable vector — is the pipeline's headline SLI; trend it, not just the queue depth.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">29.7 Re-Embedding and Index Migration</h3>
 
-<p class="text-gray-300 leading-relaxed">Model upgrades and content updates both require re-embedding — and the strategy for doing so efficiently varies based on scale and urgency.</p>
+<p class="text-gray-300 leading-relaxed">A model change re-embeds the entire corpus — the batch pipeline is how you execute it without an outage. Enqueue every document with a migration tag, let the workers drain at a throttled rate, and write into the side-by-side <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Embedding_v2</code> column (Chapter 23) rather than overwriting the live vectors. Retrieval keeps serving from the old column until the eval-gated cutover flips the query path.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Triggers for re-embedding:</strong></p>
-
-<p class="text-gray-300 leading-relaxed">1. Content update: the underlying document changed, so the stored vector is stale</p>
-<p class="text-gray-300 leading-relaxed">2. Model upgrade: a better model is available and quality improvement justifies migration cost</p>
-<p class="text-gray-300 leading-relaxed">3. Dimension change: the new model produces vectors of a different size, requiring index rebuild</p>
-<p class="text-gray-300 leading-relaxed">4. Normalization change: you decide to switch from raw to normalized vectors (or vice versa)</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Detecting stale embeddings</strong> is straightforward if you store a content hash:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL
--- Find documents whose content has changed since embedding was generated
-SELECT document_id, content, embedded_at
-FROM documents
-WHERE content_hash != md5(content)  -- content has changed since last embed
-   OR embedded_at IS NULL           -- never embedded
-   OR embed_model != 'text-embedding-3-small'  -- model version changed
-ORDER BY created_at DESC;</code></pre>
-
-<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">content_hash</code> column defined as a generated column (as shown in section 29.3) eliminates the need to compute this manually — PostgreSQL maintains it automatically on every update.</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Zero-downtime model migration pattern:</strong></p>
-
-<p class="text-gray-300 leading-relaxed">The safest approach for model migrations mirrors a blue/green deployment. Build the new index in parallel while the old index continues serving queries, then perform a cut-over once re-embedding is complete.</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL — dual-index migration setup
-
--- New index for the upgraded model (different dimension)
-CREATE TABLE documents_v2 AS TABLE documents WITH NO DATA;
-ALTER TABLE documents_v2 ADD COLUMN embedding_v2 vector(3072);
-
--- Track migration progress
-ALTER TABLE documents ADD COLUMN embed_v2_status TEXT DEFAULT 'pending';
-
--- Worker migrates batches from documents → documents_v2
--- Queries can be directed to either table via a view
-CREATE OR REPLACE VIEW documents_current AS
-SELECT
-    d.document_id,
-    d.content,
-    COALESCE(d2.embedding_v2, d.embedding) AS embedding,
-    CASE
-        WHEN d2.embedding_v2 IS NOT NULL THEN 'v2'
-        ELSE 'v1'
-    END AS embed_version
-FROM documents d
-LEFT JOIN documents_v2 d2 USING (document_id);</code></pre>
-
-<p class="text-gray-300 leading-relaxed">For Weaviate, which manages its own index internally, the migration requires a different approach — create a new class (collection) with the updated vectorizer configuration, re-ingest documents, verify result quality against a held-out query set, then update your application's class references:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python — Weaviate collection migration
-import weaviate
-from weaviate.classes.config import Configure, Property, DataType
-
-client = weaviate.connect_to_local()
-
-# Create v2 collection with new model
-client.collections.create(
-    name="DocumentsV2",
-    vectorizer_config=Configure.Vectorizer.text2vec_openai(
-        model="text-embedding-3-large",  # Upgraded from 3-small
-    ),
-    properties=[
-        Property(name="document_id", data_type=DataType.TEXT),
-        Property(name="content", data_type=DataType.TEXT),
-    ],
-)
-
-# Re-ingest — Weaviate generates embeddings via the configured vectorizer
-collection_v2 = client.collections.get("DocumentsV2")
-collection_v1 = client.collections.get("Documents")
-
-# Batch migration with Weaviate's batch API
-with collection_v2.batch.dynamic() as batch:
-    for item in collection_v1.iterator():
-        batch.add_object({
-            "document_id": item.properties["document_id"],
-            "content": item.properties["content"],
-        })
-
-# After verification, update application to read from DocumentsV2
-# Then delete DocumentsV2 (old collection) after traffic cutover
-client.close()</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Partial re-embedding</strong> is viable when only a subset of content needs updating. Use <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">embed_model</code> tracking to identify rows that need refresh:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python — targeted re-embedding of content using old model version
-import psycopg2
-import psycopg2.extras
-from sentence_transformers import SentenceTransformer
-
-OLD_MODEL = "all-MiniLM-L6-v2"
-NEW_MODEL = "all-mpnet-base-v2"
-
-new_encoder = SentenceTransformer(NEW_MODEL)
-
-
-def migrate_model_batch(conn, batch_size: int = 256):
-    """Re-embed documents that were embedded with the old model."""
-    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute(
-            """
-            UPDATE documents
-            SET embedding_status = 'processing', updated_at = NOW()
-            WHERE id IN (
-                SELECT id FROM documents
-                WHERE embed_model = %s
-                ORDER BY id
-                LIMIT %s
-                FOR UPDATE SKIP LOCKED
-            )
-            RETURNING id, content
-            """,
-            (OLD_MODEL, batch_size),
-        )
-        rows = cur.fetchall()
-        conn.commit()
-
-    if not rows:
-        return 0
-
-    ids = [r["id"] for r in rows]
-    texts = [r["content"] for r in rows]
-    embeddings = new_encoder.encode(texts, normalize_embeddings=True)
-
-    with conn.cursor() as cur:
-        psycopg2.extras.execute_batch(
-            cur,
-            """
-            UPDATE documents
-            SET embedding = %s::vector,
-                embed_model = %s,
-                embedding_status = 'complete',
-                embedded_at = NOW(),
-                updated_at = NOW()
-            WHERE id = %s
-            """,
-            [
-                (embeddings[i].tolist(), NEW_MODEL, ids[i])
-                for i in range(len(ids))
-            ],
-        )
-        conn.commit()
-
-    return len(ids)</code></pre>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: enqueue a full-corpus re-embed for model migration
+INSERT INTO dbo.EmbeddingQueue (DocId, ChunkIndex, ChunkText, TenantId, Status)
+SELECT DocId, ChunkIndex, ChunkText, TenantId, 'pending'
+FROM dbo.DocumentChunks;
+-- Workers pick these up with the NEW model id; the MERGE targets
+-- Embedding_v2 (see Chapter 23). Throttle by limiting worker count
+-- during business hours — the old vectors keep serving meanwhile.
+</code></pre>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">29.8 Choosing Your Strategy: A Practical Framework</h3>
 
-<p class="text-gray-300 leading-relaxed">The decision between real-time and batch isn't binary — it's a configuration choice you revisit as your system evolves. The following framework captures the most common decision points:</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Start with real-time when:</strong></p>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Your corpus is small (< 100K documents) and ingestion is infrequent</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Your application cannot tolerate embedding lag (search must reflect writes immediately)</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> You are prototyping and operational simplicity matters more than cost</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Query latency is your primary SLA concern</li>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Move to batch (or hybrid) when:</strong></p>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Ingestion volume exceeds what synchronous API calls can handle without rate limiting</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> You've profiled your real-time pipeline and embedding latency is your p95 bottleneck</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Cost projections for synchronous API usage are unsustainable at projected scale</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> You need different models for different content types (a local model for bulk, API for high-priority)</li>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Signs your real-time pipeline is under stress:</strong></p>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> API rate limit errors appearing in logs (even at low frequency)</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> p95 embedding latency increasing while p50 stays stable (rate limiting backpressure)</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Document ingestion success rate dropping during traffic peaks</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Queue depth in your job system growing faster than it drains</li>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Signs your batch pipeline needs tuning:</strong></p>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Queue lag exceeding your freshness SLA</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Worker throughput plateauing despite available CPU/GPU capacity (usually a DB write bottleneck)</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Failed status count growing (retry logic or content issue)</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Batch sizes too small to amortize model loading overhead</li>
-
-<p class="text-gray-300 leading-relaxed">Most teams at moderate scale land on a hybrid architecture that looks like this: a synchronous path for query-time embedding (unavoidable) and high-priority content, a Redis Streams or Kafka-backed queue for normal ingestion, and a scheduled batch job for bulk loads and re-embedding passes. The exact thresholds — what constitutes HIGH priority, how large a batch the worker pulls, how many worker instances run — are tuned empirically against your observed traffic patterns.</p>
-
-<p class="text-gray-300 leading-relaxed">The architectural principle is simple: <strong class="text-white">keep the synchronous path as thin as possible</strong>. Every operation you move off the synchronous request path is latency you give back to your users and a failure mode you decouple from your ingestion API.</p>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Freshness SLA under 1 minute?</strong> Real-time path. Accept the coupling and harden the failure mode with pending-status rows.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Freshness SLA in minutes, high volume?</strong> Batch workers with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">UPDATE TOP ... OUTPUT</code> claiming. Scales horizontally, isolates provider failures.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Mixed workload?</strong> Hybrid: urgent documents synchronous, bulk through the queue, one <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">MERGE</code> upsert underneath.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Cost-dominated?</strong> Batch everything, deduplicate by content hash, and evaluate dimension truncation before paying full rate.</li>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Query embedding is always real-time; document embedding is the decision.** You cannot precompute embeddings for arbitrary user queries, so the synchronous embedding path always exists for search. The strategic question is whether document ingestion also lives on that path or defers to an async pipeline.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The `FOR UPDATE SKIP LOCKED` pattern enables horizontally scalable batch workers.** Multiple worker instances can safely consume from the same PostgreSQL-backed embedding queue without coordination or double-processing, using the same pattern as production job queue systems.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Content hash tracking makes stale embedding detection automatic.** Storing a generated `content_hash` column eliminates manual bookkeeping; any query comparing stored hash to current content immediately surfaces documents that need re-embedding after content updates or model migrations.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Cache embedding results at the content-hash level to reduce both cost and latency.** Re-embedding identical content (system prompts, repeated queries, templated documents) is pure waste; an in-process LRU cache or Redis cache with a content-hash key can eliminate a significant fraction of API calls in typical workloads.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Model migrations require parallel indexing and a deliberate cut-over, not an in-place update.** Changing embedding model or vector dimensions means the new vectors are incompatible with the existing index; the safe pattern is to build the new index alongside the old one while the system continues serving queries, then cut over traffic once re-embedding is complete and quality is verified.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Real-time embeds on the write path</strong> for sub-minute freshness; never let an embedding failure lose the document — persist text first with a pending flag.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Batch workers claim with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">UPDATE TOP ... OUTPUT</code></strong> — atomic, parallel-safe, no external queue required. Multiple workers scale horizontally with zero coordination.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Content-hash idempotency</strong> in the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">MERGE</code> upsert prevents double-billing the embedding API and makes every path safely re-runnable.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Hybrid is the production default</strong>: urgent documents synchronous, bulk through the queue, one upsert underneath, model migrations as throttled re-embed waves into a side-by-side column.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Monitor the end-to-end lag</strong> (source change → searchable vector) as the headline SLI, with queue depth, dead letters, and oldest-pending age as the alerting signals.</li>
     </div>
     <div class="mt-14 bg-cyan-950/40 border border-cyan-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
-        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · SQL Server</p>
       </div>
       <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
          class="shrink-0 px-6 py-3 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold rounded-xl text-sm transition">
         Download Free
       </a>
     </div>
-    <div class="mt-8 text-xs">
-      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a>
+    <div class="mt-10 flex items-center justify-between text-xs">
+      <a href="b4-ch28-indexing-pipelines.html" class="text-gray-500 hover:text-gray-300 transition">← Previous Chapter</a>
+      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">All Chapters</a>
+      <a href="b4-ch30-embedding-model-versioning.html" class="text-cyan-400 hover:text-cyan-300 transition">Next Chapter →</a>
     </div>
   </article>
   <footer class="border-t border-gray-800/50 px-6 py-8">

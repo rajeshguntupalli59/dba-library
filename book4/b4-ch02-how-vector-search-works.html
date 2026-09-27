@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Chapter 2: How Vector Search Works: ANN vs Exact Search — Vector Databases & AI</title>
-  <meta name="description" content="Vector Databases & AI Chapter 2: How Vector Search Works: ANN vs Exact Search. pgvector, Pinecone, Weaviate, RAG pipelines — by Rajesh Guntupalli." />
+  <meta name="description" content="Vector Databases & AI Chapter 2: How Vector Search Works — exact search with VECTOR_DISTANCE vs approximate search with DiskANN indexes in SQL Server 2025. By Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
   <script type="module">
     import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
@@ -43,513 +43,164 @@
     <div class="space-y-4 text-sm">
 <h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 2: How Vector Search Works: ANN vs Exact Search</h2>
 
-<p class="text-gray-300 leading-relaxed">Vector search is the engine underneath every modern AI application — the mechanism that turns a user's question into a ranked list of relevant documents, products, or records. If you have spent your career building indexes on B-trees and tuning sequential scan thresholds, vector search will feel both familiar and disorienting. The data structures are different, the query semantics are different, and the performance tradeoffs are inverted in ways that will surprise you. This chapter walks through exactly how vector search works at the algorithmic level, why approximate nearest neighbor search dominates production systems, and how to make informed decisions about which algorithm and which tool to deploy for a given workload.</p>
+<p class="text-gray-300 leading-relaxed">Every vector query in SQL Server 2025 takes one of two paths: exact search, which measures the distance from your query vector to every stored vector and returns the true nearest neighbors, or approximate search, which navigates a DiskANN graph index to find nearly-the-nearest neighbors at a fraction of the cost. The two paths differ in guarantees, scaling behavior, operational overhead, and the T-SQL you write — and choosing the wrong one is the single most common performance mistake in production vector workloads. This chapter builds your intuition for both, with the numbers that determine where each one wins.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">The Geometry of Similarity: What Vector Search Is Actually Doing</h3>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Exact Search: VECTOR_DISTANCE and the Full Scan</h3>
 
-<p class="text-gray-300 leading-relaxed">Before touching any index structure, it helps to understand what the database is computing when it runs a vector query. A vector is simply an array of floating-point numbers — typically 384 to 3072 dimensions depending on the embedding model. Each number represents some learned feature of the original content. You do not interpret the individual numbers the way you would a column value. The meaning lives in the geometric relationships between vectors.</p>
+<p class="text-gray-300 leading-relaxed">Exact search is the honest baseline: compute <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_DISTANCE</code> between the query vector and every row, sort, take the top k. No index to build, no parameters to tune, and — by construction — 100% recall. The true nearest neighbors are always returned because every candidate was measured.</p>
 
-<p class="text-gray-300 leading-relaxed">When a user asks "what are the symptoms of iron deficiency?", an embedding model converts that string into a vector. The database then finds vectors in storage that are geometrically close to that query vector. Closeness is measured by a distance or similarity function. Three are in common use:</p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server 2025: exact k-NN search, 100% recall, no index required
+DECLARE @q VECTOR(1536) = '[0.12, 0.87, 0.34, ...]';  -- query embedding
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Cosine similarity</strong> measures the angle between two vectors, ignoring magnitude. It is the default choice for text embeddings because the same concept expressed in a long document versus a short sentence should still score as similar.</p>
+-- Cosine distance ranking
+SELECT TOP (10)
+       DocumentId, Title,
+       VECTOR_DISTANCE('cosine', Embedding, @q) AS Distance
+FROM dbo.RagChunks
+WHERE Embedding IS NOT NULL
+ORDER BY Distance;
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Euclidean distance (L2)</strong> measures straight-line distance in the high-dimensional space. It works well for image embeddings and some multimodal models, but is sensitive to vector magnitude.</p>
+-- Euclidean variant: change only the metric argument
+SELECT TOP (10) DocumentId,
+       VECTOR_DISTANCE('euclidean', Embedding, @q) AS L2Distance
+FROM dbo.RagChunks
+WHERE Embedding IS NOT NULL
+ORDER BY L2Distance;
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Dot product</strong> is the raw inner product without normalization. When vectors are unit-normalized, dot product and cosine similarity produce identical rankings. Many approximate index structures optimize for dot product because it is cheaper to compute at scale.</p>
+-- Dot product variant (negative dot product: smaller = more similar)
+SELECT TOP (10) DocumentId,
+       VECTOR_DISTANCE('dot', Embedding, @q) AS NegDotProduct
+FROM dbo.RagChunks
+WHERE Embedding IS NOT NULL
+ORDER BY NegDotProduct;</code></pre>
 
-<p class="text-gray-300 leading-relaxed">The choice of distance function is not just a configuration option — it changes your results. A system tuned with cosine similarity and then switched to L2 will return a different ranked list for the same query. This matters when you are integrating vector search with an existing scoring pipeline.</p>
+<p class="text-gray-300 leading-relaxed">When exact search is the right choice:</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python example — computing distances manually to build intuition
-import numpy as np
-
-def cosine_similarity(a, b):
-    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
-
-def euclidean_distance(a, b):
-    return np.linalg.norm(np.array(a) - np.array(b))
-
-def dot_product(a, b):
-    return np.dot(a, b)
-
-# Simulating two embedding vectors (normally 384–3072 dims; using 8 here for clarity)
-query_vec   = np.array([0.12, 0.87, 0.34, 0.56, 0.91, 0.23, 0.67, 0.45])
-doc_vec_a   = np.array([0.11, 0.85, 0.36, 0.54, 0.89, 0.25, 0.65, 0.43])
-doc_vec_b   = np.array([0.90, 0.10, 0.80, 0.05, 0.12, 0.95, 0.07, 0.88])
-
-print("=== Cosine Similarity ===")
-print(f"Query vs Doc A: {cosine_similarity(query_vec, doc_vec_a):.4f}")  # ~0.9998
-print(f"Query vs Doc B: {cosine_similarity(query_vec, doc_vec_b):.4f}")  # ~0.45
-
-print("\n=== Euclidean Distance (lower = closer) ===")
-print(f"Query vs Doc A: {euclidean_distance(query_vec, doc_vec_a):.4f}")  # ~0.057
-print(f"Query vs Doc B: {euclidean_distance(query_vec, doc_vec_b):.4f}")  # ~1.83
-
-print("\n=== Dot Product ===")
-print(f"Query vs Doc A: {dot_product(query_vec, doc_vec_a):.4f}")
-print(f"Query vs Doc B: {dot_product(query_vec, doc_vec_b):.4f}")</code></pre>
-
-<p class="text-gray-300 leading-relaxed">One concept that trips up database engineers is the <strong class="text-white">curse of dimensionality</strong>. In low-dimensional spaces (2D, 3D), nearest neighbor search is intuitive and B-tree-style partitioning works well. As dimensions grow past roughly 20–30, the distance between any two random points converges toward the same value. By the time you reach 1536 or 3072 dimensions — the sizes OpenAI's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-3-small</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-3-large</code> produce, respectively — traditional spatial indexes like R-trees become nearly useless. Every point looks roughly equidistant from every other point when you measure raw L2, which is why embedding models are designed so that semantically similar content clusters in specific regions of the space despite the high dimensionality.</p>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Small to medium collections.</strong> Under roughly 50,000 vectors of 1536 dimensions, exact search on modern hardware typically completes in tens of milliseconds — fast enough for interactive use with zero index maintenance.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Recall is non-negotiable.</strong> Compliance search, legal discovery, and any workload where a missed neighbor has consequences beyond a slightly worse recommendation.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Ground-truth measurement.</strong> Exact search is how you compute recall for the approximate path — it is the ruler everything else is measured against (Chapter 9).</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Prototypes and new tables.</strong> Start every new vector table on exact search. Add the DiskANN index when measurements — not anxiety — say you need it.</li>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">Exact Search (KNN): When Brute Force Is the Right Answer</h3>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">The Scaling Wall: Why Exact Search Stops Working</h3>
 
-<p class="text-gray-300 leading-relaxed">Exact k-nearest neighbor search is conceptually simple: compute the distance from the query vector to every vector in the dataset and return the k smallest distances. This guarantees 100% recall — you will never miss a closer neighbor. In database terms, it is a full table scan with a computed distance column, sorted and limited.</p>
+<p class="text-gray-300 leading-relaxed">The performance ceiling of exact search is arithmetic, not engineering. Each query computes distance to every vector: for 1 million vectors of 1536 dimensions, that is about 1.5 billion floating-point multiply-add operations. With SIMD acceleration that runs in the low hundreds of milliseconds on a modern CPU — acceptable for a batch job, too slow for a user-facing search box. At 10 million vectors you are past a second per query before I/O, and the cost grows linearly with every row you add. No index trick short of approximation changes this; the math is the math.</p>
 
-<p class="text-gray-300 leading-relaxed">pgvector supports exact search natively. If you create a table with a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">vector</code> column and do not create an HNSW or IVFFlat index, every query runs exact KNN against the full table.</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
--- Exact KNN search — no index, guaranteed 100% recall
--- Assumes: table documents(id, content, embedding vector(1536))
-
-SELECT
-    id,
-    content,
-    1 - (embedding &lt;=&gt; query.vec) AS cosine_similarity
-FROM
-    documents,
-    (SELECT '[0.12, 0.87, 0.34, ...]'::vector(1536) AS vec) AS query
-ORDER BY
-    embedding &lt;=&gt; query.vec   -- &lt;=&gt; is cosine distance in pgvector
-LIMIT 10;
-
--- For L2 distance use &lt;-&gt; operator
--- SELECT id, embedding &lt;-&gt; '[...]'::vector AS l2_dist FROM documents ORDER BY l2_dist LIMIT 10;
-
--- For inner product use &lt;#&gt; operator (returns negative dot product; negate for similarity)
--- SELECT id, -(embedding &lt;#&gt; '[...]'::vector) AS dot_sim FROM documents ORDER BY dot_sim DESC LIMIT 10;</code></pre>
-
-<p class="text-gray-300 leading-relaxed">When is exact search the right answer? More often than you might think:</p>
-
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Small datasets**: Under 100,000 vectors with 1536 dimensions, exact search on modern NVMe storage with pgvector typically completes in under 100ms. You do not need an ANN index.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **High-recall requirements**: Compliance, medical, and legal workloads sometimes cannot accept the recall tradeoff that ANN introduces. Exact search is the only way to guarantee you found the actual nearest neighbors.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Development and evaluation**: When benchmarking your embedding model or tuning your chunking strategy, exact search gives you ground truth. Use it to measure recall of your ANN configuration.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Rarely queried, frequently updated datasets**: ANN indexes must be rebuilt or updated as data changes. If your dataset changes constantly and is queried infrequently, maintaining an HNSW index costs more than the query savings justify.</li>
-
-<p class="text-gray-300 leading-relaxed">The performance ceiling of exact search is real. A table of 1 million 1536-dimensional vectors requires computing approximately 1.536 billion floating-point operations per query. On a modern CPU with AVX-512 SIMD instructions (which pgvector uses when available), that runs in roughly 3–8 seconds for a cold query on a single node — too slow for a user-facing application. At 10 million vectors, exact search becomes impractical regardless of hardware. This is where approximate search earns its place.</p>
+<p class="text-gray-300 leading-relaxed">This is also a CPU story, not just a latency story. Ten concurrent exact-search queries over a million-vector table each burn a core computing distances. Under load, exact search does not degrade gracefully — it saturates CPU and everything on the instance feels it. When <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_query_stats</code> shows your retrieval procedure dominated by worker time rather than waits, and the corpus keeps growing, you have found the wall. The way through it is approximation.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">Approximate Nearest Neighbor Search: The Algorithmic Landscape</h3>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Approximate Search: The DiskANN Graph Index</h3>
 
-<p class="text-gray-300 leading-relaxed">Approximate nearest neighbor (ANN) search accepts a controlled recall loss in exchange for query latency that is orders of magnitude lower than exact search. The term "approximate" means the index might miss some true nearest neighbors — it returns results that are close, but not guaranteed to be the absolute closest. In practice, a well-tuned ANN index returns 95–99% of the true nearest neighbors at 5–50ms latency on datasets of tens of millions of vectors.</p>
+<p class="text-gray-300 leading-relaxed">Approximate nearest neighbor (ANN) search trades a small, measurable amount of recall for dramatic speed. SQL Server 2025's approximate path is a DiskANN index — a navigable graph built over the vector collection where each vector is a node connected to its nearest neighbors. A query enters at a fixed entry point and greedily walks toward the query vector, touching only a tiny fraction of the collection. Query cost grows logarithmically with data size instead of linearly: going from 1 million to 10 million vectors barely moves latency.</p>
 
-<p class="text-gray-300 leading-relaxed">Three families of algorithms dominate production systems. Understanding how each works lets you read vendor documentation and benchmark results critically rather than accepting default configurations.</p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server 2025: DiskANN approximate index (preview) + VECTOR_SEARCH
+CREATE VECTOR INDEX IX_RagChunks_Embedding
+ON dbo.RagChunks (Embedding)
+WITH (METRIC = 'cosine', TYPE = 'DiskANN', MAXDOP = 4);
+
+DECLARE @q VECTOR(1536) = '[0.12, 0.87, 0.34, ...]';
+
+-- Approximate k-NN: graph walk instead of full scan
+SELECT t.DocumentId, t.Title, s.distance
+FROM VECTOR_SEARCH(
+         TABLE = dbo.RagChunks AS t,
+         COLUMN = Embedding,
+         SIMILAR_TO = @q,
+         METRIC = 'cosine',
+         TOP_N = 10
+     ) AS s
+ORDER BY s.distance;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Recall</strong> is the metric that makes "approximate" respectable: the fraction of the true top-k neighbors the index actually returns. A DiskANN index delivering 0.97 recall@10 finds 97 of the 100 true nearest neighbors in milliseconds instead of finding all 100 in over a second. Since embeddings are themselves approximate representations of meaning, that last few percent of geometric precision almost never changes what the user experiences — but you must measure it (Chapter 9 gives the spot-check pattern, Chapter 14 makes it a scheduled SLI).</p>
+
+<p class="text-gray-300 leading-relaxed">What DiskANN costs you: build time (minutes to hours for very large collections, scheduled in maintenance windows), the preview write-path constraint (drop and recreate the index to ingest new data — Chapter 10's staging-swap pattern), and memory competition between the graph and the buffer pool. What it buys you: flat latency into the millions of vectors.</p>
 
 <div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
-    subgraph HNSW["HNSW: layered graph"]
-        H2[Upper layer - sparse,<br/>long-range links] --> H1[Middle layer]
-        H1 --> H0[Layer 0 - dense,<br/>every vector]
-    end
-    subgraph IVF["IVFFlat: clustered lists"]
-        C0[Centroid 1] --- V1[vectors in cluster 1]
-        C1[Centroid 2] --- V2[vectors in cluster 2]
-        C2[Centroid 3] --- V3[vectors in cluster 3]
-    end
-    Q[Query vector] --> H2
-    Q --> C0
-    Q --> C1</pre></div>
-
-<p class="text-gray-300 leading-relaxed">*HNSW descends from sparse upper layers toward the query; IVFFlat jumps straight to the nearest cluster centroids and scans only those lists.*</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">IVFFlat (Inverted File Index with Flat Quantization)</strong></p>
-
-<p class="text-gray-300 leading-relaxed">IVFFlat divides the vector space into <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">nlist</code> Voronoi cells (clusters) using k-means clustering during index build. Each vector is assigned to the nearest cluster centroid. At query time, the algorithm identifies the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">nprobe</code> closest centroids to the query vector and performs exact search only within those cells.</p>
-
-<p class="text-gray-300 leading-relaxed">Think of it as a hash partition scheme, but the partitioning function is "geometric proximity" instead of a hash function. If your data has 1 million vectors and you build with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">nlist=1000</code>, each cell contains roughly 1000 vectors. Setting <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">nprobe=10</code> means the query searches approximately 10,000 vectors instead of 1,000,000 — a 100x reduction in distance computations.</p>
-
-<p class="text-gray-300 leading-relaxed">The tradeoff: k-means clustering happens at index build time. If your data distribution shifts significantly after the index is built (new product categories, new languages, domain shift in embeddings), recall degrades. IVFFlat requires periodic index rebuilds to stay healthy.</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">HNSW (Hierarchical Navigable Small World)</strong></p>
-
-<p class="text-gray-300 leading-relaxed">HNSW is the algorithm behind most production vector databases today, including pgvector (since version 0.5.0), Weaviate, Qdrant, and Milvus. It constructs a layered graph where each vector is a node connected to its approximate nearest neighbors. The graph is hierarchical — upper layers have fewer nodes with longer-range connections, lower layers are dense with short-range connections. Queries start at the top layer and greedily descend toward the query vector.</p>
-
-<p class="text-gray-300 leading-relaxed">For database engineers, HNSW is analogous to a B-tree in one important way: it supports efficient incremental inserts without full rebuilds. Unlike IVFFlat, you can add vectors to an HNSW index and they are integrated into the graph structure at insert time. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ef_construction</code> parameter controls how aggressively the graph is built (higher values = better recall but slower inserts), and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">m</code> controls the number of bidirectional links per node (higher values = better recall and faster queries, but larger index size).</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Product Quantization (PQ) and Scalar Quantization (SQ)</strong></p>
-
-<p class="text-gray-300 leading-relaxed">Quantization is a compression layer applied on top of IVFFlat or HNSW. Rather than storing full 32-bit floats for each dimension, vectors are compressed to smaller representations — sometimes 8x to 32x smaller. This dramatically reduces memory requirements and can improve query throughput because more vectors fit in CPU cache.</p>
-
-<p class="text-gray-300 leading-relaxed">The tradeoff is recall loss from quantization error plus additional complexity in tuning. Pinecone and Weaviate apply quantization transparently. In pgvector 0.7+, halfvec support (16-bit floats) gives you a 2x storage reduction with minimal recall impact.</p>
-
-<p class="text-gray-300 leading-relaxed">The table below summarizes the practical characteristics:</p>
-
-<p class="text-gray-300 leading-relaxed">| Property | Exact KNN | IVFFlat | HNSW |</p>
-<p class="text-gray-300 leading-relaxed">|---|---|---|---|</p>
-<p class="text-gray-300 leading-relaxed">| Recall | 100% | 85–98% (tunable) | 90–99% (tunable) |</p>
-<p class="text-gray-300 leading-relaxed">| Query latency (1M vecs) | 3–8s | 5–50ms | 1–20ms |</p>
-<p class="text-gray-300 leading-relaxed">| Build time | None | Fast (k-means) | Slow (graph construction) |</p>
-<p class="text-gray-300 leading-relaxed">| Incremental inserts | Instant | Requires rebuild | Supported natively |</p>
-<p class="text-gray-300 leading-relaxed">| Memory overhead | Low | Moderate | High (graph links) |</p>
-<p class="text-gray-300 leading-relaxed">| Best for | <100K vectors | Batch workloads, stable datasets | Production real-time search |</p>
+    A[Vector query] --> B{Corpus size?}
+    B -->|Under ~50K| C[Exact: VECTOR_DISTANCE<br/>ORDER BY + TOP<br/>100% recall]
+    B -->|Over ~50K| D[Approximate: DiskANN<br/>VECTOR_SEARCH<br/>95-99% recall]
+    C --> E[No index to build<br/>or maintain]
+    D --> F[CREATE VECTOR INDEX<br/>measure recall@k]</pre></div>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">HNSW in pgvector and Weaviate: Configuration That Actually Matters</h3>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">HNSW in Dedicated Engines: The Same Idea, Different Home</h3>
 
-<p class="text-gray-300 leading-relaxed">HNSW is where most production teams spend their tuning time. The two parameters that dominate behavior are <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">m</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ef_construction</code> at build time, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ef</code> (also called <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ef_search</code> or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">hnsw.ef_search</code>) at query time.</p>
+<p class="text-gray-300 leading-relaxed">You will encounter a second graph algorithm constantly in this book's later chapters: <strong class="text-white">HNSW</strong> (Hierarchical Navigable Small World), the index inside Qdrant, Weaviate, Milvus, and Pinecone's serving layer. HNSW builds a layered graph — sparse long-range connections at the top, dense short-range connections at the bottom — and descends from coarse to fine. It delivers the same O(log n) search with 95–99% recall as DiskANN.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
--- Creating an HNSW index with production-appropriate parameters
-
--- First, set memory for index construction (run before CREATE INDEX)
-SET maintenance_work_mem = '4GB';
-
--- Create the HNSW index
--- m: number of connections per node (default 16; range 2–100)
--- ef_construction: search depth during build (default 64; range 4–1000)
-CREATE INDEX ON documents
-USING hnsw (embedding vector_cosine_ops)
-WITH (m = 24, ef_construction = 128);
-
--- At query time, control recall vs speed tradeoff
--- Higher ef_search = better recall, slower queries (default 40)
-SET hnsw.ef_search = 100;
-
--- Now run the approximate nearest neighbor query
-SELECT
-    d.id,
-    d.content,
-    d.metadata-&gt;&gt;'source' AS source,
-    1 - (d.embedding &lt;=&gt; $1::vector) AS similarity
-FROM documents d
-WHERE similarity &gt; 0.75        -- pre-filter: only high-similarity results
-ORDER BY d.embedding &lt;=&gt; $1::vector
-LIMIT 5;
-
--- Check if your index is being used
-EXPLAIN (ANALYZE, BUFFERS)
-SELECT id FROM documents
-ORDER BY embedding &lt;=&gt; '[0.1, 0.2, ...]'::vector
-LIMIT 5;
--- Look for "Index Scan using documents_embedding_idx" in output
--- If you see "Seq Scan", increase enable_seqscan=off or check vector dimensions match</code></pre>
-
-<p class="text-gray-300 leading-relaxed">The interaction between <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">m</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ef_construction</code>, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ef_search</code> is the core tuning loop. A reasonable starting point for a production RAG application with 1–5 million vectors:</p>
-
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `m = 16` (default): acceptable for most workloads</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `m = 24–32`: better recall, ~20% larger index, measurably faster queries on high-traffic systems because the graph navigation converges faster</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `ef_construction = 128`: good balance of build time and recall; doubling to 256 costs roughly 2x build time for marginal recall improvement beyond 99%</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `ef_search = 64–200` at query time: tune this per query type based on latency SLA</li>
-
-<p class="text-gray-300 leading-relaxed">Weaviate exposes the same HNSW parameters through its schema configuration:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python example — configuring HNSW in Weaviate with the v4 Python client
-
-import weaviate
-import weaviate.classes as wvc
-
-client = weaviate.connect_to_local()  # or connect_to_weaviate_cloud(cluster_url=...)
-
-# Define a collection with explicit HNSW configuration
-client.collections.create(
-    name="DocumentChunks",
-    vectorizer_config=wvc.config.Configure.Vectorizer.text2vec_openai(
-        model="text-embedding-3-small",
-        dimensions=1536
-    ),
-    vector_index_config=wvc.config.Configure.VectorIndex.hnsw(
-        distance_metric=wvc.config.VectorDistances.COSINE,
-        ef_construction=128,       # build-time recall vs speed
-        max_connections=24,        # equivalent to pgvector's m parameter
-        ef=-1,                     # -1 = dynamic: Weaviate auto-tunes ef at query time
-        dynamic_ef_min=100,
-        dynamic_ef_max=500,
-        dynamic_ef_factor=8,
-    ),
-    properties=[
-        wvc.config.Property(name="content", data_type=wvc.config.DataType.TEXT),
-        wvc.config.Property(name="source", data_type=wvc.config.DataType.TEXT),
-        wvc.config.Property(name="chunk_index", data_type=wvc.config.DataType.INT),
-    ]
-)
-
-print("Collection created with HNSW index")
-client.close()</code></pre>
-
-<p class="text-gray-300 leading-relaxed">One production reality that surprises engineers coming from relational databases: HNSW index memory requirements are not optional. pgvector loads the HNSW graph into <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">shared_buffers</code> or the OS page cache during queries. For a 1-million-vector, 1536-dimension dataset with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">m=16</code>, expect approximately 3–6GB of index size on disk and similar working memory requirements for sustained query performance. On systems where the index does not fit in memory, query latency degrades sharply as the OS pages in graph nodes from disk. This is why managed vector database services like Pinecone and Qdrant Cloud advertise memory-optimized infrastructure — they are solving a real problem, not just upselling.</p>
+<p class="text-gray-300 leading-relaxed">The practical difference is memory architecture. HNSW keeps its entire graph in RAM, which makes it extremely fast and extremely memory-hungry at billion-vector scale. DiskANN was designed for SSDs: most of the graph and the full-precision vectors live on disk, with only a working set in memory, issuing a small bounded number of random reads per query. That design maps naturally onto SQL Server's buffer-pool-and-storage architecture — which is why Microsoft chose it for the in-engine index. When you read vendor benchmarks comparing HNSW engines against SQL Server's vector index, remember you are comparing two legitimate answers to the same problem, optimized for different resource profiles.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">IVFFlat for Batch Workloads and the Recall-Speed Tradeoff in Practice</h3>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Filtered Search: Combining Predicates with Similarity</h3>
 
-<p class="text-gray-300 leading-relaxed">IVFFlat gets less attention than HNSW in the AI application ecosystem, but it has a legitimate place in workloads where you control data loading patterns and can tolerate periodic index rebuilds. The build process is faster than HNSW, and for very large datasets (50M+ vectors) the memory footprint is more predictable.</p>
+<p class="text-gray-300 leading-relaxed">Real queries are rarely pure similarity — they combine "similar to this" with "and in this category, published, visible to this tenant." SQL Server's answer is the ordinary relational engine: predicates and vector ranking compose in one query, planned by the regular optimizer.</p>
 
-<p class="text-gray-300 leading-relaxed">The pgvector IVFFlat configuration follows a well-established rule of thumb: set <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">nlist</code> to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">rows / 1000</code> for up to 1 million rows, or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sqrt(rows)</code> beyond that, and start <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">nprobe</code> around <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sqrt(nlist)</code> before tuning further against your own recall measurements.</p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Filtered vector search: relational predicate + similarity in one plan
+DECLARE @q VECTOR(1536) = '[0.12, 0.87, 0.34, ...]';
+DECLARE @tenantId INT = 42;
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
--- IVFFlat index configuration and recall tuning
+-- Exact path: the predicate narrows the scan before ranking
+SELECT TOP (10) ChunkId, ChunkText,
+       VECTOR_DISTANCE('cosine', Embedding, @q) AS Distance
+FROM dbo.TenantChunks
+WHERE TenantId = @tenantId
+  AND Embedding IS NOT NULL
+ORDER BY Distance;
 
--- For a dataset of 1 million vectors:
--- sqrt(1,000,000) = 1000 → nlist = 1000
--- Starting nprobe ≈ sqrt(1000) ≈ 32, then tune up or down from there
+-- Approximate path: over-fetch, because filters consume candidates
+SELECT TOP (10) c.ChunkId, c.ChunkText, s.distance
+FROM VECTOR_SEARCH(
+         TABLE = dbo.TenantChunks AS t,
+         COLUMN = Embedding,
+         SIMILAR_TO = @q,
+         METRIC = 'cosine',
+         TOP_N = 50              -- over-fetch 5x, then filter down
+     ) AS s
+JOIN dbo.TenantChunks AS c ON c.ChunkId = s.ChunkId
+WHERE c.TenantId = @tenantId
+ORDER BY s.distance;</code></pre>
 
--- IMPORTANT: Index should be created AFTER data is loaded
--- IVFFlat builds centroids from existing data — an empty-table index is useless
-CREATE INDEX ON documents
-USING ivfflat (embedding vector_cosine_ops)
-WITH (lists = 1000);
-
--- At query time, tune nprobe for your latency vs recall SLA
--- More nprobe = higher recall, more latency
-SET ivfflat.probes = 100;  -- searches 10% of clusters
-
--- Benchmark different nprobe values against exact search results.
--- `SET` cannot appear inside a CTE, so set the session parameter first,
--- then run the comparison query as a separate statement.
-
--- Step 1: capture ground truth once (no ivfflat index used for this query,
--- or run against a table with no ANN index)
--- CREATE TEMP TABLE exact_results AS
---   SELECT id, embedding &lt;=&gt; (SELECT embedding FROM documents WHERE id = 12345) AS dist
---   FROM documents
---   ORDER BY dist LIMIT 10;
-
--- Step 2: for each probes value you want to test, set it, then query and compare
-SET ivfflat.probes = 50;  -- test with probes=50
-
-SELECT
-    COUNT(*) AS matching,
-    COUNT(*) / 10.0 AS recall_at_10
-FROM exact_results e
-JOIN (
-    SELECT id FROM documents
-    ORDER BY embedding &lt;=&gt; (SELECT embedding FROM documents WHERE id = 12345)
-    LIMIT 10
-) a USING (id);
-
--- Repeat for each probes value you want to compare, and plot recall@10 against
--- observed latency for your own data — do not assume published numbers transfer;
--- higher probes always trades latency for recall, but the exact curve is
--- data- and hardware-specific and must be measured, not assumed.</code></pre>
-
-<p class="text-gray-300 leading-relaxed">The choice between IVFFlat and HNSW in pgvector comes down to update patterns and memory budget. If you are loading a fixed dataset of embeddings (say, pre-computed embeddings for a product catalog that refreshes weekly), IVFFlat is a reasonable choice because it is built once and queries are efficient. If your dataset grows continuously — new documents indexed in real time, new user content, streaming embeddings — HNSW's incremental insert support makes it operationally far simpler.</p>
-
-<p class="text-gray-300 leading-relaxed">When you move beyond pgvector to dedicated vector databases, the algorithm choice is often abstracted away. Pinecone uses HNSW-family algorithms internally. Qdrant defaults to HNSW but exposes quantization configuration through its collection API:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python example — Qdrant collection creation with HNSW and scalar quantization
-
-from qdrant_client import QdrantClient
-from qdrant_client.models import (
-    Distance, VectorParams, HnswConfigDiff,
-    ScalarQuantizationConfig, ScalarType, QuantizationConfig
-)
-
-client = QdrantClient(url="http://localhost:6333")
-
-client.create_collection(
-    collection_name="knowledge_base",
-    vectors_config=VectorParams(
-        size=1536,                     # dimensions must match embedding model output
-        distance=Distance.COSINE,
-        hnsw_config=HnswConfigDiff(
-            m=16,
-            ef_construct=128,
-            full_scan_threshold=10_000,  # vectors below this count use exact search
-            on_disk=False,               # keep graph in RAM for latency-sensitive queries
-        )
-    ),
-    quantization_config=QuantizationConfig(
-        scalar=ScalarQuantizationConfig(
-            type=ScalarType.INT8,       # compress float32 to int8: 4x size reduction
-            quantile=0.99,             # 99th percentile used for range calibration
-            always_ram=True,           # keep quantized vectors in memory
-        )
-    )
-)
-
-print("Qdrant collection created with HNSW + INT8 quantization")
-print("Expected memory reduction: ~4x vs raw float32 vectors")
-print("Expected recall impact: ~1-3% depending on data distribution")</code></pre>
-
-<p class="text-gray-300 leading-relaxed">The quantization numbers matter for cost estimation. A collection of 10 million 1536-dimensional float32 vectors occupies roughly 61GB of raw storage (10M × 1536 × 4 bytes). With INT8 scalar quantization, that drops to approximately 15GB. On managed cloud services billing by memory allocation, quantization is not a theoretical optimization — it is a budget decision.</p>
+<p class="text-gray-300 leading-relaxed">The over-fetch pattern in the approximate query deserves emphasis because it is the most common recall bug in production: if you ask the index for exactly 10 candidates and the tenant filter discards 6, you return 4 results — not because only 4 were relevant, but because the filter ate your candidate budget. Ask for 50, filter, then trim to 10. For highly selective filters over huge shared indexes, consider the tenancy patterns in Chapter 12 (schema-per-tenant gives each tenant a dedicated DiskANN index with no filtering penalty at all).</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">Recall, Latency, and Throughput: Benchmarking Your Search Configuration</h3>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Putting It Together: The Decision You Revisit</h3>
 
-<p class="text-gray-300 leading-relaxed">Reading vendor benchmarks is necessary but insufficient. The ANN Benchmarks project (ann-benchmarks.com) provides standardized recall-vs-throughput curves across algorithms and datasets, but the results only hold for the specific dimensionality and data distribution in the benchmark. Your production embeddings, generated by a specific model on a specific domain, will have a different recall curve.</p>
-
-<p class="text-gray-300 leading-relaxed">Every production vector search deployment should include a recall evaluation pipeline. The process is straightforward: run your production queries against both exact search and your ANN index, compute recall@k (what fraction of the true top-k results appear in the ANN results), and set <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ef_search</code> or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">nprobe</code> to meet your target.</p>
-
-<p class="text-gray-300 leading-relaxed">For most RAG applications, recall@10 above 0.95 is sufficient because the LLM synthesizes answers across retrieved chunks — missing one of ten relevant chunks rarely degrades the final answer quality. For semantic deduplication or recommendation systems where the exact ranking matters more, you may need recall@10 above 0.99, which pushes toward higher <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ef_search</code> values and larger <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">m</code> configurations.</p>
-
-<p class="text-gray-300 leading-relaxed">Throughput is the metric that catches teams off guard at scale. A single pgvector query returning results in 15ms is easy to achieve. Sustaining 500 queries per second across concurrent connections is a different problem. At that scale, you are contending for CPU across parallel graph traversals, competing for shared buffer cache with simultaneous page faults, and hitting connection pool limits. This is the threshold where the architecture question shifts from "is HNSW fast enough?" to "should I be running Pinecone or Qdrant with horizontal sharding instead of pgvector on a single RDS instance?"</p>
-
-<p class="text-gray-300 leading-relaxed">These are rough, order-of-magnitude planning heuristics, not guarantees — always validate against your own hardware, data, and query mix before committing to a design:</p>
-
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **pgvector on a single node** can reasonably be expected to handle on the order of hundreds of queries per second at sub-50ms latency for a 1–5 million vector HNSW index, depending heavily on CPU cores, memory, and `ef_search`. Supabase and Neon offer managed pgvector and can vertically scale to handle moderate traffic.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Pinecone** in pod-based deployments is designed for thousands of queries per second across distributed indexes. The serverless tier optimizes for cost over raw throughput.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Qdrant** with multiple nodes and sharding is designed to scale into the thousands of queries per second with appropriately provisioned hardware and sharding, though exact throughput and p99 latency depend on your dataset and configuration and should be benchmarked directly.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Weaviate** with its built-in HNSW implementation and optional productquantization can achieve similar throughput to Qdrant when horizontally scaled, with the additional advantage of built-in vectorization that reduces network round-trips for embedding generation at query time.</li>
-
-<p class="text-gray-300 leading-relaxed">The practical implication: start with pgvector if your workload is below roughly 100–200 queries per second on a well-provisioned instance, and plan for migration or a dedicated vector database service as your usage grows. The migration is not painless — schemas differ, client libraries differ — but the algorithmic concepts in this chapter transfer directly. You are always configuring <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">m</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ef_construction</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ef_search</code>, and a distance metric, regardless of which system you run.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
-
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">Filtering During Vector Search: The Pre-Filter vs Post-Filter Distinction</h3>
-
-<p class="text-gray-300 leading-relaxed">Production applications almost never search across all vectors. A legal document search restricts to a specific client's corpus. An e-commerce recommendation system restricts to in-stock items. A customer support bot restricts to the current user's subscription tier. This combination of metadata filtering with vector similarity search is where many systems hit unexpected performance problems.</p>
-
-<p class="text-gray-300 leading-relaxed">There are two fundamentally different approaches:</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Post-filtering</strong> performs the ANN search first, returning the top-k approximate nearest neighbors from the full index, then applies the metadata filter to that result set. This is fast but dangerous: if the filter is highly selective (say, only 0.1% of your vectors match the filter), the ANN search might return 100 vectors, the filter removes 99 of them, and you return 1 result when the user wanted 10. The solution — returning a much larger initial ANN set before filtering — defeats the performance advantage.</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Pre-filtering</strong> applies the metadata filter first to identify the matching vector subset, then runs ANN search or exact search over only those vectors. This guarantees correct results for selective filters but requires the database to either maintain separate indexes per filter value (expensive for high-cardinality filters) or fall back to exact search over the filtered subset.</p>
-
-<p class="text-gray-300 leading-relaxed">pgvector's behavior is worth understanding precisely: as of version 0.7, pgvector uses the HNSW index with post-filtering. When a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WHERE</code> clause accompanies a vector query, pgvector applies the filter after retrieving candidates from the graph. For highly selective filters, this can cause the effective recall to drop dramatically. The workaround is partitioning data into separate tables by filter value, or increasing <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">hnsw.ef_search</code> to retrieve more candidates before filtering:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
--- Demonstrating the pre-filter vs post-filter behavior
-
--- This query uses post-filtering: HNSW is traversed first, then the WHERE clause
--- filters the results. If 'tenant_id = 42' matches only 1% of rows,
--- you may get fewer than 5 results even though relevant vectors exist.
-SELECT id, content, 1 - (embedding &lt;=&gt; $1::vector) AS similarity
-FROM documents
-WHERE tenant_id = 42
-ORDER BY embedding &lt;=&gt; $1::vector
-LIMIT 5;
-
--- Workaround 1: Increase ef_search so more candidates pass through before filtering
-SET hnsw.ef_search = 400;  -- retrieve 400 candidates, then filter to 5
-
-SELECT id, content, 1 - (embedding &lt;=&gt; $1::vector) AS similarity
-FROM documents
-WHERE tenant_id = 42
-ORDER BY embedding &lt;=&gt; $1::vector
-LIMIT 5;
-
--- Workaround 2: Partition by tenant into child tables (best for high-selectivity filters)
--- Each child table has its own HNSW index, so the search scope is already restricted
-CREATE TABLE documents_tenant_42 (
-    LIKE documents INCLUDING ALL
-) INHERITS (documents);
-
-CREATE INDEX ON documents_tenant_42
-USING hnsw (embedding vector_cosine_ops)
-WITH (m = 24, ef_construction = 128);
-
--- Queries against documents_tenant_42 use the tenant-specific HNSW index
--- and never traverse vectors from other tenants
-SELECT id, content, 1 - (embedding &lt;=&gt; $1::vector) AS similarity
-FROM documents_tenant_42
-ORDER BY embedding &lt;=&gt; $1::vector
-LIMIT 5;</code></pre>
-
-<p class="text-gray-300 leading-relaxed">Dedicated vector databases handle this problem differently. Pinecone uses <strong class="text-white">namespaces</strong> as the primary isolation boundary — each namespace is a separate vector partition, and search is always scoped to a namespace. Weaviate uses <strong class="text-white">tenant isolation</strong> within a collection, which creates per-tenant HNSW segments. Qdrant implements <strong class="text-white">payload-based filtering</strong> through a dedicated payload index that runs before vector search when the filter is selective enough:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python example — Qdrant filtered vector search with pre-filtering behavior
-
-from qdrant_client import QdrantClient
-from qdrant_client.models import Filter, FieldCondition, MatchValue, SearchRequest
-
-client = QdrantClient(url="http://localhost:6333")
-
-# Qdrant automatically chooses pre-filter or post-filter based on
-# the estimated selectivity of the filter condition.
-# For high-selectivity filters (few matching points), it falls back
-# to exact search over the filtered subset.
-
-results = client.search(
-    collection_name="knowledge_base",
-    query_vector=query_embedding,            # list of floats, 1536 dimensions
-    query_filter=Filter(
-        must=[
-            FieldCondition(
-                key="tenant_id",
-                match=MatchValue(value=42)
-            ),
-            FieldCondition(
-                key="document_type",
-                match=MatchValue(value="contract")
-            )
-        ]
-    ),
-    limit=10,
-    with_payload=True,                       # include metadata in results
-    score_threshold=0.75                     # only return vectors above this similarity
-)
-
-for result in results:
-    print(f"ID: {result.id}, Score: {result.score:.4f}")
-    print(f"  Content: {result.payload['content'][:100]}...")
-    print()</code></pre>
-
-<p class="text-gray-300 leading-relaxed">The key insight for production systems: <strong class="text-white">your filter selectivity determines your architecture</strong>. If most queries apply a filter that matches more than 10–20% of your vectors, post-filtering with a high <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ef_search</code> works fine. If you have tenant isolation, document-type restrictions, or date range filters that reduce the candidate set to a small fraction of the total, you need either pre-filtering support (Qdrant, Weaviate) or explicit data partitioning (pgvector table-per-tenant, Pinecone namespaces).</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
-
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">Distance Operators in SQL: A Reference for pgvector Queries</h3>
-
-<p class="text-gray-300 leading-relaxed">Because pgvector is the most common path for teams already running PostgreSQL, having a clear reference for its operator syntax avoids subtle bugs. Each operator corresponds to a different distance function, and each has a corresponding index operator class:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
--- Complete reference for vector operators and their corresponding index ops
-
--- Table setup reference
-CREATE TABLE vectors (
-    id BIGSERIAL PRIMARY KEY,
-    embedding vector(1536) NOT NULL
-);
-
--- Operator: &lt;=&gt;  — Cosine distance (1 - cosine_similarity)
--- Range: 0 (identical direction) to 2 (opposite direction)
--- Index operator class: vector_cosine_ops
-CREATE INDEX ON vectors USING hnsw (embedding vector_cosine_ops);
-SELECT id, embedding &lt;=&gt; '[...]'::vector AS cosine_dist FROM vectors ORDER BY cosine_dist LIMIT 5;
-
--- Operator: &lt;-&gt;  — L2 (Euclidean) distance
--- Range: 0 (identical) to unbounded
--- Index operator class: vector_l2_ops
-CREATE INDEX ON vectors USING hnsw (embedding vector_l2_ops);
-SELECT id, embedding &lt;-&gt; '[...]'::vector AS l2_dist FROM vectors ORDER BY l2_dist LIMIT 5;
-
--- Operator: &lt;#&gt;  — Negative inner product (returns -dot_product)
--- Negate the result to get similarity; ORDER BY ascending gives highest dot product first
--- Index operator class: vector_ip_ops
-CREATE INDEX ON vectors USING hnsw (embedding vector_ip_ops);
-SELECT id, -(embedding &lt;#&gt; '[...]'::vector) AS dot_product FROM vectors ORDER BY embedding &lt;#&gt; '[...]'::vector LIMIT 5;
-
--- Only one index can cover each operator class per column.
--- If you need to query by both cosine and L2, create two separate indexes,
--- but be aware of the storage and maintenance cost.
-
--- Verify which operator is used at query time — mismatched operators silently skip the index
-EXPLAIN SELECT id FROM vectors ORDER BY embedding &lt;=&gt; '[...]'::vector LIMIT 5;
--- Output should contain: "Index Scan using vectors_embedding_idx"
--- If it shows "Seq Scan", the operator does not match the index operator class</code></pre>
-
-<p class="text-gray-300 leading-relaxed">A common production bug: a team builds an HNSW index with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">vector_cosine_ops</code> but queries use <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs"><-></code> (L2 distance). PostgreSQL silently falls back to a sequential scan, and query latency spikes from milliseconds to seconds. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">EXPLAIN</code> output catches this immediately, but it often goes unnoticed until load testing.</p>
+<p class="text-gray-300 leading-relaxed">Start every vector table on exact search. It is correct, simple, and fast enough until it isn't. Promote to the DiskANN index when production measurements show the corpus crossing ~50K vectors with latency pressure — or when <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_query_stats</code> shows retrieval CPU dominating the instance. When you promote, measure recall@k against exact ground truth before and after, and keep measuring it on a schedule (Chapter 14). The decision is not permanent and not precious: the embedding model, the chunking strategy, and the retrieval procedure shape stay the same — only the access path changes, exactly like adding a B-tree index to a table that outgrew its scan.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Exact KNN guarantees 100% recall** but scales poorly beyond roughly 100,000 vectors for latency-sensitive applications. Use it during development for ground-truth measurements and in production only when recall requirements are non-negotiable and dataset size permits.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Exact search (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_DISTANCE</code> with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ORDER BY</code>) computes distance to every vector: 100% recall, no index, O(n) cost per query — the right default under roughly 50,000 vectors and the ground truth everything else is measured against.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **HNSW is the dominant ANN algorithm for production vector search**: it supports incremental inserts, delivers sub-millisecond to low-tens-of-milliseconds latency at millions of vectors, and is available in pgvector, Weaviate, Qdrant, and Milvus with directly comparable tuning parameters (`m`, `ef_construction`, `ef_search`).</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Approximate search (DiskANN index via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE VECTOR INDEX</code>, queried with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_SEARCH</code>) walks a navigable graph for O(log n) queries at 95–99% recall — the answer when exact search hits its arithmetic scaling wall.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **IVFFlat remains valuable for stable, batch-loaded datasets** where build simplicity and predictable memory usage matter more than incremental insert support. Set `nlist` based on dataset size, start `nprobe` at `sqrt(nlist)`, and always measure recall against your own data rather than relying on published benchmark curves.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> DiskANN is designed for SSD-backed operation (small memory working set, bounded random reads); HNSW, used by Qdrant, Weaviate, and Milvus, keeps its graph in RAM. Same problem, different resource profiles — compare them on your workload, not on marketing.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The distance function is part of the schema, not just a query option**: mixing cosine and L2 operators within the same pipeline produces inconsistent rankings. Choose one distance metric when you design your embedding pipeline, create your index with the matching operator class, and enforce it throughout your application layer.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Filtered vector search composes relational predicates with similarity ranking in one T-SQL statement; on the approximate path, over-fetch <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">TOP_N</code> well above your display count so filters do not eat your candidate budget.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Filter selectivity determines architecture**: post-filtering works when metadata filters are broad; highly selective filters (tenant isolation, document-type restrictions) require either native pre-filtering support (Qdrant, Weaviate), explicit data partitioning (pgvector table-per-tenant), or namespace-level separation (Pinecone) to avoid recall collapse in the filtered result set.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Promote from exact to approximate based on production measurements (corpus size, retrieval CPU in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_query_stats</code>), measure recall@k before and after, and keep measuring it — the access path is allowed to change as the data grows.</li>
     </div>
     <div class="mt-14 bg-cyan-950/40 border border-cyan-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
-        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · SQL Server</p>
       </div>
       <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
          class="shrink-0 px-6 py-3 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold rounded-xl text-sm transition">
         Download Free
       </a>
     </div>
-    <div class="mt-8 text-xs">
-      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a>
+    <div class="mt-10 flex items-center justify-between text-xs">
+      <a href="b4-ch01-what-are-embeddings.html" class="text-gray-500 hover:text-gray-300 transition">← Previous Chapter</a>
+      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">All Chapters</a>
+      <a href="b4-ch03-distance-metrics.html" class="text-cyan-400 hover:text-cyan-300 transition">Next Chapter →</a>
     </div>
   </article>
   <footer class="border-t border-gray-800/50 px-6 py-8">

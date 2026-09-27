@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Chapter 35: Disaster Recovery for Vector Stores — Vector Databases & AI</title>
-  <meta name="description" content="Vector Databases & AI Chapter 35: Disaster Recovery for Vector Stores. pgvector, Pinecone, Weaviate, RAG pipelines — by Rajesh Guntupalli." />
+  <meta name="description" content="Vector Databases & AI Chapter 35: Disaster recovery for vector stores — SQL Server backup/restore, availability groups, RPO/RTO planning, cross-region failover runbook, re-embedding recovery, and DR testing. By Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
   <script type="module">
     import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
@@ -16,7 +16,7 @@
     <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
       <a href="../index.html" class="flex items-center gap-2 group">
         <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-cyan-500 to-cyan-700 flex items-center justify-center">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
         </div>
         <span class="text-sm font-bold text-white group-hover:text-cyan-300 transition">Rajesh Guntupalli</span>
       </a>
@@ -43,1850 +43,231 @@
     <div class="space-y-4 text-sm">
 <h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 35: Disaster Recovery for Vector Stores</h2>
 
-<p class="text-gray-300 leading-relaxed">Vector databases are no longer experimental infrastructure. They sit directly in the critical path of production AI applications — powering search, recommendation engines, RAG pipelines, and real-time similarity lookups. When a vector store fails, the LLM application behind it often fails silently or degrades in ways that are harder to detect than a 500 error: results become stale, semantically incorrect, or simply absent. This chapter covers disaster recovery for vector stores from first principles through production-grade implementation, treating vector data with the same operational rigor that experienced DBAs apply to transactional systems. You will work through backup strategies, recovery time objectives, replication topologies, and the specific failure modes that make vector DR harder than traditional RDBMS recovery — including the cost and latency of re-embedding large corpora when source documents are your only remaining asset.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">The Unique DR Challenges of Vector Stores</h3>
 
-<p class="text-gray-300 leading-relaxed">Before designing recovery procedures, you need to understand what makes vector stores different from the relational databases you already know how to protect.</p>
+<p class="text-gray-300 leading-relaxed">In a relational database, an index is disposable — you can drop and rebuild it without losing data, because the table is the source of truth. A DiskANN vector index in SQL Server 2025 holds the navigational graph over your vectors; the vectors themselves live in the table, but the index is what makes retrieval fast. After a restore, the index structure must be rebuilt from the table data — at significant cost for large tables. This shifts backup philosophy: you cannot plan vector DR as "restore the database and go" — the DiskANN rebuild is a first-class RTO component.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Embeddings are derived data — but regenerating them is expensive</strong></p>
+<p class="text-gray-300 leading-relaxed">Vector stores rarely stand alone. They contain embeddings derived from records in SQL Server, document stores, or S3-compatible object stores. A complete DR plan must account for the synchronization point between source data and the vector index. If your source database is restored to a point-in-time 6 hours before your vector store backup, you now have semantic drift between your records and their embeddings — queries return answers grounded in documents that no longer exist.</p>
 
-<p class="text-gray-300 leading-relaxed">In a relational database, if you lose a computed column, you run a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">UPDATE</code> statement and move on. Embeddings occupy a similar logical position — they are derived from source text or images — but regeneration is orders of magnitude more expensive. Re-embedding a 10-million-document corpus using OpenAI's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-3-large</code> at roughly $0.13 per million tokens (as of 2024 pricing), with an average document size of 512 tokens, costs approximately $650 and takes several hours even with full parallelism. For billion-vector deployments, the cost and time become recovery-blocking. This means vector data must be treated as primary data, not recomputable cache, in your backup strategy.</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Indexes are the data</strong></p>
-
-<p class="text-gray-300 leading-relaxed">In PostgreSQL, you can drop and rebuild an index without losing data — the heap is your source of truth. In most vector databases, the index *is* the primary data structure. An HNSW index in Weaviate or Qdrant contains the vectors themselves along with their navigational graph. Losing the index means losing everything. This shifts backup philosophy: you cannot separate data backup from index backup.</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Consistency between vector stores and source systems</strong></p>
-
-<p class="text-gray-300 leading-relaxed">Vector stores rarely stand alone. They contain embeddings derived from records in PostgreSQL, MongoDB, or S3 object stores. A complete DR plan must account for the synchronization point between source data and the vector index. If your PostgreSQL database is restored to a point-in-time 6 hours before your vector store backup, you now have semantic drift between your relational records and their embeddings.</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Metadata amplifies the problem</strong></p>
-
-<p class="text-gray-300 leading-relaxed">Modern vector stores store payload metadata alongside vectors — document IDs, timestamps, category tags, user IDs. This metadata often has relational consistency requirements with upstream systems. Recovery must restore vectors and metadata to a mutually consistent state.</p>
-
-<p class="text-gray-300 leading-relaxed">Table 35.1 maps traditional DR concepts to vector store equivalents:</p>
-
-<p class="text-gray-300 leading-relaxed">| Traditional DB Concept | Vector Store Equivalent | Key Difference |</p>
-<p class="text-gray-300 leading-relaxed">|---|---|---|</p>
-<p class="text-gray-300 leading-relaxed">| Transaction log backup | Incremental vector export | Vectors have no native WAL |</p>
-<p class="text-gray-300 leading-relaxed">| Point-in-time recovery | Snapshot + re-sync from source | Requires source system alignment |</p>
-<p class="text-gray-300 leading-relaxed">| Logical backup (pg_dump) | JSON/binary vector export | May be 100x larger per record |</p>
-<p class="text-gray-300 leading-relaxed">| Physical backup | Volume snapshot | Index state may be partially flushed |</p>
-<p class="text-gray-300 leading-relaxed">| Read replica | Query replica / shard mirror | Consistency lag measured differently |</p>
-<p class="text-gray-300 leading-relaxed">| Restore test | Similarity query validation | Correctness, not just availability |</p>
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TB
+    SRC[Source documents<br/>SQL Server / object store] --> PIPE[Embedding pipeline]
+    PIPE --> VEC[Vector tables<br/>dbo.DocumentChunks]
+    VEC --> IDX[DiskANN index]
+    BK[Backups] -.-> VEC
+    BK -.-> SRC
+    AG[Availability Group<br/>secondary replica] --> VEC
+    VEC --> FAIL[Failover target]</pre></div>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">Backup Strategies by Vector Store Platform</h3>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Backup Strategies for SQL Server Vector Tables</h3>
 
-<p class="text-gray-300 leading-relaxed">Each major vector database has different native backup capabilities. The right strategy depends on your RTO/RPO requirements, deployment model, and whether you control the underlying infrastructure.</p>
+<p class="text-gray-300 leading-relaxed">SQL Server vector tables are ordinary tables with a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR</code> column — every native backup mechanism works without modification: full/differential/log backups, backup to URL, and managed backup in Azure. The DiskANN index definition is part of the database metadata, so it restores with the database — but the index <em>contents</em> are rebuilt from the vector data during recovery, not copied byte-for-byte. Plan for that rebuild.</p>
 
-<p class="text-gray-300 leading-relaxed">#### pgvector (PostgreSQL)</p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server 2025: backup strategy for a vector database
+-- Weekly full, daily differential, 15-minute log backups
+BACKUP DATABASE VectorRagDb
+TO URL = 'https://vecbackups.blob.core.windows.net/sqlbackups/VectorRagDb_full.bak'
+WITH COMPRESSION, CHECKSUM, STATS = 10;
+-- Differential (nightly)
+BACKUP DATABASE VectorRagDb
+TO URL = 'https://vecbackups.blob.core.windows.net/sqlbackups/VectorRagDb_diff.bak'
+WITH DIFFERENTIAL, COMPRESSION, CHECKSUM;
+-- Log (every 15 minutes via Agent job)
+BACKUP LOG VectorRagDb
+TO URL = 'https://vecbackups.blob.core.windows.net/sqlbackups/VectorRagDb_log.trn'
+WITH COMPRESSION, CHECKSUM;
+-- Record the watermark so post-restore catch-up knows where to start:
+-- SELECT MAX(EmbeddedAt) FROM dbo.DocumentChunks;  -- store with the backup
+</code></pre>
 
-<p class="text-gray-300 leading-relaxed">pgvector stores vectors in standard PostgreSQL heap tuples. This means all of PostgreSQL's backup mechanisms work without modification: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_dump</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_basebackup</code>, WAL archiving, and point-in-time recovery through your preferred tool (Barman, pgBackRest, WAL-G). The HNSW and IVFFlat indexes are rebuilt on restore from the base table data — but at significant cost for large tables.</p>
+<p class="text-gray-300 leading-relaxed">For very large vector tables where full backup windows are painful, consider a two-tier strategy: native SQL Server backups for the whole database, plus a periodic bulk export of <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DocId → vector</code> pairs to Parquet in object storage. The export is your escape hatch — it lets you rebuild the vector tables on any SQL Server instance (or a different platform) without replaying the entire backup chain.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
--- Step 1: Check the size of your vector table and index before planning backup frequency
-SELECT
-    schemaname,
-    tablename,
-    pg_size_pretty(pg_total_relation_size(schemaname||'.'||tablename)) AS total_size,
-    pg_size_pretty(pg_relation_size(schemaname||'.'||tablename)) AS table_size,
-    pg_size_pretty(
-        pg_total_relation_size(schemaname||'.'||tablename) -
-        pg_relation_size(schemaname||'.'||tablename)
-    ) AS index_size
-FROM pg_tables
-WHERE tablename = 'document_embeddings';
-
--- Step 2: Export vectors to a portable format for cross-platform recovery
--- Useful when restoring to a different vector store after catastrophic failure
-COPY (
-    SELECT
-        id,
-        document_id,
-        chunk_index,
-        content_text,
-        embedding::text AS embedding_vector,
-        metadata,
-        created_at,
-        embedding_model
-    FROM document_embeddings
-    WHERE created_at &gt;= NOW() - INTERVAL '24 hours'
-    ORDER BY created_at
-) TO '/var/backups/pgvector/embeddings_incremental.csv'
-WITH (FORMAT CSV, HEADER TRUE);
-
--- Step 3: Validate backup integrity — count and spot-check vector dimensionality
-SELECT
-    COUNT(*) AS total_vectors,
-    AVG(vector_dims(embedding)) AS avg_dims,
-    MIN(vector_dims(embedding)) AS min_dims,
-    MAX(vector_dims(embedding)) AS max_dims,
-    COUNT(*) FILTER (WHERE vector_dims(embedding) != 1536) AS malformed_vectors
-FROM document_embeddings;
-
--- Step 4: Track the last-synced position between source table and embeddings table
--- This watermark table drives incremental backup and re-sync recovery
-CREATE TABLE IF NOT EXISTS embedding_sync_state (
-    sync_id         SERIAL PRIMARY KEY,
-    source_table    TEXT NOT NULL,
-    last_source_id  BIGINT NOT NULL,
-    last_sync_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    vector_count    BIGINT NOT NULL,
-    model_version   TEXT NOT NULL,
-    notes           TEXT
-);
-
-INSERT INTO embedding_sync_state
-    (source_table, last_source_id, vector_count, model_version)
-SELECT
-    'documents',
-    MAX(id),
-    COUNT(*),
-    'text-embedding-3-large-1536'
-FROM document_embeddings
-ON CONFLICT DO NOTHING;</code></pre>
-
-<p class="text-gray-300 leading-relaxed">The critical insight for pgvector DR: after a restore, PostgreSQL recreates the heap first, then the indexes. On a 50M-row vector table with 1536-dimensional HNSW indexes, index rebuild can take 4–8 hours depending on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">maintenance_work_mem</code> and parallelism. Your RTO must account for this separately from the restore time.</p>
-
-<p class="text-gray-300 leading-relaxed">#### Pinecone</p>
-
-<p class="text-gray-300 leading-relaxed">Pinecone is a fully managed service without direct infrastructure access, so DR strategy operates at the API level. Pinecone does not provide native cross-region replication for Standard tier indexes. Their Enterprise tier offers collections (snapshots) and the ability to create indexes from collections in different regions.</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
-# Pinecone DR: backup via collection creation + cross-region restore
-
-from pinecone import Pinecone
-import time
-import json
-from datetime import datetime
-
-pc = Pinecone(api_key="YOUR_API_KEY")
-
-def create_pinecone_backup(index_name: str, collection_name: str = None) -&gt; dict:
-    """
-    Create a Pinecone collection (snapshot) from a live index.
-    Collections are immutable backups stored by Pinecone indefinitely.
-    """
-    if collection_name is None:
-        timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
-        collection_name = f"{index_name}-backup-{timestamp}"
-
-    # Verify source index exists and is ready
-    index_info = pc.describe_index(index_name)
-    if index_info.status.ready is False:
-        raise RuntimeError(f"Index {index_name} is not in ready state: {index_info.status}")
-
-    vector_count = index_info.status.vector_count
-    print(f"Creating collection from {index_name} ({vector_count:,} vectors)")
-
-    # Create collection — this is a point-in-time snapshot
-    pc.create_collection(
-        name=collection_name,
-        source=index_name
-    )
-
-    # Poll until collection is ready
-    max_wait_seconds = 600
-    poll_interval = 15
-    elapsed = 0
-
-    while elapsed &lt; max_wait_seconds:
-        collection = pc.describe_collection(collection_name)
-        if collection.status == "Ready":
-            print(f"Collection {collection_name} ready after {elapsed}s")
-            break
-        elif collection.status == "Initializing":
-            print(f"  Collection initializing... ({elapsed}s elapsed)")
-            time.sleep(poll_interval)
-            elapsed += poll_interval
-        else:
-            raise RuntimeError(f"Collection entered unexpected state: {collection.status}")
-    else:
-        raise TimeoutError(f"Collection not ready after {max_wait_seconds}s")
-
-    return {
-        "collection_name": collection_name,
-        "source_index": index_name,
-        "vector_count": collection.vector_count,
-        "dimension": collection.dimension,
-        "metric": collection.metric,
-        "created_at": datetime.utcnow().isoformat(),
-        "status": collection.status
-    }
-
-
-def restore_pinecone_from_collection(
-    collection_name: str,
-    target_index_name: str,
-    target_region: str = "us-east-1",
-    cloud: str = "aws"
-) -&gt; None:
-    """
-    Restore a Pinecone index from a collection backup, optionally in a different region.
-    This is the cross-region failover path.
-    """
-    collection = pc.describe_collection(collection_name)
-
-    if collection.status != "Ready":
-        raise RuntimeError(f"Collection {collection_name} is not in Ready state")
-
-    print(f"Restoring from collection: {collection_name}")
-    print(f"  Vectors: {collection.vector_count:,}")
-    print(f"  Dimensions: {collection.dimension}")
-    print(f"  Target region: {cloud}/{target_region}")
-
-    # Create new index from collection in target region
-    pc.create_index(
-        name=target_index_name,
-        dimension=collection.dimension,
-        metric=collection.metric,
-        source_collection=collection_name,
-        spec={
-            "serverless": {
-                "cloud": cloud,
-                "region": target_region
-            }
-        }
-    )
-
-    # Wait for index to be ready
-    max_wait = 900  # 15 minutes for large indexes
-    elapsed = 0
-    while elapsed &lt; max_wait:
-        index_desc = pc.describe_index(target_index_name)
-        if index_desc.status.ready:
-            print(f"Index {target_index_name} ready after {elapsed}s")
-            return
-        time.sleep(20)
-        elapsed += 20
-
-    raise TimeoutError("Restored index did not become ready within 15 minutes")
-
-
-def export_pinecone_vectors_to_json(
-    index_name: str,
-    output_path: str,
-    namespace: str = "",
-    batch_size: int = 1000
-) -&gt; int:
-    """
-    Export all vectors from a Pinecone index to JSON for cold storage backup.
-    Use this when you need a portable backup independent of Pinecone's collection system.
-    WARNING: Pinecone does not natively support list-all-vectors for large indexes.
-    This approach requires you to maintain a separate list of vector IDs.
-    """
-    index = pc.Index(index_name)
-    stats = index.describe_index_stats()
-
-    # Load IDs from your ID registry (you must maintain this separately)
-    with open(f"{output_path}.ids.txt", "r") as f:
-        all_ids = [line.strip() for line in f if line.strip()]
-
-    exported_count = 0
-    with open(output_path, "w") as out_file:
-        for i in range(0, len(all_ids), batch_size):
-            batch_ids = all_ids[i:i + batch_size]
-            response = index.fetch(ids=batch_ids, namespace=namespace)
-
-            for vec_id, vector_data in response.vectors.items():
-                record = {
-                    "id": vec_id,
-                    "values": vector_data.values,
-                    "metadata": vector_data.metadata or {},
-                    "namespace": namespace
-                }
-                out_file.write(json.dumps(record) + "\n")
-                exported_count += 1
-
-            if exported_count % 10000 == 0:
-                print(f"  Exported {exported_count:,} vectors...")
-
-    print(f"Export complete: {exported_count:,} vectors to {output_path}")
-    return exported_count
-
-
-# Example usage
-if __name__ == "__main__":
-    # Daily backup job
-    backup_info = create_pinecone_backup("production-embeddings")
-    
-    # Save backup manifest
-    with open(f"/var/backups/pinecone/manifest-{datetime.utcnow().date()}.json", "w") as f:
-        json.dump(backup_info, f, indent=2)
-    
-    print(f"Backup manifest: {backup_info}")</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Pinecone DR limitations to know</strong>: Collections capture vectors and metadata but not index configuration metadata like pod type (for pod-based indexes) or access control settings. Document these separately. Also, Pinecone collections are stored in the same cloud account — they protect against data corruption or accidental deletion but not against account-level or regional cloud outages unless you explicitly restore to a different region.</p>
-
-<p class="text-gray-300 leading-relaxed">#### Weaviate</p>
-
-<p class="text-gray-300 leading-relaxed">Weaviate provides native backup support via its Backup API, supporting S3, GCS, Azure Blob Storage, and local filesystem as backup destinations. This is the most operationally complete backup system of the major vector databases.</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
-# Weaviate backup and restore using the official Python client v4
-
-import weaviate
-import weaviate.classes as wvc
-import time
-import boto3
-from datetime import datetime
-
-client = weaviate.connect_to_custom(
-    http_host="weaviate.production.internal",
-    http_port=8080,
-    http_secure=False,
-    grpc_host="weaviate.production.internal",
-    grpc_port=50051,
-    grpc_secure=False
-)
-
-
-def create_weaviate_backup(
-    backup_id: str,
-    backend: str = "s3",
-    include_classes: list = None,
-    wait_for_completion: bool = True
-) -&gt; dict:
-    """
-    Create a Weaviate backup to S3 (or GCS/Azure/filesystem).
-    
-    The backup captures:
-    - All vector data (HNSW graph + raw vectors)
-    - Object properties and metadata
-    - Schema definitions
-    - Class configurations
-    
-    Weaviate performs a consistent snapshot — no writes are blocked during backup.
-    """
-    backup_config = {
-        "id": backup_id,
-        "backend": backend,
-    }
-    
-    if include_classes:
-        backup_config["include"] = include_classes
-
-    print(f"Initiating Weaviate backup: {backup_id} -&gt; {backend}")
-    
-    response = client.backup.create(
-        backup_id=backup_id,
-        backend=backend,
-        include_collections=include_classes,
-        wait_for_completion=wait_for_completion
-    )
-    
-    return {
-        "backup_id": backup_id,
-        "backend": backend,
-        "status": response.status,
-        "path": response.path,
-        "classes": response.collections,
-        "started_at": datetime.utcnow().isoformat()
-    }
-
-
-def get_backup_status(backup_id: str, backend: str = "s3") -&gt; dict:
-    """Poll backup status for async backup jobs."""
-    response = client.backup.get_create_status(
-        backup_id=backup_id,
-        backend=backend
-    )
-    return {
-        "backup_id": backup_id,
-        "status": response.status,
-        "error": getattr(response, "error", None)
-    }
-
-
-def restore_weaviate_backup(
-    backup_id: str,
-    backend: str = "s3",
-    include_classes: list = None,
-    exclude_classes: list = None,
-    wait_for_completion: bool = True
-) -&gt; dict:
-    """
-    Restore a Weaviate backup. Can restore specific classes or entire cluster.
-    
-    Weaviate restore behavior:
-    - Classes that don't exist are created fresh
-    - Classes that already exist cause restore to fail (must delete first)
-    - Schema is restored along with data
-    """
-    print(f"Starting Weaviate restore from backup: {backup_id}")
-    
-    response = client.backup.restore(
-        backup_id=backup_id,
-        backend=backend,
-        include_collections=include_classes,
-        exclude_collections=exclude_classes,
-        wait_for_completion=wait_for_completion
-    )
-    
-    return {
-        "backup_id": backup_id,
-        "status": response.status,
-        "restored_classes": response.collections,
-        "error": getattr(response, "error", None)
-    }
-
-
-def validate_weaviate_restore(
-    class_name: str,
-    expected_min_count: int,
-    sample_query_vector: list = None
-) -&gt; dict:
-    """
-    Post-restore validation:
-    1. Check object count is within expected range
-    2. Run a sample similarity query to confirm index is queryable
-    """
-    collection = client.collections.get(class_name)
-    
-    # Count validation
-    count_result = collection.aggregate.over_all(total_count=True)
-    actual_count = count_result.total_count
-    
-    count_ok = actual_count &gt;= expected_min_count
-    
-    validation = {
-        "class": class_name,
-        "expected_min": expected_min_count,
-        "actual_count": actual_count,
-        "count_ok": count_ok,
-        "query_ok": None,
-        "query_latency_ms": None
-    }
-    
-    # Query validation — if a sample vector is provided
-    if sample_query_vector and count_ok:
-        start = time.time()
-        results = collection.query.near_vector(
-            near_vector=sample_query_vector,
-            limit=5,
-            return_metadata=wvc.query.MetadataQuery(distance=True)
-        )
-        latency_ms = (time.time() - start) * 1000
-        
-        validation["query_ok"] = len(results.objects) &gt; 0
-        validation["query_latency_ms"] = round(latency_ms, 2)
-        validation["top_result_distance"] = (
-            results.objects[0].metadata.distance
-            if results.objects else None
-        )
-    
-    return validation
-
-
-def schedule_weaviate_backup_rotation(
-    backend: str = "s3",
-    retention_days: int = 7,
-    backup_prefix: str = "weaviate-backup"
-) -&gt; None:
-    """
-    Create daily backup and clean up backups older than retention_days.
-    Designed to be called from a cron job or Airflow DAG.
-    
-    Note: Weaviate doesn't manage backup retention itself.
-    Cleanup is handled through the storage backend (S3 lifecycle rules recommended).
-    """
-    today = datetime.utcnow().strftime("%Y%m%d")
-    backup_id = f"{backup_prefix}-{today}"
-    
-    result = create_weaviate_backup(
-        backup_id=backup_id,
-        backend=backend,
-        wait_for_completion=True
-    )
-    
-    print(f"Backup result: {result}")
-    
-    # For S3-backed backups, enforce retention via S3 lifecycle
-    # (Better approach than manual deletion through Weaviate API)
-    print(f"Reminder: Ensure S3 lifecycle rule expires backups after {retention_days} days")
-    print(f"Backup path prefix: weaviate-backups/{backup_id}/")
-
-
-# Example DR runbook execution
-if __name__ == "__main__":
-    # Create backup
-    backup_id = f"prod-backup-{datetime.utcnow().strftime('%Y%m%d-%H%M')}"
-    backup_info = create_weaviate_backup(backup_id, backend="s3")
-    print(f"Backup complete: {backup_info}")
-    
-    # Restore to DR site (run on DR cluster)
-    # restore_result = restore_weaviate_backup(backup_id, backend="s3")
-    
-    # Validate
-    # validation = validate_weaviate_restore(
-    #     "DocumentEmbeddings",
-    #     expected_min_count=9_000_000
-    # )
-    # print(f"Validation: {validation}")
-
-client.close()</code></pre>
-
-<p class="text-gray-300 leading-relaxed">Weaviate's backup system has one notable constraint: during a backup, write operations continue but the backup is a consistent snapshot of the moment it was initiated. You will not get a backup that includes writes that arrived after the backup started. For high-write workloads, the RPO is effectively the time since the last backup started, not the time since it completed.</p>
+<p class="text-gray-300 leading-relaxed">The critical insight for SQL Server vector DR: after a restore, the database comes online first, then the DiskANN index rebuilds from the vector column data. On a 50M-row table with 1536-dimensional DiskANN indexes, the rebuild can take several hours depending on MAXDOP and memory. Your RTO must account for this separately from the restore time — measure it on a restore test, don't estimate it.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Replication and High Availability Topologies</h3>
 
-<p class="text-gray-300 leading-relaxed">Backup and restore addresses your RPO and RTO for catastrophic failures. High availability — keeping the system running through partial failures without a full restore — requires replication.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Always On availability groups</strong> are the primary HA story for SQL Server vector workloads. Vectors in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR</code> columns replicate through the log stream exactly like any other data, and the DiskANN index on the secondary stays in sync through redo — you are not rebuilding it, you are streaming physical changes. A synchronous-commit secondary gives you zero-data-loss failover with the vector index warm and queryable immediately.</p>
 
-<p class="text-gray-300 leading-relaxed">#### pgvector Replication</p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: verify AG replica health for the vector database
+SELECT ag.name AS AgName, ar.replica_server_name AS Replica,
+       ars.role_desc AS Role, ars.synchronization_state_desc AS SyncState,
+       ars.synchronization_health_desc AS Health,
+       drs.log_send_queue_size AS SendQueueKB,
+       drs.redo_queue_size AS RedoQueueKB
+FROM sys.dm_hadr_availability_replica_states AS ars
+JOIN sys.availability_replicas AS ar
+  ON ars.replica_id = ar.replica_id
+JOIN sys.availability_groups AS ag
+  ON ar.group_id = ag.group_id
+JOIN sys.dm_hadr_database_replica_states AS drs
+  ON ars.replica_id = drs.replica_id AND ars.group_id = drs.group_id
+WHERE drs.database_id = DB_ID(N'VectorRagDb');
+-- Watch RedoQueueKB after bulk embedding loads: a growing redo queue
+-- means the secondary is falling behind the ingest rate.
+</code></pre>
 
-<p class="text-gray-300 leading-relaxed">pgvector inherits PostgreSQL's streaming replication without modification. Vectors stored in heap tuples replicate through WAL exactly like any other data. However, HNSW indexes on replicas are kept in sync through WAL as well — you are not rebuilding them, you are streaming the physical changes. This is one of pgvector's strongest operational advantages.</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># shell
-# Configure pgvector streaming replication
-# On primary: postgresql.conf
-
-cat &gt;&gt; /etc/postgresql/16/main/postgresql.conf &lt;&lt; 'EOF'
-# Replication settings for vector workloads
-wal_level = replica
-max_wal_senders = 5
-wal_keep_size = 2GB          # Vector operations generate large WAL entries
-# HNSW index updates can be 10-50x larger than row inserts
-# Increase wal_keep_size if replicas fall behind during bulk loads
-
-max_replication_slots = 5
-synchronous_commit = on      # Set to 'remote_write' if latency is unacceptable
-
-# Performance tuning for vector workloads with replication
-checkpoint_completion_target = 0.9
-max_wal_size = 4GB
-EOF
-
-# Create replication user
-psql -U postgres &lt;&lt; 'EOF'
-CREATE ROLE replicator WITH REPLICATION LOGIN PASSWORD 'strong_password_here';
-SELECT pg_create_physical_replication_slot('vector_replica_1');
-EOF
-
-# On replica: configure recovery
-cat &gt; /etc/postgresql/16/main/postgresql.conf &lt;&lt; 'EOF'
-hot_standby = on
-hot_standby_feedback = on    # Prevents query cancellation on replica during vacuum
-
-# Replica-specific tuning for vector similarity queries
-# Replicas can be dedicated to read-heavy vector search traffic
-max_parallel_workers_per_gather = 4
-hnsw.ef_search = 200         # Can tune independently on read replicas
-EOF
-
-cat &gt; /etc/postgresql/16/main/pg_hba.conf &lt;&lt; 'EOF'
-# Allow replication connections from primary
-host    replication     replicator    10.0.0.10/32    scram-sha-256
-EOF
-
-# Create recovery signal and connection config
-touch /var/lib/postgresql/16/main/standby.signal
-
-cat &gt; /var/lib/postgresql/16/main/postgresql.auto.conf &lt;&lt; 'EOF'
-primary_conninfo = 'host=10.0.0.10 port=5432 user=replicator password=strong_password_here application_name=vector_replica_1'
-primary_slot_name = 'vector_replica_1'
-EOF</code></pre>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL
--- Monitor replication lag — critical for vector workloads during bulk loads
--- Large HNSW index updates generate significant WAL; replicas can fall behind
-
-SELECT
-    client_addr,
-    application_name,
-    state,
-    sent_lsn,
-    write_lsn,
-    flush_lsn,
-    replay_lsn,
-    pg_size_pretty(pg_wal_lsn_diff(sent_lsn, replay_lsn)) AS replication_lag_bytes,
-    write_lag,
-    flush_lag,
-    replay_lag,
-    sync_state
-FROM pg_stat_replication
-ORDER BY replay_lag DESC NULLS LAST;
-
--- Check if replica is usable for vector search
--- A replica lagging more than your RPO threshold should be excluded from traffic
-SELECT
-    now() - pg_last_xact_replay_timestamp() AS replication_lag_time,
-    pg_is_in_recovery() AS is_replica,
-    pg_last_wal_receive_lsn() AS last_received,
-    pg_last_wal_replay_lsn() AS last_replayed,
-    pg_wal_lsn_diff(
-        pg_last_wal_receive_lsn(),
-        pg_last_wal_replay_lsn()
-    ) AS lag_bytes;</code></pre>
-
-<p class="text-gray-300 leading-relaxed">A common production pattern is to direct all embedding write operations (INSERT/UPDATE from the embedding pipeline) to the primary, while routing similarity search queries to one or more hot standbys. This requires your application connection pool or proxy (PgBouncer, HAProxy, pgpool-II) to distinguish read from write operations at the connection level.</p>
-
-<p class="text-gray-300 leading-relaxed">#### Weaviate Multi-Node Replication</p>
-
-<p class="text-gray-300 leading-relaxed">Weaviate uses a distributed architecture where replication is configured per class (collection). The replication factor determines how many nodes hold a copy of each shard.</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
-# Weaviate: configure a collection with replication factor for HA
-
-import weaviate
-import weaviate.classes.config as wvc_config
-
-client = weaviate.connect_to_custom(
-    http_host="weaviate-node1.internal",
-    http_port=8080,
-    http_secure=False,
-    grpc_host="weaviate-node1.internal",
-    grpc_port=50051,
-    grpc_secure=False
-)
-
-# Create a collection with replication factor 3 (tolerates 1 node failure)
-# and quorum-based consistency
-client.collections.create(
-    name="DocumentEmbeddings",
-    vectorizer_config=wvc_config.Configure.Vectorizer.none(),
-    vector_index_config=wvc_config.Configure.VectorIndex.hnsw(
-        distance_metric=wvc_config.VectorDistances.COSINE,
-        ef_construction=128,
-        max_connections=16,
-        ef=64,
-        dynamic_ef_min=100,
-        dynamic_ef_max=500
-    ),
-    replication_config=wvc_config.Configure.replication(
-        factor=3,              # Store 3 copies across cluster nodes
-        async_enabled=False    # Synchronous replication for consistency
-    ),
-    properties=[
-        wvc_config.Property(name="document_id", data_type=wvc_config.DataType.TEXT),
-        wvc_config.Property(name="content_text", data_type=wvc_config.DataType.TEXT),
-        wvc_config.Property(name="chunk_index", data_type=wvc_config.DataType.INT),
-        wvc_config.Property(name="source_url", data_type=wvc_config.DataType.TEXT),
-        wvc_config.Property(name="embedding_model", data_type=wvc_config.DataType.TEXT),
-        wvc_config.Property(name="created_at", data_type=wvc_config.DataType.DATE),
-    ]
-)
-
-# Query with explicit consistency level
-# QUORUM requires majority of replicas to agree — protects against stale reads
-collection = client.collections.get("DocumentEmbeddings")
-
-results = collection.query.near_vector(
-    near_vector=[0.1] * 1536,
-    limit=10,
-    consistency_level=wvc_config.ConsistencyLevel.QUORUM
-)
-
-# For recovery validation after node failure:
-def check_cluster_health(client: weaviate.WeaviateClient) -&gt; dict:
-    """
-    Check node health across the Weaviate cluster.
-    Returns a dict identifying any nodes that are degraded or unreachable.
-    """
-    nodes = client.cluster.nodes(output="verbose")
-    health = {
-        "total_nodes": len(nodes),
-        "healthy_nodes": 0,
-        "degraded_nodes": [],
-        "total_objects": 0,
-        "shard_detail": []
-    }
-
-    for node in nodes:
-        node_healthy = node.status == "HEALTHY"
-        if node_healthy:
-            health["healthy_nodes"] += 1
-        else:
-            health["degraded_nodes"].append({
-                "name": node.name,
-                "status": node.status,
-                "version": node.version
-            })
-
-        for shard in (node.shards or []):
-            health["total_objects"] += shard.object_count
-            health["shard_detail"].append({
-                "node": node.name,
-                "collection": shard.collection,
-                "shard": shard.name,
-                "object_count": shard.object_count,
-                "vector_indexing_status": shard.vector_indexing_status
-            })
-
-    health["quorum_available"] = (
-        health["healthy_nodes"] &gt; health["total_nodes"] // 2
-    )
-
-    return health
-
-
-cluster_status = check_cluster_health(client)
-print(f"Cluster health: {cluster_status['healthy_nodes']}/{cluster_status['total_nodes']} nodes healthy")
-print(f"Quorum available: {cluster_status['quorum_available']}")
-if cluster_status["degraded_nodes"]:
-    print(f"Degraded nodes: {cluster_status['degraded_nodes']}")
-
-client.close()</code></pre>
-
-<p class="text-gray-300 leading-relaxed">The key operational point with Weaviate replication: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">async_enabled=False</code> (synchronous replication) gives you the strongest consistency guarantee but increases write latency proportionally to the slowest replica. For write-heavy embedding pipelines, consider <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">async_enabled=True</code> during bulk loads and switch back to synchronous for production traffic. This is operationally similar to temporarily reducing <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">synchronous_commit</code> in PostgreSQL during bulk inserts.</p>
+<p class="text-gray-300 leading-relaxed">For cross-region DR, use an asynchronous-commit secondary in the distant region: RPO of seconds-to-minutes, no write-latency penalty on the primary. Combine with distributed availability groups when the DR site is a separate Windows cluster or a different domain. For Azure SQL Database, active geo-replication or auto-failover groups provide the same shape as a managed service — the vector index replicates with the database, and failover is a DNS/connection-string flip.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Cross-Region Failover Runbook</h3>
 
-<p class="text-gray-300 leading-relaxed">The sections above establish backup and replication mechanics. This section assembles them into an actionable runbook for a full regional failover. The scenario: your primary region becomes unavailable. Your DR site in a secondary region must take over serving vector similarity queries within your RTO.</p>
+<p class="text-gray-300 leading-relaxed">The runbook below assumes an Always On availability group with a synchronous local secondary and an asynchronous remote secondary, with SQL Server as both source system and vector store. Adapt the connection strings for Azure SQL failover groups — the steps are the same, the promotion is a portal/PowerShell call instead of T-SQL.</p>
 
-<p class="text-gray-300 leading-relaxed">The runbook below uses pgvector as the primary store (because its replication story is the most mature), with a Pinecone failover path shown in parallel for hybrid deployments where both are in use.</p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: planned cross-region failover runbook (T-SQL core)
+-- Step 1: Quiesce the embedding pipeline — stop writers first
+-- (run from the pipeline orchestrator, not the database)
+--   pipelinectl pause --queue embedding-jobs
+-- Step 2: Verify the remote secondary is caught up
+--   On the primary: check log_send_queue_size / redo_queue_size ~ 0
+--   (query from the previous section)
+-- Step 3: Fail over the availability group to the remote replica
+ALTER AVAILABILITY GROUP [VectorAG]
+    FAILOVER;   -- run connected to the remote secondary
+-- Step 4: Record the watermark for pipeline catch-up
+--   SELECT MAX(EmbeddedAt) AS failover_watermark FROM dbo.DocumentChunks;
+-- Step 5: Point the application connection strings at the new primary
+--   (DNS CNAME flip or config change + rolling restart)
+-- Step 6: Resume the embedding pipeline from the watermark
+--   pipelinectl resume --queue embedding-jobs --since &lt;watermark&gt;
+-- Step 7: Validate — run the recall canary (Chapter 20):
+--   recall@10 must be within 2 points of pre-failover baseline
+--   before declaring the failover complete.
+</code></pre>
 
-<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">sequenceDiagram
-    participant Op as On-call operator
-    participant Rep as DR replica
-    participant DNS as DNS / load balancer
-    participant App as Application
-
-    Op->>Rep: Check replication lag
-    alt Lag exceeds tolerance
-        Rep-->>Op: Abort — manual review required
-    else Lag within tolerance
-        Op->>Rep: Promote replica to primary
-        Rep-->>Op: Promotion confirmed
-        Op->>DNS: Update record to DR primary IP
-        DNS-->>App: Traffic reconnects to DR primary
-        Op->>Rep: Run validation query suite
-        alt Validation fails
-            Rep-->>Op: Halt — do not open traffic
-        else Validation passes
-            Op->>App: Failover complete, traffic live
-            Op->>Rep: Begin re-establishing replication
-        end
-    end</pre></div>
-<p class="text-gray-300 leading-relaxed">*Every gate gives the operator a chance to abort rather than promote a lagging or unvalidated replica.*</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
-# Cross-region failover orchestration
-# This script is designed to be run manually or by an on-call automation system
-# after a human has confirmed the primary region is unreachable.
-
-import psycopg2
-import subprocess
-import time
-import logging
-import json
-from datetime import datetime
-from typing import Optional
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
-log = logging.getLogger("vector_dr_failover")
-
-
-# ---------------------------------------------------------------------------
-# Step 1: Validate DR replica is caught up enough to promote
-# ---------------------------------------------------------------------------
-
-def check_replica_lag(
-    replica_dsn: str,
-    max_acceptable_lag_seconds: float = 30.0
-) -&gt; dict:
-    """
-    Connect to the DR replica and verify replication lag is within RTO tolerance.
-    Refuse promotion if lag exceeds threshold — stale vectors cause silent
-    search quality degradation, not obvious errors.
-    """
-    conn = psycopg2.connect(replica_dsn)
-    conn.autocommit = True
-    cur = conn.cursor()
-
-    cur.execute("""
-        SELECT
-            now() - pg_last_xact_replay_timestamp()    AS lag_time,
-            pg_last_wal_receive_lsn()                   AS last_received,
-            pg_last_wal_replay_lsn()                    AS last_replayed,
-            pg_is_in_recovery()                         AS is_standby
-    """)
-    row = cur.fetchone()
-    cur.close()
-    conn.close()
-
-    lag_interval = row[0]
-    lag_seconds = lag_interval.total_seconds() if lag_interval else float("inf")
-
-    return {
-        "lag_seconds": lag_seconds,
-        "last_received_lsn": str(row[1]),
-        "last_replayed_lsn": str(row[2]),
-        "is_standby": row[3],
-        "within_tolerance": lag_seconds &lt;= max_acceptable_lag_seconds
-    }
-
-
-# ---------------------------------------------------------------------------
-# Step 2: Promote PostgreSQL replica to primary
-# ---------------------------------------------------------------------------
-
-def promote_postgres_replica(
-    replica_host: str,
-    pg_ctl_path: str = "/usr/lib/postgresql/16/bin/pg_ctl",
-    data_dir: str = "/var/lib/postgresql/16/main"
-) -&gt; bool:
-    """
-    Promote the standby to a writable primary.
-    pg_promote() is available in PostgreSQL 12+; pg_ctl promote is the
-    older equivalent for automation from outside the database.
-    """
-    log.info(f"Promoting PostgreSQL replica at {replica_host}")
-
-    # Use pg_promote() from within the replica if we still have a connection
-    try:
-        conn = psycopg2.connect(
-            f"host={replica_host} dbname=postgres user=postgres"
-        )
-        conn.autocommit = True
-        cur = conn.cursor()
-        cur.execute("SELECT pg_promote(wait =&gt; true, wait_seconds =&gt; 60)")
-        result = cur.fetchone()[0]
-        cur.close()
-        conn.close()
-
-        if result:
-            log.info("pg_promote() succeeded — replica is now primary")
-            return True
-        else:
-            log.warning("pg_promote() returned false — may have timed out")
-            return False
-
-    except Exception as e:
-        log.error(f"pg_promote() failed: {e}. Attempting pg_ctl fallback.")
-
-    # Fallback: call pg_ctl promote via SSH if pg_promote() is unavailable
-    result = subprocess.run(
-        ["ssh", replica_host, f"sudo -u postgres {pg_ctl_path} promote -D {data_dir}"],
-        capture_output=True,
-        text=True,
-        timeout=120
-    )
-
-    if result.returncode == 0:
-        log.info("pg_ctl promote succeeded")
-        return True
-    else:
-        log.error(f"pg_ctl promote failed: {result.stderr}")
-        return False
-
-
-# ---------------------------------------------------------------------------
-# Step 3: Update DNS / load balancer to point to DR primary
-# ---------------------------------------------------------------------------
-
-def update_dns_record(
-    dns_name: str,
-    new_ip: str,
-    ttl: int = 30,
-    hosted_zone_id: str = None
-) -&gt; None:
-    """
-    Update Route 53 DNS record to point vector-db.internal to the promoted replica.
-    Applications reconnect automatically when their connection pool recycles.
-    Pre-condition: DNS TTL should already be set low (30–60s) in normal operation.
-    """
-    import boto3
-    r53 = boto3.client("route53")
-
-    change_batch = {
-        "Changes": [
-            {
-                "Action": "UPSERT",
-                "ResourceRecordSet": {
-                    "Name": dns_name,
-                    "Type": "A",
-                    "TTL": ttl,
-                    "ResourceRecords": [{"Value": new_ip}]
-                }
-            }
-        ]
-    }
-
-    response = r53.change_resource_record_sets(
-        HostedZoneId=hosted_zone_id,
-        ChangeBatch=change_batch
-    )
-
-    change_id = response["ChangeInfo"]["Id"]
-    log.info(f"DNS update submitted: {change_id} — {dns_name} -&gt; {new_ip}")
-
-    # Wait for DNS change to propagate
-    waiter = r53.get_waiter("resource_record_sets_changed")
-    waiter.wait(Id=change_id)
-    log.info("DNS change propagated")
-
-
-# ---------------------------------------------------------------------------
-# Step 4: Post-failover validation of vector search quality
-# ---------------------------------------------------------------------------
-
-def validate_vector_search_post_failover(
-    new_primary_dsn: str,
-    test_queries: list,
-    min_results_per_query: int = 5
-) -&gt; dict:
-    """
-    Run a battery of known test queries against the promoted primary.
-    For each query, we verify:
-      1. Results are returned (index is queryable)
-      2. Result count meets minimum
-      3. Top result cosine distance is within expected range
-      
-    test_queries: list of dicts with keys 'query_vector' and 'expected_top_id'
-    """
-    conn = psycopg2.connect(new_primary_dsn)
-    conn.autocommit = True
-    cur = conn.cursor()
-
-    results_summary = {
-        "total_queries": len(test_queries),
-        "passed": 0,
-        "failed": 0,
-        "failures": []
-    }
-
-    for i, test in enumerate(test_queries):
-        query_vector = test["query_vector"]
-        expected_top_id = test.get("expected_top_id")
-        label = test.get("label", f"query_{i}")
-
-        cur.execute("""
-            SELECT
-                id,
-                document_id,
-                1 - (embedding &lt;=&gt; %s::vector) AS cosine_similarity
-            FROM document_embeddings
-            ORDER BY embedding &lt;=&gt; %s::vector
-            LIMIT %s
-        """, (query_vector, query_vector, min_results_per_query))
-
-        rows = cur.fetchall()
-        result_count = len(rows)
-
-        passed = result_count &gt;= min_results_per_query
-        top_id_match = True
-
-        if expected_top_id and rows:
-            top_id_match = str(rows[0][1]) == str(expected_top_id)
-            if not top_id_match:
-                log.warning(
-                    f"Query '{label}': expected top doc {expected_top_id}, "
-                    f"got {rows[0][1]} (similarity={rows[0][2]:.4f})"
-                )
-
-        if passed and top_id_match:
-            results_summary["passed"] += 1
-        else:
-            results_summary["failed"] += 1
-            results_summary["failures"].append({
-                "label": label,
-                "result_count": result_count,
-                "top_id_match": top_id_match
-            })
-
-    cur.close()
-    conn.close()
-
-    results_summary["all_passed"] = results_summary["failed"] == 0
-    return results_summary
-
-
-# ---------------------------------------------------------------------------
-# Main failover orchestration
-# ---------------------------------------------------------------------------
-
-def execute_failover(config: dict) -&gt; None:
-    """
-    Execute full cross-region failover for vector store infrastructure.
-    config keys:
-        replica_dsn, replica_host, primary_dns, dr_primary_ip,
-        hosted_zone_id, max_lag_seconds, test_queries
-    """
-    log.info("=" * 60)
-    log.info("VECTOR STORE FAILOVER INITIATED")
-    log.info(f"Time: {datetime.utcnow().isoformat()}Z")
-    log.info("=" * 60)
-
-    # Step 1: Check lag
-    lag_info = check_replica_lag(
-        config["replica_dsn"],
-        max_acceptable_lag_seconds=config.get("max_lag_seconds", 30)
-    )
-    log.info(f"Replica lag: {lag_info['lag_seconds']:.1f}s")
-
-    if not lag_info["within_tolerance"]:
-        log.error(
-            f"Replica lag ({lag_info['lag_seconds']:.1f}s) exceeds tolerance. "
-            "Manual review required before promotion."
-        )
-        raise RuntimeError("Replication lag too high for safe failover")
-
-    # Step 2: Promote replica
-    promoted = promote_postgres_replica(config["replica_host"])
-    if not promoted:
-        raise RuntimeError("Replica promotion failed — aborting failover")
-
-    # Brief pause for promotion to fully settle
-    time.sleep(5)
-
-    # Step 3: Update DNS
-    update_dns_record(
-        dns_name=config["primary_dns"],
-        new_ip=config["dr_primary_ip"],
-        hosted_zone_id=config["hosted_zone_id"]
-    )
-
-    # Step 4: Validate
-    log.info("Running post-failover validation queries...")
-    validation = validate_vector_search_post_failover(
-        new_primary_dsn=config["dr_primary_dsn"],
-        test_queries=config["test_queries"]
-    )
-
-    log.info(f"Validation: {validation['passed']}/{validation['total_queries']} passed")
-
-    if not validation["all_passed"]:
-        log.error(f"Validation failures: {json.dumps(validation['failures'], indent=2)}")
-        raise RuntimeError("Post-failover validation failed — manual investigation required")
-
-    log.info("Failover complete. Vector search is live on DR primary.")
-    log.info("Next step: begin re-establishing replication from DR primary to new standby.")</code></pre>
+<p class="text-gray-300 leading-relaxed">The step teams most often skip is Step 1 — quiescing writers. Failing over with the embedding pipeline still writing means in-flight batches land on the old primary after the flip and are silently lost to the new primary. Pause first, verify the queue is drained, then fail over.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Recovery Point Objective and Recovery Time Objective Planning</h3>
 
-<p class="text-gray-300 leading-relaxed">RTO and RPO for vector stores have components that do not appear in relational DR planning:</p>
+<p class="text-gray-300 leading-relaxed">Three clocks must align: the source data RPO, the vector store RPO, and the embedding pipeline's processing lag. If your source database recovers to T-minus-2-hours, your vector store recovers to T-minus-6-hours, and your embedding queue was processing documents at the time of failure, you have semantic gaps no automatic process will identify.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">RPO components for vector stores:</strong></p>
-<p class="text-gray-300 leading-relaxed">1. Source document RPO (how stale can your underlying content be?)</p>
-<p class="text-gray-300 leading-relaxed">2. Embedding pipeline RPO (how many documents processed after the last backup are un-embedded?)</p>
-<p class="text-gray-300 leading-relaxed">3. Vector index RPO (gap between last backup and failure)</p>
+<p class="text-gray-300 leading-relaxed">Budget RTO in components, measured from restore tests — not vendor documentation:</p>
 
-<p class="text-gray-300 leading-relaxed">All three must align. If your source PostgreSQL database recovers to T-minus-2-hours, your vector store recovers to T-minus-6-hours, and your embedding pipeline queue was processing documents at the time of failure, you could have semantic gaps that are never automatically identified.</p>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Infrastructure recovery (VMs, networking, SQL Server online)</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Database restore time (full + differential + log replay)</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> DiskANN index rebuild time — the hidden multiplier; hours at tens of millions of rows</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Embedding catch-up (documents newer than the watermark, re-embedded at pipeline throughput)</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Validation (recall canary + smoke queries before traffic returns)</li>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">RTO components for vector stores:</strong></p>
-<p class="text-gray-300 leading-relaxed">1. Infrastructure recovery time (restore volume or index from backup)</p>
-<p class="text-gray-300 leading-relaxed">2. Index rebuild time (pgvector only — zero for managed services that persist the index)</p>
-<p class="text-gray-300 leading-relaxed">3. Catch-up embedding time (documents written between backup and failure that need to be re-embedded)</p>
-<p class="text-gray-300 leading-relaxed">4. Validation time (you cannot skip similarity query validation)</p>
+<p class="text-gray-300 leading-relaxed">The DiskANN rebuild time is the most significant operational difference versus a pure relational workload. For large deployments, this drives a strong architectural recommendation: maintain a synchronous or near-synchronous secondary as your primary HA mechanism, and treat backup-and-restore as the last resort — the secondary already has a warm index.</p>
 
-<p class="text-gray-300 leading-relaxed">Table 35.2 gives representative RTO estimates by platform and database size:</p>
-
-<p class="text-gray-300 leading-relaxed">| Platform | Vectors | Infrastructure Restore | Index Rebuild | Catch-up Embedding | Total RTO |</p>
-<p class="text-gray-300 leading-relaxed">|---|---|---|---|---|---|</p>
-<p class="text-gray-300 leading-relaxed">| pgvector | 5M × 1536-d | 15–30 min | 2–4 hours | Depends on gap | 3–5 hours |</p>
-<p class="text-gray-300 leading-relaxed">| pgvector | 50M × 1536-d | 45–90 min | 8–16 hours | Depends on gap | 10–18 hours |</p>
-<p class="text-gray-300 leading-relaxed">| Weaviate (self-hosted) | 10M | 20–40 min | Included in restore | Depends on gap | 30–90 min |</p>
-<p class="text-gray-300 leading-relaxed">| Pinecone (managed) | 10M | 30–60 min | Not applicable | Depends on gap | 45–90 min |</p>
-<p class="text-gray-300 leading-relaxed">| Qdrant (self-hosted) | 10M | 15–30 min | Included in restore | Depends on gap | 25–60 min |</p>
-
-<p class="text-gray-300 leading-relaxed">The pgvector index rebuild time is the most significant operational difference. For large deployments, this drives a strong architectural recommendation: maintain a hot standby rather than relying on backup-and-restore as your primary HA mechanism.</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
--- Estimate index rebuild time before starting a restore
--- Run this on any machine with the same hardware profile as your DR target
-
--- First, check current index build parameters
-SHOW max_parallel_maintenance_workers;
-SHOW maintenance_work_mem;
-
--- Rough rebuild time estimation based on table size and vector dimensions
--- These ratios are empirical and will vary by hardware
-WITH size_estimates AS (
-    SELECT
-        COUNT(*) AS row_count,
-        AVG(vector_dims(embedding)) AS avg_dims,
-        pg_total_relation_size('document_embeddings') AS total_bytes
-    FROM document_embeddings
-)
-SELECT
-    row_count,
-    avg_dims,
-    pg_size_pretty(total_bytes) AS table_size,
-    -- HNSW build is roughly O(n log n) — use a linear approximation for planning
-    -- Actual time depends heavily on ef_construction and m parameters
-    ROUND(row_count::numeric / 1000000 * 12) AS estimated_hnsw_minutes_low,
-    ROUND(row_count::numeric / 1000000 * 25) AS estimated_hnsw_minutes_high
-FROM size_estimates;
-
--- After restore: rebuild HNSW index with maximum parallelism
--- Run this in a maintenance window; it will block on heavy I/O
-SET maintenance_work_mem = '16GB';  -- Use as much RAM as you can spare
-SET max_parallel_maintenance_workers = 7;
-
--- Drop old index if present (e.g., restored from pg_dump which included it)
-DROP INDEX CONCURRENTLY IF EXISTS idx_document_embeddings_hnsw;
-
--- Rebuild with parameters tuned for recall vs. build time tradeoff
-CREATE INDEX idx_document_embeddings_hnsw
-    ON document_embeddings
-    USING hnsw (embedding vector_cosine_ops)
-    WITH (m = 16, ef_construction = 64);
--- ef_construction=64 builds faster; increase to 128 for higher recall
--- Monitor progress:
-SELECT
-    phase,
-    blocks_done,
-    blocks_total,
-    tuples_done,
-    tuples_total,
-    ROUND(100.0 * tuples_done / NULLIF(tuples_total, 0), 1) AS pct_complete
-FROM pg_stat_progress_create_index
-WHERE relid = 'document_embeddings'::regclass;</code></pre>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: track DiskANN index build progress during recovery
+-- (run while the index rebuilds after a restore)
+SELECT OBJECT_NAME(object_id) AS TableName, name AS IndexName,
+       index_id, type_desc
+FROM sys.indexes
+WHERE type_desc LIKE '%VECTOR%';
+-- Monitor index build phases via the SQL Server error log and
+-- extended events (no built-in progress DMV for DiskANN builds);
+-- and time full rebuilds during DR tests to calibrate RTO budgets.
+</code></pre>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">The Re-Embedding Recovery Path</h3>
 
-<p class="text-gray-300 leading-relaxed">The most costly recovery scenario — one that has no equivalent in relational DR — is the case where you must regenerate all embeddings from source documents. This happens when:</p>
+<p class="text-gray-300 leading-relaxed">Sometimes the fastest recovery isn't restoring vectors at all — it's re-embedding from source. If the source documents survived (or restore faster than the vector database), and your embedding pipeline can sustain high throughput, regenerating embeddings from the watermark forward can beat a multi-hour DiskANN rebuild plus log replay.</p>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Both the vector store and the source embedding cache are lost</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> You change embedding models (not strictly a recovery scenario, but operationally identical)</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> The original embedding model is deprecated and results are no longer consistent with new queries</li>
+<p class="text-gray-300 leading-relaxed">The re-embedding path requires three things prepared <em>before</em> the disaster: the source documents restorable independently, the embedding model version pinned (re-embedding with a different model version silently changes the geometry — Chapter 30), and pipeline throughput measured so you can compute catch-up time honestly. A pipeline that embeds 50 documents/second needs 5.5 hours per million documents — do that math before you promise a 2-hour RTO.</p>
 
-<p class="text-gray-300 leading-relaxed">This section builds a production-grade re-embedding pipeline with checkpointing, so that a failure mid-run does not force you to start from zero.</p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: watermark-based re-embedding catch-up after recovery
+-- Documents newer than the last good watermark get re-embedded;
+-- everything older is trusted from the restored vector tables.
+DECLARE @watermark DATETIME2(0) =
+    (SELECT WatermarkValue FROM dbo.DrWatermarks
+     WHERE WatermarkName = 'LastGoodEmbedding');
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
-# Re-embedding pipeline with checkpointing and rate-limit handling
-# Designed for recovery scenarios where you must regenerate all vectors from source text
-
-import asyncio
-import psycopg2
-import psycopg2.extras
-import openai
-import json
-import time
-import logging
-from datetime import datetime
-from dataclasses import dataclass
-from typing import Optional
-
-log = logging.getLogger("reembedding_pipeline")
-
-@dataclass
-class ReembeddingCheckpoint:
-    """Persisted state for resuming a failed re-embedding job."""
-    job_id: str
-    started_at: str
-    last_processed_id: int
-    total_processed: int
-    total_errors: int
-    model: str
-    status: str  # "running", "completed", "failed"
-
-
-def load_or_create_checkpoint(
-    conn,
-    job_id: str,
-    model: str
-) -&gt; ReembeddingCheckpoint:
-    """Load existing checkpoint or create a new one."""
-    cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-
-    # Create checkpoint table if not exists
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS reembedding_jobs (
-            job_id              TEXT PRIMARY KEY,
-            started_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            last_processed_id   BIGINT NOT NULL DEFAULT 0,
-            total_processed     BIGINT NOT NULL DEFAULT 0,
-            total_errors        BIGINT NOT NULL DEFAULT 0,
-            model               TEXT NOT NULL,
-            status              TEXT NOT NULL DEFAULT 'running',
-            updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )
-    """)
-
-    cur.execute(
-        "SELECT * FROM reembedding_jobs WHERE job_id = %s",
-        (job_id,)
-    )
-    row = cur.fetchone()
-
-    if row:
-        log.info(
-            f"Resuming job {job_id} from ID {row['last_processed_id']} "
-            f"({row['total_processed']} already processed)"
-        )
-        return ReembeddingCheckpoint(
-            job_id=row["job_id"],
-            started_at=str(row["started_at"]),
-            last_processed_id=row["last_processed_id"],
-            total_processed=row["total_processed"],
-            total_errors=row["total_errors"],
-            model=row["model"],
-            status=row["status"]
-        )
-    else:
-        cur.execute("""
-            INSERT INTO reembedding_jobs (job_id, model, status)
-            VALUES (%s, %s, 'running')
-        """, (job_id, model))
-        conn.commit()
-        log.info(f"Created new re-embedding job: {job_id}")
-        return ReembeddingCheckpoint(
-            job_id=job_id,
-            started_at=datetime.utcnow().isoformat(),
-            last_processed_id=0,
-            total_processed=0,
-            total_errors=0,
-            model=model,
-            status="running"
-        )
-
-
-def save_checkpoint(conn, checkpoint: ReembeddingCheckpoint) -&gt; None:
-    cur = conn.cursor()
-    cur.execute("""
-        UPDATE reembedding_jobs SET
-            last_processed_id = %s,
-            total_processed   = %s,
-            total_errors      = %s,
-            status            = %s,
-            updated_at        = NOW()
-        WHERE job_id = %s
-    """, (
-        checkpoint.last_processed_id,
-        checkpoint.total_processed,
-        checkpoint.total_errors,
-        checkpoint.status,
-        checkpoint.job_id
-    ))
-    conn.commit()
-
-
-def run_reembedding_pipeline(
-    source_dsn: str,
-    target_dsn: str,
-    job_id: str,
-    model: str = "text-embedding-3-large",
-    batch_size: int = 100,
-    checkpoint_interval: int = 1000,
-    max_retries: int = 3
-) -&gt; ReembeddingCheckpoint:
-    """
-    Re-embed all documents from source table into target embeddings table.
-    
-    source_dsn: Connection to database with 'documents' table (source text)
-    target_dsn: Connection to database with 'document_embeddings' table (destination)
-    
-    The pipeline:
-    1. Loads documents in batches ordered by ID
-    2. Generates embeddings via OpenAI API (with retry logic)
-    3. Upserts into the embeddings table
-    4. Checkpoints progress every checkpoint_interval records
-    5. On resume, skips all records with ID &lt;= last_processed_id
-    """
-    oai = openai.OpenAI()
-
-    source_conn = psycopg2.connect(source_dsn)
-    target_conn = psycopg2.connect(target_dsn)
-    target_conn.autocommit = False
-
-    checkpoint = load_or_create_checkpoint(target_conn, job_id, model)
-
-    if checkpoint.status == "completed":
-        log.info(f"Job {job_id} is already complete. Exiting.")
-        return checkpoint
-
-    log.info(f"Starting re-embedding from document ID &gt; {checkpoint.last_processed_id}")
-
-    source_cur = source_conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-    target_cur = target_conn.cursor()
-
-    # Fetch total count for progress reporting
-    source_cur.execute(
-        "SELECT COUNT(*) FROM documents WHERE id &gt; %s",
-        (checkpoint.last_processed_id,)
-    )
-    remaining = source_cur.fetchone()[0]
-    log.info(f"Documents remaining to embed: {remaining:,}")
-
-    # Stream documents in ordered batches
-    source_cur.execute("""
-        SELECT id, content_text, metadata
-        FROM documents
-        WHERE id &gt; %s
-        ORDER BY id ASC
-    """, (checkpoint.last_processed_id,))
-
-    batch = []
-    processed_this_run = 0
-
-    while True:
-        rows = source_cur.fetchmany(batch_size)
-        if not rows:
-            break
-
-        # Build embedding request
-        texts = [row["content_text"] for row in rows]
-        doc_ids = [row["id"] for row in rows]
-        metadatas = [row["metadata"] for row in rows]
-
-        # Call embedding API with retry
-        embeddings = None
-        for attempt in range(max_retries):
-            try:
-                response = oai.embeddings.create(
-                    model=model,
-                    input=texts
-                )
-                embeddings = [item.embedding for item in response.data]
-                break
-            except openai.RateLimitError:
-                wait = 2 ** attempt * 5  # exponential backoff
-                log.warning(f"Rate limited. Waiting {wait}s before retry {attempt+1}")
-                time.sleep(wait)
-            except openai.APIError as e:
-                log.error(f"API error on attempt {attempt+1}: {e}")
-                if attempt == max_retries - 1:
-                    checkpoint.total_errors += len(rows)
-                    log.error(f"Skipping batch after {max_retries} failures")
-
-        if embeddings is None:
-            continue
-
-        # Upsert embeddings into target table
-        records = [
-            (
-                doc_ids[i],
-                0,  # chunk_index — 0 for whole-document embeddings
-                texts[i],
-                embeddings[i],
-                json.dumps(metadatas[i]) if metadatas[i] else "{}",
-                model
-            )
-            for i in range(len(rows))
-        ]
-
-        psycopg2.extras.execute_values(
-            target_cur,
-            """
-            INSERT INTO document_embeddings
-                (document_id, chunk_index, content_text, embedding, metadata, embedding_model)
-            VALUES %s
-            ON CONFLICT (document_id, chunk_index)
-            DO UPDATE SET
-                embedding       = EXCLUDED.embedding,
-                content_text    = EXCLUDED.content_text,
-                metadata        = EXCLUDED.metadata,
-                embedding_model = EXCLUDED.embedding_model,
-                updated_at      = NOW()
-            """,
-            records,
-            template="(%s, %s, %s, %s::vector, %s::jsonb, %s)"
-        )
-        target_conn.commit()
-
-        checkpoint.last_processed_id = doc_ids[-1]
-        checkpoint.total_processed += len(rows)
-        processed_this_run += len(rows)
-
-        # Periodic checkpoint save and progress log
-        if processed_this_run % checkpoint_interval == 0:
-            save_checkpoint(target_conn, checkpoint)
-            pct = 100 * checkpoint.total_processed / max(remaining, 1)
-            log.info(
-                f"Progress: {checkpoint.total_processed:,} processed "
-                f"({pct:.1f}%) | last_id={checkpoint.last_processed_id} "
-                f"| errors={checkpoint.total_errors}"
-            )
-
-    # Mark complete
-    checkpoint.status = "completed"
-    save_checkpoint(target_conn, checkpoint)
-
-    log.info(
-        f"Re-embedding complete. "
-        f"Total processed: {checkpoint.total_processed:,} | "
-        f"Errors: {checkpoint.total_errors}"
-    )
-
-    source_cur.close()
-    target_cur.close()
-    source_conn.close()
-    target_conn.close()
-
-    return checkpoint</code></pre>
-
-<p class="text-gray-300 leading-relaxed">The checkpointing pattern here is the most important operational detail: every failure in a multi-hour re-embedding job that lacks checkpointing costs you the full restart. With <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">last_processed_id</code> persisted,a failure mid-run resumes from the last committed batch. At a batch size of 100 documents with checkpointing every 1,000 records, the maximum repeated work on resume is 1,000 documents — a few seconds of API calls, not hours.</p>
+SELECT DocId
+FROM dbo.SourceDocuments
+WHERE LastModified &gt; @watermark
+ORDER BY LastModified;
+-- Feed these DocIds to the embedding pipeline (Chapter 28),
+-- then update the watermark. The retrieval path serves restored
+-- vectors for old docs and fresh vectors for new docs throughout.
+</code></pre>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Testing Your DR Plan</h3>
 
-<p class="text-gray-300 leading-relaxed">A DR plan that has never been tested is a hypothesis, not a safety net. Vector store DR introduces validation challenges that relational DR does not: after a successful restore, how do you know the similarity results are *correct*, not merely *present*?</p>
+<p class="text-gray-300 leading-relaxed">An untested DR plan is a hope, not a plan. Test quarterly at minimum, and test the vector-specific parts — not just "did the database come back":</p>
 
-<p class="text-gray-300 leading-relaxed">#### Defining Validation Test Cases</p>
-
-<p class="text-gray-300 leading-relaxed">Before any disaster occurs, record a set of known-good query pairs: a query vector and the expected top-k document IDs it should return. These become your DR validation corpus.</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
--- Create a table of DR validation test cases
--- Populate this during normal operation, not during an incident
-
-CREATE TABLE IF NOT EXISTS dr_validation_queries (
-    test_id         SERIAL PRIMARY KEY,
-    label           TEXT NOT NULL,
-    description     TEXT,
-    query_vector    VECTOR(1536) NOT NULL,
-    expected_top_5  BIGINT[] NOT NULL,   -- document_ids in expected order
-    expected_max_distance FLOAT NOT NULL, -- cosine distance to top result under normal conditions
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    last_verified   TIMESTAMPTZ,
-    model_version   TEXT NOT NULL DEFAULT 'text-embedding-3-large'
-);
-
--- Insert a validation case by capturing the current top result for a known query
-INSERT INTO dr_validation_queries
-    (label, description, query_vector, expected_top_5, expected_max_distance, model_version)
-SELECT
-    'python_tutorial_query',
-    'Search for Python programming tutorials — should always return the Python docs chunks',
-    query_emb.embedding,
-    ARRAY(
-        SELECT document_id FROM document_embeddings
-        ORDER BY embedding &lt;=&gt; query_emb.embedding
-        LIMIT 5
-    ),
-    (
-        SELECT MIN(embedding &lt;=&gt; query_emb.embedding)
-        FROM document_embeddings
-        ORDER BY embedding &lt;=&gt; query_emb.embedding
-        LIMIT 1
-    ),
-    'text-embedding-3-large'
-FROM (
-    -- In practice, this would be a pre-computed embedding for your test phrase
-    SELECT embedding FROM document_embeddings
-    WHERE content_text ILIKE '%introduction to python%'
-    LIMIT 1
-) AS query_emb;
-
--- Run the full validation suite and return pass/fail per test
-WITH validation_results AS (
-    SELECT
-        dq.test_id,
-        dq.label,
-        dq.expected_top_5,
-        dq.expected_max_distance,
-        ARRAY(
-            SELECT document_id FROM document_embeddings
-            ORDER BY embedding &lt;=&gt; dq.query_vector
-            LIMIT 5
-        ) AS actual_top_5,
-        (
-            SELECT MIN(embedding &lt;=&gt; dq.query_vector)
-            FROM document_embeddings
-            ORDER BY embedding &lt;=&gt; dq.query_vector
-            LIMIT 1
-        ) AS actual_top_distance
-    FROM dr_validation_queries dq
-)
-SELECT
-    test_id,
-    label,
-    expected_top_5[1]              AS expected_top_id,
-    actual_top_5[1]                AS actual_top_id,
-    expected_top_5[1] = actual_top_5[1] AS top_id_matches,
-    ROUND(expected_max_distance::numeric, 4) AS expected_dist,
-    ROUND(actual_top_distance::numeric, 4)   AS actual_dist,
-    ABS(expected_max_distance - actual_top_distance) &lt; 0.01 AS distance_within_tolerance,
-    CASE
-        WHEN expected_top_5[1] = actual_top_5[1]
-         AND ABS(expected_max_distance - actual_top_distance) &lt; 0.01
-        THEN 'PASS'
-        ELSE 'FAIL'
-    END AS result
-FROM validation_results
-ORDER BY test_id;</code></pre>
-
-<p class="text-gray-300 leading-relaxed">The distance tolerance check (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">< 0.01</code>) is important: a restored index may produce slightly different distance values due to HNSW's approximate nature and how graph construction is seeded. An exact distance match is neither expected nor required. What matters is that the top result is the correct document and the distance is in the same range — not shifted by a magnitude that indicates a corrupt or mismatched index.</p>
-
-<p class="text-gray-300 leading-relaxed">#### Running Scheduled DR Tests</p>
-
-<p class="text-gray-300 leading-relaxed">The most effective DR test schedule for vector stores is:</p>
-
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Weekly**: Restore a single collection or schema to an isolated test environment. Run validation queries. Tear down. This tests the restore path without touching production.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Monthly**: Full failover simulation — promote the replica, redirect a canary traffic percentage, run validation, failback. This tests the entire runbook including DNS switching.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Quarterly**: Re-embedding drill — take a random sample of 10,000 documents, re-generate embeddings, compare to production embeddings using cosine similarity to verify model consistency.</li>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
-# Scheduled DR test: restore validation environment and run test suite
-
-import subprocess
-import psycopg2
-import logging
-import json
-from datetime import datetime
-
-log = logging.getLogger("dr_test")
-
-
-def restore_test_environment(
-    backup_path: str,
-    test_db_name: str = "vector_dr_test",
-    pg_host: str = "localhost"
-) -&gt; bool:
-    """
-    Create an isolated test database from the latest backup.
-    Uses pg_restore for a custom-format dump, or psql for SQL dumps.
-    """
-    log.info(f"Restoring {backup_path} to {test_db_name}")
-
-    # Drop and recreate the test database
-    subprocess.run(
-        ["psql", "-h", pg_host, "-U", "postgres",
-         "-c", f"DROP DATABASE IF EXISTS {test_db_name}"],
-        check=True
-    )
-    subprocess.run(
-        ["psql", "-h", pg_host, "-U", "postgres",
-         "-c", f"CREATE DATABASE {test_db_name}"],
-        check=True
-    )
-
-    # Restore from backup file
-    result = subprocess.run(
-        ["pg_restore",
-         "-h", pg_host,
-         "-U", "postgres",
-         "-d", test_db_name,
-         "--no-owner",
-         "--no-acl",
-         "-j", "4",       # 4 parallel restore workers
-         backup_path],
-        capture_output=True,
-        text=True
-    )
-
-    if result.returncode != 0:
-        log.error(f"pg_restore stderr: {result.stderr}")
-        return False
-
-    log.info(f"Restore to {test_db_name} complete")
-    return True
-
-
-def run_dr_validation_suite(
-    test_dsn: str,
-    validation_queries_path: str
-) -&gt; dict:
-    """
-    Load pre-recorded validation cases and run them against the test environment.
-    validation_queries_path: JSON file with list of {label, vector, expected_top_id}
-    """
-    with open(validation_queries_path) as f:
-        test_cases = json.load(f)
-
-    conn = psycopg2.connect(test_dsn)
-    conn.autocommit = True
-    cur = conn.cursor()
-
-    results = {
-        "run_at": datetime.utcnow().isoformat(),
-        "total": len(test_cases),
-        "passed": 0,
-        "failed": 0,
-        "details": []
-    }
-
-    for tc in test_cases:
-        label = tc["label"]
-        vector = tc["query_vector"]
-        expected_id = tc["expected_top_document_id"]
-
-        cur.execute("""
-            SELECT document_id, 1 - (embedding &lt;=&gt; %s::vector) AS similarity
-            FROM document_embeddings
-            ORDER BY embedding &lt;=&gt; %s::vector
-            LIMIT 1
-        """, (vector, vector))
-
-        row = cur.fetchone()
-        if row is None:
-            passed = False
-            detail = {"label": label, "pass": False, "reason": "no results returned"}
-        else:
-            actual_id, similarity = row
-            passed = str(actual_id) == str(expected_id)
-            detail = {
-                "label": label,
-                "pass": passed,
-                "expected_id": expected_id,
-                "actual_id": actual_id,
-                "similarity": round(float(similarity), 4)
-            }
-
-        results["details"].append(detail)
-        if passed:
-            results["passed"] += 1
-        else:
-            results["failed"] += 1
-            log.warning(f"FAIL: {label} — {detail}")
-
-    cur.close()
-    conn.close()
-
-    results["pass_rate"] = round(results["passed"] / max(results["total"], 1) * 100, 1)
-    log.info(
-        f"DR validation: {results['passed']}/{results['total']} passed "
-        f"({results['pass_rate']}%)"
-    )
-    return results
-
-
-def teardown_test_environment(
-    test_db_name: str = "vector_dr_test",
-    pg_host: str = "localhost"
-) -&gt; None:
-    """Remove the test database after validation."""
-    subprocess.run(
-        ["psql", "-h", pg_host, "-U", "postgres",
-         "-c", f"DROP DATABASE IF EXISTS {test_db_name}"],
-        check=True
-    )
-    log.info(f"Test environment {test_db_name} removed")
-
-
-def weekly_dr_test(config: dict) -&gt; dict:
-    """
-    Full DR test pipeline: restore, validate, teardown, report.
-    Designed to run from a scheduled job (cron, Airflow, etc.).
-    """
-    report = {
-        "test_date": datetime.utcnow().isoformat(),
-        "restore_ok": False,
-        "validation": None,
-        "overall_pass": False
-    }
-
-    try:
-        restored = restore_test_environment(
-            backup_path=config["latest_backup_path"],
-            test_db_name=config.get("test_db_name", "vector_dr_test"),
-            pg_host=config.get("pg_host", "localhost")
-        )
-        report["restore_ok"] = restored
-
-        if restored:
-            validation = run_dr_validation_suite(
-                test_dsn=config["test_dsn"],
-                validation_queries_path=config["validation_queries_path"]
-            )
-            report["validation"] = validation
-            report["overall_pass"] = (
-                restored and validation["pass_rate"] &gt;= config.get("min_pass_rate", 95.0)
-            )
-
-    finally:
-        teardown_test_environment(
-            test_db_name=config.get("test_db_name", "vector_dr_test"),
-            pg_host=config.get("pg_host", "localhost")
-        )
-
-    # Write report to file for audit trail
-    report_path = (
-        f"/var/log/dr_tests/vector_dr_{datetime.utcnow().strftime('%Y%m%d')}.json"
-    )
-    with open(report_path, "w") as f:
-        json.dump(report, f, indent=2, default=str)
-
-    log.info(f"DR test report written to {report_path}")
-    return report</code></pre>
-
-<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">min_pass_rate</code> threshold of 95% acknowledges that HNSW is an approximate index: a small percentage of queries may return a slightly different result set after restore due to non-deterministic graph construction during index rebuild. A 100% pass rate requirement would produce false failures. Define your acceptable approximate search tolerance in advance and encode it here.</p>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Restore to an isolated instance</strong> and time the full sequence: restore, DiskANN rebuild, watermark catch-up, recall canary. Record every duration — these are your RTO budget inputs.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Fail over the AG</strong> in a maintenance window and run the recall canary against the new primary before failing back.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Test the re-embedding path</strong> end-to-end on a subset: pick a watermark, re-embed 10K documents, verify recall matches the restored baseline.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Verify the pipeline quiesce.</strong> The most common real-failover bug is writers still running — rehearse the pause/drain/resume sequence, not just the database steps.</li>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Synchronizing Vector Stores with Source Systems After Recovery</h3>
 
-<p class="text-gray-300 leading-relaxed">One scenario that is easy to overlook in DR planning is the case where the vector store recovers successfully but the source system recovers to a different point in time — or vice versa. This creates semantic drift: the vector index contains embeddings for documents that no longer exist in the source, or the source has documents that have never been embedded.</p>
+<p class="text-gray-300 leading-relaxed">After any recovery, the vector store and the source system disagree about "now." Close the gap systematically: compare the source watermark (max document modification time) with the vector watermark (max embedded time), re-embed the delta, and delete vectors for source documents that were hard-deleted during the outage window.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL
--- Post-recovery drift detection: find documents in source that lack embeddings
--- Run this after any recovery event to identify re-embedding backlog
-
-WITH source_docs AS (
-    SELECT id, updated_at
-    FROM documents
-    WHERE deleted_at IS NULL
-),
-embedded_docs AS (
-    SELECT DISTINCT document_id, MAX(updated_at) AS last_embedded_at
-    FROM document_embeddings
-    GROUP BY document_id
-)
-SELECT
-    sd.id AS document_id,
-    sd.updated_at AS source_updated_at,
-    ed.last_embedded_at,
-    CASE
-        WHEN ed.document_id IS NULL THEN 'MISSING_EMBEDDING'
-        WHEN sd.updated_at &gt; ed.last_embedded_at + INTERVAL '5 minutes'
-             THEN 'STALE_EMBEDDING'
-        ELSE 'OK'
-    END AS drift_status
-FROM source_docs sd
-LEFT JOIN embedded_docs ed ON sd.id = ed.document_id
-WHERE
-    ed.document_id IS NULL
-    OR sd.updated_at &gt; ed.last_embedded_at + INTERVAL '5 minutes'
-ORDER BY sd.updated_at DESC;
-
--- Count by drift category for an at-a-glance recovery health check
-WITH source_docs AS (
-    SELECT id, updated_at FROM documents WHERE deleted_at IS NULL
-),
-embedded_docs AS (
-    SELECT DISTINCT document_id, MAX(updated_at) AS last_embedded_at
-    FROM document_embeddings GROUP BY document_id
-)
-SELECT
-    CASE
-        WHEN ed.document_id IS NULL THEN 'MISSING_EMBEDDING'
-        WHEN sd.updated_at &gt; ed.last_embedded_at + INTERVAL '5 minutes'
-             THEN 'STALE_EMBEDDING'
-        ELSE 'OK'
-    END AS drift_status,
-    COUNT(*) AS document_count
-FROM source_docs sd
-LEFT JOIN embedded_docs ed ON sd.id = ed.document_id
-GROUP BY 1
-ORDER BY 2 DESC;</code></pre>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server equivalent (using SQL Server with a vector extension or hybrid architecture
--- where SQL Server is the source system and pgvector/external store holds embeddings)
-
--- Post-recovery drift detection: documents in SQL Server source without embeddings
-WITH SourceDocs AS (
-    SELECT id, updated_at
-    FROM dbo.documents
-    WHERE deleted_at IS NULL
-),
-EmbeddedDocs AS (
-    SELECT document_id, MAX(updated_at) AS last_embedded_at
-    FROM dbo.embedding_sync_log          -- sync log maintained by embedding pipeline
-    GROUP BY document_id
-)
-SELECT
-    sd.id AS document_id,
-    sd.updated_at AS source_updated_at,
-    ed.last_embedded_at,
-    CASE
-        WHEN ed.document_id IS NULL THEN 'MISSING_EMBEDDING'
-        WHEN sd.updated_at &gt; DATEADD(MINUTE, 5, ed.last_embedded_at)
-             THEN 'STALE_EMBEDDING'
-        ELSE 'OK'
-    END AS drift_status
-FROM SourceDocs sd
-LEFT JOIN EmbeddedDocs ed ON sd.id = ed.document_id
-WHERE
-    ed.document_id IS NULL
-    OR sd.updated_at &gt; DATEADD(MINUTE, 5, ed.last_embedded_at)
-ORDER BY sd.updated_at DESC;
-
--- Summary count
-WITH SourceDocs AS (
-    SELECT id, updated_at FROM dbo.documents WHERE deleted_at IS NULL
-),
-EmbeddedDocs AS (
-    SELECT document_id, MAX(updated_at) AS last_embedded_at
-    FROM dbo.embedding_sync_log
-    GROUP BY document_id
-)
-SELECT
-    CASE
-        WHEN ed.document_id IS NULL THEN 'MISSING_EMBEDDING'
-        WHEN sd.updated_at &gt; DATEADD(MINUTE, 5, ed.last_embedded_at)
-             THEN 'STALE_EMBEDDING'
-        ELSE 'OK'
-    END AS drift_status,
-    COUNT(*) AS document_count
-FROM SourceDocs sd
-LEFT JOIN EmbeddedDocs ed ON sd.id = ed.document_id
-GROUP BY
-    CASE
-        WHEN ed.document_id IS NULL THEN 'MISSING_EMBEDDING'
-        WHEN sd.updated_at &gt; DATEADD(MINUTE, 5, ed.last_embedded_at)
-             THEN 'STALE_EMBEDDING'
-        ELSE 'OK'
-    END
-ORDER BY document_count DESC;</code></pre>
-
-<p class="text-gray-300 leading-relaxed">After drift detection, feed the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">MISSING_EMBEDDING</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">STALE_EMBEDDING</code> document IDs back into the re-embedding pipeline shown in the previous section. The pipeline's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ON CONFLICT DO UPDATE</code> upsert logic handles both new insertions and updates without special-casing.</p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: post-recovery reconciliation
+-- 1. Find vectors whose source documents changed or vanished
+SELECT c.ChunkId, c.DocId
+INTO #StaleCandidates
+FROM dbo.DocumentChunks AS c
+LEFT JOIN dbo.SourceDocuments AS s
+  ON s.DocId = c.DocId AND s.LastModified &lt;= c.EmbeddedAt
+WHERE s.DocId IS NULL              -- source deleted during outage
+   OR s.LastModified &gt; c.EmbeddedAt; -- source changed after embedding
+-- 2. Re-embed the changed docs via the pipeline (Chapter 28),
+--    then delete vectors for docs gone from the source:
+-- DELETE c FROM dbo.DocumentChunks AS c
+-- WHERE NOT EXISTS (SELECT 1 FROM dbo.SourceDocuments AS s
+--                   WHERE s.DocId = c.DocId);
+-- 3. Re-run the recall canary; only then return traffic.
+</code></pre>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">DR Runbook Checklist</h3>
 
-<p class="text-gray-300 leading-relaxed">Operational runbooks should be concise enough to use under pressure. This is the condensed checklist version of everything in this chapter:</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Before any failure (preparation):</strong></p>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> [ ] Backup schedule established with RPO clearly documented</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> [ ] Backup restore tested within the last 30 days</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> [ ] DR validation query corpus populated and stored</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> [ ] Replication lag monitoring alerts configured (alert at > 60s, page at > 300s)</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> [ ] DNS TTL for vector store endpoint set to ≤ 60 seconds</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> [ ] Index rebuild time estimated and incorporated into RTO SLA</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> [ ] Re-embedding pipeline tested with checkpointing verified</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> [ ] Source-to-vector-store sync watermark table in place</li>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">During failover:</strong></p>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> [ ] Confirm primary region is unreachable (do not fail over on transient issues)</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> [ ] Check DR replica replication lag — do not promote if lag exceeds RTO tolerance</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> [ ] Promote replica / restore from backup</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> [ ] Update DNS / load balancer target</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> [ ] Run validation query suite — do not open traffic until pass rate ≥ threshold</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> [ ] Run drift detection query — quantify the re-embedding backlog</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> [ ] Start re-embedding pipeline for drifted documents (background job)</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> [ ] Notify downstream teams of RPO impact (data as-of timestamp)</li>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">After failover:</strong></p>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> [ ] Establish new replication from DR primary to a new standby</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> [ ] Schedule new backup immediately (failover cluster has no recent backup)</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> [ ] Document the incident timeline and actual RPO/RTO achieved</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> [ ] Update RTO estimates in Table 35.2 based on observed rebuild times</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Quiesce embedding pipeline writers; verify the queue is drained.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Check secondary redo/send queues are at zero before failover.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Fail over the availability group (or geo-failover group); record the watermark.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Flip application connection strings; rolling restart.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Resume the pipeline from the recorded watermark.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Run the recall canary — within 2 points of baseline before declaring done.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Reconcile source vs vector watermarks; re-embed the delta.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Update the DR log with actual durations; feed them back into the RTO budget.</li>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Embeddings are primary data, not cache.** The cost and time to regenerate a large vector corpus from source text makes vectors as recovery-critical as the transactional data they were derived from. Treat backup frequency and retention accordingly.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">DiskANN rebuild is a hidden RTO multiplier.</strong> The index rebuilds from vector data after a restore — hours at tens of millions of rows. Measure it in DR tests; budget it explicitly.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Index rebuild is a hidden RTO multiplier for pgvector.** Unlike managed vector databases that persist HNSW indexes through restore, pgvector rebuilds indexes from heap data after restore. For datasets in the tens of millions of rows, this can extend RTO by 8–16 hours beyond infrastructure recovery time, making hot standby replication the preferred HA strategy at scale.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Prefer a warm secondary over backup-and-restore.</strong> Always On AG secondaries keep the DiskANN index in sync through redo — failover is minutes, not hours.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Synchronization with source systems is a first-class DR concern.** Because vector stores are derived from upstream content, a recovery plan that restores the vector index to a different point in time than the source database creates semantic drift — documents that exist in search results but not in the source, or source documents whose embeddings reflect outdated content. Post-recovery drift detection and targeted re-embedding are mandatory steps in any complete runbook.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Quiesce writers before failover.</strong> In-flight embedding batches landing on the old primary are silently lost — pause, drain, then flip.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Validation after restore must test similarity correctness, not just availability.** A restored vector index can return HTTP 200 and still produce incorrect results due to corrupt graph state, model mismatch, or partial restore. Pre-recording known-good query/result pairs and verifying them post-restore — with tolerance for HNSW's approximate nature — is the only reliable way to confirm a restore was successful.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Align three clocks:</strong> source RPO, vector RPO, and pipeline lag — then reconcile with watermarks after recovery.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Checkpointed re-embedding pipelines eliminate the catastrophic restart problem.** Multi-hour embedding regeneration jobs without checkpointing mean any failure requires starting from zero. Persisting a `last_processed_id` watermark after each committed batch caps the repeated work on resume to at most one checkpoint interval, turning a potentially day-long re-run into a recovery measured in minutes.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Keep the re-embedding path warm:</strong> pinned model version, measured throughput, independent source restore — it's sometimes faster than restoring vectors.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Test quarterly, time everything.</strong> Restore, rebuild, catch-up, canary — recorded durations are your RTO budget, not estimates.</li>
     </div>
     <div class="mt-14 bg-cyan-950/40 border border-cyan-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
-        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · SQL Server</p>
       </div>
       <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
          class="shrink-0 px-6 py-3 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold rounded-xl text-sm transition">
         Download Free
       </a>
     </div>
-    <div class="mt-8 text-xs">
-      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a>
+    <div class="mt-10 flex items-center justify-between text-xs">
+      <a href="b4-ch34-access-control-vectors.html" class="text-gray-500 hover:text-gray-300 transition">← Previous Chapter</a>
+      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">All Chapters</a>
+      <a href="b4-ch36-backup-embeddings.html" class="text-cyan-400 hover:text-cyan-300 transition">Next Chapter →</a>
     </div>
   </article>
   <footer class="border-t border-gray-800/50 px-6 py-8">

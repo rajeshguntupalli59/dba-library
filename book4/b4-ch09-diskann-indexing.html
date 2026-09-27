@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 9: DiskANN Indexing in SQL Server 2025: Performance Tradeoffs — Vector Databases & AI</title>
+  <meta name="description" content="Vector Databases & AI Chapter 9: DiskANN Indexing in SQL Server 2025 — how the DiskANN graph index works, exact vs approximate search, build costs, and tuning tradeoffs. By Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-cyan-500 to-cyan-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-cyan-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 4 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6">
+      <a href="index.html" class="text-xs text-cyan-400 hover:text-cyan-300 transition">← All Chapters</a>
+    </div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-cyan-900/40 border border-cyan-800/40 text-cyan-300 text-xs rounded-full font-medium">Chapter 9 of 40</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">Vector Databases & AI</span>
+    </div>
+    <div class="space-y-4 text-sm">
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 9: DiskANN Indexing in SQL Server 2025: Performance Tradeoffs</h2>
+
+<p class="text-gray-300 leading-relaxed">Vector search at scale lives or dies by its index structure. When you move beyond brute-force exact search — the vector equivalent of a full table scan — you enter the world of Approximate Nearest Neighbor (ANN) algorithms. SQL Server 2025 made its choice for you: the native vector index is built on <strong class="text-white">DiskANN</strong>, a graph-based ANN algorithm designed at Microsoft Research for billion-scale search on SSD-backed storage. This chapter unpacks how DiskANN works, where it sits relative to the exact search you already know, what the index costs to build and maintain, and how to reason about the recall-versus-latency tradeoff that defines every ANN system. If B-tree fill-factor and fragmentation tradeoffs feel natural to you, this chapter will feel like home.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">The ANN Problem: Why Exact Search Stops Scaling</h3>
+
+<p class="text-gray-300 leading-relaxed">Exact nearest-neighbor search with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_DISTANCE</code> computes the distance from the query vector to every stored vector. At 1 million vectors of 1536 dimensions, that is roughly 1.5 billion floating-point operations per query — hundreds of milliseconds even with SIMD acceleration, before any I/O. It is perfectly accurate (100% recall by definition) and perfectly acceptable up to about 50,000 vectors. Past that, latency grows linearly with table size, and no amount of hardware generosity changes the math.</p>
+
+<p class="text-gray-300 leading-relaxed">ANN algorithms trade a small, measurable amount of recall for dramatic speed improvements. <strong class="text-white">Recall</strong> is the fraction of the true top-k nearest neighbors that the approximate search actually returns: 0.97 recall means 97 of the 100 true nearest neighbors were found. The core insight is identical to why you do not read every page of a book to find a topic — you use an index that organizes content so you can skip most of it. For most production AI workloads, 97% recall at 10 milliseconds is far more valuable than 100% recall at 1,500 milliseconds — and embeddings are already approximate representations of meaning, so the last few percent of geometric precision rarely changes what the user experiences.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">How DiskANN Works: Graphs Instead of Trees</h3>
+
+<p class="text-gray-300 leading-relaxed">DiskANN builds a navigable graph over the vector collection: each vector becomes a node connected to a bounded set of its nearest neighbors. A query starts at a fixed entry point and greedily walks the graph — at each step moving to the neighbor closest to the query vector — until no unvisited neighbor is closer than the current best candidates. Because the graph is constructed so that greedy routing converges quickly, search touches only a tiny fraction of the collection: query time grows logarithmically with data size rather than linearly.</p>
+
+<p class="text-gray-300 leading-relaxed">What distinguishes DiskANN from earlier graph indexes (notably HNSW, which powers several dedicated vector databases covered in Chapters 15–19) is its storage design. HNSW keeps the entire graph in RAM, which makes it fast but memory-hungry at billion-vector scale. DiskANN was designed for SSDs: it stores the full-precision vectors and most of the graph on disk, keeps only a compressed or sampled representation in memory, and issues a small, bounded number of random SSD reads per query. The result is an index that serves billion-scale collections from a single machine without requiring terabytes of RAM — a design that maps naturally onto SQL Server's buffer-pool-and-storage architecture.</p>
+
+<p class="text-gray-300 leading-relaxed">For the DBA, the useful mental model is: <strong class="text-white">a DiskANN vector index is a specialized access path for ORDER BY VECTOR_DISTANCE queries, analogous to how a B-tree is a specialized access path for range predicates.</strong> The query optimizer chooses between the exact scan path and the approximate index path the same way it chooses between a table scan and an index seek — based on cost, with the added dimension that the approximate path deliberately sacrifices a few percent of recall for orders of magnitude less work.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
+    A[Query vector] --> B[Entry point node]
+    B --> C{Greedy walk:<br/>move to closest<br/>unvisited neighbor}
+    C -->|Closer neighbor exists| C
+    C -->|No closer neighbor| D[Return top-k<br/>candidates]
+    D --> E[Rerank exact distances<br/>optional]</pre></div>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Creating and Querying the Vector Index</h3>
+
+<p class="text-gray-300 leading-relaxed">The DDL is deliberately minimal — one statement, with the distance metric as the key decision:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- DiskANN approximate vector index (preview in SQL Server 2025)
+CREATE VECTOR INDEX IX_RagChunks_Embedding
+ON dbo.RagChunks (Embedding)
+WITH (
+    METRIC = 'cosine',     -- must match the metric your queries use
+    TYPE   = 'DiskANN',
+    MAXDOP = 4             -- parallelism for the index build
+);
+
+-- Approximate k-NN through the index
+DECLARE @q VECTOR(1536) = '[0.012, -0.043, 0.071, ...]';
+
+SELECT t.ChunkId, t.ChunkText, s.distance
+FROM VECTOR_SEARCH(
+    TABLE      = dbo.RagChunks AS t,
+    COLUMN     = Embedding,
+    SIMILAR_TO = @q,
+    METRIC     = 'cosine',
+    TOP_N      = 10
+) AS s
+ORDER BY s.distance;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">METRIC</code> choice is the single most consequential parameter: it must match both your embedding model's normalization characteristics and the metric your queries specify. Cosine is the right default for normalized text embeddings (OpenAI, most sentence-transformer models). Euclidean suits unnormalized embeddings where magnitude carries meaning. Dot product matches models trained with inner-product objectives. An index built with the wrong metric does not error — it silently returns poorly ranked results, which is worse.</p>
+
+<p class="text-gray-300 leading-relaxed">Note the current preview constraints, because they shape real designs: the table must have a single-column integer clustered primary key; the table becomes read-only while the vector index exists in SQL Server 2025; incorporating new data means dropping and recreating the index; and partitioned tables, views, and temporary tables are not supported. These constraints are why Chapter 8's schema patterns keep embeddings in ordinary tables with ordinary keys — the vector index stays a droppable performance layer, never a structural dependency.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">The Tradeoff Table: Exact vs. DiskANN</h3>
+
+<p class="text-gray-300 leading-relaxed">Every ANN decision is a position on three axes — recall, latency, and build/maintenance cost. Here is where the two SQL Server search paths land:</p>
+
+<p class="text-gray-300 leading-relaxed">| | Exact (VECTOR_DISTANCE) | Approximate (DiskANN) |</p>
+<p class="text-gray-300 leading-relaxed">|---|---|---|</p>
+<p class="text-gray-300 leading-relaxed">| Recall | 100% by definition | Typically 95–99%, tunable |</p>
+<p class="text-gray-300 leading-relaxed">| Query cost | O(n): full scan per query | O(log n): graph walk |</p>
+<p class="text-gray-300 leading-relaxed">| Latency at 1M vectors | Hundreds of ms | Single-digit to tens of ms |</p>
+<p class="text-gray-300 leading-relaxed">| Build cost | None | Minutes to hours for large collections |</p>
+<p class="text-gray-300 leading-relaxed">| Write path | Normal DML | Drop index → load → rebuild (preview) |</p>
+<p class="text-gray-300 leading-relaxed">| Memory pressure | Buffer pool for scanned pages | Graph + vectors compete for buffer pool |</p>
+<p class="text-gray-300 leading-relaxed">| Suitable for | Under ~50K vectors; 100% recall required | 50K+ vectors; interactive latency SLAs |</p>
+
+<p class="text-gray-300 leading-relaxed">The crossover point deserves emphasis because teams routinely misjudge it in both directions. Below roughly 50,000 vectors, exact search is so fast that the DiskANN index buys you almost nothing while adding build time and write-path friction — skip it. Above that, latency divergence becomes impossible to ignore, and the index pays for itself immediately. Between 50K and a few hundred thousand vectors, either path works; choose based on whether your latency SLA has headroom.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Tuning Recall: What to Measure</h3>
+
+<p class="text-gray-300 leading-relaxed">"Approximate" is only acceptable when you can measure how approximate. The standard methodology: sample a few hundred representative query vectors, run each through both the exact path (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_DISTANCE</code> with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ORDER BY</code>) and the approximate path (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_SEARCH</code>), and compute recall@k — the fraction of the exact top-k present in the approximate top-k. Automate this as a scheduled job; recall is the canary for index health, degrading when the data distribution drifts away from what the index was built on.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Recall spot-check pattern: compare exact vs approximate top-10
+-- Run for a sample of query vectors; recall@10 = |intersection| / 10
+DECLARE @q VECTOR(1536) = '[0.012, -0.043, 0.071, ...]';
+
+-- Exact ground truth
+SELECT TOP (10) ChunkId
+INTO #exact
+FROM dbo.RagChunks
+WHERE Embedding IS NOT NULL
+ORDER BY VECTOR_DISTANCE('cosine', Embedding, @q);
+
+-- Approximate candidates
+SELECT TOP (10) ChunkId
+INTO #approx
+FROM VECTOR_SEARCH(
+    TABLE = dbo.RagChunks AS t, COLUMN = Embedding,
+    SIMILAR_TO = @q, METRIC = 'cosine', TOP_N = 10
+) AS s;
+
+-- Overlap = recall@10 for this query
+SELECT COUNT(*) * 1.0 / 10 AS recall_at_10
+FROM #exact AS e JOIN #approx AS a ON a.ChunkId = e.ChunkId;
+
+DROP TABLE #exact, #approx;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">If recall slips below your target (0.95 is a common floor for RAG retrieval), the remedies in order of cost: increase <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">TOP_N</code> and rerank the surplus with exact <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_DISTANCE</code> (cheap, often sufficient); rebuild the index after significant data churn (moderate); reconsider chunking or the embedding model (expensive, but sometimes the real problem is upstream of the index).</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> SQL Server 2025's native vector index uses DiskANN — a graph-based ANN algorithm designed for SSD-backed, billion-scale search — created with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE VECTOR INDEX ... WITH (TYPE = 'DiskANN')</code> and queried via the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_SEARCH</code> table-valued function.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Exact search (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_DISTANCE</code>) gives 100% recall with O(n) cost per query and needs no index — it is the right choice under roughly 50,000 vectors. DiskANN gives 95–99% recall with O(log n) cost and is the right choice above that.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">METRIC</code> parameter must match your embedding model and your queries; a mismatched metric silently degrades ranking quality instead of erroring.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Preview constraints shape the design: single-column integer clustered key required, table read-only while the index exists, drop-and-recreate to ingest new data — keep the vector index a droppable performance layer, not a structural dependency.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Measure recall@k by comparing <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_SEARCH</code> against exact <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_DISTANCE</code> on a query sample, on a schedule. When recall slips, over-fetch with larger <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">TOP_N</code> and rerank exactly before rebuilding anything.</li>
+    </div>
+    <div class="mt-14 bg-cyan-950/40 border border-cyan-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · SQL Server</p>
+      </div>
+      <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
+         class="shrink-0 px-6 py-3 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold rounded-xl text-sm transition">
+        Download Free
+      </a>
+    </div>
+    <div class="mt-10 flex items-center justify-between text-xs">
+      <a href="b4-ch08-storing-embeddings-sql-server.html" class="text-gray-500 hover:text-gray-300 transition">← Previous Chapter</a>
+      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">All Chapters</a>
+      <a href="b4-ch10-tuning-vector-workloads-sql-server.html" class="text-cyan-400 hover:text-cyan-300 transition">Next Chapter →</a>
+    </div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · Vector Databases & AI</div>
+  </footer>
+</body>
+</html>

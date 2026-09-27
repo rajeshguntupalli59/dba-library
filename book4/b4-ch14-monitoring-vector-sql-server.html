@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 14: Monitoring Vector Query Performance in SQL Server — Vector Databases & AI</title>
+  <meta name="description" content="Vector Databases & AI Chapter 14: Monitoring Vector Query Performance in SQL Server — DMVs, Query Store, execution plans, recall tracking, and Extended Events. By Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-cyan-500 to-cyan-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-cyan-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 4 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6">
+      <a href="index.html" class="text-xs text-cyan-400 hover:text-cyan-300 transition">← All Chapters</a>
+    </div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-cyan-900/40 border border-cyan-800/40 text-cyan-300 text-xs rounded-full font-medium">Chapter 14 of 40</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">Vector Databases & AI</span>
+    </div>
+    <div class="space-y-4 text-sm">
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 14: Monitoring Vector Query Performance in SQL Server</h2>
+
+<p class="text-gray-300 leading-relaxed">Vector queries fail differently from ordinary queries. An OLTP query that slows down usually shows it in duration and logical reads; a vector query can return in the same 40 milliseconds while silently dropping from 98% recall to 70% because the data distribution drifted under a stale DiskANN index. Monitoring vector performance therefore means tracking two things traditional monitoring ignores: <strong class="text-white">result quality</strong> (recall) alongside <strong class="text-white">execution cost</strong> (CPU, I/O, latency). This chapter builds the monitoring stack for both, using the tools SQL Server DBAs already own — DMVs, Query Store, execution plans, and Extended Events — applied to vector-specific questions.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Finding Vector Queries in the Wild: DMVs</h3>
+
+<p class="text-gray-300 leading-relaxed">The first monitoring task is inventory: which queries on the instance are vector queries, and what do they cost? Because retrieval procedures are parameterized and repetitive, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_query_stats</code> gives you the aggregate picture immediately. Filter the cached plans by the telltale function names:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Inventory: top vector queries by total CPU across the instance
+SELECT TOP (20)
+    qs.execution_count,
+    qs.total_worker_time / 1000.0 / qs.execution_count AS avg_cpu_ms,
+    qs.total_elapsed_time / 1000.0 / qs.execution_count AS avg_duration_ms,
+    qs.total_logical_reads / qs.execution_count AS avg_logical_reads,
+    SUBSTRING(st.text, 1, 120) AS query_snippet
+FROM sys.dm_exec_query_stats AS qs
+CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) AS st
+WHERE st.text LIKE '%VECTOR_DISTANCE%'
+   OR st.text LIKE '%VECTOR_SEARCH%'
+ORDER BY qs.total_worker_time DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Read this output with vector-specific eyes. High <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">avg_cpu_ms</code> with low logical reads on a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_DISTANCE</code> query means compute-bound exact search — the signature of a corpus that has outgrown the exact path and needs the DiskANN index. High logical reads on a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_SEARCH</code> query means the graph walk is missing the buffer pool — a memory-sizing problem, not an index problem. And a sudden change in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">execution_count</code> patterns usually traces to an application deployment changing retrieval behavior, which is worth correlating with release logs before tuning anything.</p>
+
+<p class="text-gray-300 leading-relaxed">For the queries behind a stored procedure, join to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_procedure_stats</code> instead — retrieval almost always goes through procedures (Chapter 10's parameterization guidance), and procedure-level aggregates are cleaner than statement-level ones when one procedure issues both the ANN lookup and the relational enrichment joins.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Reading Vector Execution Plans</h3>
+
+<p class="text-gray-300 leading-relaxed">Pull the actual execution plan for your retrieval procedure and look for three things. First, <strong class="text-white">which access path the optimizer chose</strong> — the vector index seek (approximate path) or a scan with a sort on the computed distance (exact path). After statistics updates on a fast-growing chunk table, the optimizer can flip between these paths; the flip is the most common cause of sudden vector latency changes, and Query Store's plan-forcing (or Automatic Tuning's plan correction from Chapter 10) is the safety net.</p>
+
+<p class="text-gray-300 leading-relaxed">Second, <strong class="text-white">where the relational filters sit relative to the vector operation.</strong> In a healthy plan, selective relational predicates (tenant, published flag, category) reduce the row set before or alongside the vector ranking. If you see the vector operation running over the full table with filters applied afterward on millions of rows, the query shape needs restructuring — pre-filter in a CTE or derived table so the optimizer can push the predicate down.</p>
+
+<p class="text-gray-300 leading-relaxed">Third, <strong class="text-white">the sort.</strong> Exact search plans show a Top-N Sort over the computed <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_DISTANCE</code> expression; its memory grant scales with the rows sorted. If the grant spills to tempdb (look for sort warnings), the query is sorting more rows than it should — usually because a pre-filter is missing or because the corpus has grown past the point where exact search is viable.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Which plan is the retrieval procedure actually using right now?
+SELECT qs.plan_handle, qs.execution_count,
+       qs.last_elapsed_time / 1000.0 AS last_duration_ms
+FROM sys.dm_exec_procedure_stats AS qs
+WHERE OBJECT_NAME(qs.object_id, qs.database_id) = 'usp_RetrieveChunks';
+-- Then: SELECT * FROM sys.dm_exec_query_plan(plan_handle) for the actual plan</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Query Store: The Vector Performance Record</h3>
+
+<p class="text-gray-300 leading-relaxed">Enable Query Store on every database holding vectors — it is the durable record that DMVs cannot be, since DMV counters reset on service restart and plan cache eviction. For vector workloads, Query Store earns its keep in two specific ways.</p>
+
+<p class="text-gray-300 leading-relaxed">First, <strong class="text-white">regression detection on repetitive shapes.</strong> Retrieval queries execute the same parameterized shape thousands of times a day, which makes regressions statistically obvious: a step change in average duration for <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">usp_RetrieveChunks</code> with no application change points at a plan flip or a data-distribution change. Query Store's "Top Resource Consuming Queries" and plan comparison views turn that investigation from archaeology into a five-minute exercise.</p>
+
+<p class="text-gray-300 leading-relaxed">Second, <strong class="text-white">wait statistics per query.</strong> Query Store's wait stats break down where vector query time goes: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SOS_SCHEDULER_YIELD</code> dominating means CPU-bound distance computation (exact search under load); <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">PAGEIOLATCH_SH</code> dominating means the vector data is not resident (memory sizing); <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">LCK_M_S</code> appearing on a retrieval query means your read-committed-snapshot setting from Chapter 10 is not actually enabled. Each wait type maps to a specific remediation — that is the whole point of collecting them.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Query Store: wait profile for the retrieval workload
+SELECT qsq.query_id,
+       ws.wait_category_desc,
+       SUM(wrs.avg_query_wait_time_ms * wrs.count_executions) AS total_wait_ms
+FROM sys.query_store_query AS qsq
+JOIN sys.query_store_plan AS qsp ON qsp.query_id = qsq.query_id
+JOIN sys.query_store_runtime_stats AS wrs ON wrs.plan_id = qsp.plan_id
+JOIN sys.query_store_wait_stats AS ws ON ws.runtime_stats_id = wrs.runtime_stats_id
+WHERE qsq.object_id = OBJECT_ID('dbo.usp_RetrieveChunks')
+GROUP BY qsq.query_id, ws.wait_category_desc
+ORDER BY total_wait_ms DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Monitoring Recall: The Metric Other Databases Don't Have</h3>
+
+<p class="text-gray-300 leading-relaxed">Latency and CPU tell you the query ran well; recall tells you it ran <em>correctly</em>. No DMV measures recall — you have to instrument it. The Chapter 9 spot-check pattern (comparing <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_SEARCH</code> results against exact <code class="bg-gray-800 px-1.5 rounded text-blue-300 text-xs">VECTOR_DISTANCE</code> ground truth on a sample of queries) becomes a scheduled job that writes to a history table:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Recall history table: trend this like any other SLI
+CREATE TABLE dbo.VectorRecallHistory (
+    MeasuredAt  DATETIME2(0) NOT NULL CONSTRAINT DF_Recall_MeasuredAt DEFAULT SYSUTCDATETIME(),
+    SampleSize  INT NOT NULL,
+    AvgRecallAt10 DECIMAL(5,4) NOT NULL,
+    MinRecallAt10 DECIMAL(5,4) NOT NULL,
+    CONSTRAINT PK_VectorRecallHistory PRIMARY KEY (MeasuredAt)
+);
+
+-- Alert rule of thumb: page when avg recall@10 < 0.95,
+-- investigate when it trends down three consecutive runs.
+-- A falling recall with flat latency = stale index or drifted data distribution.
+-- A falling recall with rising latency = resource pressure (memory/CPU).</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The diagnostic split in that comment is worth memorizing because it determines the response. Recall falling while latency stays flat means the index no longer represents the data — rebuild it (or check whether a recent bulk load bypassed the refresh cycle). Recall and latency degrading together means resource pressure — the instance needs memory, CPU, or the noisy-neighbor governance from Chapter 12. One is an index maintenance problem; the other is a capacity problem; treating one as the other wastes a weekend.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Extended Events: Capturing the Slow Ones</h3>
+
+<p class="text-gray-300 leading-relaxed">For the queries that escape aggregate monitoring — the occasional 5-second retrieval in a sea of 40-millisecond ones — an Extended Events session capturing slow vector queries with their plans gives you the forensic record:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Capture vector queries running longer than 2 seconds, with plans
+CREATE EVENT SESSION [SlowVectorQueries] ON SERVER
+ADD EVENT sqlserver.rpc_completed(
+    ACTION(sqlserver.sql_text, sqlserver.query_hash, sqlserver.client_app_name)
+    WHERE ([duration] > 2000000
+       AND ([sqlserver].[like_i_sql_unicode_string]([sqlserver].[sql_text], N'%VECTOR%')))),
+ADD EVENT sqlserver.sql_batch_completed(
+    ACTION(sqlserver.sql_text, sqlserver.query_hash, sqlserver.client_app_name)
+    WHERE ([duration] > 2000000
+       AND ([sqlserver].[like_i_sql_unicode_string]([sqlserver].[sql_text], N'%VECTOR%'))))
+ADD TARGET package0.event_file(
+    SET filename = N'C:\XEvents\SlowVectorQueries.xel',
+    max_file_size = 100, max_rollover_files = 5);
+GO
+ALTER EVENT SESSION [SlowVectorQueries] ON SERVER STATE = START;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Correlate slow-query events with the recall history timestamps. A slow query at the same time recall dips tells a different story from a slow query with recall intact — the first is data/index health, the second is resource contention. Keep the session's threshold aligned with your retrieval SLA (the 2-second threshold above is illustrative; set it just above your p99 target so the session captures true outliers, not normal traffic).</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
+    A[Vector monitoring] --> B[Cost: DMVs + Query Store<br/>CPU, reads, waits, plans]
+    A --> C[Quality: recall history<br/>scheduled spot-checks]
+    A --> D[Forensics: Extended Events<br/>slow query capture]
+    B --> E{Regression?}
+    C --> F{Recall &lt; 0.95?}
+    E -->|Yes| G[Plan flip or<br/>resource pressure]
+    F -->|Yes, latency flat| H[Stale index:<br/>rebuild]
+    F -->|Yes, latency up| I[Capacity:<br/>memory/CPU]</pre></div>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Inventory vector queries with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_query_stats</code> filtered on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_DISTANCE</code>/<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_SEARCH</code>: CPU-bound exact search signals a corpus ready for the DiskANN index; I/O-bound approximate search signals a memory-sizing problem.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Read vector execution plans for three things: which access path the optimizer chose (index seek vs. scan-plus-sort), where relational filters sit relative to the vector operation, and whether the Top-N sort is spilling to tempdb.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Enable Query Store on every vector database: its regression detection catches plan flips on the highly repetitive retrieval shapes, and per-query wait stats (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SOS_SCHEDULER_YIELD</code> vs <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">PAGEIOLATCH_SH</code> vs <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">LCK_M_S</code>) map directly to remediations.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Instrument recall as a scheduled SLI: compare <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_SEARCH</code> against exact ground truth, trend recall@10, and alert below 0.95. Falling recall with flat latency means rebuild the index; falling recall with rising latency means add capacity.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Capture slow vector queries with Extended Events (threshold just above your p99 SLA) and correlate the timestamps with recall history — the combination distinguishes data/index health problems from resource contention.</li>
+    </div>
+    <div class="mt-14 bg-cyan-950/40 border border-cyan-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · SQL Server</p>
+      </div>
+      <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
+         class="shrink-0 px-6 py-3 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold rounded-xl text-sm transition">
+        Download Free
+      </a>
+    </div>
+    <div class="mt-10 flex items-center justify-between text-xs">
+      <a href="b4-ch13-vector-support-azure-sql-rds.html" class="text-gray-500 hover:text-gray-300 transition">← Previous Chapter</a>
+      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">All Chapters</a>
+      <a href="b4-ch15-pinecone.html" class="text-cyan-400 hover:text-cyan-300 transition">Next Chapter →</a>
+    </div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · Vector Databases & AI</div>
+  </footer>
+</body>
+</html>

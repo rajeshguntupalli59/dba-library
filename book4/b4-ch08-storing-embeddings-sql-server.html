@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 8: Creating and Storing Embeddings in SQL Server — Vector Databases & AI</title>
+  <meta name="description" content="Vector Databases & AI Chapter 8: Creating and Storing Embeddings in SQL Server — schema patterns, sp_invoke_external_rest_endpoint, batch loading, and backfill. By Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-cyan-500 to-cyan-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-cyan-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 4 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6">
+      <a href="index.html" class="text-xs text-cyan-400 hover:text-cyan-300 transition">← All Chapters</a>
+    </div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-cyan-900/40 border border-cyan-800/40 text-cyan-300 text-xs rounded-full font-medium">Chapter 8 of 40</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">Vector Databases & AI</span>
+    </div>
+    <div class="space-y-4 text-sm">
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 8: Creating and Storing Embeddings in SQL Server</h2>
+
+<p class="text-gray-300 leading-relaxed">An embedding pipeline has two halves: generating vectors from content, and storing them where queries can reach them. Most teams overthink the first half and underthink the second. Generating an embedding is an API call; storing it well is a schema design, bulk-load, backfill, and lifecycle discipline that determines whether your vector search stays fast and correct for years. This chapter covers the full write path in SQL Server 2025: table patterns for documents and chunks, inserting vectors with proper type conversions, generating embeddings from inside the database with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sp_invoke_external_rest_endpoint</code>, bulk-loading millions of vectors efficiently, and backfilling the inevitable gaps.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Schema Patterns: Documents, Chunks, and Embeddings</h3>
+
+<p class="text-gray-300 leading-relaxed">Two schema shapes cover nearly every vector workload. The simple shape — one row per document with a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR</code> column — works when each document is embedded whole. The chunked shape — a parent document table plus a child chunk table carrying the embeddings — is what production RAG systems actually use, because retrieval quality depends on chunking (Chapter 22) and chunks are the unit of both embedding and ranking.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Production RAG schema: documents + chunks, embeddings on the chunks
+CREATE TABLE dbo.RagDocuments (
+    DocumentId  INT IDENTITY(1,1) NOT NULL CONSTRAINT PK_RagDocuments PRIMARY KEY,
+    Title       NVARCHAR(300) NOT NULL,
+    SourceUri   NVARCHAR(1000) NULL,
+    DocHash     BINARY(32) NOT NULL,          -- SHA-256 of source: detects changes
+    CreatedAt   DATETIME2(0) NOT NULL CONSTRAINT DF_RagDocuments_CreatedAt DEFAULT SYSUTCDATETIME()
+);
+
+CREATE TABLE dbo.RagChunks (
+    ChunkId     INT IDENTITY(1,1) NOT NULL CONSTRAINT PK_RagChunks PRIMARY KEY,
+    DocumentId  INT NOT NULL CONSTRAINT FK_RagChunks_Documents
+                    REFERENCES dbo.RagDocuments (DocumentId) ON DELETE CASCADE,
+    ChunkSeq    INT NOT NULL,                 -- order within the document
+    ChunkText   NVARCHAR(MAX) NOT NULL,
+    TokenCount  INT NOT NULL,
+    Embedding   VECTOR(1536) NULL,            -- NULL until embedded
+    ModelName   NVARCHAR(100) NULL,
+    EmbeddedAt  DATETIME2(0) NULL,
+    CONSTRAINT UQ_RagChunks_DocSeq UNIQUE (DocumentId, ChunkSeq)
+);
+CREATE INDEX IX_RagChunks_DocumentId ON dbo.RagChunks (DocumentId);
+CREATE INDEX IX_RagChunks_NeedsEmbedding ON dbo.RagChunks (DocumentId)
+    WHERE Embedding IS NULL;                 -- filtered index drives backfill</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Several deliberate choices here. <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DocHash</code> lets the indexing pipeline detect when source content changed and re-chunk only what moved (Chapter 28). The filtered index on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Embedding IS NULL</code> makes "find everything still needing embeddings" a trivial seek — the backfill query you will run most often. The single-column integer primary key on the chunk table keeps the door open for a DiskANN vector index later. And <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ModelName</code> per chunk means a model migration never silently mixes coordinate spaces.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Inserting Vectors: Conversions That Keep You Honest</h3>
+
+<p class="text-gray-300 leading-relaxed">Application code almost always produces embeddings as JSON arrays of floats. SQL Server converts those strings to the native type with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CAST</code> — and the conversion is strict about dimensions, which is a guardrail worth keeping:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Strict conversion: wrong dimension count fails loudly (good)
+UPDATE dbo.RagChunks
+SET Embedding  = CAST('[0.012, -0.043, 0.071, ...]' AS VECTOR(1536)),
+    ModelName  = 'text-embedding-3-small',
+    EmbeddedAt = SYSUTCDATETIME()
+WHERE ChunkId = 42;
+
+-- Defensive pattern for pipeline code: TRY_CAST + explicit check
+UPDATE dbo.RagChunks
+SET Embedding  = TRY_CAST(@embeddingJson AS VECTOR(1536)),
+    ModelName  = @modelName,
+    EmbeddedAt = SYSUTCDATETIME()
+WHERE ChunkId = @chunkId;
+
+-- Catch rows where conversion failed instead of silently storing NULL
+SELECT ChunkId, DocumentId
+FROM dbo.RagChunks
+WHERE EmbeddedAt IS NULL AND ChunkId IN (...);  -- investigate these</code></pre>
+
+<p class="text-gray-300 leading-relaxed">From .NET, the cleanest path is SqlClient with the vector passed as a string parameter converted in T-SQL, or EF Core 10+, whose SQL Server provider maps <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">float[]</code> properties to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR(n)</code> columns with LINQ support for <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_DISTANCE</code>. Python pipelines typically use pyodbc with the JSON-string-plus-CAST pattern. Whichever client you use, parameterize — never concatenate embedding JSON into dynamic SQL.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Generating Embeddings Inside the Database</h3>
+
+<p class="text-gray-300 leading-relaxed">SQL Server can call out to embedding APIs directly through <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sp_invoke_external_rest_endpoint</code>, which invokes an HTTPS endpoint — such as Azure OpenAI's embeddings API — and returns the response as JSON. This is genuinely useful for backfills, prototypes, and low-volume workloads: the database that stores the vectors also orchestrates their creation, with no middle-tier service to build.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Generate an embedding via Azure OpenAI without leaving T-SQL
+-- (Requires a database-scoped credential for the endpoint; see docs)
+DECLARE @payload NVARCHAR(MAX) = JSON_OBJECT(
+    'input': (SELECT ChunkText FROM dbo.RagChunks WHERE ChunkId = 42),
+    'model': 'text-embedding-3-small'
+);
+DECLARE @response NVARCHAR(MAX);
+
+EXEC sp_invoke_external_rest_endpoint
+    @url     = 'https://YOUR-RESOURCE.openai.azure.com/openai/deployments/YOUR-DEPLOYMENT/embeddings?api-version=2024-10-21',
+    @method  = 'POST',
+    @payload = @payload,
+    @response = @response OUTPUT;
+
+-- Extract the embedding array and store it as a native VECTOR
+UPDATE dbo.RagChunks
+SET Embedding  = CAST(JSON_QUERY(@response, '$.data[0].embedding') AS VECTOR(1536)),
+    ModelName  = 'text-embedding-3-small',
+    EmbeddedAt = SYSUTCDATETIME()
+WHERE ChunkId = 42;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Be clear-eyed about the limits of this pattern. It issues one HTTPS call per invocation, so embedding a million chunks row-by-row through the stored procedure is slow and expensive — and it couples your database to the latency and rate limits of an external API. The right mental model: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sp_invoke_external_rest_endpoint</code> is for backfills of modest size, administrative re-embedding, and prototypes. Production ingestion at scale belongs in an application pipeline (Azure Functions, a container job, ADF) that batches requests, honors rate limits, and writes vectors with bulk load — which is the next section.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Bulk Loading: Millions of Vectors Without the Pain</h3>
+
+<p class="text-gray-300 leading-relaxed">The initial load — and every model migration — is a bulk operation, and it should be treated like one. Row-by-row inserts of million-row embedding sets will take hours and generate transaction log pressure that affects the whole instance. The DBA playbook applies directly:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Stage first, then merge.</strong> Bulk-load raw embedding JSON into a staging table (heap, no indexes), then <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">INSERT ... SELECT</code> with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CAST(... AS VECTOR(n))</code> into the production table. Validation failures land in staging where they are cheap to inspect, not in production where they roll back a giant transaction.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Batch the transaction.</strong> Commit every 5,000–10,000 rows. This bounds transaction log growth, keeps lock escalation from surprising you, and gives restartable checkpoints if the load fails halfway.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Drop the vector index first.</strong> If a DiskANN vector index exists on the target table, drop it before the bulk load and rebuild after. Index maintenance during bulk insert is pure overhead, and the preview vector index requires drop-and-recreate to incorporate new data anyway.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Use the fastest path available.</strong> <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">bcp</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">BULK INSERT</code>, or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SqlBulkCopy</code> into staging; set-based <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">INSERT...SELECT</code> for the typed load. <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">TABLOCK</code> on the staging insert enables minimal logging where the recovery model allows it.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Validate dimensions in staging.</strong> A single malformed vector — wrong dimension count, NaN values, non-numeric tokens — aborts a batch. Check <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">TRY_CAST</code> results in staging and quarantine failures before they touch production.</li>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Bulk pattern: stage raw JSON, validate, then typed insert in batches
+CREATE TABLE dbo.StageEmbeddings (
+    ChunkId       INT NOT NULL,
+    EmbeddingJson NVARCHAR(MAX) NOT NULL,
+    ModelName     NVARCHAR(100) NOT NULL
+);  -- heap, no indexes: fastest possible load target
+
+-- ... bcp / BULK INSERT the raw JSON here ...
+
+-- Quarantine malformed rows before they poison the batch
+SELECT ChunkId, LEFT(EmbeddingJson, 80) AS Sample
+INTO dbo.QuarantineEmbeddings
+FROM dbo.StageEmbeddings
+WHERE TRY_CAST(EmbeddingJson AS VECTOR(1536)) IS NULL;
+
+DELETE s FROM dbo.StageEmbeddings AS s
+JOIN dbo.QuarantineEmbeddings AS q ON q.ChunkId = s.ChunkId;
+
+-- Typed, batched insert into production
+DECLARE @batch INT = 10000, @done INT = 0;
+WHILE 1 = 1
+BEGIN
+    UPDATE TOP (@batch) c
+    SET c.Embedding  = CAST(s.EmbeddingJson AS VECTOR(1536)),
+        c.ModelName  = s.ModelName,
+        c.EmbeddedAt = SYSUTCDATETIME()
+    FROM dbo.RagChunks AS c
+    JOIN dbo.StageEmbeddings AS s ON s.ChunkId = c.ChunkId
+    WHERE c.Embedding IS NULL;
+
+    IF @@ROWCOUNT = 0 BREAK;
+    SET @done += @@ROWCOUNT;
+    RAISERROR('Embedded %d chunks so far', 0, 1, @done) WITH NOWAIT;
+END</code></pre>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph LR
+    A[Source documents] --> B[Chunking<br/>Chapter 22]
+    B --> C[Embedding API<br/>batched]
+    C --> D[Staging table<br/>raw JSON heap]
+    D --> E[Validate<br/>TRY_CAST quarantine]
+    E --> F[Typed batch insert<br/>VECTOR column]
+    F --> G[Vector index<br/>rebuild]</pre></div>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Backfill and Lifecycle: Vectors Are Never "Done"</h3>
+
+<p class="text-gray-300 leading-relaxed">Embedding storage is a lifecycle, not a one-time load. Documents get added, edited, and deleted; models get upgraded; chunks get re-split. Design the write path for the steady state:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">New documents</strong> arrive with NULL embeddings; a scheduled job (SQL Agent or an external scheduler) picks them up via the filtered index and embeds them in batches. The application never blocks on embedding latency.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Edited documents</strong> are detected by comparing <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DocHash</code>; only changed documents are re-chunked and re-embedded. Deleting the old chunks first (or versioning them) prevents stale vectors from outranking fresh ones.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Deleted documents</strong> cascade to chunks through the foreign key — no orphan vectors. If you soft-delete instead, add the delete flag to every retrieval query's filter.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Model changes</strong> mean re-embedding everything into a new column (or table) and cutting over atomically — never mixing coordinate spaces in one column. Chapter 30 covers the migration playbook.</li>
+
+<p class="text-gray-300 leading-relaxed">A simple monitoring query keeps the lifecycle honest — run it on a schedule and alert when the un-embedded backlog grows:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Backlog health: how much content is waiting for embeddings?
+SELECT
+    COUNT(*) AS TotalChunks,
+    SUM(CASE WHEN Embedding IS NULL THEN 1 ELSE 0 END) AS AwaitingEmbedding,
+    MIN(CreatedAt) AS OldestUnembedded
+FROM dbo.RagChunks AS c
+JOIN dbo.RagDocuments AS d ON d.DocumentId = c.DocumentId;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Use the chunked schema — documents plus a child chunk table carrying the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR(n)</code> column — with a content hash for change detection, a filtered index on un-embedded rows, and the embedding model recorded per row.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Convert embedding JSON with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CAST(... AS VECTOR(n))</code> and let dimension mismatches fail loudly; use <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">TRY_CAST</code> plus quarantine tables in pipeline code so one malformed vector never aborts a batch.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sp_invoke_external_rest_endpoint</code> lets T-SQL call embedding APIs directly — ideal for backfills and prototypes, but production ingestion at scale belongs in a batched application pipeline.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Bulk-load in three stages: raw JSON into an unindexed staging heap, validation with quarantine, then batched typed inserts — dropping any DiskANN vector index before the load and rebuilding after.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Treat embeddings as a lifecycle: NULL-then-backfill for new documents, hash-based change detection for edits, cascade deletes for removals, and a monitored backlog query so the pipeline never silently stalls.</li>
+    </div>
+    <div class="mt-14 bg-cyan-950/40 border border-cyan-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · SQL Server</p>
+      </div>
+      <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
+         class="shrink-0 px-6 py-3 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold rounded-xl text-sm transition">
+        Download Free
+      </a>
+    </div>
+    <div class="mt-10 flex items-center justify-between text-xs">
+      <a href="b4-ch07-enabling-native-vector-sql-server.html" class="text-gray-500 hover:text-gray-300 transition">← Previous Chapter</a>
+      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">All Chapters</a>
+      <a href="b4-ch09-diskann-indexing.html" class="text-cyan-400 hover:text-cyan-300 transition">Next Chapter →</a>
+    </div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · Vector Databases & AI</div>
+  </footer>
+</body>
+</html>

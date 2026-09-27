@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Chapter 20: Benchmarking Vector Databases: Throughput, Latency, Recall — Vector Databases & AI</title>
-  <meta name="description" content="Vector Databases & AI Chapter 20: Benchmarking Vector Databases: Throughput, Latency, Recall. pgvector, Pinecone, Weaviate, RAG pipelines — by Rajesh Guntupalli." />
+  <meta name="description" content="Vector Databases & AI Chapter 20: Benchmarking Vector Databases: Throughput, Latency, Recall. SQL Server native vectors, Pinecone, Weaviate, RAG pipelines — by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
   <script type="module">
     import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
@@ -43,7 +43,7 @@
     <div class="space-y-4 text-sm">
 <h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 20: Benchmarking Vector Databases: Throughput, Latency, Recall</h2>
 
-<p class="text-gray-300 leading-relaxed">Choosing a vector database without benchmarking it is the equivalent of selecting a relational engine based on marketing collateral alone — you will eventually regret it. The vector database ecosystem is young, vendor claims are aggressive, and the gap between synthetic benchmark numbers and production behavior is wide enough to cause real incidents at scale. This chapter builds a rigorous framework for measuring what actually matters in vector search systems: query throughput, tail latency, and recall accuracy. You will learn how these three metrics interact (improving one often degrades another), how to construct benchmarks that reflect your actual workload rather than a vendor's best-case scenario, and how to interpret results from the most common tools in the ecosystem — pgvector, Pinecone, Weaviate, Qdrant, and Milvus. By the end, you will have runnable harnesses, concrete thresholds to target, and a vocabulary for communicating vector database performance the same way you already communicate IOPS, latency percentiles, and cache hit ratios.</p>
+<p class="text-gray-300 leading-relaxed">Choosing a vector database without benchmarking it is the equivalent of selecting a relational engine based on marketing collateral alone — you will eventually regret it. The vector database ecosystem is young, vendor claims are aggressive, and the gap between synthetic benchmark numbers and production behavior is wide enough to cause real incidents at scale. This chapter builds a rigorous framework for measuring what actually matters in vector search systems: query throughput, tail latency, and recall accuracy. You will learn how these three metrics interact (improving one often degrades another), how to construct benchmarks that reflect your actual workload rather than a vendor's best-case scenario, and how to interpret results from the most common tools in the ecosystem — SQL Server native vectors, Pinecone, Weaviate, Qdrant, and Milvus. By the end, you will have runnable harnesses, concrete thresholds to target, and a vocabulary for communicating vector database performance the same way you already communicate IOPS, latency percentiles, and cache hit ratios.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
@@ -216,8 +216,8 @@ if __name__ == "__main__":
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
 # vector_benchmark_harness.py
-# Multi-database benchmark harness for pgvector, Qdrant, and Pinecone
-# Requires: psycopg2, qdrant-client, pinecone-client, numpy, h5py, scipy
+# Multi-database benchmark harness for SQL Server, Qdrant, and Pinecone
+# Requires: pyodbc, qdrant-client, pinecone-client, numpy, h5py, scipy
 
 import time
 import numpy as np
@@ -228,7 +228,7 @@ from dataclasses import dataclass, field
 from typing import Callable, List, Optional
 from contextlib import contextmanager
 
-import psycopg2
+import pyodbc
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
     Distance, VectorParams, PointStruct,
@@ -288,111 +288,132 @@ def compute_recall(
 # Database adapters
 # ─────────────────────────────────────────────────────────────────────────────
 
-class PgvectorBenchmark:
+class SqlServerBenchmark:
     """
-    pgvector benchmark adapter.
-    Tests both ivfflat and hnsw index types.
+    SQL Server 2025 native vector benchmark adapter.
+    Compares exact VECTOR_DISTANCE search (ground truth, 100% recall)
+    against approximate VECTOR_SEARCH over a DiskANN index.
     """
-    
-    def __init__(self, dsn: str, table_name: str = "benchmark_vectors"):
-        self.dsn = dsn
+
+    def __init__(self, connection_string: str, table_name: str = "benchmark_vectors"):
+        self.connection_string = connection_string
         self.table = table_name
-    
+        self.dim = 0
+
     @contextmanager
     def _conn(self):
-        conn = psycopg2.connect(self.dsn)
-        conn.autocommit = True
+        conn = pyodbc.connect(self.connection_string)
         try:
             yield conn
         finally:
             conn.close()
-    
+
     def load_data(self, vectors: np.ndarray) -&gt; float:
         """Loads corpus vectors and returns seconds elapsed."""
         n, dim = vectors.shape
+        self.dim = dim
         t0 = time.time()
         with self._conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
-                cur.execute(f"DROP TABLE IF EXISTS {self.table}")
-                cur.execute(f"""
-                    CREATE TABLE {self.table} (
-                        id BIGINT PRIMARY KEY,
-                        embedding vector({dim})
-                    )
-                """)
-                # Bulk insert using COPY for performance
-                from io import StringIO
-                buf = StringIO()
-                for i, vec in enumerate(vectors):
-                    vec_str = "[" + ",".join(f"{v:.6f}" for v in vec) + "]"
-                    buf.write(f"{i}\t{vec_str}\n")
-                buf.seek(0)
-                cur.copy_from(buf, self.table, columns=("id", "embedding"))
+            cur = conn.cursor()
+            cur.execute(f"IF OBJECT_ID('{self.table}', 'U') IS NOT NULL DROP TABLE {self.table}")
+            cur.execute(f"""
+                CREATE TABLE {self.table} (
+                    id        INT NOT NULL CONSTRAINT PK_{self.table} PRIMARY KEY,
+                    embedding VECTOR({dim}) NOT NULL
+                )
+            """)
+            # Bulk insert: fast_executemany batches the parameter arrays
+            cur.fast_executemany = True
+            rows = [
+                (i, "[" + ",".join(f"{v:.6f}" for v in vec) + "]")
+                for i, vec in enumerate(vectors)
+            ]
+            cur.executemany(
+                f"INSERT INTO {self.table} (id, embedding) "
+                f"VALUES (?, CAST(? AS VECTOR({dim})))",
+                rows
+            )
+            conn.commit()
         return time.time() - t0
-    
-    def build_hnsw_index(self, m: int = 16, ef_construction: int = 64) -&gt; float:
-        """Builds HNSW index, returns build time in seconds."""
+
+    def build_diskann_index(self, maxdop: int = 4) -&gt; float:
+        """Builds the DiskANN vector index, returns build time in seconds."""
         t0 = time.time()
         with self._conn() as conn:
-            with conn.cursor() as cur:
-                # Drop existing index if present
-                cur.execute(f"DROP INDEX IF EXISTS {self.table}_hnsw_idx")
-                cur.execute(f"""
-                    CREATE INDEX {self.table}_hnsw_idx
-                    ON {self.table}
-                    USING hnsw (embedding vector_cosine_ops)
-                    WITH (m = {m}, ef_construction = {ef_construction})
-                """)
-                # Ensure index is fully built before timing stops
-                cur.execute(f"SELECT COUNT(*) FROM {self.table}")
+            cur = conn.cursor()
+            cur.execute(
+                f"IF EXISTS (SELECT 1 FROM sys.indexes "
+                f"WHERE name = '{self.table}_diskann_idx') "
+                f"DROP INDEX {self.table}_diskann_idx ON {self.table}"
+            )
+            cur.execute(f"""
+                CREATE VECTOR INDEX {self.table}_diskann_idx
+                ON {self.table} (embedding)
+                WITH (METRIC = 'cosine', TYPE = 'DiskANN', MAXDOP = {maxdop})
+            """)
+            conn.commit()
         return time.time() - t0
-    
-    def set_ef_search(self, conn, ef_search: int):
-        with conn.cursor() as cur:
-            cur.execute(f"SET hnsw.ef_search = {ef_search}")
-    
+
     def run_queries(
         self,
         query_vectors: np.ndarray,
         k: int = 10,
         concurrency: int = 1,
-        ef_search: int = 100
+        mode: str = "ann",
+        top_n: int = 50
     ) -&gt; tuple:
         """
         Returns (latencies_ms, all_returned_ids).
+        mode='exact': VECTOR_DISTANCE ORDER BY — ground truth, 100% recall.
+        mode='ann':   VECTOR_SEARCH over the DiskANN index with TOP_N over-fetch.
         """
         n_queries = len(query_vectors)
         latencies = []
         all_ids = []
-        
+
         def single_query(i: int):
             vec = query_vectors[i]
-            vec_str = "[" + ",".join(f"{v:.6f}" for v in vec) + "]"
-            conn = psycopg2.connect(self.dsn)
+            vec_lit = "[" + ",".join(f"{v:.6f}" for v in vec) + "]"
+            conn = pyodbc.connect(self.connection_string)
             try:
-                with conn.cursor() as cur:
-                    cur.execute(f"SET hnsw.ef_search = {ef_search}")
-                    t0 = time.perf_counter()
+                cur = conn.cursor()
+                t0 = time.perf_counter()
+                if mode == "exact":
                     cur.execute(f"""
-                        SELECT id
+                        SELECT TOP ({k}) id
                         FROM {self.table}
-                        ORDER BY embedding &lt;=&gt; %s::vector
-                        LIMIT {k}
-                    """, (vec_str,))
-                    ids = [row[0] for row in cur.fetchall()]
-                    elapsed = (time.perf_counter() - t0) * 1000
+                        WHERE embedding IS NOT NULL
+                        ORDER BY VECTOR_DISTANCE('cosine', embedding,
+                                                 CAST(? AS VECTOR({self.dim})))
+                    """, (vec_lit,))
+                else:
+                    # Join back to the table: VECTOR_SEARCH returns the key
+                    # columns plus s.distance (see Chapter 2)
+                    cur.execute(f"""
+                        SELECT TOP ({k}) t2.id
+                        FROM VECTOR_SEARCH(
+                                 TABLE = {self.table} AS t,
+                                 COLUMN = embedding,
+                                 SIMILAR_TO = CAST(? AS VECTOR({self.dim})),
+                                 METRIC = 'cosine',
+                                 TOP_N = ?
+                             ) AS s
+                        JOIN {self.table} AS t2 ON t2.id = s.id
+                        ORDER BY s.distance
+                    """, (vec_lit, top_n))
+                ids = [row[0] for row in cur.fetchall()]
+                elapsed = (time.perf_counter() - t0) * 1000
                 return elapsed, ids
             finally:
                 conn.close()
-        
+
         with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
             futures = [executor.submit(single_query, i) for i in range(n_queries)]
             for future in concurrent.futures.as_completed(futures):
                 lat, ids = future.result()
                 latencies.append(lat)
                 all_ids.append(ids)
-        
+
         return latencies, all_ids
 
 
@@ -499,15 +520,15 @@ class QdrantBenchmark:
 
 def run_benchmark(
     dataset_path: str,
-    pgvector_dsn: Optional[str] = None,
+    sqlserver_conn: Optional[str] = None,
     qdrant_url: Optional[str] = None,
     concurrencies: List[int] = [1, 4, 16, 32],
     k: int = 10,
-    ef_search_values: List[int] = [64, 128, 256]
+    top_n_values: List[int] = [10, 50, 100]
 ) -&gt; List[BenchmarkResult]:
     """
     Runs the full benchmark suite against all configured databases.
-    Returns a list of BenchmarkResult objects, one per (database, concurrency, ef_search) combination.
+    Returns a list of BenchmarkResult objects, one per (database, concurrency, TOP_N) combination.
     """
     # Load dataset
     print(f"Loading dataset from {dataset_path}...")
@@ -522,51 +543,57 @@ def run_benchmark(
     
     results = []
     
-    # ── pgvector ──────────────────────────────────────────────────────────────
-    if pgvector_dsn:
-        print("\n=== pgvector benchmark ===")
-        pg = PgvectorBenchmark(pgvector_dsn)
-        
+    # ── SQL Server native vectors ─────────────────────────────────────────
+    if sqlserver_conn:
+        print("\n=== SQL Server native vectors benchmark ===")
+        mssql = SqlServerBenchmark(sqlserver_conn)
+
         print("Loading data...")
-        load_time = pg.load_data(corpus)
+        load_time = mssql.load_data(corpus)
         print(f"  Data load: {load_time:.1f}s")
-        
-        for m, ef_c in [(16, 64), (16, 128), (32, 128)]:
-            print(f"  Building HNSW index (m={m}, ef_construction={ef_c})...")
-            build_time = pg.build_hnsw_index(m=m, ef_construction=ef_c)
-            print(f"  Index build: {build_time:.1f}s")
-            
-            for ef_s in ef_search_values:
-                for concurrency in concurrencies:
-                    print(f"  Querying: ef_search={ef_s}, concurrency={concurrency}")
-                    latencies, returned_ids = pg.run_queries(
-                        queries, k=k,
-                        concurrency=concurrency,
-                        ef_search=ef_s
-                    )
-                    recall = compute_recall(returned_ids, ground_truth, k)
-                    latencies_sorted = sorted(latencies)
-                    
-                    result = BenchmarkResult(
-                        database="pgvector",
-                        index_config={"m": m, "ef_construction": ef_c, "ef_search": ef_s},
-                        n_corpus=n_corpus,
-                        n_queries=n_queries,
-                        concurrency=concurrency,
-                        k=k,
-                        total_queries=n_queries,
-                        total_time_sec=sum(latencies) / 1000 / concurrency,
-                        qps=n_queries / (sum(latencies) / 1000 / concurrency),
-                        latencies_ms=latencies,
-                        p50_ms=latencies_sorted[int(0.50 * len(latencies_sorted))],
-                        p95_ms=latencies_sorted[int(0.95 * len(latencies_sorted))],
-                        p99_ms=latencies_sorted[int(0.99 * len(latencies_sorted))],
-                        recall_at_k=recall,
-                        index_build_sec=build_time
-                    )
-                    results.append(result)
-                    print(f"    QPS={result.qps:.0f}  p99={result.p99_ms:.1f}ms  recall={recall:.4f}")
-    
+
+        print("Building DiskANN index (MAXDOP=4)...")
+        build_time = mssql.build_diskann_index(maxdop=4)
+        print(f"  Index build: {build_time:.1f}s")
+
+        # Exact search gives the ground truth for recall measurement
+        print("Measuring exact-search baseline (ground truth)...")
+        _, exact_ids = mssql.run_queries(queries, k=k, concurrency=4, mode="exact")
+        exact_recall = compute_recall(exact_ids, ground_truth, k)
+        print(f"  Exact baseline recall: {exact_recall:.4f} (should be 1.0000)")
+
+        for top_n in top_n_values:
+            for concurrency in concurrencies:
+                print(f"  Querying: TOP_N={top_n}, concurrency={concurrency}")
+                latencies, returned_ids = mssql.run_queries(
+                    queries, k=k,
+                    concurrency=concurrency,
+                    mode="ann",
+                    top_n=top_n
+                )
+                recall = compute_recall(returned_ids, ground_truth, k)
+                latencies_sorted = sorted(latencies)
+
+                result = BenchmarkResult(
+                    database="sqlserver",
+                    index_config={"type": "DiskANN", "metric": "cosine", "top_n": top_n},
+                    n_corpus=n_corpus,
+                    n_queries=n_queries,
+                    concurrency=concurrency,
+                    k=k,
+                    total_queries=n_queries,
+                    total_time_sec=sum(latencies) / 1000 / concurrency,
+                    qps=n_queries / (sum(latencies) / 1000 / concurrency),
+                    latencies_ms=latencies,
+                    p50_ms=latencies_sorted[int(0.50 * len(latencies_sorted))],
+                    p95_ms=latencies_sorted[int(0.95 * len(latencies_sorted))],
+                    p99_ms=latencies_sorted[int(0.99 * len(latencies_sorted))],
+                    recall_at_k=recall,
+                    index_build_sec=build_time
+                )
+                results.append(result)
+                print(f"    QPS={result.qps:.0f}  p99={result.p99_ms:.1f}ms  recall={recall:.4f}")
+
     # ── Qdrant ────────────────────────────────────────────────────────────────
     if qdrant_url:
         print("\n=== Qdrant benchmark ===")
@@ -618,7 +645,7 @@ def print_summary_table(results: List[BenchmarkResult]):
           f"{'p99ms':&gt;7} {'Recall':&gt;8}")
     print("-" * 90)
     for r in sorted(results, key=lambda x: (-x.recall_at_k, x.p99_ms)):
-        cfg = f"m={r.index_config.get('m','-')} ef_s={r.index_config.get('ef_search','-')}"
+        cfg = f"top_n={r.index_config.get('top_n','-')}"
         print(f"{r.database:&lt;12} {cfg:&lt;30} {r.concurrency:&gt;5} {r.qps:&gt;8.0f} "
               f"{r.p50_ms:&gt;7.1f} {r.p99_ms:&gt;7.1f} {r.recall_at_k:&gt;8.4f}")
     print("=" * 90)
@@ -628,7 +655,7 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", default="minilm_100k_benchmark.h5")
-    parser.add_argument("--pgvector-dsn", default=None)
+    parser.add_argument("--sqlserver-conn", default=None)
     parser.add_argument("--qdrant-url", default=None)
     parser.add_argument("--concurrencies", nargs="+", type=int, default=[1, 4, 16, 32])
     parser.add_argument("--k", type=int, default=10)
@@ -636,7 +663,7 @@ if __name__ == "__main__":
     
     results = run_benchmark(
         dataset_path=args.dataset,
-        pgvector_dsn=args.pgvector_dsn,
+        sqlserver_conn=args.sqlserver_conn,
         qdrant_url=args.qdrant_url,
         concurrencies=args.concurrencies,
         k=args.k
@@ -647,74 +674,77 @@ if __name__ == "__main__":
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">pgvector: Index Tuning for Production Throughput</h3>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">SQL Server Native Vectors: Index Tuning for Production Throughput</h3>
 
-<p class="text-gray-300 leading-relaxed">pgvector is the most common starting point because it lives inside PostgreSQL, which means you inherit connection pooling via PgBouncer, replication, ACID transactions, and decades of operational tooling. It is not the fastest vector database in pure QPS terms, but it is frequently the right answer when your dataset fits in a single node and your team already operates PostgreSQL.</p>
+<p class="text-gray-300 leading-relaxed">SQL Server 2025 native vectors are the most common starting point for teams already on the Microsoft stack, which means you inherit connection pooling via SqlClient, availability groups, ACID transactions, and decades of operational tooling. They are not the fastest vector option in pure QPS terms, but they are frequently the right answer when your dataset fits on your existing instances and your team already operates SQL Server.</p>
 
-<p class="text-gray-300 leading-relaxed">pgvector supports two index types as of version 0.6.0:</p>
+<p class="text-gray-300 leading-relaxed">Two access paths govern SQL Server vector performance: exact search with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_DISTANCE</code> (a scan, 100% recall) and approximate search through the DiskANN index with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_SEARCH</code>. The levers that matter most:</p>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **HNSW** (`hnsw`): Hierarchical Navigable Small World. Better recall-latency tradeoff for query-heavy workloads. Higher memory consumption during build. Generally preferred for production read workloads.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **IVFFlat** (`ivfflat`): Inverted file with flat quantization. Faster index builds, lower memory footprint, but inferior recall at equivalent latency. Still useful when you are rebuilding indices frequently (e.g., nightly batch workflows).</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Index metric match.** The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">METRIC</code> in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE VECTOR INDEX</code> must equal the metric argument in every <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_DISTANCE</code> / <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_SEARCH</code> call. A mismatch silently disables the index and drops you to a full scan.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">TOP_N</code> over-fetch in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_SEARCH</code>.** Higher <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">TOP_N</code> → better recall, higher latency. This is the recall-latency knob you sweep, analogous to ef_search in HNSW engines.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">MAXDOP</code> at index build time.** DiskANN builds are CPU-intensive; set <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">MAXDOP</code> in the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WITH</code> clause to use multiple cores, then schedule builds in maintenance windows.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Plan choice under filters.** With selective <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WHERE</code> clauses the optimizer may choose a scan over the DiskANN index. Inspect actual execution plans and treat unexpected plan flips as the vector equivalent of a parameter-sniffing incident.</li>
 
-<p class="text-gray-300 leading-relaxed">The five parameters that govern pgvector performance are:</p>
+<p class="text-gray-300 leading-relaxed">The relationship between <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">TOP_N</code> and the recall-latency tradeoff is the most important control knob during production tuning. The following T-SQL sweeps it against the exact-search baseline:</p>
 
-<p class="text-gray-300 leading-relaxed">| Parameter | Index Type | Effect |</p>
-<p class="text-gray-300 leading-relaxed">|---|---|---|</p>
-<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">m</code> | HNSW | Graph connectivity. Higher → better recall, larger index, slower build. |</p>
-<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ef_construction</code> | HNSW | Search depth during build. Higher → better recall, slower build. |</p>
-<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">hnsw.ef_search</code> | HNSW | Search depth at query time. Higher → better recall, higher latency. Set per-session. |</p>
-<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">lists</code> | IVFFlat | Number of inverted lists (centroids). Target <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sqrt(n_corpus)</code>. |</p>
-<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ivfflat.probes</code> | IVFFlat | Number of lists searched per query. Higher → better recall, higher latency. |</p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server 2025: sweep TOP_N to find the recall-latency knee point
+DECLARE @q VECTOR(1536) = '[0.1, 0.2, ...]';
 
-<p class="text-gray-300 leading-relaxed">The relationship between <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">hnsw.ef_search</code> and the recall-latency tradeoff is the most important control knob during production tuning. The following SQL illustrates how to sweep it:</p>
+-- TOP_N = 10: fast but lower recall
+SELECT t2.id, s.distance
+FROM VECTOR_SEARCH(
+         TABLE = dbo.benchmark_vectors AS t,
+         COLUMN = embedding,
+         SIMILAR_TO = @q,
+         METRIC = 'cosine',
+         TOP_N = 10
+     ) AS s
+JOIN dbo.benchmark_vectors AS t2 ON t2.id = s.id
+ORDER BY s.distance;
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: sweep ef_search to find the recall-latency knee point
--- Run this in psql with \timing enabled, then compare results against ground truth
+-- TOP_N = 50: balanced
+SELECT t2.id, s.distance
+FROM VECTOR_SEARCH(
+         TABLE = dbo.benchmark_vectors AS t,
+         COLUMN = embedding,
+         SIMILAR_TO = @q,
+         METRIC = 'cosine',
+         TOP_N = 50
+     ) AS s
+JOIN dbo.benchmark_vectors AS t2 ON t2.id = s.id
+ORDER BY s.distance;
 
--- Set up timing
-\timing on
+-- TOP_N = 200: high recall, slower
+SELECT t2.id, s.distance
+FROM VECTOR_SEARCH(
+         TABLE = dbo.benchmark_vectors AS t,
+         COLUMN = embedding,
+         SIMILAR_TO = @q,
+         METRIC = 'cosine',
+         TOP_N = 200
+     ) AS s
+JOIN dbo.benchmark_vectors AS t2 ON t2.id = s.id
+ORDER BY s.distance;
 
--- ef_search = 40: fast but lower recall
-SET hnsw.ef_search = 40;
-EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
-SELECT id, embedding &lt;=&gt; '[0.1, 0.2, ...]'::vector AS distance
-FROM benchmark_vectors
-ORDER BY embedding &lt;=&gt; '[0.1, 0.2, ...]'::vector
-LIMIT 10;
+-- Compare each run's result set against the exact ground truth:
+SELECT TOP (10) id
+FROM dbo.benchmark_vectors
+WHERE embedding IS NOT NULL
+ORDER BY VECTOR_DISTANCE('cosine', embedding, @q);</code></pre>
 
--- ef_search = 100: balanced
-SET hnsw.ef_search = 100;
-EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
-SELECT id, embedding &lt;=&gt; '[0.1, 0.2, ...]'::vector AS distance
-FROM benchmark_vectors
-ORDER BY embedding &lt;=&gt; '[0.1, 0.2, ...]'::vector
-LIMIT 10;
+<p class="text-gray-300 leading-relaxed">One SQL Server behavior that surprises engineers coming from pure vector databases: <strong class="text-white">the query optimizer can choose not to use the vector index.</strong> If your query includes a highly selective WHERE clause, the optimizer may decide a scan is cheaper than an index seek followed by a filter. This is generally correct behavior for small result sets, but it means your p99 latency can spike when a predicate causes plan flips. The remedy is to examine actual execution plans for queries that combine vector ranking with metadata filters, and to compare plans in a controlled test (the benchmark harness above makes this repeatable) to find the index-vs-scan crossover point.</p>
 
--- ef_search = 400: high recall, slower
-SET hnsw.ef_search = 400;
-EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
-SELECT id, embedding &lt;=&gt; '[0.1, 0.2, ...]'::vector AS distance
-FROM benchmark_vectors
-ORDER BY embedding &lt;=&gt; '[0.1, 0.2, ...]'::vector
-LIMIT 10;</code></pre>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Parallelism</strong> is another SQL Server lever that most engineers do not configure for vector workloads. DiskANN index builds accept <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">MAXDOP</code> directly, so a build can use multiple CPU cores:</p>
 
-<p class="text-gray-300 leading-relaxed">One pgvector behavior that surprises engineers coming from pure vector databases: <strong class="text-white">the query planner can choose not to use the vector index.</strong> If your query includes a highly selective WHERE clause, PostgreSQL may decide a sequential scan is cheaper than an ANN index scan followed by a filter. This is generally correct behavior for small result sets, but it means your p99 latency can spike when a WHERE clause causes plan flips. The remedy is to examine <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">EXPLAIN</code> output for queries with both vector distance ordering and metadata filters, and to use <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SET enable_seqscan = off</code> in a controlled test to understand the index-vs-seqscan crossover point.</p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server 2025: parallel DiskANN index build
+CREATE VECTOR INDEX IX_benchmark_vectors_embedding
+ON dbo.benchmark_vectors (embedding)
+WITH (METRIC = 'cosine', TYPE = 'DiskANN', MAXDOP = 8);
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Parallel workers</strong> are another pgvector lever that most engineers do not configure. HNSW index scans in pgvector 0.7+ support parallel query execution. Setting <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_parallel_workers_per_gather</code> correctly means a single query can use multiple CPU cores to search the graph simultaneously:</p>
+-- Verify build parallelism and timing via the actual plan / Query Store
+-- (Chapter 14 covers vector-specific wait and plan analysis)</code></pre>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: enable parallel HNSW scanning
-ALTER TABLE benchmark_vectors SET (parallel_workers = 4);
-SET max_parallel_workers_per_gather = 4;
-SET min_parallel_table_scan_size = '1MB';
-
--- Verify the plan uses parallel workers
-EXPLAIN SELECT id
-FROM benchmark_vectors
-ORDER BY embedding &lt;=&gt; '[...]'::vector
-LIMIT 10;
--- Look for "Gather" or "Gather Merge" nodes in the plan</code></pre>
-
-<p class="text-gray-300 leading-relaxed">The tradeoff with parallel workers is predictable: they increase single-query throughput at the cost of total system throughput when many queries are running concurrently. At low concurrency (< 4 clients), parallel workers help. At high concurrency (> 16 clients), you are typically better served by allowing each query to use a single worker and letting concurrency itself saturate your CPU cores.</p>
+<p class="text-gray-300 leading-relaxed">The tradeoff with build parallelism is predictable: it shortens the maintenance window at the cost of CPU pressure on the instance. Schedule builds off-hours, and at high query concurrency prefer letting concurrency itself saturate CPU cores rather than over-parallelizing individual operations.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
@@ -769,7 +799,7 @@ def benchmark_weaviate(
     
     return latencies, all_ids</code></pre>
 
-<p class="text-gray-300 leading-relaxed">One Weaviate-specific tuning parameter deserves explicit attention: the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ef</code> parameter in the collection's HNSW configuration controls search depth at query time, similar to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">hnsw.ef_search</code> in pgvector. Unlike pgvector, where you set it per-session with SET, Weaviate requires updating the collection's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">efConfig</code> via the schema API to change it without restarting. This makes dynamic ef sweeping more cumbersome in Weaviate — plan your benchmark parameter grid before starting rather than adjusting on the fly.</p>
+<p class="text-gray-300 leading-relaxed">One Weaviate-specific tuning parameter deserves explicit attention: the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ef</code> parameter in the collection's HNSW configuration controls search depth at query time, similar to the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">TOP_N</code> over-fetch in SQL Server's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_SEARCH</code>. Unlike SQL Server, where <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">TOP_N</code> is a per-query argument, Weaviate requires updating the collection's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">efConfig</code> via the schema API to change it without restarting. This makes dynamic ef sweeping more cumbersome in Weaviate — plan your benchmark parameter grid before starting rather than adjusting on the fly.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
@@ -901,7 +931,7 @@ def run_filtered_benchmark(
         print(f"{selectivity:&lt;20} {n_cat:&lt;15} {avg_lat:&gt;11.1f}ms "
               f"{p99:&gt;11.1f}ms {avg_results:&gt;12.1f}")</code></pre>
 
-<p class="text-gray-300 leading-relaxed">When you run this across databases, the output reveals something that synthetic benchmarks hide entirely: <strong class="text-white">highly selective filters (small buckets) cause different failure modes in different databases.</strong> In pgvector, a highly selective filter may cause the planner to abandon the HNSW index and perform a sequential scan — which is slow but returns perfect recall. In Weaviate, the ef parameter drives how aggressively the system oversamples before filtering, so high selectivity requires increasing ef dramatically to maintain recall, which increases latency. In Qdrant, the filterable HNSW implementation tracks which vectors satisfy payload predicates inside the graph structure itself, which generally maintains recall at lower latency penalty — but requires the payload index to be created before ingest, not after.</p>
+<p class="text-gray-300 leading-relaxed">When you run this across databases, the output reveals something that synthetic benchmarks hide entirely: <strong class="text-white">highly selective filters (small buckets) cause different failure modes in different databases.</strong> In SQL Server, a highly selective filter may cause the optimizer to skip the DiskANN index in favor of a scan — which is slow but returns perfect recall. In Weaviate, the ef parameter drives how aggressively the system oversamples before filtering, so high selectivity requires increasing ef dramatically to maintain recall, which increases latency. In Qdrant, the filterable HNSW implementation tracks which vectors satisfy payload predicates inside the graph structure itself, which generally maintains recall at lower latency penalty — but requires the payload index to be created before ingest, not after.</p>
 
 <p class="text-gray-300 leading-relaxed">These are the kinds of behavioral differences that do not appear in any vendor benchmark and that will determine which database actually fits your production query pattern.</p>
 
@@ -915,11 +945,11 @@ def run_filtered_benchmark(
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">The single-client trap.</strong> If your application generates concurrent queries — and production applications almost always do — measuring at concurrency=1 gives you latency numbers that are optimistic by a factor of 2–5x for CPU-bound workloads. Measure at concurrency levels matching your peak application concurrency, not your baseline.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">The index-not-built trap.</strong> Some databases defer index construction until a threshold of writes is reached, or until a compaction job runs. Milvus, for example, will serve queries from growing segments using brute-force until a segment reaches a size threshold and gets indexed. If you run your benchmark immediately after loading, you may be benchmarking brute-force search, not ANN. Always verify index status before measuring. For Milvus, call <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">utility.index_building_progress()</code>. For Qdrant, check that <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">collection_info.status == "green"</code>. For pgvector, run <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SELECT pg_size_pretty(pg_relation_size('your_index_name'))</code> and confirm it matches expected size.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">The index-not-built trap.</strong> Some databases defer index construction until a threshold of writes is reached, or until a compaction job runs. Milvus, for example, will serve queries from growing segments using brute-force until a segment reaches a size threshold and gets indexed. If you run your benchmark immediately after loading, you may be benchmarking brute-force search, not ANN. Always verify index status before measuring. For Milvus, call <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">utility.index_building_progress()</code>. For Qdrant, check that <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">collection_info.status == "green"</code>. For SQL Server, confirm the vector index exists in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.indexes</code> and that row counts match the expected corpus size before measuring.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">The metric distance trap.</strong> Cosine similarity and Euclidean distance produce different nearest neighbor orderings, and recall numbers computed against ground truth using the wrong metric will be meaningless. Always confirm that your ground truth was computed with the same distance metric as your index. The benchmark harness above uses cosine similarity (dot product on normalized vectors) throughout — verify this is consistent if you adapt it.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">The dimensionality compression trap.</strong> Some databases support scalar quantization (SQ8, SQ4) or product quantization (PQ) to compress vectors and reduce memory usage. These techniques trade recall for memory efficiency, sometimes dramatically. When comparing a quantized Milvus index against an unquantized pgvector HNSW index, you are not comparing like for like — you are comparing a memory-efficient approximate index against a full-precision one. Measure both the quantized and unquantized configurations if your target system uses quantization.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">The dimensionality compression trap.</strong> Some databases support scalar quantization (SQ8, SQ4) or product quantization (PQ) to compress vectors and reduce memory usage. These techniques trade recall for memory efficiency, sometimes dramatically. When comparing a quantized Milvus index against an unquantized SQL Server DiskANN index, you are not comparing like for like — you are comparing a memory-efficient approximate index against a full-precision one. Measure both the quantized and unquantized configurations if your target system uses quantization.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
@@ -936,7 +966,7 @@ def run_filtered_benchmark(
 import sys
 import h5py
 import numpy as np
-import psycopg2
+import pyodbc
 import time
 
 RECALL_THRESHOLD = 0.95
@@ -954,21 +984,26 @@ def run_ci_benchmark(dsn: str, dataset_path: str, k: int = 10) -&gt; bool:
     latencies = []
     returned_ids = []
     
-    conn = psycopg2.connect(dsn)
-    conn.autocommit = True
-    with conn.cursor() as cur:
-        cur.execute("SET hnsw.ef_search = 100")
-        for vec in queries:
-            vec_str = "[" + ",".join(f"{v:.6f}" for v in vec) + "]"
-            t0 = time.perf_counter()
-            cur.execute(
-                f"SELECT id FROM benchmark_vectors "
-                f"ORDER BY embedding &lt;=&gt; %s::vector LIMIT {k}",
-                (vec_str,)
-            )
-            ids = [row[0] for row in cur.fetchall()]
-            latencies.append((time.perf_counter() - t0) * 1000)
-            returned_ids.append(ids)
+    DIM = 1536  # must match benchmark_vectors.embedding
+    conn = pyodbc.connect(dsn)
+    cur = conn.cursor()
+    for vec in queries:
+        vec_str = "[" + ",".join(f"{v:.6f}" for v in vec) + "]"
+        t0 = time.perf_counter()
+        cur.execute(
+            f"SELECT TOP ({k}) t2.id "
+            f"FROM VECTOR_SEARCH( "
+            f"         TABLE = benchmark_vectors AS t, "
+            f"         COLUMN = embedding, "
+            f"         SIMILAR_TO = CAST(? AS VECTOR({DIM})), "
+            f"         METRIC = 'cosine', TOP_N = 50) AS s "
+            f"JOIN benchmark_vectors AS t2 ON t2.id = s.id "
+            f"ORDER BY s.distance",
+            (vec_str,)
+        )
+        ids = [row[0] for row in cur.fetchall()]
+        latencies.append((time.perf_counter() - t0) * 1000)
+        returned_ids.append(ids)
     conn.close()
     
     # Compute metrics
@@ -1015,15 +1050,15 @@ if __name__ == "__main__":
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Choosing Between Databases: A Decision Framework</h3>
 
-<p class="text-gray-300 leading-relaxed">After running benchmarks across pgvector, Pinecone, Weaviate, Qdrant, and Milvus, most teams face the same question: given similar recall numbers at similar latency, how do I choose? Pure throughput numbers rarely decide the question. The decision rests on four operational dimensions that benchmarks illuminate but do not automatically answer.</p>
+<p class="text-gray-300 leading-relaxed">After running benchmarks across SQL Server native vectors, Pinecone, Weaviate, Qdrant, and Milvus, most teams face the same question: given similar recall numbers at similar latency, how do I choose? Pure throughput numbers rarely decide the question. The decision rests on four operational dimensions that benchmarks illuminate but do not automatically answer.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Dataset size and growth trajectory.</strong> If your dataset is under 5 million vectors today and is expected to grow slowly, pgvector on a well-provisioned PostgreSQL instance handles the workload with no additional infrastructure. The operational simplicity of a single system is worth significant throughput headroom. If your dataset is already in the tens of millions and growing at a rate that will require horizontal scaling within twelve months, start with a distributed system (Qdrant cluster, Weaviate with multiple shards, or Milvus) even if a single node would technically suffice today. Migration from single-node to distributed is painful; choosing the right architecture at 20M vectors is far cheaper than migrating at 80M.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Dataset size and growth trajectory.</strong> If your dataset is under 5 million vectors today and is expected to grow slowly, SQL Server native vectors on a well-provisioned instance handle the workload with no additional infrastructure. The operational simplicity of a single system is worth significant throughput headroom. If your dataset is already in the tens of millions and growing at a rate that will require horizontal scaling within twelve months, start with a distributed system (Qdrant cluster, Weaviate with multiple shards, or Milvus) even if a single node would technically suffice today. Migration from single-node to distributed is painful; choosing the right architecture at 20M vectors is far cheaper than migrating at 80M.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Filter complexity.</strong> If your queries are predominantly unfiltered — similarity search against the full corpus — most databases perform comparably at equivalent hardware spend. If your queries are predominantly filtered by high-cardinality metadata (per-user, per-tenant, per-category with thousands of categories), Qdrant's filterable HNSW is worth measuring carefully, because the recall-under-filter numbers differ meaningfully from unfiltered recall at the same ef parameter values.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Operational maturity of your team.</strong> Milvus is architecturally sophisticated — it has separate query nodes, index nodes, data nodes, and a message queue — and running it reliably requires understanding all of those components. If your team has not operated distributed systems with complex topology before, the operational surface area is a real risk. Pinecone eliminates that risk entirely by being a managed service at the cost of query customization and egress pricing. There is no architecture decision that is universally correct; the right choice accounts for the humans who will be on call when it fails at 2am.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Latency budget and tail behavior.</strong> Managed services like Pinecone have network round-trips to their API endpoints that add fixed latency regardless of index parameters. If your application requires sub-10ms p99 and it is co-located in the same cloud region as the vector database, self-hosted Qdrant or pgvector will consistently outperform managed Pinecone on raw latency, because you eliminate the inter-service network hop. If your latency budget is 100ms and reliability is more important than raw speed, the managed operational model wins on total cost of ownership.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Latency budget and tail behavior.</strong> Managed services like Pinecone have network round-trips to their API endpoints that add fixed latency regardless of index parameters. If your application requires sub-10ms p99 and it is co-located in the same cloud region as the vector database, self-hosted Qdrant or SQL Server native vectors will consistently outperform managed Pinecone on raw latency, because you eliminate the inter-service network hop. If your latency budget is 100ms and reliability is more important than raw speed, the managed operational model wins on total cost of ownership.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
@@ -1035,22 +1070,24 @@ if __name__ == "__main__":
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Filtered search is where vendor benchmarks diverge most from production behavior:** the interaction between vector ANN indices and metadata filters produces dramatically different recall and latency outcomes across databases. Measure filtered recall at multiple selectivity levels before trusting any performance claim for a workload that combines similarity search with attribute filtering.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Index state validation is a prerequisite for valid measurements:** databases like Milvus, Qdrant, and pgvector can serve queries from unindexed or partially indexed data, producing benchmark numbers that reflect brute-force search rather than ANN search. Always confirm index build completion and warm query caches with a separate, non-overlapping query set before recording measurements.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Index state validation is a prerequisite for valid measurements:** systems like Milvus, Qdrant, and SQL Server can serve queries without using the ANN index (exact-scan fallback), producing benchmark numbers that reflect brute-force search rather than ANN search. Always confirm index build completion and warm query caches with a separate, non-overlapping query set before recording measurements.</li>
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Continuous benchmarking in CI/CD converts a one-time evaluation into an ongoing regression signal:** committing recall thresholds, p99 latency limits, and minimum QPS values alongside application code ensures that schema migrations, index parameter changes, data growth, and dependency upgrades are caught before they degrade production search quality.</li>
     </div>
     <div class="mt-14 bg-cyan-950/40 border border-cyan-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
-        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · SQL Server</p>
       </div>
       <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
          class="shrink-0 px-6 py-3 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold rounded-xl text-sm transition">
         Download Free
       </a>
     </div>
-    <div class="mt-8 text-xs">
-      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a>
+    <div class="mt-10 flex items-center justify-between text-xs">
+      <a href="b4-ch19-milvus.html" class="text-gray-500 hover:text-gray-300 transition">← Previous Chapter</a>
+      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">All Chapters</a>
+      <a href="b4-ch21-what-is-rag.html" class="text-cyan-400 hover:text-cyan-300 transition">Next Chapter →</a>
     </div>
   </article>
   <footer class="border-t border-gray-800/50 px-6 py-8">

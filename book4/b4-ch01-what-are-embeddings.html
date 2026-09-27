@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Chapter 1: What Are Embeddings and Why Databases Need Them — Vector Databases & AI</title>
-  <meta name="description" content="Vector Databases & AI Chapter 1: What Are Embeddings and Why Databases Need Them. pgvector, Pinecone, Weaviate, RAG pipelines — by Rajesh Guntupalli." />
+  <meta name="description" content="Vector Databases & AI Chapter 1: What Are Embeddings and Why Databases Need Them. SQL Server 2025 native vectors, Pinecone, Weaviate, RAG pipelines — by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
   <script type="module">
     import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
@@ -125,7 +125,7 @@ print(f"Sentence 0 vs 2: {sim_matrix[0][2]:.4f}")  # low — dissimilar</code></
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Why Traditional Indexes Fail for Vector Search</h3>
 
-<p class="text-gray-300 leading-relaxed">At this point a reasonable question is: why not just store vectors in a standard <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">FLOAT[]</code> column and query them with a computed similarity? PostgreSQL has supported array types for decades.</p>
+<p class="text-gray-300 leading-relaxed">At this point a reasonable question is: why not just store vectors in a standard <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">NVARCHAR(MAX)</code> column as JSON arrays and query them with computed similarity? Before SQL Server 2025, that workaround was exactly what teams did.</p>
 
 <p class="text-gray-300 leading-relaxed">You can do this. For small datasets it even works. The problem is that similarity search over vectors does not have the algebraic properties that make B-tree and hash indexes effective.</p>
 
@@ -137,111 +137,98 @@ print(f"Sentence 0 vs 2: {sim_matrix[0][2]:.4f}")  # low — dissimilar</code></
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> At ~10 billion FLOPs per second on a single CPU core, that is roughly 1.5 seconds per query</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> That is before any I/O overhead</li>
 
-<p class="text-gray-300 leading-relaxed">This is why approximate nearest neighbor (ANN) algorithms exist, and why vector databases exist as a category. The two dominant index types you will encounter throughout this book are:</p>
+<p class="text-gray-300 leading-relaxed">This is why approximate nearest neighbor (ANN) algorithms exist, and why vector databases exist as a category. The index type you will encounter most in this book is <strong class="text-white">DiskANN</strong> — the graph-based ANN algorithm behind SQL Server 2025's native vector index — alongside <strong class="text-white">HNSW</strong>, which powers several dedicated vector databases:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">HNSW (Hierarchical Navigable Small World):</strong> Builds a layered graph structure where each node connects to its nearest neighbors. Search traverses from coarse upper layers to precise lower layers. Query time is O(log n) with excellent recall (typically 95–99%) at the cost of significant build time and memory. HNSW is the right default for most production workloads.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">DiskANN (SQL Server 2025's vector index):</strong> Builds a navigable graph where each vector connects to a bounded set of neighbors, designed for SSD-backed storage so billion-scale collections do not require terabytes of RAM. Query time is O(log n) with recall typically 95–99%. Created with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE VECTOR INDEX ... WITH (TYPE = 'DiskANN')</code> and queried through <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_SEARCH</code>.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">IVFFlat (Inverted File with Flat quantization):</strong> Partitions the vector space into k clusters (Voronoi cells) at index build time. A query searches only the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">nprobe</code> nearest clusters rather than the full dataset. Much faster to build and lighter on memory than HNSW, but recall depends heavily on the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">nprobe</code> parameter. IVFFlat works well for large, relatively static datasets where you can afford an offline index rebuild.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">HNSW (Hierarchical Navigable Small World):</strong> Builds a layered graph structure where each node connects to its nearest neighbors, traversed from coarse upper layers to precise lower layers. Also O(log n) with excellent recall, but keeps the full graph in memory — fast at the cost of significant RAM. HNSW is the index inside Qdrant, Weaviate, and several other dedicated engines you will meet in Chapters 15–19.</p>
 
 <p class="text-gray-300 leading-relaxed">The tradeoff table that matters in practice:</p>
 
-<p class="text-gray-300 leading-relaxed">| | HNSW | IVFFlat |</p>
+<p class="text-gray-300 leading-relaxed">| | Exact scan (VECTOR_DISTANCE) | DiskANN index |</p>
 <p class="text-gray-300 leading-relaxed">|---|---|---|</p>
-<p class="text-gray-300 leading-relaxed">| Build time | Slow (minutes–hours for 10M vectors) | Fast (seconds–minutes) |</p>
-<p class="text-gray-300 leading-relaxed">| Memory | High (overhead scales with graph connectivity, i.e. <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">m</code>) | Low |</p>
-<p class="text-gray-300 leading-relaxed">| Query speed | Very fast | Moderate (tunable) |</p>
-<p class="text-gray-300 leading-relaxed">| Recall at default settings | ~97% | ~85–95% |</p>
-<p class="text-gray-300 leading-relaxed">| Suitable for | Real-time, high-QPS | Batch, large static corpora |</p>
+<p class="text-gray-300 leading-relaxed">| Build time | None | Minutes–hours for 10M vectors |</p>
+<p class="text-gray-300 leading-relaxed">| Memory | Buffer pool for scanned pages | Graph + vectors compete for buffer pool |</p>
+<p class="text-gray-300 leading-relaxed">| Query speed | Slow at scale (O(n)) | Very fast (O(log n)) |</p>
+<p class="text-gray-300 leading-relaxed">| Recall | 100% | ~95–99% |</p>
+<p class="text-gray-300 leading-relaxed">| Suitable for | Under ~50K vectors | 50K+ vectors, interactive latency SLAs |</p>
 
 <p class="text-gray-300 leading-relaxed">Neither algorithm guarantees finding the exact nearest neighbor — that is the "approximate" in ANN. For most production use cases, 95% recall at 10ms latency is far more valuable than 100% recall at 1,500ms latency. This is a tradeoff database professionals sometimes resist initially because exact results are the norm in relational systems. In vector search, approximation is an engineering choice, not a deficiency.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">Storing Vectors in PostgreSQL with pgvector</h3>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Storing Vectors in SQL Server with the Native VECTOR Type</h3>
 
-<p class="text-gray-300 leading-relaxed">PostgreSQL is where most database professionals will encounter vectors first, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pgvector</code> is the extension that makes it possible. Rather than immediately reaching for a specialized vector database, understanding what pgvector can do — and where it hits limits — gives you the foundation to make informed infrastructure decisions throughout this book.</p>
+<p class="text-gray-300 leading-relaxed">SQL Server 2025 is where database professionals running the Microsoft stack will encounter vectors first: the native <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR(n)</code> data type is built into the engine — no extension to install, no separate process to run. Rather than immediately reaching for a specialized vector database, understanding what native vectors can do — and where they hit limits — gives you the foundation to make informed infrastructure decisions throughout this book.</p>
 
 <div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph LR
     A[Raw content<br/>text / image / audio] --> B[Embedding Model]
     B --> C[Dense Vector<br/>e.g. 1536 floats]
-    C --> D[(Vector column<br/>pgvector / Pinecone / etc.)]
-    D --> E[ANN Index<br/>HNSW or IVFFlat]
+    C --> D[(VECTOR column<br/>SQL Server / Pinecone / etc.)]
+    D --> E[ANN Index<br/>DiskANN]
     F[Query text] --> B
     E --> G[Ranked nearest<br/>neighbors]</pre></div>
 
 <p class="text-gray-300 leading-relaxed">*The same embedding model encodes both stored content and incoming queries into one shared vector space — the ANN index only has to search that space, not the original content.*</p>
 
-<p class="text-gray-300 leading-relaxed">Installation is straightforward:</p>
+<p class="text-gray-300 leading-relaxed">There is nothing to install — verify the engine version and create a table with a vector column:</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Install pgvector on Ubuntu/Debian (PostgreSQL 15+)
-sudo apt install postgresql-15-pgvector
-
-# Or compile from source
-git clone https://github.com/pgvector/pgvector.git
-cd pgvector
-make && sudo make install</code></pre>
-
-<p class="text-gray-300 leading-relaxed">With the extension available, enabling it in your database and creating a table with a vector column takes seconds:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
--- Enable the extension
-CREATE EXTENSION IF NOT EXISTS vector;
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server 2025: native VECTOR type, no extension needed
+SELECT SERVERPROPERTY('ProductMajorVersion');  -- 17 = SQL Server 2025
 
 -- Create a product table with an embedding column
-CREATE TABLE products (
-    id          BIGSERIAL PRIMARY KEY,
-    sku         TEXT NOT NULL UNIQUE,
-    name        TEXT NOT NULL,
-    description TEXT,
-    category    TEXT,
-    embedding   vector(1536),   -- OpenAI text-embedding-3-small dimensions
-    created_at  TIMESTAMPTZ DEFAULT NOW()
+CREATE TABLE dbo.Products (
+    ProductId   INT IDENTITY(1,1) NOT NULL CONSTRAINT PK_Products PRIMARY KEY,
+    Sku         NVARCHAR(50) NOT NULL UNIQUE,
+    Name        NVARCHAR(200) NOT NULL,
+    Description NVARCHAR(MAX) NULL,
+    Category    NVARCHAR(50) NULL,
+    Embedding   VECTOR(1536) NULL,   -- OpenAI text-embedding-3-small dimensions
+    CreatedAt   DATETIME2(0) NOT NULL CONSTRAINT DF_Products_CreatedAt DEFAULT SYSUTCDATETIME()
 );
 
 -- Insert a row with a pre-computed embedding (abbreviated here)
 -- In production, embeddings are populated by an application-layer pipeline
-INSERT INTO products (sku, name, description, category, embedding)
+INSERT INTO dbo.Products (Sku, Name, Description, Category, Embedding)
 VALUES (
     'NK-RUN-001',
     'Nike Air Zoom Pegasus 40',
     'Cushioned daily trainer for long-distance running',
     'running',
-    '[0.012, -0.043, 0.071, ...]'::vector  -- 1536 values in practice
+    CAST('[0.012, -0.043, 0.071, ...]' AS VECTOR(1536))  -- 1536 values in practice
 );
 
--- Create an HNSW index for approximate nearest neighbor search
--- m = max connections per layer, ef_construction = build quality
-CREATE INDEX ON products USING hnsw (embedding vector_cosine_ops)
-    WITH (m = 16, ef_construction = 64);
+-- DiskANN index for approximate nearest neighbor search (preview)
+CREATE VECTOR INDEX IX_Products_Embedding
+ON dbo.Products (Embedding)
+WITH (METRIC = 'cosine', TYPE = 'DiskANN');
 
--- Semantic similarity search: find 10 most similar products to a query vector
--- $1 is the query embedding generated at application layer
-SELECT
-    id,
-    sku,
-    name,
-    category,
-    1 - (embedding &lt;=&gt; $1) AS cosine_similarity
-FROM products
-WHERE category = 'running'          -- pre-filter on scalar columns
-ORDER BY embedding &lt;=&gt; $1           -- &lt;=&gt; is cosine distance operator
-LIMIT 10;</code></pre>
+-- Semantic similarity search: 10 most similar products to a query vector
+-- @q is the query embedding generated at the application layer
+DECLARE @q VECTOR(1536) = '[0.012, -0.043, 0.071, ...]';
 
-<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs"><=></code> operator computes cosine distance. pgvector also provides <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs"><-></code> for L2 (Euclidean) distance and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs"><#></code> for negative inner product (dot product). The choice depends on your embedding model's normalization properties.</p>
+SELECT TOP (10)
+    ProductId, Sku, Name, Category,
+    VECTOR_DISTANCE('cosine', Embedding, @q) AS Distance
+FROM dbo.Products
+WHERE Category = 'running'          -- relational pre-filter, same query
+ORDER BY Distance;</code></pre>
 
-<p class="text-gray-300 leading-relaxed">A few things to notice in this schema. The pre-filter <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WHERE category = 'running'</code> runs before the vector search. This is important for query performance and result relevance, but it interacts with the HNSW index in a way that is not obvious: pgvector performs the filter after retrieving HNSW candidates, not before. For high-selectivity filters (e.g., <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WHERE user_id = 12345</code>), this can degrade recall because the ANN search may return candidates that are then filtered away. This is a known limitation of pgvector's current architecture and a common reason teams graduate to dedicated vector databases for complex filtered searches.</p>
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_DISTANCE</code> function takes the metric as its first argument: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">'cosine'</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">'euclidean'</code>, or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">'dot'</code> (negative dot product). The choice depends on your embedding model's normalization properties — cosine is the right default for normalized text embeddings.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">When pgvector is enough:</strong> Up to approximately 1–2 million vectors, single-server deployments, workloads where vector search is one feature among many in a relational application, and teams that want to stay in the PostgreSQL operational model.</p>
+<p class="text-gray-300 leading-relaxed">A few things to notice in this schema. The pre-filter <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WHERE Category = 'running'</code> combines with vector ranking in a single T-SQL statement planned by the regular query optimizer — relational predicates and similarity ranking compose naturally, which is the core advantage of keeping vectors inside the relational engine. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR(1536)</code> type enforces dimensionality at write time: storing a 384-dimension vector in this column fails loudly instead of silently corrupting search quality.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">When to consider a dedicated vector database:</strong> Beyond 5 million vectors, high-QPS requirements (>1,000 queries/second), complex metadata filtering, multi-tenant isolation, or hybrid dense+sparse search requirements.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">When SQL Server native vectors are enough:</strong> Up to millions of vectors, single-server or Azure SQL deployments, workloads where vector search is one feature among many in a relational application, and teams that want to stay in the SQL Server operational model — transactions, row-level security, and backups included.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">When to consider a dedicated vector database:</strong> Tens of millions of vectors with aggressive latency SLAs, high-QPS requirements (thousands of queries per second), complex metadata filtering at scale, SaaS-scale multi-tenant isolation, or first-class hybrid dense-plus-sparse search requirements.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">The Ecosystem Map: pgvector, Pinecone, Weaviate, and When to Use Each</h3>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">The Ecosystem Map: SQL Server Vectors, Pinecone, Weaviate, and When to Use Each</h3>
 
-<p class="text-gray-300 leading-relaxed">The vector database market has grown rapidly, and the naming is not always consistent. Some are databases built specifically for vectors. Others are extensions to existing systems. Still others are cloud services that abstract away the infrastructure entirely. A practical map of the landscape will ground the rest of this book.</p>
+<p class="text-gray-300 leading-relaxed">The vector database market has grown rapidly, and the naming is not always consistent. Some are databases built specifically for vectors. Others are cloud services that abstract away the infrastructure entirely. Still others are the relational database you already run, with vectors added as a native type. A practical map of the landscape will ground the rest of this book.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">pgvector</strong> — PostgreSQL extension. Already discussed. Best for: teams already on PostgreSQL who want to add semantic search without new infrastructure. Managed through AWS RDS, Azure Database for PostgreSQL, Supabase, and Neon.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server 2025 native vectors</strong> — built into the engine. Already discussed. Best for: teams already on SQL Server who want to add semantic search without new infrastructure. Also generally available on Azure SQL Database and Azure SQL Managed Instance.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Pinecone</strong> — Fully managed, cloud-native vector database. No infrastructure to operate. Supports hybrid search (dense + sparse), namespace-based multi-tenancy, and serverless tiers. Best for: teams that want production-grade vector search without operational overhead, and can accept SaaS pricing and data residency constraints.</p>
 
@@ -253,7 +240,7 @@ LIMIT 10;</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Milvus</strong> — Open-source, cloud-native vector database designed for horizontal scaling. Kubernetes-native architecture with separate storage, query, and index layers. Best for: large-scale deployments requiring distributed operation and fine-grained resource management.</p>
 
-<p class="text-gray-300 leading-relaxed">Here is a minimal example showing the same semantic search operation across two systems — pgvector and Pinecone — so you can see how the abstractions differ:</p>
+<p class="text-gray-300 leading-relaxed">Here is a minimal example showing the same semantic search operation across two systems — SQL Server native vectors and Pinecone — so you can see how the abstractions differ:</p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python example — semantic search with Pinecone
 from pinecone import Pinecone
@@ -283,7 +270,7 @@ results = index.query(
 for match in results["matches"]:
     print(f"Score: {match['score']:.4f} | SKU: {match['metadata']['sku']} | {match['metadata']['name']}")</code></pre>
 
-<p class="text-gray-300 leading-relaxed">The Pinecone <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">filter</code> parameter is processed as a true pre-filter against the index, not a post-filter on ANN results. This is one of the concrete operational differences between pgvector and a purpose-built system. At low vector counts the distinction is academic. At millions of vectors with selective filters it is the difference between 95% recall and 60% recall.</p>
+<p class="text-gray-300 leading-relaxed">The Pinecone <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">filter</code> parameter is processed as a true pre-filter against the index, not a post-filter on ANN results. This is one of the concrete operational differences between a relational engine and a purpose-built vector system. At low vector counts the distinction is academic. At millions of vectors with selective filters it is the difference between 95% recall and 60% recall — and the reason SQL Server's single-query hybrid of relational predicates plus vector ranking matters.</p>
 
 <p class="text-gray-300 leading-relaxed">The right tool for your workload depends on scale, operational constraints, data residency requirements, and where vectors fit in your overall data architecture. This book covers all of them — the goal is informed selection, not advocacy for any single system.</p>
 
@@ -293,26 +280,28 @@ for match in results["matches"]:
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> An embedding is a fixed-length array of floating-point numbers that represents the semantic content of text, images, or other data as a point in high-dimensional space. Two semantically similar inputs produce vectors that are geometrically close, regardless of surface-level similarity in the original content.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Traditional B-tree and hash indexes cannot support similarity search because vector similarity has no total ordering. Approximate nearest neighbor (ANN) algorithms — primarily HNSW and IVFFlat — solve this problem by trading exact results for dramatically lower query latency.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Traditional B-tree and hash indexes cannot support similarity search because vector similarity has no total ordering. Approximate nearest neighbor (ANN) algorithms — DiskANN in SQL Server 2025 — solve this problem by trading exact results for dramatically lower query latency.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> pgvector brings vector storage and ANN search into PostgreSQL, making it the natural starting point for database teams. It is well-suited for datasets under 1–2 million vectors but has known limitations around pre-filtered searches and horizontal scaling that matter at production scale.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> SQL Server 2025 native vectors bring vector storage and ANN search into the relational engine, making them the natural starting point for SQL Server teams. They are well-suited for datasets into the millions of vectors, with hybrid relational-plus-vector queries as the defining strength — and the DiskANN index still in preview, worth tracking as it matures.</li>
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> The embedding model you choose determines storage cost, query performance, and which distance metric is appropriate. All vectors in a collection must come from the same model, making embedding model upgrades a significant data migration event that must be planned for from the start.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> The vector database ecosystem — pgvector, Pinecone, Weaviate, Qdrant, Chroma, Milvus — spans a wide range of operational models from embedded libraries to fully managed cloud services. Selection criteria include dataset size, query-per-second requirements, metadata filtering complexity, and whether you need to own the infrastructure or prefer a managed service.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> The vector database ecosystem — SQL Server native vectors, Pinecone, Weaviate, Qdrant, Chroma, Milvus — spans a wide range of operational models from embedded libraries to fully managed cloud services. Selection criteria include dataset size, query-per-second requirements, metadata filtering complexity, and whether you need to own the infrastructure or prefer a managed service.</li>
     </div>
     <div class="mt-14 bg-cyan-950/40 border border-cyan-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
-        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · SQL Server</p>
       </div>
       <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
          class="shrink-0 px-6 py-3 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold rounded-xl text-sm transition">
         Download Free
       </a>
     </div>
-    <div class="mt-8 text-xs">
-      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a>
+    <div class="mt-10 flex items-center justify-between text-xs">
+      <span></span>
+      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">All Chapters</a>
+      <a href="b4-ch02-how-vector-search-works.html" class="text-cyan-400 hover:text-cyan-300 transition">Next Chapter →</a>
     </div>
   </article>
   <footer class="border-t border-gray-800/50 px-6 py-8">

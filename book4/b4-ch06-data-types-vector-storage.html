@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Chapter 6: Data Types in Vector Storage: Text, Images, Audio, Code — Vector Databases & AI</title>
-  <meta name="description" content="Vector Databases & AI Chapter 6: Data Types in Vector Storage: Text, Images, Audio, Code. pgvector, Pinecone, Weaviate, RAG pipelines — by Rajesh Guntupalli." />
+  <meta name="description" content="Vector Databases & AI Chapter 6: Data Types in Vector Storage: Text, Images, Audio, Code. SQL Server native vectors, Pinecone, Weaviate, RAG pipelines — by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
   <script type="module">
     import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
@@ -49,7 +49,7 @@
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">6.1 Text Embeddings: The Dominant Workload</h3>
 
-<p class="text-gray-300 leading-relaxed">Text is where most teams start, and for good reason. The tooling is mature, the models are well-benchmarked, and the use cases — semantic search, RAG pipelines, document classification, duplicate detection — map directly onto problems DBAs already understand. If you have maintained a full-text search index in PostgreSQL or Elasticsearch, you already understand the tension text embeddings are meant to resolve: keyword search finds documents that share vocabulary, but not necessarily meaning. A query for "myocardial infarction" will miss documents that only use "heart attack." Embedding-based search collapses that gap.</p>
+<p class="text-gray-300 leading-relaxed">Text is where most teams start, and for good reason. The tooling is mature, the models are well-benchmarked, and the use cases — semantic search, RAG pipelines, document classification, duplicate detection — map directly onto problems DBAs already understand. If you have maintained a full-text search index in SQL Server (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CONTAINS</code>/<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">FREETEXT</code>) or Elasticsearch, you already understand the tension text embeddings are meant to resolve: keyword search finds documents that share vocabulary, but not necessarily meaning. A query for "myocardial infarction" will miss documents that only use "heart attack." Embedding-based search collapses that gap.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">How text embeddings work</strong></p>
 
@@ -62,18 +62,24 @@
 <p class="text-gray-300 leading-relaxed">A practical baseline: 512-token chunks with 50-token overlap. The overlap prevents semantic content from being split across chunk boundaries the way a page boundary in a B-tree splits a row.</p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
-# Text embedding pipeline using OpenAI + pgvector
-# Requirements: openai&gt;=1.0, psycopg2-binary, tiktoken
+# Text embedding pipeline using OpenAI + SQL Server
+# Requirements: openai&gt;=1.0, pyodbc, tiktoken
 
 import openai
-import psycopg2
+import pyodbc
 import tiktoken
 from typing import List, Tuple
 
 client = openai.OpenAI()  # reads OPENAI_API_KEY from environment
 
+conn = pyodbc.connect(
+    "DRIVER={ODBC Driver 18 for SQL Server};SERVER=localhost;"
+    "DATABASE=vectordb;Trusted_Connection=yes;Encrypt=yes;"
+    "TrustServerCertificate=yes"
+)
+
 def chunk_text(text: str, model: str = "text-embedding-3-small",
-               chunk_tokens: int = 512, overlap_tokens: int = 50) -&gt; List[str]:
+               chunk_tokens: int = 512, overlap_tokens: int = 50) -> List[str]:
     """Split text into overlapping token-bounded chunks."""
     enc = tiktoken.encoding_for_model(model)
     tokens = enc.encode(text)
@@ -88,67 +94,64 @@ def chunk_text(text: str, model: str = "text-embedding-3-small",
         start += chunk_tokens - overlap_tokens
     return chunks
 
-def embed_texts(texts: List[str], model: str = "text-embedding-3-small") -&gt; List[List[float]]:
+def embed_texts(texts: List[str], model: str = "text-embedding-3-small") -> List[List[float]]:
     """Batch embed up to 2048 strings per API call."""
     response = client.embeddings.create(input=texts, model=model)
     return [item.embedding for item in response.data]
 
-def ingest_document(conn, doc_id: str, title: str, body: str) -&gt; int:
+def to_vector_literal(embedding: List[float]) -> str:
+    """Format an embedding as a VECTOR literal SQL Server can CAST."""
+    return "[" + ",".join(str(v) for v in embedding) + "]"
+
+def ingest_document(cursor, doc_id: str, title: str, body: str) -> int:
     """Chunk, embed, and store a document. Returns number of chunks inserted."""
     chunks = chunk_text(body)
     embeddings = embed_texts(chunks)
-
-    with conn.cursor() as cur:
-        cur.executemany(
-            """
-            INSERT INTO document_chunks (doc_id, title, chunk_index, chunk_text, embedding)
-            VALUES (%s, %s, %s, %s, %s::vector)
-            """,
-            [
-                (doc_id, title, i, chunk, str(emb))
-                for i, (chunk, emb) in enumerate(zip(chunks, embeddings))
-            ]
+    for i, (chunk, emb) in enumerate(zip(chunks, embeddings)):
+        cursor.execute(
+            "INSERT INTO document_chunks (doc_id, title, chunk_index, chunk_text, embedding) "
+            "VALUES (?, ?, ?, ?, CAST(? AS VECTOR(1536)))",
+            (doc_id, title, i, chunk, to_vector_literal(emb))
         )
-    conn.commit()
+    cursor.commit()
     return len(chunks)
 
 # ── Schema (run once) ─────────────────────────────────────────────────────────
 SCHEMA_SQL = """
-CREATE EXTENSION IF NOT EXISTS vector;
-
-CREATE TABLE IF NOT EXISTS document_chunks (
-    id          BIGSERIAL PRIMARY KEY,
-    doc_id      TEXT        NOT NULL,
-    title       TEXT,
-    chunk_index INTEGER     NOT NULL,
-    chunk_text  TEXT        NOT NULL,
-    embedding   vector(1536) NOT NULL,
-    created_at  TIMESTAMPTZ DEFAULT now()
+CREATE TABLE document_chunks (
+    id          BIGINT IDENTITY(1,1) NOT NULL CONSTRAINT PK_document_chunks PRIMARY KEY,
+    doc_id      NVARCHAR(100) NOT NULL,
+    title       NVARCHAR(200) NULL,
+    chunk_index INT NOT NULL,
+    chunk_text  NVARCHAR(MAX) NOT NULL,
+    embedding   VECTOR(1536) NOT NULL,
+    created_at  DATETIME2(0) NOT NULL CONSTRAINT DF_document_chunks_created
+                    DEFAULT SYSUTCDATETIME()
 );
 
-CREATE INDEX IF NOT EXISTS document_chunks_embedding_idx
-    ON document_chunks
-    USING hnsw (embedding vector_cosine_ops)
-    WITH (m = 16, ef_construction = 64);
+CREATE VECTOR INDEX document_chunks_embedding_idx
+    ON document_chunks (embedding)
+    WITH (METRIC = 'cosine', TYPE = 'DiskANN', MAXDOP = 4);
 """
 
 # ── Query ─────────────────────────────────────────────────────────────────────
-def semantic_search(conn, query: str, top_k: int = 5) -&gt; List[Tuple]:
+def semantic_search(cursor, query: str, top_k: int = 5) -> List[Tuple]:
     query_embedding = embed_texts([query])[0]
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT doc_id, title, chunk_index, chunk_text,
-                   1 - (embedding &lt;=&gt; %s::vector) AS cosine_similarity
-            FROM   document_chunks
-            ORDER  BY embedding &lt;=&gt; %s::vector
-            LIMIT  %s
-            """,
-            (str(query_embedding), str(query_embedding), top_k)
-        )
-        return cur.fetchall()</code></pre>
+    cursor.execute(
+        """
+        SELECT TOP (?) doc_id, title, chunk_index, chunk_text,
+               1 - VECTOR_DISTANCE('cosine', embedding, CAST(? AS VECTOR(1536)))
+                   AS cosine_similarity
+        FROM   document_chunks
+        WHERE  embedding IS NOT NULL
+        ORDER  BY VECTOR_DISTANCE('cosine', embedding, CAST(? AS VECTOR(1536)))
+        """,
+        (top_k, to_vector_literal(query_embedding), to_vector_literal(query_embedding))
+    )
+    return cursor.fetchall()
+</code></pre>
 
-<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs"><=></code> operator is pgvector's cosine distance. One minus that value gives you cosine similarity, which is more intuitive when you need to filter by a quality threshold (e.g., <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WHERE 1 - (embedding <=> query) > 0.75</code>).</p>
+<p class="text-gray-300 leading-relaxed"><code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_DISTANCE('cosine', embedding, @query)</code> is SQL Server's cosine distance. One minus that value gives you cosine similarity, which is more intuitive when you need to filter by a quality threshold (e.g., <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WHERE 1 - VECTOR_DISTANCE('cosine', embedding, @query) > 0.75</code>).</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Choosing a text embedding model</strong></p>
 
@@ -529,7 +532,7 @@ def search_code(query: str, top_k: int = 5, namespace: str = "") -&gt; list[dict
 
 <p class="text-gray-300 leading-relaxed">When your codebase spans multiple languages — Go services, Python scripts, TypeScript frontends, SQL stored procedures — you have two practical options:</p>
 
-<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Single shared index:</strong> Embed all code regardless of language into the same Pinecone or pgvector index. This works well when queries are natural language ("find the function that handles payment retries"), because the model maps both the query and code across languages into a shared semantic space. Include <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">language</code> as a metadata field and filter when needed.</p>
+<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Single shared index:</strong> Embed all code regardless of language into the same Pinecone index or SQL Server vector table. This works well when queries are natural language ("find the function that handles payment retries"), because the model maps both the query and code across languages into a shared semantic space. Include <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">language</code> as a metadata field and filter when needed.</p>
 
 <p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Per-language indexes:</strong> Maintain separate indexes or namespaces per language. This is useful when queries are themselves code ("find Go functions similar to this Python function") because it lets you tune chunking, model selection, and distance thresholds per language without cross-contamination.</p>
 
@@ -537,7 +540,7 @@ def search_code(query: str, top_k: int = 5, namespace: str = "") -&gt; list[dict
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL and database code</strong></p>
 
-<p class="text-gray-300 leading-relaxed">SQL stored procedures, views, and migration scripts are a special case worth calling out. Developers routinely need to find queries that JOIN a particular table, update a specific column, or implement a pattern like a slowly changing dimension. Embedding SQL is straightforward — feed the SQL text to the embedding model — but chunking differs: a SQL file may contain dozens of independent statements. Split on statement boundaries (semicolons, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">GO</code> delimiters in SQL Server, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">$$</code> delimiters in PostgreSQL) and embed each statement independently.</p>
+<p class="text-gray-300 leading-relaxed">SQL stored procedures, views, and migration scripts are a special case worth calling out. Developers routinely need to find queries that JOIN a particular table, update a specific column, or implement a pattern like a slowly changing dimension. Embedding SQL is straightforward — feed the SQL text to the embedding model — but chunking differs: a SQL file may contain dozens of independent statements. Split on statement boundaries (semicolons, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">GO</code> delimiters in SQL Server) and embed each statement independently.</p>
 
 <p class="text-gray-300 leading-relaxed">The metadata fields that pay off for SQL code search: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">database_name</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">schema_name</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">object_type</code> (table, view, procedure, trigger), <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">tables_referenced</code> (extracted by parsing), and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">last_modified</code>. This turns your vector database into a semantic catalog layer on top of your existing database assets.</p>
 
@@ -618,20 +621,25 @@ def reciprocal_rank_fusion(
 
 <p class="text-gray-300 leading-relaxed">A practical metadata pattern for a product catalog:</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: unified metadata table that all modality indexes reference
-CREATE TABLE product_assets (
-    asset_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    product_id    TEXT NOT NULL,
-    modality      TEXT NOT NULL CHECK (modality IN ('text', 'image', 'audio', 'code')),
-    source_ref    TEXT NOT NULL,   -- chunk text, S3 path, git SHA, etc.
-    embedding_dim INTEGER NOT NULL,
-    index_name    TEXT NOT NULL,   -- which external index holds the vector
-    external_id   TEXT NOT NULL,   -- the vector's ID in that index
-    created_at    TIMESTAMPTZ DEFAULT now()
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: unified metadata table that all modality indexes reference
+CREATE TABLE dbo.product_assets (
+    asset_id      UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_product_assets_id DEFAULT NEWID(),
+    product_id    NVARCHAR(100) NOT NULL,
+    modality      NVARCHAR(20) NOT NULL
+                  CONSTRAINT CK_product_assets_modality
+                  CHECK (modality IN ('text', 'image', 'audio', 'code')),
+    source_ref    NVARCHAR(500) NOT NULL,   -- chunk text, S3 path, git SHA, etc.
+    embedding_dim INT NOT NULL,
+    index_name    SYSNAME NOT NULL,         -- which index/table holds the vector
+    external_id   NVARCHAR(100) NOT NULL,   -- the vector's ID in that index
+    created_at    DATETIME2(0) NOT NULL CONSTRAINT DF_product_assets_created
+                    DEFAULT SYSUTCDATETIME(),
+    CONSTRAINT PK_product_assets PRIMARY KEY (asset_id)
 );
 
-CREATE INDEX ON product_assets (product_id);
-CREATE INDEX ON product_assets (modality, index_name);</code></pre>
+CREATE INDEX IX_product_assets_product ON dbo.product_assets (product_id);
+CREATE INDEX IX_product_assets_modality ON dbo.product_assets (modality, index_name);
+</code></pre>
 
 <p class="text-gray-300 leading-relaxed">This table acts as a reverse-lookup registry: given a vector ID returned by Pinecone or Weaviate, you can join back to the canonical <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">product_id</code> and fetch any other modality's vectors or metadata.</p>
 
@@ -649,9 +657,9 @@ CREATE INDEX ON product_assets (modality, index_name);</code></pre>
 <p class="text-gray-300 leading-relaxed">| Audio (semantic) | CLAP | Cosine similarity | Same contrastive training as CLIP |</p>
 <p class="text-gray-300 leading-relaxed">| Audio (speaker ID) | ECAPA-TDNN, x-vectors | Cosine similarity | Speaker embeddings respond well to cosine |</p>
 <p class="text-gray-300 leading-relaxed">| Code | voyage-code-2, CodeBERT | Cosine similarity | Normalize outputs |</p>
-<p class="text-gray-300 leading-relaxed">| Binary / hash | SimHash, MinHash | Hamming distance | Use <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">bit</code> type in pgvector 0.7+ |</p>
+<p class="text-gray-300 leading-relaxed">| Binary / hash | SimHash, MinHash | Hamming distance | Store hashes in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VARBINARY(MAX)</code> in SQL Server |</p>
 
-<p class="text-gray-300 leading-relaxed">The near-universal answer is cosine similarity, which is why most production systems normalize vectors to unit length at ingestion time and then use dot product as a fast approximation (dot product on unit vectors equals cosine similarity). The pgvector operators <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs"><=></code> (cosine distance) and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs"><#></code> (negative dot product) let you switch without changing the schema.</p>
+<p class="text-gray-300 leading-relaxed">The near-universal answer is cosine similarity, which is why most production systems normalize vectors to unit length at ingestion time and then use dot product as a fast approximation (dot product on unit vectors equals cosine similarity). SQL Server's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_DISTANCE</code> takes the metric as an argument (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">'cosine'</code> vs <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">'dot'</code>), so you can switch metrics without changing the schema.</p>
 
 <p class="text-gray-300 leading-relaxed">Euclidean (L2) distance is appropriate when the magnitude of the vector carries semantic information, which is rare in embedding models designed for retrieval — those models are typically trained with normalization objectives. Hamming distance is useful for binary fingerprinting and near-duplicate detection in image or document deduplication pipelines.</p>
 
@@ -677,7 +685,7 @@ CREATE INDEX ON product_assets (modality, index_name);</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Quantization</strong></p>
 
-<p class="text-gray-300 leading-relaxed">Scalar quantization (SQ8) and binary quantization (BQ) reduce vector storage at the cost of some retrieval precision. pgvector supports <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">halfvec</code> (float16, half the storage of float32) and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">bit</code> (binary, 32× reduction from float32). Pinecone offers built-in int8 quantization. Weaviate supports both scalar and product quantization natively.</p>
+<p class="text-gray-300 leading-relaxed">Scalar quantization (SQ8) and binary quantization (BQ) reduce vector storage at the cost of some retrieval precision. SQL Server stores vectors as float32 in the native <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR</code> type; application-side float16 arrays or binary hashes in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VARBINARY</code> trade retrieval precision for storage when you need it. Pinecone offers built-in int8 quantization. Weaviate supports both scalar and product quantization natively.</p>
 
 <p class="text-gray-300 leading-relaxed">A common production pattern:</p>
 
@@ -689,13 +697,13 @@ CREATE INDEX ON product_assets (modality, index_name);</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Cost across platforms</strong></p>
 
-<p class="text-gray-300 leading-relaxed">Managed vector databases price on stored vectors, queries per second, and sometimes on the hosting tier (pod-based vs. serverless). Self-hosted pgvector running on a compute instance with adequate RAM is often the most cost-effective option at moderate scale — tens of millions of vectors — because you pay only for compute and storage, not a per-vector premium. Beyond a few hundred million vectors, the operational overhead of running a purpose-built system like Qdrant or Weaviate at scale often justifies the higher unit cost.</p>
+<p class="text-gray-300 leading-relaxed">Managed vector databases price on stored vectors, queries per second, and sometimes on the hosting tier (pod-based vs. serverless). Self-hosted SQL Server on a VM with adequate RAM is often the most cost-effective option at moderate scale — tens of millions of vectors — because you pay only for compute and storage, not a per-vector premium. Beyond a few hundred million vectors, the operational overhead of running a purpose-built system like Qdrant or Weaviate at scale often justifies the higher unit cost.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Modality determines the embedding pipeline, not the storage layer.** pgvector, Pinecone, Weaviate, and Qdrant are all modality-agnostic; what changes is the model you call before writing a vector to the index. Design your ingestion pipeline first, then select the database that fits your operational constraints.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Modality determines the embedding pipeline, not the storage layer.** SQL Server native vectors, Pinecone, Weaviate, and Qdrant are all modality-agnostic; what changes is the model you call before writing a vector to the index. Design your ingestion pipeline first, then select the database that fits your operational constraints.</li>
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Chunking and segmentation are first-class engineering problems.** Whether you are splitting a legal document into 512-token windows, extracting Python functions from an AST, or segmenting a call recording by voice activity, how you divide data before embedding determines retrieval granularity more than model choice does.</li>
 
@@ -708,15 +716,17 @@ CREATE INDEX ON product_assets (modality, index_name);</code></pre>
     <div class="mt-14 bg-cyan-950/40 border border-cyan-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
-        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · SQL Server</p>
       </div>
       <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
          class="shrink-0 px-6 py-3 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold rounded-xl text-sm transition">
         Download Free
       </a>
     </div>
-    <div class="mt-8 text-xs">
-      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a>
+    <div class="mt-10 flex items-center justify-between text-xs">
+      <a href="b4-ch05-sql-server-vs-dedicated.html" class="text-gray-500 hover:text-gray-300 transition">← Previous Chapter</a>
+      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">All Chapters</a>
+      <a href="b4-ch07-enabling-native-vector-sql-server.html" class="text-cyan-400 hover:text-cyan-300 transition">Next Chapter →</a>
     </div>
   </article>
   <footer class="border-t border-gray-800/50 px-6 py-8">

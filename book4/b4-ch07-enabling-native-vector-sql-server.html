@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 7: Enabling Native Vector Support in SQL Server — Vector Databases & AI</title>
+  <meta name="description" content="Vector Databases & AI Chapter 7: Enabling Native Vector Support in SQL Server — engine requirements, verification, migration from legacy storage, and first VECTOR column. By Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-cyan-500 to-cyan-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-cyan-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 4 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6">
+      <a href="index.html" class="text-xs text-cyan-400 hover:text-cyan-300 transition">← All Chapters</a>
+    </div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-cyan-900/40 border border-cyan-800/40 text-cyan-300 text-xs rounded-full font-medium">Chapter 7 of 40</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">Vector Databases & AI</span>
+    </div>
+    <div class="space-y-4 text-sm">
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 7: Enabling Native Vector Support in SQL Server</h2>
+
+<p class="text-gray-300 leading-relaxed">One of the pleasant surprises of SQL Server 2025's vector support is how little ceremony it requires. There is no extension to install, no separate service to deploy, no feature flag buried in a configuration file. Native vectors are part of the database engine itself: if your instance runs SQL Server 2025 (version 17.x), the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR</code> data type, the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_DISTANCE</code> function, and the supporting infrastructure are already there. This chapter walks through verifying your environment, understanding what is generally available versus preview, planning the upgrade if you are on an older version, and creating your first vector-enabled table the right way.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Step 1: Verify the Engine Version</h3>
+
+<p class="text-gray-300 leading-relaxed">Native vector support requires SQL Server 2025, which reports itself as major version 17. Confirm what you are running before anything else:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Confirm the engine version: vector support needs 17.x (SQL Server 2025)
+SELECT @@VERSION AS EngineVersion,
+       SERVERPROPERTY('ProductMajorVersion') AS MajorVersion,
+       SERVERPROPERTY('ProductLevel')        AS ProductLevel,
+       SERVERPROPERTY('Edition')             AS Edition;
+-- Expect: MajorVersion = 17, e.g. "Microsoft SQL Server 2025 (RTM) - 17.0.xxxx"</code></pre>
+
+<p class="text-gray-300 leading-relaxed">If you are on SQL Server 2022 or earlier, native vectors are not available in-engine. Your options are: upgrade to 2025 (the path this book assumes), use Azure SQL Database or Azure SQL Managed Instance where native vector support is generally available, or — as a stopgap only — store embeddings as serialized JSON in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">NVARCHAR(MAX)</code> and compute similarity in the application tier. That stopgap is worth naming explicitly because many teams built it before 2025 shipped; Chapter 8 covers migrating those legacy columns to the native type.</p>
+
+<p class="text-gray-300 leading-relaxed">Check that the type is actually usable in your database with a one-line smoke test:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Smoke test: if this runs, native vector support is live
+DECLARE @v VECTOR(3) = '[1.0, 2.0, 3.0]';
+SELECT VECTOR_DISTANCE('cosine', @v, '[1.0, 2.0, 3.0]') AS SelfDistance;
+-- Returns 0: identical vectors have zero cosine distance</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Step 2: Know What Is GA and What Is Preview</h3>
+
+<p class="text-gray-300 leading-relaxed">As of SQL Server 2025, the vector feature set is split across two maturity levels, and planning around that split saves unpleasant surprises later.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Generally available:</strong> the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR(n)</code> data type (1 to 1998 dimensions), <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_DISTANCE</code> with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">'cosine'</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">'euclidean'</code>, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">'dot'</code> metrics, plus the helper functions <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_NORM</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_NORMALIZE</code>. These work on SQL Server 2025, Azure SQL Database, and Azure SQL Managed Instance, and you can build production workloads on them today. Exact nearest-neighbor search with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_DISTANCE</code> performs well up to roughly 50,000 vectors — plenty for departmental knowledge bases, product catalogs, and pilot RAG systems.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">In preview:</strong> the approximate vector index (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE VECTOR INDEX ... WITH (TYPE = 'DiskANN')</code>) and the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_SEARCH</code> table-valued function, available in SQL Server 2025 (17.x), Azure SQL Database, and SQL database in Microsoft Fabric. Preview status matters for two reasons: the syntax and behavior can still change, and the current implementation carries real constraints — the table needs a single-column integer clustered primary key, the table becomes read-only while the vector index exists, the index must be dropped and recreated to incorporate new data, and partitioned tables, views, and temp tables are not supported.</p>
+
+<p class="text-gray-300 leading-relaxed">The practical implication: design your schema so the GA features carry the production load and the preview index is an accelerator you can adopt, drop, or rebuild without redesigning tables. Keep the source documents and their embeddings in ordinary tables with ordinary keys; add the vector index as a performance layer, not a structural dependency. Chapters 9 and 10 go deep on DiskANN index design and tuning.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Step 3: Plan the Upgrade (If You Are Not on 2025 Yet)</h3>
+
+<p class="text-gray-300 leading-relaxed">Most SQL Server estates are not on 2025 yet, so the realistic path to native vectors runs through an upgrade project. Treat vector enablement as one workstream inside that project, not the reason for it — the upgrade justification should stand on its own (support lifecycle, performance, security), with vectors as a bonus capability.</p>
+
+<p class="text-gray-300 leading-relaxed">A few upgrade specifics that matter for vector workloads:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">In-place vs. side-by-side.</strong> For any workload you intend to add vectors to, prefer a side-by-side migration (new 2025 instance, restore and validate) over an in-place upgrade. It gives you a rollback path and a clean environment for the schema changes vector columns require.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Compatibility level.</strong> New engine features generally expect the database compatibility level to match the engine. After upgrading, test your workload at the new compatibility level before enabling anything vector-related, so vector issues and compat issues do not get conflated.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Driver and client library versions.</strong> The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR</code> type is new to the TDS type system. Older SqlClient, ODBC, or JDBC drivers may not understand it. Plan a driver upgrade alongside the engine upgrade, and verify that your ORM (Entity Framework Core 10+ has built-in vector support) handles the type.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Cloud shortcut.</strong> If the on-premises upgrade timeline is long, Azure SQL Database gives you native vectors immediately with no upgrade project at all — a legitimate interim home for vector workloads while the on-prem estate catches up. Chapter 13 covers the cloud deployment details.</li>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Step 4: Create Your First Vector-Enabled Table</h3>
+
+<p class="text-gray-300 leading-relaxed">With the engine verified, creating vector storage is ordinary DDL. The pattern to internalize: keep the source content and the embedding in the same row, with the embedding nullable so documents can exist before they are embedded (backfill is a normal part of vector operations).</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Canonical pattern: source content + embedding side by side
+CREATE TABLE dbo.Documents (
+    DocumentId  INT IDENTITY(1,1) NOT NULL CONSTRAINT PK_Documents PRIMARY KEY,
+    Title       NVARCHAR(300) NOT NULL,
+    Body        NVARCHAR(MAX) NOT NULL,
+    SourceUri   NVARCHAR(1000) NULL,
+    Embedding   VECTOR(1536) NULL,          -- NULL until embedded
+    EmbeddedAt  DATETIME2(0) NULL,         -- tracks backfill progress
+    ModelName   NVARCHAR(100) NULL,         -- which model produced the vector
+    CreatedAt   DATETIME2(0) NOT NULL CONSTRAINT DF_Documents_CreatedAt DEFAULT SYSUTCDATETIME()
+);
+GO
+
+-- Insert a document; embedding arrives later from the embedding pipeline
+INSERT INTO dbo.Documents (Title, Body, SourceUri)
+VALUES ('Password reset procedure',
+        'To reset your password, open Settings > Security > ...',
+        'https://intranet/help/password-reset');
+
+-- Store an embedding: implicit conversion from JSON array string
+UPDATE dbo.Documents
+SET Embedding  = CAST('[0.012, -0.043, 0.071, ...]' AS VECTOR(1536)),
+    EmbeddedAt = SYSUTCDATETIME(),
+    ModelName  = 'text-embedding-3-small'
+WHERE DocumentId = 1;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Three design decisions in that script deserve emphasis. First, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR(1536)</code> fixes the dimensionality at the type level — attempting to store a 384-dimension vector in a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR(1536)</code> column fails loudly at write time, which is exactly what you want. Silent dimension mismatches are a notorious source of garbage search results. Second, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ModelName</code> records which embedding model produced each vector, because vectors from different models live in different coordinate spaces and cannot be mixed (Chapter 30 covers model versioning). Third, the single-column integer primary key is not just good practice — it is a prerequisite for the DiskANN vector index should you add one later.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph LR
+    A[Verify engine<br/>17.x] --> B[Smoke test<br/>VECTOR_DISTANCE]
+    B --> C{On 2025?}
+    C -->|No| D[Upgrade project<br/>or Azure SQL interim]
+    C -->|Yes| E[Create VECTOR tables<br/>nullable embeddings]
+    D --> E
+    E --> F[Backfill embeddings<br/>Chapter 8]
+    F --> G[Exact search<br/>GA today]
+    G --> H[DiskANN index<br/>preview accelerator]</pre></div>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Common Gotchas on Day One</h3>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Dimension mismatches fail at write time — by design.</strong> If your embedding pipeline emits 1536-dimension vectors and someone points a 384-dimension model at the same table, the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CAST</code> fails. Treat that error as a guardrail, not a bug: it caught a model-configuration mistake before it poisoned your index.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">NULL embeddings sort and filter normally.</strong> <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_DISTANCE</code> with a NULL input returns NULL, so un-embedded rows naturally fall out of <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ORDER BY</code> ranking. Use <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WHERE Embedding IS NOT NULL</code> in retrieval queries during backfill windows to keep plans clean.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Storage math.</strong> A 1536-dimension float32 vector occupies about 6 KB. One million vectors is roughly 6 GB of raw column data before indexes — trivial for modern storage, but worth knowing when sizing the buffer pool for hot vector workloads. Higher-dimension models (3072) double it; smaller models (384) cut it to about 1.5 KB per vector.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Do not skip the driver upgrade.</strong> The most common day-one failure is not the engine at all — it is an old SqlClient or ODBC driver that cannot parse the new TDS type metadata for <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR</code> columns. If reads of vector columns fail while everything else works, the driver is the first suspect.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Native vector support needs SQL Server 2025 (version 17.x) — verify with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SERVERPROPERTY('ProductMajorVersion')</code> and a one-line <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_DISTANCE</code> smoke test. There is nothing to install: vectors are part of the engine.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR(n)</code> type and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_DISTANCE</code> are generally available and production-ready; the DiskANN vector index and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_SEARCH</code> are in preview with real constraints — design so the GA features carry production and the index is an accelerator.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> If you are not on 2025 yet, run vector enablement as a workstream inside the upgrade project — side-by-side migration, compatibility-level validation, and driver upgrades included — or use Azure SQL Database as an interim home.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> The canonical table pattern keeps source content and a nullable <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR(n)</code> column in the same row, records the embedding model per row, and uses a single-column integer primary key to stay eligible for a future DiskANN index.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Day-one gotchas: dimension mismatches fail loudly at write time (a feature), NULL embeddings need explicit filtering during backfill, budget ~6 KB per 1536-dimension vector, and upgrade client drivers so they understand the new TDS type.</li>
+    </div>
+    <div class="mt-14 bg-cyan-950/40 border border-cyan-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · SQL Server</p>
+      </div>
+      <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
+         class="shrink-0 px-6 py-3 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold rounded-xl text-sm transition">
+        Download Free
+      </a>
+    </div>
+    <div class="mt-10 flex items-center justify-between text-xs">
+      <a href="b4-ch06-data-types-vector-storage.html" class="text-gray-500 hover:text-gray-300 transition">← Previous Chapter</a>
+      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">All Chapters</a>
+      <a href="b4-ch08-storing-embeddings-sql-server.html" class="text-cyan-400 hover:text-cyan-300 transition">Next Chapter →</a>
+    </div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · Vector Databases & AI</div>
+  </footer>
+</body>
+</html>

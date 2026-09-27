@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Chapter 40: Building a Production Vector DB Monitoring Dashboard — Vector Databases & AI</title>
-  <meta name="description" content="Vector Databases & AI Chapter 40: Building a Production Vector DB Monitoring Dashboard. pgvector, Pinecone, Weaviate, RAG pipelines — by Rajesh Guntupalli." />
+  <title>Chapter 40: Vector Database Monitoring Dashboard — Vector Databases & AI</title>
+  <meta name="description" content="Vector Databases & AI Chapter 40: Building a vector database monitoring dashboard — SQL Server DMVs and Query Store, managed-service APIs, recall probes, golden datasets, alerting, and Grafana layout. By Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
   <script type="module">
     import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
@@ -16,7 +16,7 @@
     <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
       <a href="../index.html" class="flex items-center gap-2 group">
         <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-cyan-500 to-cyan-700 flex items-center justify-center">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
         </div>
         <span class="text-sm font-bold text-white group-hover:text-cyan-300 transition">Rajesh Guntupalli</span>
       </a>
@@ -41,1261 +41,268 @@
       <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">Vector Databases & AI</span>
     </div>
     <div class="space-y-4 text-sm">
-<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 40: Building a Production Vector DB Monitoring Dashboard</h2>
-
-<p class="text-gray-300 leading-relaxed">Monitoring a vector database in production is not the same as monitoring a relational database. The familiar metrics—query throughput, lock waits, buffer hit ratio, replication lag—still matter when the underlying engine is PostgreSQL or a similar system, but they tell you nothing about the health of your embedding pipeline, the quality of your search results, or whether your index structures are serving queries efficiently under load. This chapter brings together everything from earlier in the book and shows you how to build a dashboard that covers all three layers: infrastructure metrics, vector-specific operational metrics, and application-layer quality signals. By the end, you will have runnable code for a Prometheus/Grafana stack that monitors pgvector, Pinecone, and Weaviate simultaneously, a Python-based quality probe that runs continuously against your RAG pipeline, and a pattern for surfacing drift and recall degradation before your users notice.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 40: Vector Database Monitoring Dashboard</h2>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">The Three-Layer Monitoring Model</h3>
 
-<p class="text-gray-300 leading-relaxed">Most teams start with infrastructure monitoring because it is familiar: CPU, memory, disk I/O, and connection counts. That baseline is necessary but insufficient for vector workloads. You need to think in three distinct layers, each requiring different instrumentation.</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Layer 1 — Infrastructure and Engine Metrics</strong></p>
-<p class="text-gray-300 leading-relaxed">These are the metrics your existing tools already collect. For pgvector on PostgreSQL, that means <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code>, autovacuum activity, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">shared_buffers</code> utilization, and WAL generation rate. For Pinecone, it means pod CPU and memory exposed through the Pinecone console API. For Weaviate, it means the built-in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">/v1/nodes</code> endpoint and Prometheus scrape target.</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Layer 2 — Vector Index Operational Metrics</strong></p>
-<p class="text-gray-300 leading-relaxed">These metrics are specific to the vector engine and have no direct SQL equivalent. Index build status, HNSW graph construction rate, quantization compression ratio, segment count, and—most importantly—approximate nearest neighbor (ANN) query latency at the 50th, 95th, and 99th percentiles. Think of the HNSW index as an analogy to a B-tree: just as you would monitor B-tree bloat and split frequency, you monitor HNSW graph connectivity and segment merger rates.</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Layer 3 — Embedding and Search Quality Metrics</strong></p>
-<p class="text-gray-300 leading-relaxed">This layer has no equivalent in traditional database monitoring. It answers questions like: Are the embeddings being stored still aligned with the model that generated the query embeddings? Is the top-k recall degrading as new data is inserted without re-indexing? Are cosine similarity scores drifting toward lower values, indicating that the vector space is becoming less discriminative? These signals require synthetic probes—queries you run against the database with known expected results—and they need to run on a schedule, not just when a user complains.</p>
+<p class="text-gray-300 leading-relaxed">Monitoring a vector database in production is not the same as monitoring a relational database. The familiar metrics — query throughput, lock waits, buffer hit ratio, Always On sync health — still matter when the underlying engine is SQL Server, but they tell you nothing about the health of your embedding pipeline, the quality of your search results, or whether your DiskANN indexes are serving queries efficiently under load. This chapter brings together everything from earlier in the book and shows you how to build a dashboard that covers all three layers: infrastructure metrics, vector-specific operational metrics, and application-layer quality signals. By the end, you will have runnable T-SQL for SQL Server DMV and Query Store monitoring, a Python quality probe that runs continuously against your RAG pipeline, and a pattern for surfacing drift and recall degradation before your users notice.</p>
 
 <div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
-    L3["Layer 3: Embedding & search quality<br/>golden dataset recall probes, similarity drift"]
-    L2["Layer 2: Vector index operations<br/>HNSW build status, ANN latency, segment merges"]
-    L1["Layer 1: Infrastructure & engine<br/>CPU, memory, disk I/O, connections"]
-    L3 -->|earliest warning| L2
-    L2 -->|cascades to| L1
-    style L3 fill:#c8e6c9
-    style L2 fill:#fff9c4
-    style L1 fill:#ffe0b2</pre></div>
-<p class="text-gray-300 leading-relaxed">*A Layer 3 failure — recall or similarity drift — typically shows up weeks before it cascades into a visible Layer 2 or Layer 1 problem, which is why quality probes matter as much as infrastructure dashboards.*</p>
+    L1[Layer 1: Infrastructure<br/>CPU, memory, I/O, AG health] --> D[Dashboard]
+    L2[Layer 2: Vector operations<br/>DiskANN health, query latency,<br/>index size, pipeline lag] --> D
+    L3[Layer 3: Quality signals<br/>recall@k probes, drift,<br/>user feedback] --> D</pre></div>
 
-<p class="text-gray-300 leading-relaxed">The architectural principle is that your dashboard should surface a failure at Layer 3 before it becomes visible at Layer 2, and a Layer 2 failure before it cascades to Layer 1. In practice, embedding drift shows up weeks before your HNSW index becomes so fragmented that query latency spikes.</p>
+<p class="text-gray-300 leading-relaxed">Layer 1 is your existing SQL Server monitoring — keep it. Layer 2 is new: DiskANN index health, vector query latency from Query Store, embedding pipeline lag. Layer 3 is the one teams skip and regret: continuous quality probes that prove the system still retrieves the right documents.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">Instrumenting pgvector with Prometheus and Custom Metrics</h3>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Instrumenting SQL Server Vectors with DMVs and Query Store</h3>
 
-<p class="text-gray-300 leading-relaxed">PostgreSQL does not expose vector-specific metrics natively. You need to instrument them yourself, either through a custom <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">postgres_exporter</code> configuration or by running a metrics collection script that queries system views and writes to a Prometheus pushgateway.</p>
+<p class="text-gray-300 leading-relaxed">SQL Server exposes vector workload telemetry through the same DMVs and Query Store you already use — no exporter required. The queries below form the Layer 2 core.</p>
 
-<p class="text-gray-300 leading-relaxed">The following script collects the most important pgvector operational metrics and pushes them to a Prometheus pushgateway on a 60-second interval. It covers index status, approximate row counts per collection, and query latency histograms derived from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code>.</p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server 2025: Layer 2 vector operations monitoring
+-- 1. DiskANN index space and growth (run hourly, trend in Grafana)
+SELECT DB_NAME() AS DbName, i.name AS IndexName,
+       SUM(s.used_page_count) * 8 / 1024 AS UsedMB,
+       SUM(s.row_count) AS VectorRows
+FROM sys.indexes AS i
+JOIN sys.dm_db_partition_stats AS s
+  ON s.object_id = i.object_id AND s.index_id = i.index_id
+WHERE i.object_id = OBJECT_ID(N'dbo.DocumentChunks')
+GROUP BY i.name;
+-- 2. Vector query latency from Query Store (top offenders, last hour)
+SELECT TOP (10) qsqt.query_sql_text,
+       SUM(qrs.count_executions) AS Execs,
+       SUM(qrs.avg_duration * qrs.count_executions) / 1000.0 AS TotalMs,
+       MAX(qrs.max_duration) / 1000.0 AS MaxMs
+FROM sys.query_store_query_text AS qsqt
+JOIN sys.query_store_query AS qsq ON qsq.query_text_id = qsqt.query_text_id
+JOIN sys.query_store_plan AS qsp ON qsp.query_id = qsq.query_id
+JOIN sys.query_store_runtime_stats AS qrs ON qrs.plan_id = qsp.plan_id
+WHERE qsqt.query_sql_text LIKE '%VECTOR\_DISTANCE%' ESCAPE '\'
+   OR qsqt.query_sql_text LIKE '%VECTOR\_SEARCH%' ESCAPE '\'
+GROUP BY qsqt.query_sql_text
+ORDER BY TotalMs DESC;
+-- 3. Embedding pipeline lag: unprocessed queue depth + oldest item age
+SELECT COUNT(*) AS PendingJobs,
+       DATEDIFF(minute, MIN(EnqueuedAt), SYSUTCDATETIME()) AS OldestAgeMin
+FROM dbo.EmbeddingJobs
+WHERE Status = 'pending';
+-- 4. AG replica health for the vector database (Chapter 35)
+SELECT ars.role_desc AS Role, ars.synchronization_health_desc AS Health,
+       drs.log_send_queue_size AS SendQueueKB,
+       drs.redo_queue_size AS RedoQueueKB
+FROM sys.dm_hadr_availability_replica_states AS ars
+JOIN sys.dm_hadr_database_replica_states AS drs
+  ON drs.replica_id = ars.replica_id AND drs.group_id = ars.group_id
+WHERE drs.database_id = DB_ID(N'VectorRagDb');
+</code></pre>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
-# pgvector_metrics_collector.py
-# Requires: psycopg2, prometheus_client, schedule
+<p class="text-gray-300 leading-relaxed">This uses Query Store rather than wrapping every query with timing code — it captures the full query load from all connections, not just the ones your application explicitly instruments. Keep Query Store in read-write mode with a sensible retention (30 days is a good default for vector workloads) so latency trends survive long enough to correlate with recall-probe history.</p>
 
-import time
-import schedule
-import psycopg2
-import psycopg2.extras
-from prometheus_client import (
-    CollectorRegistry,
-    Gauge,
-    Histogram,
-    push_to_gateway,
-)
+<p class="text-gray-300 leading-relaxed">For Grafana, expose these as a Prometheus pushgateway feed or a SQL data source: a collector script runs the four queries every 60 seconds via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pyodbc</code> and pushes gauges (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sqlserver_vector_index_mb</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sqlserver_vector_query_ms</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sqlserver_embedding_queue_depth</code>). The PromQL for the dashboard's slowest-query panel is then trivial:</p>
 
-PUSHGATEWAY_URL = "http://localhost:9091"
-PG_DSN = "host=localhost dbname=vectordb user=monitor password=monitor_pass"
-
-registry = CollectorRegistry()
-
-# Gauge: number of live rows per vector table
-vector_table_row_count = Gauge(
-    "pgvector_table_live_rows",
-    "Estimated live row count for vector tables",
-    ["table_name", "index_name"],
-    registry=registry,
-)
-
-# Gauge: index size in bytes
-vector_index_size_bytes = Gauge(
-    "pgvector_index_size_bytes",
-    "On-disk size of vector indexes",
-    ["index_name", "table_name"],
-    registry=registry,
-)
-
-# Gauge: HNSW index build progress (0=not building, 1=building)
-vector_index_building = Gauge(
-    "pgvector_index_building",
-    "Whether an HNSW index is currently being built (1=yes)",
-    ["index_name"],
-    registry=registry,
-)
-
-# Histogram: ANN query latency from pg_stat_statements (p50, p95, p99)
-vector_query_latency_ms = Gauge(
-    "pgvector_ann_query_mean_latency_ms",
-    "Mean latency in ms for ANN queries (from pg_stat_statements)",
-    ["query_pattern"],
-    registry=registry,
-)
-
-vector_query_calls_total = Gauge(
-    "pgvector_ann_query_calls_total",
-    "Total call count for ANN query patterns",
-    ["query_pattern"],
-    registry=registry,
-)
-
-
-def collect_metrics():
-    conn = psycopg2.connect(PG_DSN)
-    cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-
-    # Collect live row counts and index sizes for vector tables
-    # Identify vector tables by looking for vector-typed columns
-    cur.execute("""
-        SELECT
-            c.relname                          AS table_name,
-            i.relname                          AS index_name,
-            pg_relation_size(i.oid)            AS index_size_bytes,
-            pg_stat_get_live_tuples(c.oid)     AS live_rows,
-            am.amname                          AS index_method
-        FROM
-            pg_class c
-            JOIN pg_index ix ON c.oid = ix.indrelid
-            JOIN pg_class i  ON i.oid = ix.indexrelid
-            JOIN pg_am am    ON i.relam = am.oid
-            JOIN pg_attribute a ON a.attrelid = c.oid
-                AND a.attnum = ANY(ix.indkey)
-            JOIN pg_type t  ON a.atttypid = t.oid
-        WHERE
-            t.typname = 'vector'
-            AND c.relkind = 'r'
-            AND am.amname IN ('hnsw', 'ivfflat')
-        ORDER BY
-            c.relname, i.relname;
-    """)
-    rows = cur.fetchall()
-    for row in rows:
-        vector_table_row_count.labels(
-            table_name=row["table_name"],
-            index_name=row["index_name"],
-        ).set(row["live_rows"])
-        vector_index_size_bytes.labels(
-            index_name=row["index_name"],
-            table_name=row["table_name"],
-        ).set(row["index_size_bytes"])
-
-    # Detect in-progress index builds
-    cur.execute("""
-        SELECT
-            relname AS index_name,
-            phase,
-            blocks_done,
-            blocks_total
-        FROM
-            pg_stat_progress_create_index
-        WHERE
-            command = 'CREATE INDEX CONCURRENTLY'
-            OR command = 'CREATE INDEX';
-    """)
-    building = cur.fetchall()
-    # Reset all to 0 first, then set active ones
-    for row in building:
-        vector_index_building.labels(index_name=row["index_name"]).set(1)
-
-    # ANN query latency from pg_stat_statements
-    # Filter for queries that contain '&lt;-&gt;' (L2), '&lt;=&gt;' (cosine), or '&lt;#&gt;' (inner product)
-    cur.execute("""
-        SELECT
-            LEFT(query, 80)                             AS query_pattern,
-            calls                                       AS total_calls,
-            mean_exec_time                              AS mean_ms
-        FROM
-            pg_stat_statements
-        WHERE
-            query LIKE '%&lt;-&gt;%'
-            OR query LIKE '%&lt;=&gt;%'
-            OR query LIKE '%&lt;#&gt;%'
-        ORDER BY
-            total_exec_time DESC
-        LIMIT 20;
-    """)
-    query_rows = cur.fetchall()
-    for qrow in query_rows:
-        label = qrow["query_pattern"].strip().replace("\n", " ")[:60]
-        vector_query_latency_ms.labels(query_pattern=label).set(qrow["mean_ms"])
-        vector_query_calls_total.labels(query_pattern=label).set(qrow["total_calls"])
-
-    cur.close()
-    conn.close()
-
-    push_to_gateway(
-        PUSHGATEWAY_URL,
-        job="pgvector_metrics",
-        registry=registry,
-    )
-    print(f"[{time.strftime('%H:%M:%S')}] Metrics pushed to Prometheus gateway")
-
-
-schedule.every(60).seconds.do(collect_metrics)
-
-if __name__ == "__main__":
-    collect_metrics()  # Run immediately on start
-    while True:
-        schedule.run_pending()
-        time.sleep(1)</code></pre>
-
-<p class="text-gray-300 leading-relaxed">This script intentionally uses <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> rather than wrapping every query with timing code. That means it captures the full query load from all connections, not just the ones your application explicitly instruments. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">mean_exec_time</code> from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> is a rolling mean since the last statistics reset; pair it with the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">calls</code> counter and you can compute a rate-weighted average in Grafana.</p>
-
-<p class="text-gray-300 leading-relaxed">For the Grafana dashboard, create a panel with this PromQL expression to show the top-5 slowest ANN query patterns:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># shell
-# Prometheus query for Grafana panel: Top 5 slowest ANN query patterns
-# Panel type: Table
-# PromQL:
-topk(5, pgvector_ann_query_mean_latency_ms)
-
-# Panel type: Time series for index size growth
-# PromQL:
-rate(pgvector_index_size_bytes[5m]) * 300
-# Multiplied by 300 seconds (5-minute interval) to get bytes added per scrape window
-
-# Alert rule: ANN query latency exceeds 200ms mean
-# In Prometheus alerting rules YAML:
-# alert: VectorQueryLatencyHigh
-# expr: pgvector_ann_query_mean_latency_ms &gt; 200
-# for: 5m
-# labels:
-#   severity: warning
-# annotations:
-#   summary: "ANN query mean latency &gt; 200ms for {{ $labels.query_pattern }}"</code></pre>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Prometheus alerting rules (vector_alerts.yaml)
+# Warn when p99-ish vector query latency exceeds 200ms for 10 minutes:
+# expr: max_over_time(sqlserver_vector_query_max_ms[10m]) &gt; 200
+# Crit when the embedding queue stops draining (depth growing 30 min):
+# expr: deriv(sqlserver_embedding_queue_depth[30m]) &gt; 0
+# Crit when DiskANN index size grows &gt;20%/day unexpectedly (runaway ingest):
+# expr: deriv(sqlserver_vector_index_mb[1d]) &gt; 0.2 * sqlserver_vector_index_mb</code></pre>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">Monitoring Pinecone and Weaviate via Their Native APIs</h3>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Monitoring Managed Services via Their Native APIs</h3>
 
-<p class="text-gray-300 leading-relaxed">Pinecone and Weaviate expose operational metrics through REST APIs, but they each have different granularity and different concepts of what "healthy" means.</p>
+<p class="text-gray-300 leading-relaxed">Where part of the estate lives in Pinecone, Weaviate, or Qdrant, fold their native metrics into the same dashboard rather than maintaining a second one. Pinecone exposes index stats (vector count, dimension, index fullness) via its API; Weaviate exposes a Prometheus endpoint natively; Qdrant exposes cluster telemetry at <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">/metrics</code>.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Pinecone Monitoring</strong></p>
-
-<p class="text-gray-300 leading-relaxed">Pinecone's Python client exposes <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">describe_index_stats()</code>, which gives you namespace-level vector counts and fullness. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">fullness</code> metric is the single most important operational signal for a pod-based Pinecone deployment: when it exceeds 0.90, query latency climbs steeply and inserts may fail.</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
-# pinecone_metrics_collector.py
-# Requires: pinecone-client&gt;=3.0, prometheus_client
-
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python — managed-service metrics into the same pushgateway
+# Requires: pinecone-client>=3.0, requests, prometheus_client, pyodbc
 import os
-import time
-import schedule
 from pinecone import Pinecone
-from prometheus_client import (
-    CollectorRegistry,
-    Gauge,
-    push_to_gateway,
-)
-
-PUSHGATEWAY_URL = "http://localhost:9091"
-PINECONE_API_KEY = os.environ["PINECONE_API_KEY"]
-
-pc = Pinecone(api_key=PINECONE_API_KEY)
+from prometheus_client import CollectorRegistry, Gauge, push_to_gateway
 
 registry = CollectorRegistry()
+pc_fullness = Gauge("pinecone_index_fullness_ratio",
+                    "Index fullness 0-1", registry=registry)
+pc_vectors = Gauge("pinecone_vector_count",
+                   "Total vectors", ["index"], registry=registry)
 
-pinecone_vector_count = Gauge(
-    "pinecone_namespace_vector_count",
-    "Number of vectors in a Pinecone namespace",
-    ["index_name", "namespace"],
-    registry=registry,
-)
+pc = Pinecone(api_key=os.environ["PINECONE_API_KEY"])
+for desc in pc.list_indexes():
+    stats = pc.Index(desc.name).describe_index_stats()
+    pc_vectors.labels(index=desc.name).set(stats["total_vector_count"])
+    pc_fullness.set(stats.get("index_fullness", 0.0))
+    # Fullness > 0.8 on a pod-based index means scale the pods
+    # BEFORE latency degrades — this is the managed equivalent of
+    # watching DiskANN index growth in the previous section.
 
-pinecone_index_fullness = Gauge(
-    "pinecone_index_fullness_ratio",
-    "Index fullness ratio (0.0 to 1.0). Alert at &gt; 0.85",
-    ["index_name"],
-    registry=registry,
-)
-
-pinecone_index_dimension = Gauge(
-    "pinecone_index_dimension",
-    "Vector dimension for a Pinecone index",
-    ["index_name", "metric"],
-    registry=registry,
-)
-
-pinecone_index_ready = Gauge(
-    "pinecone_index_ready",
-    "1 if the index state is Ready, 0 otherwise",
-    ["index_name"],
-    registry=registry,
-)
-
-
-def collect_pinecone_metrics():
-    indexes = pc.list_indexes()
-
-    for index_info in indexes:
-        index_name = index_info.name
-        idx = pc.Index(index_name)
-
-        # Index status
-        desc = pc.describe_index(index_name)
-        is_ready = 1 if desc.status.ready else 0
-        pinecone_index_ready.labels(index_name=index_name).set(is_ready)
-        pinecone_index_dimension.labels(
-            index_name=index_name,
-            metric=desc.metric,
-        ).set(desc.dimension)
-
-        # Stats per namespace
-        stats = idx.describe_index_stats()
-        pinecone_index_fullness.labels(index_name=index_name).set(
-            stats.index_fullness
-        )
-
-        for namespace, ns_stats in stats.namespaces.items():
-            pinecone_vector_count.labels(
-                index_name=index_name,
-                namespace=namespace if namespace else "__default__",
-            ).set(ns_stats.vector_count)
-
-    push_to_gateway(
-        PUSHGATEWAY_URL,
-        job="pinecone_metrics",
-        registry=registry,
-    )
-    print(f"[{time.strftime('%H:%M:%S')}] Pinecone metrics pushed")
-
-
-schedule.every(30).seconds.do(collect_pinecone_metrics)
-
-if __name__ == "__main__":
-    collect_pinecone_metrics()
-    while True:
-        schedule.run_pending()
-        time.sleep(1)</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Weaviate Monitoring</strong></p>
-
-<p class="text-gray-300 leading-relaxed">Weaviate ships with a built-in Prometheus endpoint at <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">http://<host>:2112/metrics</code> when you set <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">PROMETHEUS_MONITORING_ENABLED=true</code> in the environment. The native metrics cover object count, index segment count, vector dimension, and batch import throughput. Beyond those, you want to query the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">/v1/nodes</code> REST endpoint for cluster health.</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
-# weaviate_health_probe.py
-# Requires: weaviate-client&gt;=4.0, requests, prometheus_client
-
-import os
-import time
-import requests
-import schedule
-import weaviate
-from weaviate.classes.init import Auth
-from prometheus_client import (
-    CollectorRegistry,
-    Gauge,
-    push_to_gateway,
-)
-
-PUSHGATEWAY_URL = "http://localhost:9091"
-WEAVIATE_URL = os.environ.get("WEAVIATE_URL", "http://localhost:8080")
-WEAVIATE_API_KEY = os.environ.get("WEAVIATE_API_KEY", "")
-
-registry = CollectorRegistry()
-
-weaviate_node_status = Gauge(
-    "weaviate_node_healthy",
-    "1 if the Weaviate node is healthy",
-    ["node_name"],
-    registry=registry,
-)
-
-weaviate_object_count = Gauge(
-    "weaviate_collection_object_count",
-    "Number of objects in a Weaviate collection",
-    ["collection_name", "node_name"],
-    registry=registry,
-)
-
-weaviate_shard_count = Gauge(
-    "weaviate_collection_shard_count",
-    "Number of shards for a Weaviate collection",
-    ["collection_name"],
-    registry=registry,
-)
-
-weaviate_vector_index_queue_length = Gauge(
-    "weaviate_async_index_queue_length",
-    "Number of objects waiting to be indexed asynchronously",
-    ["collection_name", "shard_name"],
-    registry=registry,
-)
-
-
-def collect_weaviate_metrics():
-    # Use REST directly for /v1/nodes — gives richer cluster info than client
-    headers = {}
-    if WEAVIATE_API_KEY:
-        headers["Authorization"] = f"Bearer {WEAVIATE_API_KEY}"
-
-    try:
-        resp = requests.get(
-            f"{WEAVIATE_URL}/v1/nodes",
-            headers=headers,
-            params={"output": "verbose"},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        nodes_data = resp.json()
-    except Exception as e:
-        print(f"Failed to reach Weaviate nodes endpoint: {e}")
-        return
-
-    collection_shards: dict[str, int] = {}
-    collection_objects: dict[tuple, int] = {}
-
-    for node in nodes_data.get("nodes", []):
-        node_name = node.get("name", "unknown")
-        node_status = node.get("status", "UNHEALTHY")
-        weaviate_node_status.labels(node_name=node_name).set(
-            1 if node_status == "HEALTHY" else 0
-        )
-
-        for shard in node.get("shards", []) or []:
-            coll_name = shard.get("class", "unknown")
-            shard_name = shard.get("name", "unknown")
-            obj_count = shard.get("objectCount", 0)
-            queue_len = shard.get("vectorIndexingQueue", 0)
-
-            collection_shards[coll_name] = (
-                collection_shards.get(coll_name, 0) + 1
-            )
-            key = (coll_name, node_name)
-            collection_objects[key] = collection_objects.get(key, 0) + obj_count
-
-            weaviate_vector_index_queue_length.labels(
-                collection_name=coll_name,
-                shard_name=shard_name,
-            ).set(queue_len)
-
-    for (coll_name, node_name), count in collection_objects.items():
-        weaviate_object_count.labels(
-            collection_name=coll_name,
-            node_name=node_name,
-        ).set(count)
-
-    for coll_name, shard_count in collection_shards.items():
-        weaviate_shard_count.labels(collection_name=coll_name).set(shard_count)
-
-    push_to_gateway(
-        PUSHGATEWAY_URL,
-        job="weaviate_metrics",
-        registry=registry,
-    )
-    print(f"[{time.strftime('%H:%M:%S')}] Weaviate metrics pushed")
-
-
-schedule.every(30).seconds.do(collect_weaviate_metrics)
-
-if __name__ == "__main__":
-    collect_weaviate_metrics()
-    while True:
-        schedule.run_pending()
-        time.sleep(1)</code></pre>
-
-<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">weaviate_async_index_queue_length</code> metric is particularly important when using Weaviate's async indexing mode. A queue that grows monotonically without draining indicates that your import rate exceeds the indexing throughput—the vector equivalent of a replication lag that never catches up. Set an alert at queue depth > 50,000 for most workloads, and > 10,000 for latency-sensitive applications.</p>
+push_to_gateway("localhost:9091", job="managed_vector_metrics",
+                registry=registry)
+# Weaviate needs no collector: point Prometheus at its native endpoint
+# (PROMETHEUS_MONITORING_ENABLED=true) and alert on
+# weaviate_async_replication_queue_length and query latency histograms.
+</code></pre>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Embedding Quality and Recall Probes</h3>
 
-<p class="text-gray-300 leading-relaxed">Infrastructure metrics tell you whether your database is running. Quality probes tell you whether it is working. This distinction matters enormously for RAG applications because a system can show green on every infrastructure dashboard while silently returning wrong results.</p>
+<p class="text-gray-300 leading-relaxed">Infrastructure metrics tell you the system is <em>running</em>. Quality probes tell you it is <em>working</em>. A probe runs a fixed set of queries with known-good answers against the live retrieval path every five minutes and records recall@k — the earliest warning of index corruption, bad deployments, or embedding drift.</p>
 
-<p class="text-gray-300 leading-relaxed">The right way to implement quality probes is to maintain a <strong class="text-white">golden dataset</strong>: a small set of queries (typically 50–200) for which you know the correct top-k results. These are generated once, stored in a separate table or file, and then replayed continuously. The probe computes <strong class="text-white">recall@k</strong>—the fraction of expected results that appear in the actual results—and reports it as a metric.</p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python — continuous recall probe against SQL Server (pyodbc)
+# Requires: pyodbc, openai, prometheus_client, numpy
+import json, os, time
+import pyodbc, openai
+from prometheus_client import CollectorRegistry, Gauge, push_to_gateway
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
-# quality_probe.py
-# Runs recall@10 probes against pgvector, Pinecone, and Weaviate
-# Requires: psycopg2, pinecone-client&gt;=3.0, weaviate-client&gt;=4.0,
-#           sentence-transformers, prometheus_client, numpy
+GOLDEN = json.load(open("golden_dataset.json"))
+# [{"query": "...", "expected_chunk_ids": [101, 102], "k": 10}, ...]
+client = openai.OpenAI()
+conn = pyodbc.connect(os.environ["SQLSERVER_DSN"])
 
-import os
-import json
-import time
-import numpy as np
-import psycopg2
-import psycopg2.extras
-import schedule
-import weaviate
-import requests
-from pinecone import Pinecone
-from sentence_transformers import SentenceTransformer
-from prometheus_client import (
-    CollectorRegistry,
-    Gauge,
-    Histogram,
-    push_to_gateway,
-)
+def recall_at_k(retrieved, expected, k):
+    return len(set(retrieved[:k]) & set(expected)) / max(len(expected), 1)
 
-PUSHGATEWAY_URL = "http://localhost:9091"
-GOLDEN_DATASET_PATH = "golden_queries.json"
-EMBED_MODEL = "all-MiniLM-L6-v2"          # 384-dim, fast, good baseline
-TOP_K = 10
-
-# Load golden dataset once
-# Format: [{"query": "...", "expected_ids": ["id1", "id2", ...], "collection": "docs"}]
-with open(GOLDEN_DATASET_PATH) as f:
-    golden_queries = json.load(f)
-
-embedder = SentenceTransformer(EMBED_MODEL)
-
-registry = CollectorRegistry()
-
-recall_at_k = Gauge(
-    "vector_search_recall_at_k",
-    "Recall@K for a named golden query set",
-    ["backend", "collection", "k"],
-    registry=registry,
-)
-
-mean_similarity_score = Gauge(
-    "vector_search_mean_top1_similarity",
-    "Mean cosine similarity of the top-1 result across golden queries",
-    ["backend", "collection"],
-    registry=registry,
-)
-
-probe_latency_ms = Gauge(
-    "vector_search_probe_latency_ms",
-    "Mean query latency in ms during quality probe run",
-    ["backend", "collection"],
-    registry=registry,
-)
-
-
-# ─── pgvector probe ──────────────────────────────────────────────────────────
-
-def probe_pgvector():
-    conn = psycopg2.connect(os.environ["PG_DSN"])
-    cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-
-    # Group golden queries by collection (maps to table name in pgvector)
-    from itertools import groupby
-    from operator import itemgetter
-
-    grouped = {}
-    for q in golden_queries:
-        if q.get("backend", "pgvector") != "pgvector":
-            continue
-        coll = q["collection"]
-        grouped.setdefault(coll, []).append(q)
-
-    for collection, queries in grouped.items():
-        recalls = []
-        similarities = []
-        latencies = []
-
-        for gq in queries:
-            query_vec = embedder.encode(gq["query"]).tolist()
-            expected = set(gq["expected_ids"])
-
-            t0 = time.perf_counter()
-            cur.execute(
-                f"""
-                SELECT id, 1 - (embedding &lt;=&gt; %s::vector) AS cosine_sim
-                FROM {collection}
-                ORDER BY embedding &lt;=&gt; %s::vector
-                LIMIT %s
-                """,
-                (query_vec, query_vec, TOP_K),
-            )
-            rows = cur.fetchall()
-            elapsed_ms = (time.perf_counter() - t0) * 1000
-
-            returned_ids = {str(r["id"]) for r in rows}
-            hit_count = len(expected & returned_ids)
-            recall = hit_count / len(expected) if expected else 0.0
-            recalls.append(recall)
-
-            if rows:
-                similarities.append(rows[0]["cosine_sim"])
-            latencies.append(elapsed_ms)
-
-        recall_at_k.labels(
-            backend="pgvector",
-            collection=collection,
-            k=str(TOP_K),
-        ).set(np.mean(recalls))
-
-        mean_similarity_score.labels(
-            backend="pgvector",
-            collection=collection,
-        ).set(np.mean(similarities) if similarities else 0.0)
-
-        probe_latency_ms.labels(
-            backend="pgvector",
-            collection=collection,
-        ).set(np.mean(latencies))
-
-    cur.close()
-    conn.close()
-
-
-# ─── Pinecone probe ───────────────────────────────────────────────────────────
-
-def probe_pinecone():
-    pc = Pinecone(api_key=os.environ["PINECONE_API_KEY"])
-
-    grouped = {}
-    for q in golden_queries:
-        if q.get("backend", "pinecone") != "pinecone":
-            continue
-        coll = q["collection"]
-        grouped.setdefault(coll, []).append(q)
-
-    for index_name, queries in grouped.items():
-        idx = pc.Index(index_name)
-        recalls = []
-        similarities = []
-        latencies = []
-
-        for gq in queries:
-            query_vec = embedder.encode(gq["query"]).tolist()
-            expected = set(gq["expected_ids"])
-            namespace = gq.get("namespace", "")
-
-            t0 = time.perf_counter()
-            result = idx.query(
-                vector=query_vec,
-                top_k=TOP_K,
-                namespace=namespace,
-                include_metadata=False,
-            )
-            elapsed_ms = (time.perf_counter() - t0) * 1000
-
-            returned_ids = {m.id for m in result.matches}
-            hit_count = len(expected & returned_ids)
-            recall = hit_count / len(expected) if expected else 0.0
-            recalls.append(recall)
-
-            if result.matches:
-                similarities.append(result.matches[0].score)
-            latencies.append(elapsed_ms)
-
-        recall_at_k.labels(
-            backend="pinecone",
-            collection=index_name,
-            k=str(TOP_K),
-        ).set(np.mean(recalls))
-
-        mean_similarity_score.labels(
-            backend="pinecone",
-            collection=index_name,
-        ).set(np.mean(similarities) if similarities else 0.0)
-
-        probe_latency_ms.labels(
-            backend="pinecone",
-            collection=index_name,
-        ).set(np.mean(latencies))
-
-
-# ─── Weaviate probe ───────────────────────────────────────────────────────────
-
-def probe_weaviate():
-    weaviate_url = os.environ.get("WEAVIATE_URL", "http://localhost:8080")
-    weaviate_api_key = os.environ.get("WEAVIATE_API_KEY", "")
-    headers = {}
-    if weaviate_api_key:
-        headers["Authorization"] = f"Bearer {weaviate_api_key}"
-
-    grouped = {}
-    for q in golden_queries:
-        if q.get("backend", "weaviate") != "weaviate":
-            continue
-        coll = q["collection"]
-        grouped.setdefault(coll, []).append(q)
-
-    for collection_name, queries in grouped.items():
-        recalls = []
-        similarities = []
-        latencies = []
-
-        for gq in queries:
-            query_vec = embedder.encode(gq["query"]).tolist()
-            expected = set(gq["expected_ids"])
-
-            # Use Weaviate's GraphQL nearVector API
-            graphql_query = {
-                "query": f"""
-                {{
-                  Get {{
-                    {collection_name}(
-                      nearVector: {{
-                        vector: {json.dumps(query_vec)}
-                        certainty: 0.0
-                      }}
-                      limit: {TOP_K}
-                    ) {{
-                      _additional {{
-                        id
-                        certainty
-                      }}
-                    }}
-                  }}
-                }}
-                """
-            }
-
-            t0 = time.perf_counter()
-            resp = requests.post(
-                f"{weaviate_url}/v1/graphql",
-                json=graphql_query,
-                headers=headers,
-                timeout=15,
-            )
-            elapsed_ms = (time.perf_counter() - t0) * 1000
-            resp.raise_for_status()
-            data = resp.json()
-
-            objects = (
-                data.get("data", {})
-                    .get("Get", {})
-                    .get(collection_name, []) or []
-            )
-            returned_ids = {
-                obj["_additional"]["id"]
-                for obj in objects
-                if obj.get("_additional", {}).get("id")
-            }
-            hit_count = len(expected & returned_ids)
-            recall = hit_count / len(expected) if expected else 0.0
-            recalls.append(recall)
-
-            if objects:
-                top_certainty = objects[0].get("_additional", {}).get("certainty", 0.0)
-                similarities.append(top_certainty)
-            latencies.append(elapsed_ms)
-
-        recall_at_k.labels(
-            backend="weaviate",
-            collection=collection_name,
-            k=str(TOP_K),
-        ).set(np.mean(recalls))
-
-        mean_similarity_score.labels(
-            backend="weaviate",
-            collection=collection_name,
-        ).set(np.mean(similarities) if similarities else 0.0)
-
-        probe_latency_ms.labels(
-            backend="weaviate",
-            collection=collection_name,
-        ).set(np.mean(latencies))
-
-
-# ─── Orchestration ────────────────────────────────────────────────────────────
-
-def run_all_probes():
-    try:
-        probe_pgvector()
-    except Exception as e:
-        print(f"pgvector probe failed: {e}")
-
-    try:
-        probe_pinecone()
-    except Exception as e:
-        print(f"Pinecone probe failed: {e}")
-
-    try:
-        probe_weaviate()
-    except Exception as e:
-        print(f"Weaviate probe failed: {e}")
-
-    push_to_gateway(
-        PUSHGATEWAY_URL,
-        job="vector_quality_probes",
-        registry=registry,
-    )
-    print(f"[{time.strftime('%H:%M:%S')}] Quality probe metrics pushed")
-
-
-schedule.every(5).minutes.do(run_all_probes)
+def probe():
+    registry = CollectorRegistry()
+    g_recall = Gauge("rag_recall_at_k", "Probe recall@k",
+                     ["query_id"], registry=registry)
+    g_dist = Gauge("rag_top1_distance", "Top-1 cosine distance",
+                   ["query_id"], registry=registry)
+    cur = conn.cursor()
+    for i, q in enumerate(GOLDEN):
+        emb = client.embeddings.create(
+            input=[q["query"]],
+            model="text-embedding-3-small").data[0].embedding
+        vec = "[" + ",".join(str(v) for v in emb) + "]"
+        rows = cur.execute("""SELECT TOP (?) ChunkId,
+                    VECTOR_DISTANCE('cosine', Embedding,
+                        CAST(? AS VECTOR(1536))) AS d
+                FROM dbo.DocumentChunks
+                WHERE TenantId = ?
+                ORDER BY d""",
+                (q["k"], vec, q.get("tenant_id", 1))).fetchall()
+        retrieved = [r[0] for r in rows]
+        g_recall.labels(query_id=str(i)).set(
+            recall_at_k(retrieved, q["expected_chunk_ids"], q["k"]))
+        g_dist.labels(query_id=str(i)).set(rows[0][1] if rows else 1.0)
+    push_to_gateway("localhost:9091", job="rag_quality_probe",
+                    registry=registry)
+    print(f"[{time.strftime('%H:%M:%S')}] Probe complete: "
+          f"{len(GOLDEN)} queries")
 
 if __name__ == "__main__":
-    run_all_probes()
     while True:
-        schedule.run_pending()
-        time.sleep(1)</code></pre>
+        probe()
+        time.sleep(300)   # every 5 minutes
+</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Alert on the probe metrics, not just the infrastructure ones: a 5-point drop in mean recall@k sustained over 30 minutes pages the on-call engineer; a single query's top-1 distance drifting upward week over week is the early signal of embedding drift (Chapter 30) or a degraded DiskANN index in need of rebuild.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Building the Golden Dataset</h3>
 
-<p class="text-gray-300 leading-relaxed">The quality probe is only as good as the dataset it runs against. Building that dataset correctly is the step most teams skip, and skipping it is why they discover recall regressions from user complaints rather than from dashboards.</p>
+<p class="text-gray-300 leading-relaxed">The probe is only as good as its golden dataset. Build it deliberately:</p>
 
-<p class="text-gray-300 leading-relaxed">The golden dataset should satisfy three properties:</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Coverage</strong>: Queries should represent the real distribution of production queries. If your RAG application handles product support questions, customer onboarding topics, and billing inquiries in roughly equal measure, your golden set should reflect those proportions. Capture 30 days of production query logs, cluster them by topic using k-means on their embeddings, then sample representative queries from each cluster.</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Stability</strong>: The expected results must be verified by a human or by a higher-quality reference retrieval system, not by your production system at a point in time. If you generate ground truth by querying your own system and storing what it returns, you are measuring consistency, not correctness. Run your golden queries against a re-ranked or BM25+vector hybrid result set, review the top-10 by hand for a sample, and store verified IDs.</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Versioning</strong>: When you upgrade your embedding model, your golden dataset expected IDs become invalid because the same document will have a different ID if it was re-embedded and re-inserted, or a different vector if the document ID is stable but the model changed. Tag each golden query with the embedding model version that was used to generate both the query embedding and the document embeddings. When you rotate models, regenerate the golden set for the new model in parallel before cutting over.</p>
-
-<p class="text-gray-300 leading-relaxed">The following SQL creates the golden dataset table in PostgreSQL:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL
--- Schema for the golden query dataset
-
-CREATE TABLE monitoring.golden_queries (
-    id              SERIAL PRIMARY KEY,
-    query_text      TEXT        NOT NULL,
-    backend         TEXT        NOT NULL CHECK (backend IN ('pgvector', 'pinecone', 'weaviate')),
-    collection_name TEXT        NOT NULL,
-    namespace       TEXT,
-    embedding_model TEXT        NOT NULL,
-    expected_ids    TEXT[]      NOT NULL,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    retired_at      TIMESTAMPTZ,
-    notes           TEXT
-);
-
-CREATE INDEX ON monitoring.golden_queries (backend, collection_name)
-    WHERE retired_at IS NULL;
-
-COMMENT ON TABLE monitoring.golden_queries IS
-    'Ground-truth query/result pairs for continuous recall monitoring. '
-    'Retire rows (set retired_at) when embedding model changes; do not delete.';</code></pre>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server
--- Schema for the golden query dataset
-
-CREATE TABLE monitoring.golden_queries (
-    id              INT IDENTITY(1,1) PRIMARY KEY,
-    query_text      NVARCHAR(MAX)   NOT NULL,
-    backend         NVARCHAR(20)    NOT NULL
-        CHECK (backend IN ('pgvector', 'pinecone', 'weaviate')),
-    collection_name NVARCHAR(256)   NOT NULL,
-    namespace       NVARCHAR(256)   NULL,
-    embedding_model NVARCHAR(128)   NOT NULL,
-    -- SQL Server has no native array type; store as JSON
-    expected_ids    NVARCHAR(MAX)   NOT NULL
-        CHECK (ISJSON(expected_ids) = 1),
-    created_at      DATETIMEOFFSET  NOT NULL DEFAULT SYSDATETIMEOFFSET(),
-    retired_at      DATETIMEOFFSET  NULL,
-    notes           NVARCHAR(MAX)   NULL
-);
-
-CREATE INDEX IX_golden_queries_backend_collection
-    ON monitoring.golden_queries (backend, collection_name)
-    WHERE retired_at IS NULL;</code></pre>
-
-<p class="text-gray-300 leading-relaxed">Note that SQL Server does not have a native array column type, so <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">expected_ids</code> is stored as a JSON string (e.g., <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">'["id1","id2"]'</code>) and the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ISJSON</code> check constraint validates the format. Your probe code reads from this table and deserializes accordingly.</p>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Start with 50–100 queries</strong> drawn from real production query logs — the questions users actually ask, not the ones engineers imagine.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Label expected chunks by hand</strong> for the first version. A domain expert marking "these 2–3 chunks answer this question" beats any automated labeling for probe trustworthiness.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Cover the failure modes:</strong> paraphrased duplicates (tests threshold tuning), multi-hop questions (tests top-k depth), tenant-boundary queries (tests RLS — the probe must <em>not</em> retrieve cross-tenant chunks).</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Version the dataset</strong> alongside the embedding model version. A model rotation (Chapter 30) invalidates golden expectations — re-validate, don't just re-run.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Store it in the database</strong> (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dbo.GoldenQueries</code>) rather than a JSON file once it stabilizes — versioned, backed up, auditable.</li>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Alerting Rules and Escalation Thresholds</h3>
 
-<p class="text-gray-300 leading-relaxed">Collecting metrics is only half the problem. The other half is deciding when to page someone versus when to log a warning and move on. The thresholds below are starting points calibrated for a production RAG application with moderate query volume; you will tune them based on your baseline.</p>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Critical — page immediately:</strong> recall@k probe drops &gt;5 points for 30 minutes; AG replica health = NOT_HEALTHY; embedding queue depth growing for 30 minutes (ingest stalled).</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Warning — ticket for business hours:</strong> vector query p99 latency &gt;200ms for 10 minutes; DiskANN index growth &gt;20%/day; Pinecone index fullness &gt;0.8; probe top-1 distance trending up over 7 days.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Info — dashboard only:</strong> backup completion, index rebuild completion, model rotation events, golden dataset version changes.</li>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Recall degradation alert</strong>: Fire a warning when <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">vector_search_recall_at_k</code> (for any backend or collection) drops below 0.80 for two consecutive probe cycles. Fire a critical alert when it drops below 0.65. A drop from your established baseline of, say, 0.92 to 0.85 warrants investigation; a drop to below 0.65 typically indicates a model mismatch or index corruption that affects users now.</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Index fullness alert (Pinecone)</strong>: Warning at 0.80 fullness; critical at 0.90. Above 0.90, Pinecone pod-based indexes begin rejecting upserts silently in some configurations. Scale your pods before hitting this threshold.</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Async indexing queue alert (Weaviate)</strong>: Warning when <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">weaviate_async_index_queue_length</code> exceeds 25,000 for more than 10 minutes. Critical when it exceeds 100,000. At high queue depths, newly inserted objects are searchable via object lookup but not yet via vector similarity—users may see recently-uploaded documents missing from search results.</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">ANN query latency alert (pgvector)</strong>: Warning when <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pgvector_ann_query_mean_latency_ms</code> exceeds 150ms; critical at 500ms. The primary causes are: (1) HNSW <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ef_search</code> set too high for the current load, (2) shared_buffers too small to keep the HNSW graph in memory, or (3) concurrent index builds competing for I/O.</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Similarity score drift</strong>: Track the 7-day rolling mean of <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">vector_search_mean_top1_similarity</code>. If it drops more than 0.08 below the 30-day baseline, emit a warning. Gradual similarity score decline with no change in recall usually means your corpus is becoming more heterogeneous—new document categories whose embeddings populate different regions of the vector space, pulling average top-1 similarity down without reducing accuracy. Sudden drops in both recall and similarity together almost always indicate an embedding model change was applied to queries but not to stored documents.</p>
-
-<p class="text-gray-300 leading-relaxed">The Prometheus alerting rules YAML for the recall and latency alerts:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># YAML
-# prometheus_vector_alerts.yaml
-# Place in your Prometheus rules directory and reference in prometheus.yml
-
-groups:
-  - name: vector_database_alerts
-    interval: 60s
-    rules:
-
-      - alert: VectorRecallDegradedWarning
-        expr: vector_search_recall_at_k &lt; 0.80
-        for: 10m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Recall@{{ $labels.k }} below 0.80 on {{ $labels.backend }}/{{ $labels.collection }}"
-          description: &gt;
-            The quality probe reports recall@{{ $labels.k }} = {{ $value | printf "%.3f" }}
-            for backend={{ $labels.backend }}, collection={{ $labels.collection }}.
-            This may indicate index fragmentation, model drift, or data pipeline issues.
-
-      - alert: VectorRecallDegradedCritical
-        expr: vector_search_recall_at_k &lt; 0.65
-        for: 5m
-        labels:
-          severity: critical
-        annotations:
-          summary: "CRITICAL: Recall@{{ $labels.k }} below 0.65 on {{ $labels.backend }}/{{ $labels.collection }}"
-          description: &gt;
-            Search quality has degraded severely. Immediate investigation required.
-            Current recall = {{ $value | printf "%.3f" }}.
-
-      - alert: PineconeIndexFullnessWarning
-        expr: pinecone_index_fullness_ratio &gt; 0.80
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Pinecone index {{ $labels.index_name }} fullness &gt; 80%"
-          description: &gt;
-            Index fullness = {{ $value | printf "%.2f" }}. Plan pod scaling before reaching 90%.
-
-      - alert: PineconeIndexFullnessCritical
-        expr: pinecone_index_fullness_ratio &gt; 0.90
-        for: 2m
-        labels:
-          severity: critical
-        annotations:
-          summary: "CRITICAL: Pinecone index {{ $labels.index_name }} fullness &gt; 90%"
-          description: &gt;
-            Upserts may fail. Scale pods immediately.
-
-      - alert: WeaviateIndexQueueHigh
-        expr: weaviate_async_index_queue_length &gt; 25000
-        for: 10m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Weaviate async index queue depth &gt; 25k on {{ $labels.collection_name }}"
-          description: &gt;
-            Queue = {{ $value }} objects. Recently inserted documents may not be searchable.
-
-      - alert: WeaviateIndexQueueCritical
-        expr: weaviate_async_index_queue_length &gt; 100000
-        for: 5m
-        labels:
-          severity: critical
-        annotations:
-          summary: "CRITICAL: Weaviate async index queue depth &gt; 100k"
-          description: &gt;
-            Import rate is outpacing indexing throughput. Reduce import concurrency
-            or add Weaviate replica nodes.
-
-      - alert: PgvectorANNLatencyWarning
-        expr: pgvector_ann_query_mean_latency_ms &gt; 150
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "pgvector ANN query mean latency &gt; 150ms"
-          description: &gt;
-            Query pattern: {{ $labels.query_pattern }}.
-            Mean latency = {{ $value | printf "%.1f" }}ms.
-            Check ef_search setting, shared_buffers, and concurrent index builds.
-
-      - alert: PgvectorANNLatencyCritical
-        expr: pgvector_ann_query_mean_latency_ms &gt; 500
-        for: 2m
-        labels:
-          severity: critical
-        annotations:
-          summary: "CRITICAL: pgvector ANN query latency &gt; 500ms"
-          description: &gt;
-            Vector search is severely degraded. Check for concurrent REINDEX operations
-            or shared_buffers exhaustion.</code></pre>
+<p class="text-gray-300 leading-relaxed">Two-tier thresholds (warning then critical) on every metric that predicts user-facing degradation. The probe alerts are the most important in the whole stack — they are the only ones that fire when the system is running perfectly and returning the wrong answers.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Grafana Dashboard Layout</h3>
 
-<p class="text-gray-300 leading-relaxed">With all metrics flowing into Prometheus, the Grafana dashboard organizes into four rows. Here is the recommended panel layout with the PromQL for each panel:</p>
+<p class="text-gray-300 leading-relaxed">One dashboard, three rows mirroring the three layers:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Row 1 — Health Overview (Status panels)</strong></p>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Row 1 — Quality (the top row, the one executives see).</strong> Mean recall@k probe gauge, probe pass/fail timeline, top-1 distance trend, user feedback rate (thumbs-down per 1K queries).</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Row 2 — Vector operations.</strong> Query latency p50/p99 from Query Store, DiskANN index size growth, embedding queue depth and oldest-item age, per-namespace hit rates.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Row 3 — Infrastructure.</strong> CPU, memory, buffer pool, AG sync health, backup age, managed-service fullness/queue metrics.</li>
 
-<p class="text-gray-300 leading-relaxed">| Panel | PromQL | Visualization |</p>
-<p class="text-gray-300 leading-relaxed">|---|---|---|</p>
-<p class="text-gray-300 leading-relaxed">| pgvector ANN Latency (p-mean) | <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pgvector_ann_query_mean_latency_ms</code> | Stat (threshold: green < 100ms, yellow < 200ms, red ≥ 200ms) |</p>
-<p class="text-gray-300 leading-relaxed">| Pinecone Index Fullness | <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pinecone_index_fullness_ratio</code> | Gauge (0–1, threshold at 0.80 and 0.90) |</p>
-<p class="text-gray-300 leading-relaxed">| Weaviate Node Health | <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">weaviate_node_healthy</code> | Stat (1=green, 0=red) |</p>
-<p class="text-gray-300 leading-relaxed">| Overall Recall@10 | <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">min(vector_search_recall_at_k{k="10"})</code> | Stat (threshold: green > 0.85, yellow > 0.70, red ≤ 0.70) |</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Row 2 — Vector Index Operational Metrics (Time series)</strong></p>
-
-<p class="text-gray-300 leading-relaxed">| Panel | PromQL | Notes |</p>
-<p class="text-gray-300 leading-relaxed">|---|---|---|</p>
-<p class="text-gray-300 leading-relaxed">| pgvector Index Size Growth | <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pgvector_index_size_bytes</code> | One series per index; watch for sudden jumps indicating failed vacuums |</p>
-<p class="text-gray-300 leading-relaxed">| pgvector Live Row Counts | <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pgvector_table_live_rows</code> | Divergence from expected growth rate signals pipeline stalls |</p>
-<p class="text-gray-300 leading-relaxed">| Pinecone Vector Count by Namespace | <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pinecone_namespace_vector_count</code> | Flat lines indicate ingestion stopped |</p>
-<p class="text-gray-300 leading-relaxed">| Weaviate Async Queue Depth | <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">weaviate_async_index_queue_length</code> | Should drain between import batches |</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Row 3 — Query Latency Breakdown (Time series + heatmap)</strong></p>
-
-<p class="text-gray-300 leading-relaxed">| Panel | PromQL | Notes |</p>
-<p class="text-gray-300 leading-relaxed">|---|---|---|</p>
-<p class="text-gray-300 leading-relaxed">| pgvector Top-5 Slowest Patterns | <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">topk(5, pgvector_ann_query_mean_latency_ms)</code> | Table panel, sorted descending |</p>
-<p class="text-gray-300 leading-relaxed">| Pinecone Query Probe Latency | <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">probe_latency_ms{backend="pinecone"}</code> | From quality probe; measures round-trip including network |</p>
-<p class="text-gray-300 leading-relaxed">| Weaviate Query Probe Latency | <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">probe_latency_ms{backend="weaviate"}</code> | Compare against Weaviate's native <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">/metrics</code> histogram |</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Row 4 — Recall and Similarity Quality (Time series)</strong></p>
-
-<p class="text-gray-300 leading-relaxed">| Panel | PromQL | Notes |</p>
-<p class="text-gray-300 leading-relaxed">|---|---|---|</p>
-<p class="text-gray-300 leading-relaxed">| Recall@10 by Backend | <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">vector_search_recall_at_k{k="10"}</code> | Overlay all backends; regression shows immediately |</p>
-<p class="text-gray-300 leading-relaxed">| Top-1 Similarity Score | <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">vector_search_mean_top1_similarity</code> | Downward trend without recall drop = corpus drift |</p>
-<p class="text-gray-300 leading-relaxed">| Recall@10 7-Day Delta | <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">vector_search_recall_at_k{k="10"} - vector_search_recall_at_k{k="10"} offset 7d</code> | Negative values indicate week-over-week degradation |</p>
-
-<p class="text-gray-300 leading-relaxed">The JSON export for this Grafana dashboard would be several hundred lines; rather than reproducing the full JSON here, the pattern above is sufficient to construct it using Grafana's dashboard builder, or you can use the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">grafana_dashboard</code> Terraform resource if your infrastructure is managed with Terraform.</p>
+<p class="text-gray-300 leading-relaxed">Quality on top is deliberate: when the 2 AM page fires for a latency spike, the first question is "are users getting wrong answers?" — and the answer is one glance up, not three dashboards over.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Handling Embedding Model Rotation</h3>
 
-<p class="text-gray-300 leading-relaxed">One operational scenario that defeats most monitoring setups is an embedding model rotation: the moment when your team switches from one model (say, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-ada-002</code> at 1536 dimensions) to another (say, a fine-tuned 768-dimension model). The transition period creates a mixed-state problem where some documents use the old embeddings and some use the new, and queries always use one or the other, never both.</p>
+<p class="text-gray-300 leading-relaxed">Model rotation is a monitoring event, not just a deployment event (Chapter 30). When the embedding model changes:</p>
 
-<p class="text-gray-300 leading-relaxed">Your monitoring dashboard needs to detect this state explicitly. The most reliable signal is a sudden change in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">vector_search_mean_top1_similarity</code> combined with a drop in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">vector_search_recall_at_k</code>. Similarity alone is ambiguous—a new model in a new vector space has different absolute similarity scales. Recall dropping while the system appears operationally healthy is the diagnostic signature of a model mismatch.</p>
-
-<p class="text-gray-300 leading-relaxed">The operational procedure for a safe model rotation:</p>
-
-<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Create a new collection/index</strong> alongside the existing one. Never overwrite in-place.</p>
-<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Run dual-write</strong>: new documents are embedded with both models and inserted into both collections.</p>
-<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Re-embed the corpus</strong> in the new collection using a background job. Track progress with a dedicated Prometheus gauge (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">embedding_backfill_progress_ratio</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">embedding_backfill_rows_complete</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">embedding_backfill_rows_total</code>).</p>
-<p class="text-gray-300 leading-relaxed">4. <strong class="text-white">Promote the new collection</strong> as the read target only when <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">embedding_backfill_progress_ratio >= 1.0</code> AND <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">vector_search_recall_at_k</code> (measured against a golden set generated with the new model) exceeds your baseline threshold.</p>
-<p class="text-gray-300 leading-relaxed">5. <strong class="text-white">Retire the old collection</strong> after a soak period of at least 72 hours with no recall alerts.</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
-# backfill_progress_tracker.py
-# Reports embedding backfill progress as a Prometheus metric
-
-import os
-import time
-import psycopg2
-import schedule
-from prometheus_client import CollectorRegistry, Gauge, push_to_gateway
-
-PUSHGATEWAY_URL = "http://localhost:9091"
-registry = CollectorRegistry()
-
-backfill_progress = Gauge(
-    "embedding_backfill_progress_ratio",
-    "Fraction of rows re-embedded for a collection (0.0 to 1.0)",
-    ["collection_name", "new_model"],
-    registry=registry,
-)
-
-backfill_rows_complete = Gauge(
-    "embedding_backfill_rows_complete",
-    "Count of rows that have been re-embedded",
-    ["collection_name", "new_model"],
-    registry=registry,
-)
-
-backfill_rows_total = Gauge(
-    "embedding_backfill_rows_total",
-    "Total rows to re-embed for the collection",
-    ["collection_name", "new_model"],
-    registry=registry,
-)
-
-
-def collect_backfill_metrics():
-    conn = psycopg2.connect(os.environ["PG_DSN"])
-    cur = conn.cursor()
-
-    # This query assumes a backfill_status table that your backfill job maintains
-    cur.execute("""
-        SELECT
-            collection_name,
-            new_model,
-            rows_complete,
-            rows_total,
-            CASE WHEN rows_total &gt; 0
-                 THEN rows_complete::float / rows_total
-                 ELSE 0
-            END AS progress_ratio
-        FROM
-            monitoring.embedding_backfill_status
-        WHERE
-            completed_at IS NULL;
-    """)
-    for row in cur.fetchall():
-        coll, model, done, total, ratio = row
-        backfill_progress.labels(collection_name=coll, new_model=model).set(ratio)
-        backfill_rows_complete.labels(collection_name=coll, new_model=model).set(done)
-        backfill_rows_total.labels(collection_name=coll, new_model=model).set(total)
-
-    cur.close()
-    conn.close()
-
-    push_to_gateway(PUSHGATEWAY_URL, job="backfill_progress", registry=registry)
-
-
-schedule.every(30).seconds.do(collect_backfill_metrics)
-
-if __name__ == "__main__":
-    collect_backfill_metrics()
-    while True:
-        schedule.run_pending()
-        time.sleep(1)</code></pre>
-
-<p class="text-gray-300 leading-relaxed">The supporting table:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL
-CREATE TABLE monitoring.embedding_backfill_status (
-    id               SERIAL PRIMARY KEY,
-    collection_name  TEXT           NOT NULL,
-    new_model        TEXT           NOT NULL,
-    rows_total       BIGINT         NOT NULL DEFAULT 0,
-    rows_complete    BIGINT         NOT NULL DEFAULT 0,
-    started_at       TIMESTAMPTZ    NOT NULL DEFAULT now(),
-    completed_at     TIMESTAMPTZ,
-    notes            TEXT
-);</code></pre>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server
-CREATE TABLE monitoring.embedding_backfill_status (
-    id               INT IDENTITY(1,1) PRIMARY KEY,
-    collection_name  NVARCHAR(256)    NOT NULL,
-    new_model        NVARCHAR(128)    NOT NULL,
-    rows_total       BIGINT           NOT NULL DEFAULT 0,
-    rows_complete    BIGINT           NOT NULL DEFAULT 0,
-    started_at       DATETIMEOFFSET   NOT NULL DEFAULT SYSDATETIMEOFFSET(),
-    completed_at     DATETIMEOFFSET   NULL,
-    notes            NVARCHAR(MAX)    NULL
-);</code></pre>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Freeze the golden dataset version</strong> and re-validate expectations against the new model's geometry before trusting probe results again.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Run old and new probes in parallel</strong> during the side-by-side backfill — two probe jobs, two metric series, one dashboard comparing them.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Alert on backfill lag</strong> as a first-class metric: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sqlserver_backfill_remaining</code> trending to zero is the cutover gate; a stalled backfill pages like any stalled pipeline.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Annotate the dashboard</strong> at cutover time — six months later, the recall@k step-change needs its explanation attached.</li>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Putting It All Together: The Monitoring Stack Deployment</h3>
 
-<p class="text-gray-300 leading-relaxed">Running three separate metrics collector scripts alongside your application is manageable, but they need to be deployed reliably. The cleanest approach is to containerize each collector and deploy them as sidecar containers or separate services in the same Kubernetes namespace as your application.</p>
+<p class="text-gray-300 leading-relaxed">A minimal <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">docker-compose.yml</code> wires together Prometheus, the pushgateway, Grafana, the SQL Server collector, and the recall probe:</p>
 
-<p class="text-gray-300 leading-relaxed">A minimal <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">docker-compose.yml</code> that wires together Prometheus, the pushgateway, Grafana, and all three collectors:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># YAML
-# docker-compose.yml
-# Vector database monitoring stack
-
-version: "3.9"
-
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># docker-compose.yml — vector monitoring stack
 services:
-
   prometheus:
     image: prom/prometheus:v2.51.0
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - ./prometheus_vector_alerts.yaml:/etc/prometheus/rules/vector_alerts.yaml:ro
+      - ./vector_alerts.yaml:/etc/prometheus/rules/vector_alerts.yaml:ro
       - prometheus_data:/prometheus
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
-      - "--storage.tsdb.retention.time=30d"
-      - "--web.enable-lifecycle"
-    ports:
-      - "9090:9090"
-    restart: unless-stopped
-
+    ports: ["9090:9090"]
   pushgateway:
-    image: prom/pushgateway:v1.8.0
-    ports:
-      - "9091:9091"
-    restart: unless-stopped
-
+    image: prom/pushgateway:v1.7.0
+    ports: ["9091:9091"]
   grafana:
     image: grafana/grafana:10.4.0
     environment:
       GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_ADMIN_PASSWORD}"
-      GF_USERS_ALLOW_SIGN_UP: "false"
-    volumes:
-      - grafana_data:/var/lib/grafana
-    ports:
-      - "3000:3000"
-    depends_on:
-      - prometheus
-    restart: unless-stopped
-
-  pgvector_collector:
-    build:
-      context: .
-      dockerfile: Dockerfile.collector
-    command: python pgvector_metrics_collector.py
+    volumes: ["grafana_data:/var/lib/grafana"]
+    ports: ["3000:3000"]
+    depends_on: [prometheus]
+  sqlserver_collector:          # runs the DMV/Query Store queries hourly
+    build: ./collectors
     environment:
-      PG_DSN: "${PG_DSN}"
-    depends_on:
-      - pushgateway
-    restart: unless-stopped
-
-  pinecone_collector:
-    build:
-      context: .
-      dockerfile: Dockerfile.collector
-    command: python pinecone_metrics_collector.py
+      SQLSERVER_DSN: "${SQLSERVER_DSN}"
+      PUSHGATEWAY: "pushgateway:9091"
+    command: python sqlserver_vector_collector.py
+  rag_quality_probe:            # recall probe every 5 minutes
+    build: ./collectors
     environment:
-      PINECONE_API_KEY: "${PINECONE_API_KEY}"
-    depends_on:
-      - pushgateway
-    restart: unless-stopped
-
-  weaviate_health_probe:
-    build:
-      context: .
-      dockerfile: Dockerfile.collector
-    command: python weaviate_health_probe.py
-    environment:
-      WEAVIATE_URL: "${WEAVIATE_URL}"
-      WEAVIATE_API_KEY: "${WEAVIATE_API_KEY}"
-    depends_on:
-      - pushgateway
-    restart: unless-stopped
-
-  quality_probe:
-    build:
-      context: .
-      dockerfile: Dockerfile.collector
-    command: python quality_probe.py
-    environment:
-      PG_DSN: "${PG_DSN}"
-      PINECONE_API_KEY: "${PINECONE_API_KEY}"
-      WEAVIATE_URL: "${WEAVIATE_URL}"
-      WEAVIATE_API_KEY: "${WEAVIATE_API_KEY}"
-    volumes:
-      - ./golden_queries.json:/app/golden_queries.json:ro
-    depends_on:
-      - pushgateway
-    restart: unless-stopped
-
-  backfill_tracker:
-    build:
-      context: .
-      dockerfile: Dockerfile.collector
-    command: python backfill_progress_tracker.py
-    environment:
-      PG_DSN: "${PG_DSN}"
-    depends_on:
-      - pushgateway
-    restart: unless-stopped
-
+      SQLSERVER_DSN: "${SQLSERVER_DSN}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY}"
+      PUSHGATEWAY: "pushgateway:9091"
+    command: python rag_quality_probe.py
 volumes:
   prometheus_data:
   grafana_data:</code></pre>
 
-<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">prometheus.yml</code> to scrape both the pushgateway (for pushed metrics from all collectors) and Weaviate's native endpoint:</p>
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">prometheus.yml</code> scrapes the pushgateway (for pushed metrics from all collectors) and Weaviate's native endpoint directly:</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># YAML
-# prometheus.yml
-
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># prometheus.yml
 global:
-  scrape_interval: 30s
-  evaluation_interval: 60s
-
+  scrape_interval: 60s
 rule_files:
   - /etc/prometheus/rules/*.yaml
-
 scrape_configs:
-
-  - job_name: pushgateway
-    honor_labels: true
+  - job_name: pushgateway        # SQL Server collector + probes + Pinecone
     static_configs:
       - targets: ["pushgateway:9091"]
-
-  - job_name: weaviate_native
-    # Weaviate's built-in Prometheus endpoint
-    # Requires PROMETHEUS_MONITORING_ENABLED=true in Weaviate config
+  - job_name: weaviate           # native endpoint, no collector needed
     static_configs:
-      - targets: ["weaviate:2112"]
-    metrics_path: /metrics
-
+      - targets: ["weaviate:2112"]   # PROMETHEUS_MONITORING_ENABLED=true
   - job_name: prometheus_self
     static_configs:
       - targets: ["localhost:9090"]</code></pre>
@@ -1304,28 +311,32 @@ scrape_configs:
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Three-layer monitoring is non-negotiable for vector workloads.** Infrastructure metrics alone will not show you recall degradation or embedding drift. You need Layer 1 (infrastructure), Layer 2 (vector index operations), and Layer 3 (embedding quality probes) running simultaneously before problems become user-visible.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Monitor three layers:</strong> SQL Server infrastructure (DMVs, AG health), vector operations (Query Store latency, DiskANN growth, pipeline lag), and quality signals (recall probes, drift, feedback).</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The golden dataset is your most valuable monitoring asset.** A set of 50–200 human-verified query/result pairs, tagged by embedding model version, lets you compute recall@k continuously. Build it early, version it carefully, and regenerate it whenever you rotate embedding models.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Query Store is your vector APM</strong> — it captures every vector query's latency from all connections with no code changes; trend it, alert on it.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Pinecone fullness, Weaviate async queue depth, and pgvector HNSW latency are the three backend-specific metrics that most directly predict user-facing degradation.** Alert on them with two-tier thresholds (warning and critical) so on-call engineers can act before users are affected.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">DiskANN index growth and embedding queue depth are the two backend metrics that most directly predict user-facing degradation</strong> — alert with two-tier thresholds.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Embedding model rotation is the highest-risk operational event in a vector database's lifecycle.** A mixed-state corpus—some documents on the old model, some on the new—will degrade recall quietly and systematically. The safe pattern is: create a parallel collection, dual-write, backfill, measure recall against a new-model golden set, then promote. Never overwrite in-place.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Continuous quality probes make the invisible visible.</strong> Recall@k every five minutes against a golden dataset is the only metric that fires when the system runs perfectly and returns wrong answers.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Continuous quality probes make the invisible visible.** Cosine similarity score drift and recall degradation are silent failures. A probe that runs every five minutes against your golden dataset and pushes recall and similarity metrics to Prometheus gives you a continuous signal that your search system is doing what it was built to do—something no infrastructure metric can tell you.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Treat model rotation as a monitoring event:</strong> parallel probes, backfill-lag alerts, frozen golden versions, annotated dashboards.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Quality row on top.</strong> When the page fires, "are users getting wrong answers?" must be answerable in one glance.</li>
     </div>
     <div class="mt-14 bg-cyan-950/40 border border-cyan-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
-        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · SQL Server</p>
       </div>
       <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
          class="shrink-0 px-6 py-3 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold rounded-xl text-sm transition">
         Download Free
       </a>
     </div>
-    <div class="mt-8 text-xs">
-      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a>
+    <div class="mt-10 flex items-center justify-between text-xs">
+      <a href="b4-ch39-future-hybrid-relational-vector.html" class="text-gray-500 hover:text-gray-300 transition">← Previous Chapter</a>
+      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">All Chapters</a>
+      <span></span>
     </div>
   </article>
   <footer class="border-t border-gray-800/50 px-6 py-8">

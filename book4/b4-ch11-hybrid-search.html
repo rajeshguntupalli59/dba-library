@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Chapter 11: Hybrid Search: Combining Full-Text and Vector Search — Vector Databases & AI</title>
-  <meta name="description" content="Vector Databases & AI Chapter 11: Hybrid Search: Combining Full-Text and Vector Search. pgvector, Pinecone, Weaviate, RAG pipelines — by Rajesh Guntupalli." />
+  <meta name="description" content="Vector Databases & AI Chapter 11: Hybrid Search — combining SQL Server Full-Text Search (CONTAINS/FREETEXT) with native vector search, RRF fusion, and tuning the lexical/semantic balance. By Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
   <script type="module">
     import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
@@ -43,1032 +43,168 @@
     <div class="space-y-4 text-sm">
 <h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 11: Hybrid Search: Combining Full-Text and Vector Search</h2>
 
-<p class="text-gray-300 leading-relaxed">Full-text search and vector search solve different problems, and in production AI applications you almost always need both. Full-text search excels at exact keyword matching, proper nouns, SKU codes, and domain-specific terminology that embedding models may not have seen during training. Vector search excels at semantic similarity, handling paraphrase, typos, and intent that keywords miss entirely. This chapter covers how to combine these two retrieval mechanisms into a single pipeline — the architecture decisions, scoring fusion strategies, and the practical implementation details that determine whether hybrid search actually outperforms either approach alone. You will come away with working code for pgvector, Pinecone, and Weaviate, and a mental model for tuning the balance between lexical and semantic signals in your own applications.</p>
+<p class="text-gray-300 leading-relaxed">Full-text search and vector search solve different problems, and in production AI applications you almost always need both. Full-text search excels at exact keyword matching, proper nouns, SKU codes, error numbers, and domain-specific terminology that embedding models may not have seen during training. Vector search excels at semantic similarity, handling paraphrase, typos, and intent that keywords miss entirely. This chapter covers how to combine these two retrieval mechanisms into a single pipeline on SQL Server 2025 — the architecture decisions, scoring fusion strategies, and the practical implementation details that determine whether hybrid search actually outperforms either approach alone. You will come away with working T-SQL for full-text plus vector fusion, the reciprocal-rank pattern used across the industry, and a mental model for tuning the balance between lexical and semantic signals.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">11.1 Why Neither Approach Alone Is Sufficient</h3>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Two Retrieval Models, Complementary Failures</h3>
 
-<p class="text-gray-300 leading-relaxed">To understand why hybrid search exists, it helps to be precise about where each approach fails.</p>
+<p class="text-gray-300 leading-relaxed">Traditional full-text search — whether SQL Server Full-Text Search with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CONTAINS</code>, Elasticsearch BM25, or any TF-IDF-based engine — operates on term frequency and inverse document frequency with normalization. The retrieval model rewards documents that share exact terms with the query. This creates predictable failure modes:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Where full-text search fails</strong></p>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Vocabulary mismatch.</strong> A query for "myocardial infarction" misses documents that only say "heart attack." An error search for "login timeout" misses "authentication expired."</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Paraphrase blindness.</strong> "How do I make queries faster?" and "query performance tuning guide" share almost no tokens but mean the same thing.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Typos and morphology.</strong> "color" vs "colour," "optimise" vs "optimize" — stemming and word-breakers help, but only within the limits of the language rules installed.</li>
 
-<p class="text-gray-300 leading-relaxed">Traditional full-text search — whether PostgreSQL <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">tsvector</code>, Elasticsearch BM25, or SQL Server Full-Text — operates on term frequency and inverse document frequency (TF-IDF) with some normalization. The retrieval model rewards documents that share exact terms with the query. This creates predictable failure modes:</p>
+<p class="text-gray-300 leading-relaxed">Vector search inverts these strengths and weaknesses: it finds meaning without terms, but it is sloppy about exact identifiers. A query for the specific error number 18456 will match documents about login failures generally — but the one document that names 18456 in its title might rank below five loosely-related docs. Hybrid search exists to get both: the precision of lexical matching and the recall of semantic matching, fused into one ranked list.</p>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> *Vocabulary mismatch*: A user queries "car insurance" but the document says "automobile coverage." No overlap, no result.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> *Intent without keywords*: "I need to fix my credit score" doesn't share terms with an article titled "Improving Your FICO Rating."</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> *Multilingual queries*: A Spanish query over English documents retrieves nothing unless you've built language-specific synonym rings, which is expensive to maintain.</li>
+<p class="text-gray-300 leading-relaxed">---</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Where vector search fails</strong></p>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Full-Text Search in SQL Server: The Lexical Side</h3>
 
-<p class="text-gray-300 leading-relaxed">Embedding-based retrieval encodes queries and documents into a shared semantic space and retrieves by distance. The failure modes are different but equally real:</p>
+<p class="text-gray-300 leading-relaxed">SQL Server's full-text engine (iFTS) has been production-hardened for decades: full-text catalogs, word breakers per language, thesaurus files for synonyms, and the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CONTAINSTABLE</code> / <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">FREETEXTTABLE</code> functions that return ranked results. If you already run full-text indexes, hybrid search does not replace them — it adds a second ranking signal on the same tables.</p>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> *Rare proper nouns*: "NVDA earnings Q3 2024" — a model trained on general text may embed NVDA close to many tech companies, diluting precision on this specific ticker.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> *Exact strings*: Product codes, error codes, UUIDs. `ERR_CONN_REFUSED` is semantically close to other error strings, but a user searching for exactly that code wants exactly that code.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> *Recency and domain shift*: New terminology post-training cutoff is either out-of-vocabulary or embedded based on morphological similarity alone, which is unreliable.</li>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: full-text catalog + index on the documents table
+CREATE FULLTEXT CATALOG FTC_KnowledgeBase AS DEFAULT;
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">The complementary hypothesis</strong></p>
+CREATE FULLTEXT INDEX ON dbo.KnowledgeChunks (ChunkText LANGUAGE 1033)
+    KEY INDEX PK_KnowledgeChunks
+    WITH STOPLIST = SYSTEM, CHANGE_TRACKING = AUTO;
+-- CHANGE_TRACKING = AUTO keeps the full-text index current on every write
 
-<p class="text-gray-300 leading-relaxed">The practical observation, borne out repeatedly in production retrieval systems, is that full-text and vector search retrieve different sets of relevant documents, with modest overlap. A hybrid retrieval system that can combine both sets tends to outperform either alone on NDCG and recall@k metrics. The BEIR benchmark suite — a widely used collection of retrieval datasets spanning multiple domains — is the standard academic reference point for this comparison, and hybrid BM25 + dense retrieval configurations frequently outperform either component alone across a majority of its datasets, though the exact margin and dataset count vary by model pairing and fusion method, so treat any single number here as illustrative rather than a benchmark to cite directly.</p>
+-- Ranked lexical search: CONTAINSTABLE returns [KEY] + [RANK]
+DECLARE @keywords NVARCHAR(4000) = N'"login timeout" OR 18456';
 
-<p class="text-gray-300 leading-relaxed">For database engineers, this is analogous to query plan diversity in parallel query execution: two access paths that each capture a partial result can be combined through a merge operation with a ranking function to produce a result that is better than either path alone.</p>
+SELECT TOP (50) c.ChunkId, c.Title, ft.[RANK] AS FtsRank
+FROM CONTAINSTABLE(dbo.KnowledgeChunks, ChunkText, @keywords, 50) AS ft
+JOIN dbo.KnowledgeChunks AS c ON c.ChunkId = ft.[KEY]
+ORDER BY ft.[RANK] DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CONTAINSTABLE</code> gives you boolean control (phrases, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">AND</code>/<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">OR</code>/<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">NEAR</code>, prefix terms) plus a rank; <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">FREETEXTTABLE</code> does the "find me documents like this text" expansion, which is itself a useful query-rewriting step before vector search. Both are maintained incrementally — with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CHANGE_TRACKING = AUTO</code>, freshness is not a concern, and neither is the full-text population schedule once you monitor <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.fulltext_indexes</code> for crawl lag.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">The Fusion Pattern: Reciprocal Rank Fusion in T-SQL</h3>
+
+<p class="text-gray-300 leading-relaxed">The industry-standard way to combine two ranked lists is <strong class="text-white">reciprocal rank fusion (RRF)</strong>: for each document, sum <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">1 / (k + rank)</code> across the lexical and semantic rankings (k is typically 60). RRF needs no score normalization — it works on ranks alone, which is exactly what you want when one system returns BM25-ish ranks and the other returns cosine distances on incompatible scales. Documents appearing high in both lists get the strongest boost, which is precisely the behavior you want from a hybrid system.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server 2025: hybrid search with reciprocal rank fusion (RRF)
+-- Lexical branch: CONTAINSTABLE rank. Semantic branch: cosine distance rank.
+DECLARE @keywords NVARCHAR(4000) = N'"login timeout" OR 18456';
+DECLARE @q VECTOR(1536) = '[0.12, 0.87, 0.34, ...]';   -- query embedding
+DECLARE @k FLOAT = 60.0;                                -- RRF constant
+
+WITH Lexical AS (
+    SELECT ft.[KEY] AS ChunkId,
+           ROW_NUMBER() OVER (ORDER BY ft.[RANK] DESC) AS LexRank
+    FROM CONTAINSTABLE(dbo.KnowledgeChunks, ChunkText, @keywords, 50) AS ft
+),
+Semantic AS (
+    SELECT TOP (50) ChunkId,
+           ROW_NUMBER() OVER (
+               ORDER BY VECTOR_DISTANCE('cosine', Embedding, @q)) AS SemRank
+    FROM dbo.KnowledgeChunks
+    WHERE Embedding IS NOT NULL
+)
+SELECT TOP (10)
+       c.ChunkId, c.Title, c.ChunkText,
+       COALESCE(1.0 / (@k + l.LexRank), 0)
+     + COALESCE(1.0 / (@k + s.SemRank), 0) AS RrfScore
+FROM dbo.KnowledgeChunks AS c
+LEFT JOIN Lexical  AS l ON l.ChunkId = c.ChunkId
+LEFT JOIN Semantic AS s ON s.ChunkId = c.ChunkId
+WHERE l.ChunkId IS NOT NULL OR s.ChunkId IS NOT NULL
+ORDER BY RrfScore DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">A few design notes on this pattern. Each branch retrieves its own top-50 before fusion — the branches are independent, so both can use their indexes (full-text index for the lexical branch, DiskANN via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_SEARCH</code> for the semantic branch at scale). The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">COALESCE</code> handles documents that appear in only one list: they still get their single-branch score rather than being dropped. And the semantic branch shown uses exact <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_DISTANCE</code> ranking; swap it for the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_SEARCH</code> approximate path from Chapter 2 once the corpus justifies the index.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Weighted Fusion: Tuning the Lexical/Semantic Balance</h3>
+
+<p class="text-gray-300 leading-relaxed">RRF treats both signals equally. In practice, the right balance depends on your query distribution. A support-knowledge-base workload heavy on error numbers and product codes wants lexical weight; a conceptual documentation search wants semantic weight. The weighted variant normalizes each branch's scores to [0,1] and blends with an alpha parameter:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Weighted hybrid: alpha = 1.0 is pure semantic, 0.0 is pure lexical
+DECLARE @alpha FLOAT = 0.6;   -- start here, then tune against labeled queries
+
+WITH Lexical AS (
+    SELECT ft.[KEY] AS ChunkId,
+           CAST(ft.[RANK] AS FLOAT) / NULLIF(MAX(CAST(ft.[RANK] AS FLOAT)) OVER (), 0) AS LexScore
+    FROM CONTAINSTABLE(dbo.KnowledgeChunks, ChunkText, @keywords, 50) AS ft
+),
+Semantic AS (
+    SELECT TOP (50) ChunkId,
+           1.0 - VECTOR_DISTANCE('cosine', Embedding, @q) / 2.0 AS SemScore
+           -- cosine distance in [0,2] maps to similarity in [0,1]
+    FROM dbo.KnowledgeChunks
+    WHERE Embedding IS NOT NULL
+    ORDER BY VECTOR_DISTANCE('cosine', Embedding, @q)
+)
+SELECT TOP (10) c.ChunkId, c.Title,
+       @alpha * COALESCE(s.SemScore, 0)
+     + (1 - @alpha) * COALESCE(l.LexScore, 0) AS HybridScore
+FROM dbo.KnowledgeChunks AS c
+LEFT JOIN Lexical  AS l ON l.ChunkId = c.ChunkId
+LEFT JOIN Semantic AS s ON s.ChunkId = c.ChunkId
+WHERE l.ChunkId IS NOT NULL OR s.ChunkId IS NOT NULL
+ORDER BY HybridScore DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Tune alpha empirically: run a few hundred labeled queries through alpha values of 0.3, 0.5, 0.7 and measure precision@10 or MRR against your relevance judgments. The curve usually has a broad plateau — hybrid beats either pure approach across most of the range — which means you do not need to over-tune. Log the alpha value in your deployment configuration next to the embedding model version; both are retrieval parameters that future you will need.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">How the Dedicated Engines Do It</h3>
+
+<p class="text-gray-300 leading-relaxed">The same two-signal idea appears in every dedicated vector engine, with different mechanics. <strong class="text-white">Weaviate</strong> implements hybrid search natively with an <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">alpha</code> parameter: 1.0 is pure vector, 0.0 is pure BM25, and the default fusion is a normalized weighted sum — conceptually the same blend as the query above, maintained inside the engine's inverted index plus HNSW graph. <strong class="text-white">Pinecone</strong> takes the sparse-plus-dense route: you supply a sparse vector (term weights, often BM25-derived) alongside the dense embedding, and the index scores both with a configurable alpha. <strong class="text-white">Qdrant</strong> supports query-time fusion across multiple named vectors per point, letting you run the same RRF idea across dense and sparse sub-indexes.</p>
+
+<p class="text-gray-300 leading-relaxed">The SQL Server approach differs in one useful way: the fusion logic lives in T-SQL you own, not inside an engine's opaque implementation. That makes the blend auditable, testable with ordinary query tools, and adjustable without re-indexing — you can A/B test alpha values in a stored procedure parameter and watch the effect in Query Store the same afternoon.</p>
 
 <div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">sequenceDiagram
-    participant U as User
-    participant E as Embedding Model
-    participant V as Vector Index (HNSW)
-    participant F as Full-Text Index (BM25/GIN)
-    participant R as RRF Fusion
-    U->>E: embed query text
-    E->>V: query vector
-    U->>F: raw query text
-    V-->>R: top-50 by cosine distance
-    F-->>R: top-50 by BM25 rank
-    R-->>U: fused top-N results</pre></div>
-
-<p class="text-gray-300 leading-relaxed">*Vector and full-text retrieval run independently; Reciprocal Rank Fusion merges the two ranked lists using rank position alone, so no score normalization is needed.*</p>
+    participant Q as Query
+    participant L as Lexical branch<br/>(CONTAINSTABLE)
+    participant S as Semantic branch<br/>(VECTOR_DISTANCE)
+    participant F as Fusion (RRF / weighted)
+    Q->>L: keywords → ranked ChunkIds
+    Q->>S: embedding → ranked ChunkIds
+    L->>F: LexRank per ChunkId
+    S->>F: SemRank per ChunkId
+    F->>Q: TOP 10 by fused score</pre></div>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">11.2 Scoring Fusion: RRF, Linear Combination, and When to Use Each</h3>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Pre-Filtering and the Approximate Path</h3>
 
-<p class="text-gray-300 leading-relaxed">The core architectural question in hybrid search is not how to retrieve from two sources — that part is straightforward. The hard part is how to merge two ranked lists with incomparable scores into a single ranked result.</p>
+<p class="text-gray-300 leading-relaxed">One operational subtlety carries over from Chapter 2's filtered-search discussion: when the semantic branch runs through the approximate <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_SEARCH</code> path, over-fetch <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">TOP_N</code> generously before fusion. RRF only sees the candidates each branch returns — if the semantic branch returns 10 candidates and the tenant filter or fusion drops half, the lexical branch's documents dominate the final list not because they are better, but because the semantic branch was starved. Ask for 50–100 per branch, fuse, then trim to the display count. On the exact path this costs CPU; on the approximate path it costs almost nothing.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Reciprocal Rank Fusion (RRF)</strong></p>
-
-<p class="text-gray-300 leading-relaxed">RRF is the dominant approach in production systems because it is score-agnostic. It only uses rank position, not the raw score. The formula:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>RRF_score(d) = Σ 1 / (k + rank_i(d))</code></pre>
-
-<p class="text-gray-300 leading-relaxed">Where <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">k</code> is a smoothing constant (typically 60, from the original Cormack et al. 2009 paper), and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">rank_i(d)</code> is the position of document <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">d</code> in result list <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">i</code>. A document that appears at rank 1 in both lists scores <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">1/61 + 1/61 = 0.0328</code>. A document that appears at rank 1 in only one list but rank 100 in the other scores <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">1/61 + 1/160 = 0.0226</code>.</p>
-
-<p class="text-gray-300 leading-relaxed">The strength of RRF is that you don't need to normalize scores from BM25 and cosine similarity, which live on completely different scales. The weakness is that it treats all rank positions equally in terms of *relative* weight, which means you cannot explicitly up-weight the semantic signal over the lexical signal or vice versa.</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Linear Score Combination</strong></p>
-
-<p class="text-gray-300 leading-relaxed">When you need tunable control, linear combination gives you a single weight <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">α</code> that governs the balance:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>hybrid_score(d) = α * normalize(vector_score(d)) + (1 - α) * normalize(bm25_score(d))</code></pre>
-
-<p class="text-gray-300 leading-relaxed">This requires score normalization — min-max normalization per result set is typical. The challenge is that BM25 score distributions vary with corpus size and query length, so your normalization bounds shift with every query. This makes <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">α</code> a hyperparameter that needs continuous calibration as your corpus changes.</p>
-
-<p class="text-gray-300 leading-relaxed">In practice:</p>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `α = 0.75` (heavy semantic) works well for open-domain question answering where intent matters more than keywords.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `α = 0.25` (heavy lexical) works well for enterprise search over technical documentation where product names and codes are common.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `α = 0.5` is a reasonable starting point for unknown workloads.</li>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Which to choose</strong></p>
-
-<p class="text-gray-300 leading-relaxed">| Criterion | RRF | Linear Combination |</p>
-<p class="text-gray-300 leading-relaxed">|---|---|---|</p>
-<p class="text-gray-300 leading-relaxed">| Score normalization required | No | Yes |</p>
-<p class="text-gray-300 leading-relaxed">| Tunable weighting | No | Yes |</p>
-<p class="text-gray-300 leading-relaxed">| Stable across corpus changes | High | Medium |</p>
-<p class="text-gray-300 leading-relaxed">| Implementation complexity | Low | Medium |</p>
-<p class="text-gray-300 leading-relaxed">| Calibration overhead | None | Requires labeled queries |</p>
-
-<p class="text-gray-300 leading-relaxed">For most new deployments, start with RRF. Move to linear combination only if you have labeled evaluation data to calibrate <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">α</code> and a system for monitoring retrieval quality over time.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
-
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">11.3 Hybrid Search in pgvector + PostgreSQL Full-Text Search</h3>
-
-<p class="text-gray-300 leading-relaxed">PostgreSQL has native full-text search via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">tsvector</code>/<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">tsquery</code> and the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ts_rank</code> function. Combined with pgvector's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs"><=></code> operator, you can implement a complete hybrid search pipeline inside a single database.</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Schema design</strong></p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
-CREATE EXTENSION IF NOT EXISTS vector;
-
-CREATE TABLE documents (
-    id          BIGSERIAL PRIMARY KEY,
-    title       TEXT NOT NULL,
-    body        TEXT NOT NULL,
-    source      TEXT,
-    created_at  TIMESTAMPTZ DEFAULT NOW(),
-    -- Vector embedding (text-embedding-3-small = 1536 dims)
-    embedding   VECTOR(1536),
-    -- Full-text search vector (precomputed for performance)
-    fts_vector  TSVECTOR GENERATED ALWAYS AS (
-        setweight(to_tsvector('english', coalesce(title, '')), 'A') ||
-        setweight(to_tsvector('english', coalesce(body,  '')), 'B')
-    ) STORED
-);
-
--- GIN index for full-text search
-CREATE INDEX idx_documents_fts
-    ON documents USING GIN (fts_vector);
-
--- HNSW index for vector search
-CREATE INDEX idx_documents_embedding
-    ON documents USING hnsw (embedding vector_cosine_ops)
-    WITH (m = 16, ef_construction = 64);</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">RRF hybrid query</strong></p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
--- Hybrid search using Reciprocal Rank Fusion
--- :query_text   = raw text query from user
--- :query_embed  = pgvector literal of the embedding, e.g. '[0.1, 0.2, ...]'
--- :k            = RRF smoothing constant (default 60)
--- :top_n        = number of final results to return
-
-WITH
--- Semantic search: top 50 candidates by cosine similarity
-vector_results AS (
-    SELECT
-        id,
-        1 - (embedding &lt;=&gt; :query_embed::vector) AS score,
-        ROW_NUMBER() OVER (ORDER BY embedding &lt;=&gt; :query_embed::vector) AS rank
-    FROM documents
-    WHERE embedding IS NOT NULL
-    ORDER BY embedding &lt;=&gt; :query_embed::vector
-    LIMIT 50
-),
--- Full-text search: top 50 candidates by BM25-equivalent ts_rank
-fts_results AS (
-    SELECT
-        id,
-        ts_rank_cd(fts_vector, query) AS score,
-        ROW_NUMBER() OVER (ORDER BY ts_rank_cd(fts_vector, query) DESC) AS rank
-    FROM documents,
-         to_tsquery('english', :query_text) query
-    WHERE fts_vector @@ query
-    ORDER BY ts_rank_cd(fts_vector, query) DESC
-    LIMIT 50
-),
--- RRF merge
-rrf_scores AS (
-    SELECT
-        COALESCE(v.id, f.id) AS id,
-        COALESCE(1.0 / (60 + v.rank), 0) +
-        COALESCE(1.0 / (60 + f.rank), 0) AS rrf_score
-    FROM vector_results v
-    FULL OUTER JOIN fts_results f ON v.id = f.id
-)
-SELECT
-    d.id,
-    d.title,
-    d.body,
-    r.rrf_score
-FROM rrf_scores r
-JOIN documents d ON d.id = r.id
-ORDER BY r.rrf_score DESC
-LIMIT :top_n;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Performance notes</strong></p>
-
-<p class="text-gray-300 leading-relaxed">The query above runs two independent index scans and then merges via a hash join on the combined candidate set (at most 100 rows). At 10M documents, expect:</p>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Vector HNSW scan: 5–15ms with `ef_search = 40`</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> GIN full-text scan: 2–8ms depending on term selectivity</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Merge and sort: sub-millisecond</li>
-
-<p class="text-gray-300 leading-relaxed">Total latency under 20ms for the retrieval phase at this scale is achievable on a properly sized instance (8+ vCPU, fast NVMe SSD). The main tuning lever is reducing the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">LIMIT 50</code> in each subquery — smaller candidate sets mean faster merges at the cost of potentially missing relevant documents.</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Python wrapper with automatic embedding</strong></p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
-import psycopg2
-import numpy as np
-from openai import OpenAI
-
-openai_client = OpenAI()  # uses OPENAI_API_KEY env var
-
-def get_embedding(text: str, model: str = "text-embedding-3-small") -&gt; list[float]:
-    response = openai_client.embeddings.create(input=text, model=model)
-    return response.data[0].embedding
-
-def prepare_fts_query(text: str) -&gt; str:
-    """Convert raw text to a PostgreSQL tsquery-compatible string."""
-    # Strip punctuation and join with & for AND semantics
-    # For production, consider using websearch_to_tsquery instead
-    tokens = [t.strip() for t in text.split() if len(t.strip()) &gt; 2]
-    return " & ".join(tokens)
-
-def hybrid_search(
-    conn,
-    query_text: str,
-    top_n: int = 10,
-    k_rrf: int = 60,
-) -&gt; list[dict]:
-    embedding = get_embedding(query_text)
-    fts_query  = prepare_fts_query(query_text)
-
-    # Format vector as PostgreSQL literal
-    vec_literal = "[" + ",".join(f"{x:.6f}" for x in embedding) + "]"
-
-    sql = """
-    WITH
-    vector_results AS (
-        SELECT id,
-               ROW_NUMBER() OVER (ORDER BY embedding &lt;=&gt; %s::vector) AS rank
-        FROM documents
-        WHERE embedding IS NOT NULL
-        ORDER BY embedding &lt;=&gt; %s::vector
-        LIMIT 50
-    ),
-    fts_results AS (
-        SELECT id,
-               ROW_NUMBER() OVER (
-                   ORDER BY ts_rank_cd(fts_vector, to_tsquery('english', %s)) DESC
-               ) AS rank
-        FROM documents
-        WHERE fts_vector @@ to_tsquery('english', %s)
-        ORDER BY ts_rank_cd(fts_vector, to_tsquery('english', %s)) DESC
-        LIMIT 50
-    ),
-    rrf_scores AS (
-        SELECT
-            COALESCE(v.id, f.id) AS id,
-            COALESCE(1.0 / (%s + v.rank), 0) +
-            COALESCE(1.0 / (%s + f.rank), 0) AS rrf_score
-        FROM vector_results v
-        FULL OUTER JOIN fts_results f ON v.id = f.id
-    )
-    SELECT d.id, d.title, LEFT(d.body, 300) AS snippet, r.rrf_score
-    FROM rrf_scores r
-    JOIN documents d ON d.id = r.id
-    ORDER BY r.rrf_score DESC
-    LIMIT %s;
-    """
-
-    params = (
-        vec_literal, vec_literal,   # vector search (used twice for ROW_NUMBER)
-        fts_query, fts_query, fts_query,  # FTS (used three times)
-        k_rrf, k_rrf,               # RRF constant
-        top_n,
-    )
-
-    with conn.cursor() as cur:
-        cur.execute(sql, params)
-        rows = cur.fetchall()
-
-    return [
-        {"id": r[0], "title": r[1], "snippet": r[2], "rrf_score": float(r[3])}
-        for r in rows
-    ]
-
-# Usage
-conn = psycopg2.connect("postgresql://user:pass@localhost:5432/mydb")
-results = hybrid_search(conn, "how to improve credit score quickly", top_n=5)
-for r in results:
-    print(f"[{r['rrf_score']:.4f}] {r['title']}")</code></pre>
-
-<p class="text-gray-300 leading-relaxed">One practical note on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">prepare_fts_query</code>: for production workloads, replace the manual tokenization with PostgreSQL's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">websearch_to_tsquery</code>, which handles phrase queries and negation correctly. The simple <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">&</code> join is shown here for transparency, but it fails on multi-word phrases.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
-
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">11.4 Hybrid Search in Pinecone</h3>
-
-<p class="text-gray-300 leading-relaxed">Pinecone's hybrid search model relies on sparse vectors (representing BM25 term weights) alongside dense vectors. Both are stored in the same index, and the query combines them using a weighted sum controlled by the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">alpha</code> parameter — <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">alpha=1.0</code> is pure dense, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">alpha=0.0</code> is pure sparse.</p>
-
-<p class="text-gray-300 leading-relaxed">Pinecone uses their own sparse encoding scheme, but the inputs are standard: you compute sparse vectors using a BM25 encoder (Pinecone provides one via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pinecone-text</code>) and dense vectors using any embedding model.</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
-from pinecone import Pinecone
-from pinecone_text.sparse import BM25Encoder
-from openai import OpenAI
-
-# Initialize clients
-pc = Pinecone(api_key="YOUR_PINECONE_API_KEY")
-openai_client = OpenAI()
-
-# Connect to a dotproduct-metric index (required for hybrid search)
-# Index must be created with metric="dotproduct" and sparse vectors enabled
-index = pc.Index("hybrid-search-demo")
-
-# Initialize BM25 encoder — fit on your corpus first
-bm25 = BM25Encoder()
-
-def fit_bm25_on_corpus(corpus: list[str], save_path: str = "bm25_params.json"):
-    """Fit BM25 encoder on corpus and persist params."""
-    bm25.fit(corpus)
-    bm25.dump(save_path)
-    return bm25
-
-def load_bm25(path: str = "bm25_params.json") -&gt; BM25Encoder:
-    return BM25Encoder.load(path)
-
-def get_dense_embedding(text: str) -&gt; list[float]:
-    response = openai_client.embeddings.create(
-        input=text,
-        model="text-embedding-3-small"
-    )
-    return response.data[0].embedding
-
-def upsert_documents(documents: list[dict], bm25_encoder: BM25Encoder):
-    """
-    documents: list of {"id": str, "text": str, "metadata": dict}
-    """
-    vectors = []
-    texts   = [d["text"] for d in documents]
-
-    # Batch embed (dense)
-    embed_response = openai_client.embeddings.create(
-        input=texts,
-        model="text-embedding-3-small"
-    )
-    dense_vecs = [e.embedding for e in embed_response.data]
-
-    # Sparse encode
-    sparse_vecs = bm25_encoder.encode_documents(texts)
-
-    for doc, dense, sparse in zip(documents, dense_vecs, sparse_vecs):
-        vectors.append({
-            "id":           doc["id"],
-            "values":       dense,           # dense vector
-            "sparse_values": sparse,         # sparse BM25 vector
-            "metadata":     doc.get("metadata", {}),
-        })
-
-    # Upsert in batches of 100 (Pinecone limit)
-    batch_size = 100
-    for i in range(0, len(vectors), batch_size):
-        index.upsert(vectors=vectors[i:i + batch_size])
-
-def hybrid_query(
-    query_text: str,
-    bm25_encoder: BM25Encoder,
-    top_k: int = 10,
-    alpha: float = 0.7,   # 0 = pure BM25, 1 = pure dense
-    filter: dict = None,
-) -&gt; list[dict]:
-    """
-    alpha=0.7 gives 70% weight to semantic similarity, 30% to BM25.
-    """
-    dense_vec  = get_dense_embedding(query_text)
-    sparse_vec = bm25_encoder.encode_queries(query_text)
-
-    # Scale vectors according to alpha for weighted combination
-    # Pinecone combines: score = alpha * dense_dot + (1-alpha) * sparse_dot
-    scaled_dense  = [v * alpha       for v in dense_vec]
-    scaled_sparse = {
-        "indices": sparse_vec["indices"],
-        "values":  [v * (1 - alpha) for v in sparse_vec["values"]],
-    }
-
-    query_params = {
-        "vector":        scaled_dense,
-        "sparse_vector": scaled_sparse,
-        "top_k":         top_k,
-        "include_metadata": True,
-    }
-    if filter:
-        query_params["filter"] = filter
-
-    result = index.query(**query_params)
-
-    return [
-        {
-            "id":       m["id"],
-            "score":    m["score"],
-            "metadata": m["metadata"],
-        }
-        for m in result["matches"]
-    ]
-
-# Example usage
-bm25_encoder = load_bm25("bm25_params.json")
-
-results = hybrid_query(
-    query_text="vehicle insurance coverage requirements",
-    bm25_encoder=bm25_encoder,
-    top_k=5,
-    alpha=0.7,
-)
-
-for r in results:
-    print(f"[{r['score']:.4f}] ID={r['id']}  {r['metadata'].get('title','')}")</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Index creation requirement</strong></p>
-
-<p class="text-gray-300 leading-relaxed">Pinecone's hybrid search requires a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dotproduct</code> metric index. <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">cosine</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">euclidean</code> indexes do not support sparse vectors. This is because the combination of dense and sparse scores is implemented as a dotproduct internally. If you are creating a new index for hybrid use, specify this from the start — you cannot convert an existing index.</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
-# Create a new hybrid-capable Pinecone index
-pc.create_index(
-    name="hybrid-search-demo",
-    dimension=1536,             # must match your embedding model
-    metric="dotproduct",        # required for hybrid search
-    spec=ServerlessSpec(
-        cloud="aws",
-        region="us-east-1",
-    ),
-)</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Tradeoff to understand</strong>: Pinecone's BM25 sparse encoding is computed at indexing time against the full corpus term statistics. If your corpus grows significantly (by more than ~20%), the IDF weights in your BM25 encoder become stale and retrieval quality degrades. Plan for periodic BM25 re-fitting, followed by a full re-upsert if sparse vectors change materially.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
-
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">11.5 Hybrid Search in Weaviate</h3>
-
-<p class="text-gray-300 leading-relaxed">Weaviate has first-class hybrid search support through its <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">hybrid</code> query parameter, which combines BM25 (their inverted index) and vector search using a configurable fusion strategy — either <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">rankedFusion</code> (RRF) or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">relativeScoreFusion</code> (score normalization + linear combination).</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
-import weaviate
-import weaviate.classes as wvc
-from weaviate.classes.query import HybridFusion
-from openai import OpenAI
-
-# Connect to Weaviate (local or cloud)
-client = weaviate.connect_to_local()   # or weaviate.connect_to_wcs(...)
-
-openai_client = OpenAI()
-
-# --- Schema setup (run once) ---
-def create_documents_collection(client):
-    """
-    Weaviate manages embeddings automatically if you configure a vectorizer.
-    Here we use manual vectors (bring-your-own-embeddings) for full control.
-    """
-    if client.collections.exists("Document"):
-        return
-
-    client.collections.create(
-        name="Document",
-        vectorizer_config=wvc.config.Configure.Vectorizer.none(),  # manual embeddings
-        properties=[
-            wvc.config.Property(name="title",  data_type=wvc.config.DataType.TEXT),
-            wvc.config.Property(name="body",   data_type=wvc.config.DataType.TEXT),
-            wvc.config.Property(name="source", data_type=wvc.config.DataType.TEXT),
-        ],
-        vector_index_config=wvc.config.Configure.VectorIndex.hnsw(
-            distance_metric=wvc.config.VectorDistances.COSINE,
-            ef_construction=128,
-            max_connections=16,
-        ),
-        inverted_index_config=wvc.config.Configure.inverted_index(
-            bm25_b=0.75,   # length normalization factor
-            bm25_k1=1.2,   # term frequency saturation
-        ),
-    )
-
-def embed_text(text: str) -&gt; list[float]:
-    resp = openai_client.embeddings.create(
-        input=text,
-        model="text-embedding-3-small"
-    )
-    return resp.data[0].embedding
-
-# --- Insert documents ---
-def insert_documents(client, docs: list[dict]):
-    collection = client.collections.get("Document")
-    with collection.batch.dynamic() as batch:
-        for doc in docs:
-            embedding = embed_text(doc["title"] + " " + doc["body"])
-            batch.add_object(
-                properties={
-                    "title":  doc["title"],
-                    "body":   doc["body"],
-                    "source": doc.get("source", ""),
-                },
-                vector=embedding,
-            )
-
-# --- Hybrid query using Weaviate's built-in fusion ---
-def hybrid_search_weaviate(
-    client,
-    query_text: str,
-    query_embedding: list[float],
-    top_k: int = 10,
-    alpha: float = 0.7,
-    fusion_type: HybridFusion = HybridFusion.RANKED,  # RRF
-) -&gt; list[dict]:
-    """
-    alpha=1.0  → pure vector search
-    alpha=0.0  → pure BM25 search
-    alpha=0.5  → balanced hybrid
-
-    fusion_type:
-      HybridFusion.RANKED              → Reciprocal Rank Fusion
-      HybridFusion.RELATIVE_SCORE      → Normalized score combination
-    """
-    collection = client.collections.get("Document")
-
-    results = collection.query.hybrid(
-        query=query_text,           # used for BM25 scoring
-        vector=query_embedding,     # used for vector scoring
-        alpha=alpha,
-        fusion_type=fusion_type,
-        limit=top_k,
-        return_properties=["title", "body", "source"],
-        return_metadata=wvc.query.MetadataQuery(score=True, explain_score=True),
-    )
-
-    return [
-        {
-            "id":       str(obj.uuid),
-            "title":    obj.properties["title"],
-            "snippet":  obj.properties["body"][:300],
-            "score":    obj.metadata.score,
-        }
-        for obj in results.objects
-    ]
-
-# --- Usage ---
-create_documents_collection(client)
-
-query = "how to repair damaged credit"
-q_embedding = embed_text(query)
-
-results = hybrid_search_weaviate(
-    client,
-    query_text=query,
-    query_embedding=q_embedding,
-    top_k=5,
-    alpha=0.6,
-    fusion_type=HybridFusion.RANKED,
-)
-
-for r in results:
-    print(f"[{r['score']:.4f}] {r['title']}")
-
-client.close()</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Choosing between RANKED and RELATIVE_SCORE in Weaviate</strong></p>
-
-<p class="text-gray-300 leading-relaxed"><code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">HybridFusion.RANKED</code> applies RRF — the same formula discussed in Section 11.2. It is stable, requires no score normalization, and handles corpus changes gracefully.</p>
-
-<p class="text-gray-300 leading-relaxed"><code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">HybridFusion.RELATIVE_SCORE</code> normalizes both score distributions to [0, 1] within each result set before combining. This preserves information about how much better rank-1 is than rank-10 (which RRF ignores), but it is sensitive to the shape of the score distribution. If your BM25 scores for a particular query are clustered tightly (e.g., many documents with similar term frequency), the relative score fusion will treat them as nearly equivalent even when there is a meaningful difference in relevance. For most workloads, start with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">RANKED</code>.</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">GraphQL alternative for Weaviate</strong></p>
-
-<p class="text-gray-300 leading-relaxed">If you are working with Weaviate's HTTP interface directly rather than the Python client, the equivalent hybrid query via GraphQL:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>{
-  Get {
-    Document(
-      hybrid: {
-        query: "how to repair damaged credit"
-        vector: [0.012, -0.034, ...]   # truncated
-        alpha: 0.6
-        fusionType: rankedFusion
-      }
-      limit: 5
-    ) {
-      title
-      body
-      _additional {
-        score
-        explainScore
-      }
-    }
-  }
-}</code></pre>
-
-<p class="text-gray-300 leading-relaxed">---</p>
-
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">11.6 Filtering in Hybrid Search</h3>
-
-<p class="text-gray-300 leading-relaxed">Production hybrid search almost always involves metadata filters — user-specific document sets, date ranges, product categories, access control lists. Applying filters correctly is harder than it looks, because the interaction between filters and vector indexes can silently degrade recall.</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Pre-filter vs. Post-filter</strong></p>
-
-<p class="text-gray-300 leading-relaxed">*Post-filtering* is the naive approach: retrieve top-k from each component, merge, then discard results that don't match the filter. It is easy to implement but broken by design when the filter is selective. If 95% of your corpus is filtered out, top-k vector retrieval returns mostly documents that will be discarded, and you end up with fewer than k results despite abundant matching documents.</p>
-
-<p class="text-gray-300 leading-relaxed">*Pre-filtering* applies the filter before or during the approximate nearest neighbor search. This is the correct approach for selective filters, but it requires index support. PostgreSQL with pgvector supports this naturally through <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WHERE</code> clause conditions that combine with the vector index scan (though with very selective filters, the query planner may fall back to a sequential scan — always <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">EXPLAIN ANALYZE</code>). Pinecone and Weaviate both implement pre-filtering natively for their managed indexes.</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Implementing pre-filtering in pgvector</strong></p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
--- Hybrid search with pre-filter on source and date range
-WITH
-vector_results AS (
-    SELECT
-        id,
-        ROW_NUMBER() OVER (ORDER BY embedding &lt;=&gt; :query_embed::vector) AS rank
-    FROM documents
-    WHERE embedding IS NOT NULL
-      AND source = :source_filter            -- pre-filter applied before ranking
-      AND created_at &gt;= :date_from
-    ORDER BY embedding &lt;=&gt; :query_embed::vector
-    LIMIT 50
-),
-fts_results AS (
-    SELECT
-        id,
-        ROW_NUMBER() OVER (
-            ORDER BY ts_rank_cd(fts_vector, to_tsquery('english', :query_text)) DESC
-        ) AS rank
-    FROM documents
-    WHERE fts_vector @@ to_tsquery('english', :query_text)
-      AND source = :source_filter            -- same pre-filter
-      AND created_at &gt;= :date_from
-    ORDER BY ts_rank_cd(fts_vector, to_tsquery('english', :query_text)) DESC
-    LIMIT 50
-),
-rrf_scores AS (
-    SELECT
-        COALESCE(v.id, f.id) AS id,
-        COALESCE(1.0 / (60 + v.rank), 0) +
-        COALESCE(1.0 / (60 + f.rank), 0) AS rrf_score
-    FROM vector_results v
-    FULL OUTER JOIN fts_results f ON v.id = f.id
-)
-SELECT d.id, d.title, LEFT(d.body, 300) AS snippet, r.rrf_score
-FROM rrf_scores r
-JOIN documents d ON d.id = r.id
-ORDER BY r.rrf_score DESC
-LIMIT :top_n;</code></pre>
-
-<p class="text-gray-300 leading-relaxed">When the filter column has low cardinality and high selectivity (e.g., <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">source</code> narrows results to fewer than 1% of the corpus), the HNSW index may be bypassed entirely. In that case, consider a partial index:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL
--- Partial HNSW index for a specific source
-CREATE INDEX idx_documents_embedding_internal
-    ON documents USING hnsw (embedding vector_cosine_ops)
-    WITH (m = 16, ef_construction = 64)
-    WHERE source = 'internal';</code></pre>
-
-<p class="text-gray-300 leading-relaxed">Partial indexes require one index per filter predicate combination, so this approach scales only when you have a small, stable set of filter values that appear frequently.</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Filtering in Pinecone</strong></p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
-# Pinecone pre-filtering using metadata filters
-results = hybrid_query(
-    query_text="vehicle insurance requirements",
-    bm25_encoder=bm25_encoder,
-    top_k=10,
-    alpha=0.7,
-    filter={
-        "$and": [
-            {"source": {"$eq": "internal"}},
-            {"created_year": {"$gte": 2022}},
-        ]
-    }
-)</code></pre>
-
-<p class="text-gray-300 leading-relaxed">Pinecone applies metadata filters during the ANN search, not after. This means the filter is always pre-filter semantically, though Pinecone's internal implementation uses a combination of brute-force scan and index pruning depending on filter selectivity. For highly selective filters over large indexes (hundreds of millions of vectors), Pinecone recommends namespacing (partitioning by filter value) rather than relying on metadata filters alone.</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Filtering in Weaviate</strong></p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
-import weaviate.classes as wvc
-
-results = collection.query.hybrid(
-    query=query_text,
-    vector=query_embedding,
-    alpha=0.6,
-    limit=10,
-    filters=wvc.query.Filter.by_property("source").equal("internal")
-         & wvc.query.Filter.by_property("created_year").greater_or_equal(2022),
-    return_properties=["title", "body", "source"],
-    return_metadata=wvc.query.MetadataQuery(score=True),
-)</code></pre>
-
-<p class="text-gray-300 leading-relaxed">Weaviate implements filtering through an ACORN-style approach that integrates the filter into the HNSW graph traversal, substantially reducing the post-filter recall loss that affects naïve implementations.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
-
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">11.7 Evaluating Hybrid Search Quality</h3>
-
-<p class="text-gray-300 leading-relaxed">You cannot tune <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">alpha</code> or decide between RRF and linear combination without a way to measure whether your changes help. This section covers the minimum evaluation infrastructure you need.</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">The offline evaluation loop</strong></p>
-
-<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Collect a query set with relevance judgments.</strong> The minimum useful set is 50–100 queries, each with at least 3–5 relevant document IDs manually labeled by domain experts or collected from user click logs. For production systems, you want several hundred labeled queries to get stable metric estimates.</p>
-
-<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Compute retrieval metrics.</strong> The two most useful for hybrid search tuning are:</p>
-<p class="text-gray-300 leading-relaxed">   - *Recall@k*: Of all relevant documents, what fraction appear in the top-k results? Use k=10 or k=20 depending on your application's display window.</p>
-<p class="text-gray-300 leading-relaxed">   - *NDCG@k* (Normalized Discounted Cumulative Gain): Accounts for rank position. A relevant document at rank 1 is worth more than one at rank 10.</p>
-
-<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Run A/B comparisons across configurations.</strong> Test BM25-only, vector-only, RRF hybrid, and linear-combination hybrid. The hybrid configurations should consistently match or exceed the best single-mode configuration.</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Minimal Python evaluation harness</strong></p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
-import numpy as np
-
-def recall_at_k(retrieved_ids: list, relevant_ids: set, k: int) -&gt; float:
-    """Fraction of relevant documents appearing in top-k retrieved."""
-    if not relevant_ids:
-        return 0.0
-    retrieved_at_k = set(retrieved_ids[:k])
-    return len(retrieved_at_k & relevant_ids) / len(relevant_ids)
-
-def dcg_at_k(retrieved_ids: list, relevant_ids: set, k: int) -&gt; float:
-    """Discounted Cumulative Gain at k."""
-    dcg = 0.0
-    for i, doc_id in enumerate(retrieved_ids[:k]):
-        if doc_id in relevant_ids:
-            dcg += 1.0 / np.log2(i + 2)   # i+2 because log2(1) = 0
-    return dcg
-
-def ndcg_at_k(retrieved_ids: list, relevant_ids: set, k: int) -&gt; float:
-    """Normalized DCG: DCG / ideal DCG."""
-    ideal_hits = min(len(relevant_ids), k)
-    ideal_dcg = sum(1.0 / np.log2(i + 2) for i in range(ideal_hits))
-    if ideal_dcg == 0:
-        return 0.0
-    return dcg_at_k(retrieved_ids, relevant_ids, k) / ideal_dcg
-
-def evaluate_retrieval(
-    queries: list[dict],       # [{"query": str, "relevant_ids": list[str]}]
-    retrieval_fn,              # callable(query_text) -&gt; list[str] of doc IDs
-    k: int = 10,
-) -&gt; dict:
-    recalls, ndcgs = [], []
-    for item in queries:
-        retrieved = retrieval_fn(item["query"])
-        relevant  = set(item["relevant_ids"])
-        recalls.append(recall_at_k(retrieved, relevant, k))
-        ndcgs.append(ndcg_at_k(retrieved, relevant, k))
-    return {
-        f"recall@{k}":  np.mean(recalls),
-        f"ndcg@{k}":    np.mean(ndcgs),
-        "n_queries":    len(queries),
-    }
-
-# Example: compare BM25-only vs hybrid
-labeled_queries = [
-    {"query": "fix credit score fast", "relevant_ids": ["doc_42", "doc_17", "doc_88"]},
-    # ... more labeled queries
-]
-
-bm25_metrics   = evaluate_retrieval(labeled_queries, bm25_only_search,   k=10)
-vector_metrics = evaluate_retrieval(labeled_queries, vector_only_search,  k=10)
-hybrid_metrics = evaluate_retrieval(labeled_queries, hybrid_search_fn,    k=10)
-
-print(f"BM25-only:   {bm25_metrics}")
-print(f"Vector-only: {vector_metrics}")
-print(f"Hybrid:      {hybrid_metrics}")</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Online signals</strong></p>
-
-<p class="text-gray-300 leading-relaxed">Offline metrics require labeled data, which is expensive to collect. Online signals from user behavior can supplement them:</p>
-
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> *Click-through rate on top-3 results*: If users consistently click results at position 4 or lower, your ranking is off.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> *Zero-result rate*: The fraction of queries where the retrieval system returns nothing useful. This is a strong signal that either your FTS query construction is too strict or your embeddings don't cover the domain.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> *Query reformulation rate*: Users who immediately rephrase a query signal dissatisfaction with the first retrieval attempt. This is detectable from session logs.</li>
-
-<p class="text-gray-300 leading-relaxed">These signals don't replace labeled evaluation, but they allow continuous monitoring in production without ongoing manual labeling effort.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
-
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">11.8 Operational Considerations: Latency, Cost, and Freshness</h3>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Latency budget</strong></p>
-
-<p class="text-gray-300 leading-relaxed">Hybrid search is inherently more expensive than single-mode retrieval: you are running two retrieval paths plus a merge. At small corpus sizes (< 1M documents), this is rarely a problem — both paths return in single-digit milliseconds. At larger scales, you have two strategies:</p>
-
-<p class="text-gray-300 leading-relaxed">1. *Parallel execution*: Run the vector and full-text searches concurrently in separate coroutines/threads, then merge the results. This reduces wall-clock latency to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max(t_vector, t_fts)</code> rather than the sum.</p>
-
-<p class="text-gray-300 leading-relaxed">2. *Candidate set reduction*: Reduce the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">LIMIT</code> in each subquery. Retrieving top-20 candidates from each path instead of top-50 cuts merge overhead and typically loses minimal quality — the probability that a genuinely relevant document appears between rank 20 and rank 50 in only one of the two retrievers is low.</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Parallel PostgreSQL hybrid search in Python</strong></p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
-import asyncio
-import asyncpg
-
-async def vector_search_async(pool, query_embed: str, limit: int = 20) -&gt; list[tuple]:
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT id, ROW_NUMBER() OVER (ORDER BY embedding &lt;=&gt; $1::vector) AS rank
-            FROM documents
-            WHERE embedding IS NOT NULL
-            ORDER BY embedding &lt;=&gt; $1::vector
-            LIMIT $2
-            """,
-            query_embed, limit,
-        )
-    return [(r["id"], r["rank"]) for r in rows]
-
-async def fts_search_async(pool, fts_query: str, limit: int = 20) -&gt; list[tuple]:
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT id,
-                   ROW_NUMBER() OVER (
-                       ORDER BY ts_rank_cd(fts_vector, to_tsquery('english', $1)) DESC
-                   ) AS rank
-            FROM documents
-            WHERE fts_vector @@ to_tsquery('english', $1)
-            ORDER BY ts_rank_cd(fts_vector, to_tsquery('english', $1)) DESC
-            LIMIT $2
-            """,
-            fts_query, limit,
-        )
-    return [(r["id"], r["rank"]) for r in rows]
-
-def rrf_merge(
-    vector_results: list[tuple],
-    fts_results: list[tuple],
-    k: int = 60,
-    top_n: int = 10,
-) -&gt; list[tuple]:
-    scores: dict[int, float] = {}
-    for doc_id, rank in vector_results:
-        scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k + rank)
-    for doc_id, rank in fts_results:
-        scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k + rank)
-    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-    return ranked[:top_n]
-
-async def parallel_hybrid_search(pool, query_text: str, top_n: int = 10) -&gt; list[tuple]:
-    embedding   = get_embedding(query_text)
-    vec_literal = "[" + ",".join(f"{x:.6f}" for x in embedding) + "]"
-    fts_query   = prepare_fts_query(query_text)
-
-    vector_task = asyncio.create_task(vector_search_async(pool, vec_literal, limit=20))
-    fts_task    = asyncio.create_task(fts_search_async(pool, fts_query,   limit=20))
-
-    vector_results, fts_results = await asyncio.gather(vector_task, fts_task)
-    return rrf_merge(vector_results, fts_results, top_n=top_n)</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Embedding cost and caching</strong></p>
-
-<p class="text-gray-300 leading-relaxed">Every hybrid query requires an embedding call (for the vector component) and a text query construction (for the BM25 component). The BM25 text query is free — it is just string manipulation. The embedding call is where cost concentrates. At high query volumes, cache embeddings for repeated or near-duplicate queries using an LRU cache keyed on normalized query text. A hit rate of 20–30% is common in production search applications due to popular queries.</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
-from functools import lru_cache
-
-@lru_cache(maxsize=4096)
-def get_embedding_cached(text: str) -&gt; tuple[float, ...]:
-    """Cache embeddings for repeated queries. Returns tuple (hashable)."""
-    return tuple(get_embedding(text))</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Index freshness</strong></p>
-
-<p class="text-gray-300 leading-relaxed">Hybrid search has two freshness concerns: the vector index and the BM25 statistics.</p>
-
-<p class="text-gray-300 leading-relaxed">For pgvector, the HNSW index is updated incrementally on every INSERT — no rebuild required. The GIN index for full-text is also maintained incrementally. Freshness is not a concern.</p>
-
-<p class="text-gray-300 leading-relaxed">For Pinecone, new vectors appear in the index within seconds of upsert. However, if you re-fit your BM25 encoder because corpus term statistics have shifted significantly, you need to re-encode and re-upsert the sparse vectors for all existing documents. This is a batch operation — plan for it in your data engineering pipeline.</p>
-
-<p class="text-gray-300 leading-relaxed">For Weaviate, both the HNSW index and the inverted index are updated in real-time on object insertion. The BM25 IDF weights are computed dynamically at query time from the live inverted index, so they stay current without any batch refresh step. This is a meaningful operational advantage over solutions that pre-compute and freeze BM25 statistics.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
-
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">11.9 A Complete End-to-End Example</h3>
-
-<p class="text-gray-300 leading-relaxed">This section assembles a minimal but complete hybrid search service backed by PostgreSQL and pgvector, exposing a FastAPI endpoint. It is intended as a starting template, not a production-ready service — error handling, authentication, and connection pool sizing are left to the reader.</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
-# hybrid_search_service.py
-from contextlib import asynccontextmanager
-import asyncio
-import asyncpg
-from fastapi import FastAPI, Query
-from pydantic import BaseModel
-from openai import AsyncOpenAI
-
-EMBEDDING_MODEL = "text-embedding-3-small"
-DB_DSN          = "postgresql://user:pass@localhost:5432/mydb"
-POOL_MIN_SIZE   = 5
-POOL_MAX_SIZE   = 20
-
-openai_client = AsyncOpenAI()
-pool: asyncpg.Pool = None
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global pool
-    pool = await asyncpg.create_pool(
-        DB_DSN,
-        min_size=POOL_MIN_SIZE,
-        max_size=POOL_MAX_SIZE,
-    )
-    yield
-    await pool.close()
-
-app = FastAPI(title="Hybrid Search Service", lifespan=lifespan)
-
-class SearchResult(BaseModel):
-    id:        int
-    title:     str
-    snippet:   str
-    rrf_score: float
-
-class SearchResponse(BaseModel):
-    query:   str
-    results: list[SearchResult]
-
-async def embed(text: str) -&gt; list[float]:
-    resp = await openai_client.embeddings.create(
-        input=text,
-        model=EMBEDDING_MODEL,
-    )
-    return resp.data[0].embedding
-
-def to_fts_query(text: str) -&gt; str:
-    tokens = [t.strip() for t in text.split() if len(t.strip()) &gt; 2]
-    return " & ".join(tokens) if tokens else "null"
-
-@app.get("/search", response_model=SearchResponse)
-async def search(
-    q:     str = Query(..., min_length=2, description="Search query"),
-    top_n: int = Query(10, ge=1, le=50),
-    k_rrf: int = Query(60, ge=1),
-):
-    embedding = await embed(q)
-    vec_literal = "[" + ",".join(f"{x:.6f}" for x in embedding) + "]"
-    fts_query   = to_fts_query(q)
-
-    # Run both searches in parallel
-    async with pool.acquire() as conn:
-        vector_task = conn.fetch(
-            """
-            SELECT id,
-                   ROW_NUMBER() OVER (ORDER BY embedding &lt;=&gt; $1::vector) AS rank
-            FROM documents
-            WHERE embedding IS NOT NULL
-            ORDER BY embedding &lt;=&gt; $1::vector
-            LIMIT 50
-            """,
-            vec_literal,
-        )
-        fts_task = conn.fetch(
-            """
-            SELECT id,
-                   ROW_NUMBER() OVER (
-                       ORDER BY ts_rank_cd(fts_vector,
-                                           to_tsquery('english', $1)) DESC
-                   ) AS rank
-            FROM documents
-            WHERE fts_vector @@ to_tsquery('english', $1)
-            ORDER BY ts_rank_cd(fts_vector, to_tsquery('english', $1)) DESC
-            LIMIT 50
-            """,
-            fts_query,
-        )
-        # asyncpg doesn't support concurrent queries on the same connection;
-        # use separate connections for true parallelism
-        vector_rows = await vector_task
-        fts_rows    = await fts_task
-
-    # RRF merge in Python
-    scores: dict[int, float] = {}
-    for row in vector_rows:
-        scores[row["id"]] = scores.get(row["id"], 0.0) + 1.0 / (k_rrf + row["rank"])
-    for row in fts_rows:
-        scores[row["id"]] = scores.get(row["id"], 0.0) + 1.0 / (k_rrf + row["rank"])
-
-    ranked_ids = sorted(scores, key=lambda x: scores[x], reverse=True)[:top_n]
-
-    if not ranked_ids:
-        return SearchResponse(query=q, results=[])
-
-    # Fetch document details for top results
-    async with pool.acquire() as conn:
-        docs = await conn.fetch(
-            "SELECT id, title, LEFT(body, 300) AS snippet FROM documents WHERE id = ANY($1)",
-            ranked_ids,
-        )
-    doc_map = {d["id"]: d for d in docs}
-
-    results = [
-        SearchResult(
-            id=doc_id,
-            title=doc_map[doc_id]["title"],
-            snippet=doc_map[doc_id]["snippet"],
-            rrf_score=scores[doc_id],
-        )
-        for doc_id in ranked_ids
-        if doc_id in doc_map
-    ]
-
-    return SearchResponse(query=q, results=results)</code></pre>
-
-<p class="text-gray-300 leading-relaxed">To run:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>pip install fastapi uvicorn asyncpg openai
-uvicorn hybrid_search_service:app --host 0.0.0.0 --port 8080</code></pre>
-
-<p class="text-gray-300 leading-relaxed">Test with:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>curl "http://localhost:8080/search?q=how+to+improve+credit+score&top_n=5"</code></pre>
-
-<p class="text-gray-300 leading-relaxed">Note the comment in the code about asyncpg connection sharing: asyncpg connections are not safe for concurrent queries on the same connection object. For true parallel execution, acquire two connections from the pool, or use the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">asyncio.gather</code> pattern shown in Section 11.8 with separate <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pool.acquire()</code> calls.</p>
+<p class="text-gray-300 leading-relaxed">Also note the interplay between full-text and vector freshness. With <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CHANGE_TRACKING = AUTO</code>, newly inserted chunks are searchable lexically within seconds, while the vector side is current as soon as the ingest pipeline writes the embedding. If you run the DiskANN index (preview write-path constraint: drop and recreate to ingest), the semantic branch sees new data only after a rebuild — a freshness asymmetry worth documenting in your runbook, since users will notice that keyword search finds a document before semantic search does.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Full-text search and vector search are complementary, not competing.** Full-text retrieval excels at exact terms, product codes, and proper nouns; vector retrieval excels at semantic intent and vocabulary mismatch. Combining both consistently improves retrieval quality over either approach alone.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Full-text search (SQL Server <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CONTAINSTABLE</code>/<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">FREETEXTTABLE</code>) handles exact terms, identifiers, and error codes; vector search handles meaning, paraphrase, and intent. Production retrieval needs both, fused into one ranked list.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Reciprocal Rank Fusion (RRF) is the right default fusion strategy.** It requires no score normalization, is robust to corpus changes, and needs no labeled calibration data. Move to linear score combination only when you have sufficient labeled queries to tune and monitor the `alpha` weight reliably.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Reciprocal rank fusion — <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">1/(k + rank)</code> summed across branches — combines rankings without score normalization and is implementable in a single T-SQL statement with two CTEs.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Pre-filtering is not optional for selective metadata filters.** Post-filtering hybrid search degrades silently when filters are selective, returning fewer than k results even when many matching documents exist. Use database-native pre-filtering in all three systems covered here.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Weighted fusion with an alpha parameter lets you tune the lexical/semantic balance for your query distribution; tune it empirically against labeled queries and version it with your embedding model.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Candidate set size is your primary latency lever.** Reducing the per-path candidate limit from 50 to 20 cuts merge overhead and typically loses minimal recall, because the probability of a relevant document appearing only between rank 20 and rank 50 in a single retriever is small. Measure the tradeoff on your own workload before committing to a limit.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Retrieve generously per branch (50–100 candidates) before fusing — RRF can only rank the candidates it sees, and a starved branch silently biases the final list toward the other signal.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **BM25 statistics have a freshness lifecycle in managed systems.** In Pinecone, sparse vectors are computed at indexing time against frozen corpus statistics and must be re-encoded when the corpus grows substantially. In Weaviate, IDF weights are recomputed from the live inverted index at query time, eliminating this concern. In PostgreSQL, the GIN index is updated incrementally on every write. Match your re-indexing strategy to the freshness model of your chosen system.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Keeping fusion logic in T-SQL you own makes the blend auditable and A/B-testable without re-indexing; watch for freshness asymmetry between the incremental full-text index and the rebuild-cycle DiskANN index.</li>
     </div>
     <div class="mt-14 bg-cyan-950/40 border border-cyan-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
-        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · SQL Server</p>
       </div>
       <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
          class="shrink-0 px-6 py-3 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold rounded-xl text-sm transition">
         Download Free
       </a>
     </div>
-    <div class="mt-8 text-xs">
-      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a>
+    <div class="mt-10 flex items-center justify-between text-xs">
+      <a href="b4-ch10-tuning-vector-workloads-sql-server.html" class="text-gray-500 hover:text-gray-300 transition">← Previous Chapter</a>
+      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">All Chapters</a>
+      <a href="b4-ch12-multitenant-vector-sql-server.html" class="text-cyan-400 hover:text-cyan-300 transition">Next Chapter →</a>
     </div>
   </article>
   <footer class="border-t border-gray-800/50 px-6 py-8">

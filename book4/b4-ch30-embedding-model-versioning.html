@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Chapter 30: Handling Embedding Model Version Changes — Vector Databases & AI</title>
-  <meta name="description" content="Vector Databases & AI Chapter 30: Handling Embedding Model Version Changes. pgvector, Pinecone, Weaviate, RAG pipelines — by Rajesh Guntupalli." />
+  <title>Chapter 30: Embedding Model Versioning — Vector Databases & AI</title>
+  <meta name="description" content="Vector Databases & AI Chapter 30: Embedding model versioning — why model changes break vector search, zero-downtime migration strategies, backfill design, dimension changes, and deprecation tracking on SQL Server. By Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
   <script type="module">
     import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
@@ -16,7 +16,7 @@
     <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
       <a href="../index.html" class="flex items-center gap-2 group">
         <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-cyan-500 to-cyan-700 flex items-center justify-center">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
         </div>
         <span class="text-sm font-bold text-white group-hover:text-cyan-300 transition">Rajesh Guntupalli</span>
       </a>
@@ -41,1135 +41,191 @@
       <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">Vector Databases & AI</span>
     </div>
     <div class="space-y-4 text-sm">
-<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 30: Handling Embedding Model Version Changes</h2>
-
-<p class="text-gray-300 leading-relaxed">Embedding models are not static infrastructure. OpenAI retires <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-ada-002</code> in favor of <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-3-small</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-3-large</code>. Cohere ships <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">embed-v3</code> with a different vector dimension than <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">embed-v2</code>. A sentence-transformers model you fine-tuned six months ago gets replaced by a better checkpoint. Every time the model changes, every vector in your database becomes potentially incompatible with every new query vector — and the search results degrade silently unless you have a plan. This chapter covers what actually breaks during an embedding model transition, how to detect degradation before your users do, and the concrete migration strategies that let you move from one model to another without taking your search system offline.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 30: Embedding Model Versioning</h2>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Why Model Changes Break Vector Search</h3>
 
-<p class="text-gray-300 leading-relaxed">The core problem is geometric. Every embedding model defines its own latent space — a coordinate system where semantically similar concepts cluster together. When you switch models, you are not changing the data; you are changing the entire coordinate system. A document vector produced by <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-ada-002</code> (1536 dimensions) and a query vector produced by <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-3-small</code> (also 1536 dimensions, but a completely different latent space) are meaningless when compared with cosine similarity. The numbers look plausible. The system returns results. But those results are essentially random relative to what the user actually asked.</p>
+<p class="text-gray-300 leading-relaxed">Embedding models are versioned artifacts, and vendors update them: new training data, new architectures, deprecated endpoints. Every model change breaks vector search in one of two ways. <strong class="text-white">Dimension mismatch</strong> is the loud one — the new model produces vectors of a different length than the old model. SQL Server's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR(1536)</code> column throws a hard error if you attempt to insert a 1,024-dimensional vector. This is the easy failure to catch.</p>
 
-<p class="text-gray-300 leading-relaxed">This failure mode is the worst kind in database systems: silent and gradual. There is no error thrown. There is no query timeout. The cosine distance computation succeeds perfectly — it just computes the distance between two points in incompatible coordinate systems. If you have monitoring on query latency but not on result quality, this class of failure will go undetected until users start complaining or A/B test metrics collapse.</p>
-
-<p class="text-gray-300 leading-relaxed">From a database perspective, think of it like changing your collation rules on a text column after the data is already indexed. The index physically exists and returns results, but the sort order is now wrong relative to the application's expectations. The difference is that collation failures at least sometimes produce obviously garbled output. Embedding model mismatches produce results that look completely reasonable.</p>
-
-<p class="text-gray-300 leading-relaxed">The specific failure scenarios are:</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Dimension mismatch</strong>: The new model produces vectors of a different length than the old model. pgvector will throw a hard error if you attempt to insert a 1024-dimensional vector into a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">vector(1536)</code> column. Pinecone will reject the upsert with an HTTP 400. This is the *easy* failure to catch.</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Latent space drift</strong>: Same vector dimension, completely different coordinate space. <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-ada-002</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-3-small</code> both produce 1536-dimensional vectors, but they are not comparable. This is the silent failure that requires active quality monitoring to detect.</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Normalization differences</strong>: Some models produce unit-normalized vectors by default; others do not. If your index uses dot product similarity (which many ANN indexes optimize for), switching from a normalized to an unnormalized model changes the effective similarity function without changing your index configuration.</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Tokenization boundary shifts</strong>: A new model version might chunk text differently at the tokenizer level, meaning that the same 512-token input produces a vector that reflects subtly different semantic content. This is the hardest to detect because the degradation is partial rather than total.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Semantic drift</strong> is the quiet one — same dimension, different geometry. A new model version with 1,536 dimensions produces vectors that fit your column perfectly and mean something completely different. Queries run, distances look plausible, and retrieval quality degrades without a single error. This is the failure that costs you users, and it is why model identity must be a first-class column in your schema, not a deployment note.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Detecting Degradation Before and After Migration</h3>
 
-<p class="text-gray-300 leading-relaxed">Before you migrate a single vector, establish a baseline you can measure against. Detection requires two things: a ground-truth evaluation set and a continuous monitoring pipeline.</p>
+<p class="text-gray-300 leading-relaxed">Never migrate on faith. Before committing to a new model, run the canary: embed your eval question set with both models, retrieve from side-by-side columns, and compare recall@k and faithfulness (Chapters 22.8, 27). Migrate only when the new model meets or beats the old on your data — vendor benchmark improvements do not always transfer to domain corpora.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Building an evaluation set</strong></p>
+<p class="text-gray-300 leading-relaxed">After cutover, keep the old column for one full business cycle as the control. If production metrics (refusal rate, thumbs-down rate, top-1 distance distribution) degrade, the rollback is a query-path switch, not a re-ingest — because the old vectors are still there.</p>
 
-<p class="text-gray-300 leading-relaxed">A ground truth evaluation set is a collection of queries where you already know which documents should rank in the top K results. For a customer support system, this might be 200 sample support tickets paired with the knowledge base articles that human agents actually used to resolve them. For a code search system, it might be 100 natural language queries paired with the functions they should retrieve.</p>
-
-<p class="text-gray-300 leading-relaxed">The metric to track is Recall@K — specifically, what percentage of the known-relevant documents appear in the top K results. For most production systems, Recall@10 between 0.75 and 0.90 indicates healthy retrieval. A drop below 0.60 is a signal that something has gone wrong with your retrieval layer.</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
-# Evaluation harness for embedding model comparison
-# Requires: openai, sentence-transformers, numpy, scikit-learn
-
-import numpy as np
-from openai import OpenAI
-from sentence_transformers import SentenceTransformer
-from sklearn.metrics.pairwise import cosine_similarity
-
-client = OpenAI()
-
-# Ground truth evaluation set
-# Format: (query, [list of relevant doc ids])
-EVAL_SET = [
-    ("How do I reset my password?", ["doc_042", "doc_107"]),
-    ("billing cycle change request", ["doc_019", "doc_023", "doc_091"]),
-    ("API rate limit exceeded error", ["doc_055", "doc_056"]),
-    ("cancel subscription", ["doc_011", "doc_012"]),
-    ("two factor authentication setup", ["doc_088", "doc_089", "doc_090"]),
-]
-
-# Precomputed document corpus embeddings (already stored in your vector DB)
-# In practice, load these from your database
-def load_corpus_embeddings(model_label: str) -&gt; tuple[dict, np.ndarray]:
-    """Load document ID -&gt; index mapping and embedding matrix for a given model."""
-    # Placeholder: replace with actual DB retrieval
-    # Returns: (doc_id_to_index: dict, embedding_matrix: np.ndarray)
-    raise NotImplementedError("Connect to your vector store here")
-
-def embed_queries_openai(queries: list[str], model: str) -&gt; np.ndarray:
-    response = client.embeddings.create(input=queries, model=model)
-    return np.array([r.embedding for r in response.data])
-
-def embed_queries_st(queries: list[str], model_name: str) -&gt; np.ndarray:
-    model = SentenceTransformer(model_name)
-    return model.encode(queries, normalize_embeddings=True)
-
-def recall_at_k(
-    query_embeddings: np.ndarray,
-    corpus_embeddings: np.ndarray,
-    doc_id_to_index: dict,
-    eval_set: list,
-    k: int = 10
-) -&gt; float:
-    """Compute Recall@K across the evaluation set."""
-    index_to_doc_id = {v: k for k, v in doc_id_to_index.items()}
-    sims = cosine_similarity(query_embeddings, corpus_embeddings)
-    
-    recall_scores = []
-    for i, (query, relevant_ids) in enumerate(eval_set):
-        top_k_indices = np.argsort(sims[i])[::-1][:k]
-        top_k_doc_ids = {index_to_doc_id[idx] for idx in top_k_indices}
-        relevant_set = set(relevant_ids)
-        
-        hits = len(relevant_set & top_k_doc_ids)
-        recall_scores.append(hits / len(relevant_set))
-    
-    return float(np.mean(recall_scores))
-
-def compare_models(eval_set: list, k: int = 10):
-    queries = [q for q, _ in eval_set]
-    
-    models_to_test = [
-        {
-            "label": "ada-002",
-            "embed_fn": lambda q: embed_queries_openai(q, "text-embedding-ada-002"),
-        },
-        {
-            "label": "3-small",
-            "embed_fn": lambda q: embed_queries_openai(q, "text-embedding-3-small"),
-        },
-        {
-            "label": "3-large",
-            "embed_fn": lambda q: embed_queries_openai(q, "text-embedding-3-large"),
-        },
-        {
-            "label": "bge-large-en",
-            "embed_fn": lambda q: embed_queries_st(q, "BAAI/bge-large-en-v1.5"),
-        },
-    ]
-    
-    print(f"{'Model':&lt;20} {'Recall@' + str(k):&lt;12} {'Latency (ms)':&lt;15}")
-    print("-" * 48)
-    
-    for model_cfg in models_to_test:
-        import time
-        start = time.perf_counter()
-        query_embeddings = model_cfg["embed_fn"](queries)
-        elapsed_ms = (time.perf_counter() - start) * 1000
-        
-        try:
-            doc_id_to_index, corpus_embeddings = load_corpus_embeddings(
-                model_cfg["label"]
-            )
-            score = recall_at_k(
-                query_embeddings, corpus_embeddings, doc_id_to_index, eval_set, k
-            )
-            print(
-                f"{model_cfg['label']:&lt;20} {score:&lt;12.4f} {elapsed_ms:&lt;15.1f}"
-            )
-        except NotImplementedError:
-            print(
-                f"{model_cfg['label']:&lt;20} {'N/A (load corpus)':&lt;12} {elapsed_ms:&lt;15.1f}"
-            )
-
-if __name__ == "__main__":
-    compare_models(EVAL_SET, k=10)</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Continuous monitoring in production</strong></p>
-
-<p class="text-gray-300 leading-relaxed">Run the evaluation set against your live system on a scheduled basis — every hour during a migration, daily in steady state. Store the scores in a time-series table alongside deployment metadata:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
--- Schema for tracking embedding model quality over time
-
-CREATE TABLE embedding_model_registry (
-    model_id        SERIAL PRIMARY KEY,
-    model_name      TEXT NOT NULL,           -- 'text-embedding-3-small'
-    model_version   TEXT NOT NULL,           -- 'v1', 'v2', or commit hash
-    vector_dim      INTEGER NOT NULL,
-    provider        TEXT NOT NULL,           -- 'openai', 'cohere', 'local'
-    deployed_at     TIMESTAMPTZ,
-    deprecated_at   TIMESTAMPTZ,
-    is_active       BOOLEAN NOT NULL DEFAULT FALSE,
-    metadata        JSONB DEFAULT '{}'::jsonb,
-    UNIQUE (model_name, model_version)
-);
-
-CREATE TABLE retrieval_quality_log (
-    log_id          BIGSERIAL PRIMARY KEY,
-    recorded_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    model_id        INTEGER REFERENCES embedding_model_registry(model_id),
-    eval_set_name   TEXT NOT NULL,
-    k               INTEGER NOT NULL,
-    recall_at_k     NUMERIC(5,4) NOT NULL,
-    ndcg_at_k       NUMERIC(5,4),
-    eval_query_count INTEGER NOT NULL,
-    notes           TEXT
-);
-
-CREATE INDEX idx_rql_recorded_at ON retrieval_quality_log (recorded_at DESC);
-CREATE INDEX idx_rql_model_id    ON retrieval_quality_log (model_id, recorded_at DESC);
-
--- Query: detect recall drops over the last 24 hours
-WITH recent AS (
-    SELECT
-        r.model_id,
-        reg.model_name,
-        r.recorded_at,
-        r.recall_at_k,
-        AVG(r.recall_at_k) OVER (
-            PARTITION BY r.model_id
-            ORDER BY r.recorded_at
-            ROWS BETWEEN 23 PRECEDING AND CURRENT ROW
-        ) AS rolling_24h_avg
-    FROM retrieval_quality_log r
-    JOIN embedding_model_registry reg USING (model_id)
-    WHERE r.recorded_at &gt; NOW() - INTERVAL '48 hours'
-      AND r.eval_set_name = 'production_eval_v1'
-      AND r.k = 10
-)
-SELECT
-    model_name,
-    recorded_at,
-    recall_at_k,
-    rolling_24h_avg,
-    (recall_at_k - rolling_24h_avg) AS delta
-FROM recent
-WHERE ABS(recall_at_k - rolling_24h_avg) &gt; 0.05  -- alert if &gt;5 point swing
-ORDER BY recorded_at DESC;</code></pre>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: pre-migration A/B comparison on the eval set
+-- Documents(Embedding = old model, Embedding_v2 = new model backfilled)
+-- EvalQuestions(QuestionId, QOld VECTOR(1536), QNew VECTOR(1536), GoldChunkId)
+SELECT 'old_model' AS Model,
+       AVG(CASE WHEN g.GoldChunkId IN (
+           SELECT TOP (10) d.ChunkId FROM dbo.Documents AS d
+           ORDER BY VECTOR_DISTANCE('cosine', d.Embedding, q.QOld))
+           THEN 1.0 ELSE 0.0 END) AS RecallAt10
+FROM dbo.EvalQuestions AS q JOIN dbo.GoldChunks AS g
+  ON g.QuestionId = q.QuestionId
+UNION ALL
+SELECT 'new_model',
+       AVG(CASE WHEN g.GoldChunkId IN (
+           SELECT TOP (10) d.ChunkId FROM dbo.Documents AS d
+           WHERE d.Embedding_v2 IS NOT NULL
+           ORDER BY VECTOR_DISTANCE('cosine', d.Embedding_v2, q.QNew))
+           THEN 1.0 ELSE 0.0 END)
+FROM dbo.EvalQuestions AS q JOIN dbo.GoldChunks AS g
+  ON g.QuestionId = q.QuestionId;
+-- Migrate only if new_model RecallAt10 >= old_model on YOUR questions.
+</code></pre>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Migration Strategies: Zero-Downtime Approaches</h3>
 
-<p class="text-gray-300 leading-relaxed">There are three practical migration strategies. Which one you choose depends on your corpus size, your SLA requirements, and whether you have the infrastructure to run dual indexes simultaneously.</p>
+<p class="text-gray-300 leading-relaxed">The zero-downtime pattern is side-by-side: add a second vector column, backfill it with the new model, build a second DiskANN index, eval-gate the cutover, then retire the old column. Retrieval never stops serving — it just switches which column the query reads.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Strategy 1: Big Bang (Full Re-index)</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: zero-downtime embedding model migration
+-- Phase 1: add the new column (nullable; old column keeps serving)
+ALTER TABLE dbo.Documents ADD Embedding_v2 VECTOR(3072) NULL;
+-- Phase 2: backfill in throttled batches (see Section 30.4)
+-- Phase 3: index the new column once backfill completes
+CREATE VECTOR INDEX IX_Documents_Embedding_v2
+    ON dbo.Documents (Embedding_v2)
+    WITH (METRIC = 'cosine', TYPE = 'DiskANN', MAXDOP = 8);
+-- Phase 4: cutover — retrieval procedure switches column + model predicate
+--   (deploy behind a feature flag; eval-gate before flipping)
+-- Phase 5: after one stable business cycle, retire the old column
+-- DROP INDEX IX_Documents_Embedding ON dbo.Documents;
+-- ALTER TABLE dbo.Documents DROP COLUMN Embedding;
+-- EXEC sp_rename 'dbo.Documents.Embedding_v2', 'Embedding', 'COLUMN';</code></pre>
 
-<p class="text-gray-300 leading-relaxed">Re-embed the entire corpus with the new model, load it into a new collection or table, then atomically switch traffic. Simple to reason about, but requires 2x storage during the transition and a cutover window where you must freeze writes to the old index while completing the final sync.</p>
+<p class="text-gray-300 leading-relaxed">The retrieval procedure must be model-aware from day one — a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">@modelVersion</code> parameter that selects the column and the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ModelName</code> predicate. If the model choice is hardcoded in application code, every migration becomes a code deploy instead of a flag flip, and rollbacks get slower exactly when you need them fast.</p>
 
-<p class="text-gray-300 leading-relaxed">Suitable for corpora under ~5 million documents where the re-embedding job completes in under 4 hours and your application can tolerate brief read-only mode.</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Strategy 2: Dual-Model Shadow Period</strong></p>
-
-<p class="text-gray-300 leading-relaxed">Run both the old model and the new model simultaneously. New documents are written to both indexes. Queries are served from the old index until you validate the new one. Then you drain the old index by re-embedding documents in batches during off-peak hours.</p>
-
-<p class="text-gray-300 leading-relaxed">This is the pattern most production teams use because it decouples the "new model is ready" decision from the "all data is migrated" state.</p>
-
-<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">sequenceDiagram
-    participant App as Application
-    participant Old as Old model index
-    participant New as New model index
-    participant Eval as Recall evaluation
-
-    Note over App,New: Shadow period — dual write
-    App->>Old: write (embed with old model)
-    App->>New: write (embed with new model)
-    App->>Old: queries served here
-
-    Note over App,New: Backfill
-    App->>New: batch re-embed existing corpus
-
-    Eval->>Old: run golden query set
-    Eval->>New: run golden query set
-    Eval-->>App: recall@k comparison
-
-    Note over App,New: Cutover (only after recall threshold met)
-    App->>New: queries now served here
-    App--xOld: decommission</pre></div>
-<p class="text-gray-300 leading-relaxed">*Dual-write shadow migration: new writes go to both indexes, the corpus backfills in the background, and query traffic cuts over only after recall parity is confirmed.*</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
-# Dual-model write path using pgvector via psycopg2 and asyncpg
-# Demonstrates shadow-writing to both old and new embedding columns
-
-import asyncio
-import asyncpg
-from openai import AsyncOpenAI
-
-client = AsyncOpenAI()
-
-CREATE_SCHEMA = """
-CREATE TABLE IF NOT EXISTS documents (
-    id              TEXT PRIMARY KEY,
-    content         TEXT NOT NULL,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    
-    -- Old model column (ada-002, 1536 dims)
-    embedding_ada002        vector(1536),
-    embedding_ada002_at     TIMESTAMPTZ,
-    
-    -- New model column (3-small, 1536 dims — different latent space)
-    embedding_3small        vector(1536),
-    embedding_3small_at     TIMESTAMPTZ,
-    
-    -- Which model is authoritative for reads
-    active_model    TEXT NOT NULL DEFAULT 'ada-002'
-        CHECK (active_model IN ('ada-002', '3-small'))
-);
-
--- Indexes for both models
-CREATE INDEX IF NOT EXISTS idx_docs_ada002
-    ON documents USING hnsw (embedding_ada002 vector_cosine_ops)
-    WITH (m = 16, ef_construction = 64);
-
-CREATE INDEX IF NOT EXISTS idx_docs_3small
-    ON documents USING hnsw (embedding_3small vector_cosine_ops)
-    WITH (m = 16, ef_construction = 64);
-"""
-
-async def embed_text(text: str, model: str) -&gt; list[float]:
-    response = await client.embeddings.create(input=text, model=model)
-    return response.data[0].embedding
-
-async def upsert_document_dual_write(
-    conn: asyncpg.Connection,
-    doc_id: str,
-    content: str,
-    shadow_write_new_model: bool = True
-):
-    """
-    Write to old model always.
-    Write to new model if shadow_write_new_model=True.
-    Enables gradual validation before flipping active_model.
-    """
-    # Embed with old model (always)
-    ada_embedding = await embed_text(content, "text-embedding-ada-002")
-    
-    if shadow_write_new_model:
-        # Embed with new model simultaneously
-        small_embedding = await embed_text(content, "text-embedding-3-small")
-        
-        await conn.execute(
-            """
-            INSERT INTO documents (
-                id, content,
-                embedding_ada002, embedding_ada002_at,
-                embedding_3small, embedding_3small_at
-            )
-            VALUES ($1, $2, $3::vector, NOW(), $4::vector, NOW())
-            ON CONFLICT (id) DO UPDATE SET
-                content              = EXCLUDED.content,
-                embedding_ada002     = EXCLUDED.embedding_ada002,
-                embedding_ada002_at  = EXCLUDED.embedding_ada002_at,
-                embedding_3small     = EXCLUDED.embedding_3small,
-                embedding_3small_at  = EXCLUDED.embedding_3small_at
-            """,
-            doc_id, content,
-            str(ada_embedding),
-            str(small_embedding),
-        )
-    else:
-        await conn.execute(
-            """
-            INSERT INTO documents (id, content, embedding_ada002, embedding_ada002_at)
-            VALUES ($1, $2, $3::vector, NOW())
-            ON CONFLICT (id) DO UPDATE SET
-                content             = EXCLUDED.content,
-                embedding_ada002    = EXCLUDED.embedding_ada002,
-                embedding_ada002_at = EXCLUDED.embedding_ada002_at
-            """,
-            doc_id, content, str(ada_embedding),
-        )
-
-async def search_documents(
-    conn: asyncpg.Connection,
-    query: str,
-    model_override: str | None = None,
-    top_k: int = 10
-) -&gt; list[dict]:
-    """
-    Search using whichever model is currently active,
-    or a specific model if overriding for A/B testing.
-    """
-    # Determine active model (read from a config row or feature flag)
-    active_model = model_override or await get_active_model(conn)
-    
-    if active_model == "ada-002":
-        embedding = await embed_text(query, "text-embedding-ada-002")
-        col = "embedding_ada002"
-    else:
-        embedding = await embed_text(query, "text-embedding-3-small")
-        col = "embedding_3small"
-    
-    rows = await conn.fetch(
-        f"""
-        SELECT
-            id,
-            content,
-            active_model,
-            1 - ({col} &lt;=&gt; $1::vector) AS cosine_similarity
-        FROM documents
-        WHERE {col} IS NOT NULL
-        ORDER BY {col} &lt;=&gt; $1::vector
-        LIMIT $2
-        """,
-        str(embedding), top_k
-    )
-    return [dict(r) for r in rows]
-
-async def get_active_model(conn: asyncpg.Connection) -&gt; str:
-    # In practice, store this in a config table or read from a feature flag service
-    row = await conn.fetchrow(
-        "SELECT value FROM app_config WHERE key = 'active_embedding_model'"
-    )
-    return row["value"] if row else "ada-002"
-
-async def flip_active_model(conn: asyncpg.Connection, new_model: str):
-    """
-    Atomic model flip — called only after backfill is complete
-    and quality metrics have been validated.
-    """
-    # Verify backfill completeness before flipping
-    gap = await conn.fetchval(
-        f"""
-        SELECT COUNT(*) FROM documents
-        WHERE embedding_3small IS NULL
-          AND active_model = 'ada-002'
-        """
-    )
-    if gap &gt; 0:
-        raise RuntimeError(
-            f"Cannot flip: {gap} documents still missing new embeddings"
-        )
-    
-    await conn.execute(
-        "UPDATE app_config SET value = $1 WHERE key = 'active_embedding_model'",
-        new_model
-    )
-    # Also update all rows to reflect new authoritative model
-    await conn.execute("UPDATE documents SET active_model = $1", new_model)
-    print(f"Active model flipped to: {new_model}")</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Strategy 3: Rolling Backfill with Pinecone Namespaces</strong></p>
-
-<p class="text-gray-300 leading-relaxed">Pinecone namespaces provide a clean mechanism for this pattern when you are not using a self-hosted vector database. You create a new namespace for the new model and backfill it in batches while the old namespace continues serving traffic.</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
-# Rolling backfill using Pinecone namespaces for model isolation
-# Requires: pinecone-client&gt;=3.0, openai
-
-from pinecone import Pinecone
-from openai import OpenAI
-import time
-
-pc = Pinecone(api_key="YOUR_PINECONE_API_KEY")
-openai_client = OpenAI()
-
-# Two indexes: one per model dimension if dimensions differ,
-# or one index with two namespaces if dimensions are the same
-INDEX_NAME = "knowledge-base"  # Must exist with dim=1536
-
-OLD_NAMESPACE = "model-ada002"
-NEW_NAMESPACE = "model-3small"
-
-index = pc.Index(INDEX_NAME)
-
-def embed_batch_openai(texts: list[str], model: str) -&gt; list[list[float]]:
-    response = openai_client.embeddings.create(input=texts, model=model)
-    return [r.embedding for r in response.data]
-
-def backfill_namespace(
-    documents: list[dict],  # [{"id": str, "text": str, "metadata": dict}]
-    target_model: str,
-    target_namespace: str,
-    batch_size: int = 100,
-    requests_per_minute: int = 3000
-):
-    """
-    Re-embed all documents with new model and upsert into new namespace.
-    Rate limiting respects OpenAI RPM limits.
-    """
-    total = len(documents)
-    upserted = 0
-    skipped = 0
-    
-    # Check which IDs are already in the new namespace
-    # to support resumable backfill
-    all_ids = [doc["id"] for doc in documents]
-    existing_ids = set()
-    
-    # Fetch in batches of 1000 (Pinecone fetch limit)
-    for i in range(0, len(all_ids), 1000):
-        batch_ids = all_ids[i:i+1000]
-        fetch_result = index.fetch(ids=batch_ids, namespace=target_namespace)
-        existing_ids.update(fetch_result.vectors.keys())
-    
-    print(f"Total documents: {total}")
-    print(f"Already backfilled: {len(existing_ids)}")
-    print(f"Remaining: {total - len(existing_ids)}")
-    
-    pending = [doc for doc in documents if doc["id"] not in existing_ids]
-    
-    for i in range(0, len(pending), batch_size):
-        batch = pending[i:i + batch_size]
-        texts = [doc["text"] for doc in batch]
-        
-        try:
-            embeddings = embed_batch_openai(texts, target_model)
-        except Exception as e:
-            print(f"Embedding failed for batch {i//batch_size}: {e}")
-            time.sleep(60)
-            continue
-        
-        vectors = [
-            {
-                "id": doc["id"],
-                "values": emb,
-                "metadata": {
-                    **doc.get("metadata", {}),
-                    "embedding_model": target_model,
-                    "backfilled_at": int(time.time()),
-                }
-            }
-            for doc, emb in zip(batch, embeddings)
-        ]
-        
-        index.upsert(vectors=vectors, namespace=target_namespace)
-        upserted += len(vectors)
-        
-        progress_pct = (upserted / len(pending)) * 100
-        print(f"Progress: {upserted}/{len(pending)} ({progress_pct:.1f}%)")
-        
-        # Respect rate limits: ~60s / RPM * batch_size
-        sleep_seconds = (batch_size / requests_per_minute) * 60
-        time.sleep(max(sleep_seconds, 0.1))
-    
-    print(f"Backfill complete. Upserted: {upserted}, Skipped: {skipped}")
-    return upserted
-
-def query_with_model_routing(
-    query_text: str,
-    active_namespace: str,
-    top_k: int = 10,
-    filter_metadata: dict | None = None
-) -&gt; list[dict]:
-    """
-    Query the active namespace. Namespace determines which model's
-    embeddings are used — the embedding model must match the namespace.
-    """
-    model_map = {
-        OLD_NAMESPACE: "text-embedding-ada-002",
-        NEW_NAMESPACE: "text-embedding-3-small",
-    }
-    model = model_map[active_namespace]
-    
-    response = openai_client.embeddings.create(
-        input=query_text,
-        model=model
-    )
-    query_vector =response.data[0].embedding
-    
-    results = index.query(
-        vector=query_vector,
-        top_k=top_k,
-        namespace=active_namespace,
-        filter=filter_metadata,
-        include_metadata=True
-    )
-    
-    return [
-        {
-            "id": match.id,
-            "score": match.score,
-            "metadata": match.metadata,
-        }
-        for match in results.matches
-    ]</code></pre>
-
-<p class="text-gray-300 leading-relaxed">The namespace approach has an important operational advantage: you can run A/B traffic splits simply by routing a fraction of queries to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">NEW_NAMESPACE</code> while the backfill is still in progress — as long as you track which documents have been backfilled so you do not count misses from documents that are not yet present in the new namespace.</p>
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph LR
+    A[Phase 1<br/>Add Embedding_v2] --> B[Phase 2<br/>Throttled backfill]
+    B --> C[Phase 3<br/>Build DiskANN v2]
+    C --> D[Phase 4<br/>Eval-gated cutover<br/>feature flag]
+    D --> E[Phase 5<br/>Retire old column<br/>after stable cycle]</pre></div>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Backfill Job Design: Resumability and Rate Limiting</h3>
 
-<p class="text-gray-300 leading-relaxed">A backfill job that processes five million documents will take hours. It will be interrupted. The network will hiccup. The embedding API will return a 429. Your database connection will drop. The job must be resumable from the point of failure without reprocessing already-migrated documents and without leaving the corpus in an inconsistent state.</p>
+<p class="text-gray-300 leading-relaxed">The backfill is the heaviest write workload your vector table will ever see: full-corpus embedding API spend plus a full column rewrite. Design it like any bulk job — resumable, throttled, observable:</p>
 
-<p class="text-gray-300 leading-relaxed">The pattern is checkpoint tables. Every batch that completes successfully writes its completion state to a tracking table. On restart, the job reads the highest completed checkpoint and picks up from there.</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL
--- Backfill tracking schema for large-scale re-embedding jobs
-
-CREATE TABLE embedding_backfill_jobs (
-    job_id          SERIAL PRIMARY KEY,
-    job_name        TEXT NOT NULL UNIQUE,
-    source_model    TEXT NOT NULL,
-    target_model    TEXT NOT NULL,
-    target_column   TEXT NOT NULL,
-    total_docs      BIGINT,
-    started_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    completed_at    TIMESTAMPTZ,
-    status          TEXT NOT NULL DEFAULT 'running'
-        CHECK (status IN ('running', 'completed', 'failed', 'paused')),
-    last_error      TEXT
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: migration backfill queue (resumable, observable)
+CREATE TABLE dbo.ModelMigrationQueue (
+    QueueId   BIGINT IDENTITY(1,1) NOT NULL
+        CONSTRAINT PK_ModelMigrationQueue PRIMARY KEY,
+    ChunkId   BIGINT NOT NULL,
+    Status    NVARCHAR(20) NOT NULL
+        CONSTRAINT DF_MMQ_Status DEFAULT ('pending'),
+    Attempts  INT NOT NULL CONSTRAINT DF_MMQ_Attempts DEFAULT (0),
+    EnqueuedAt DATETIME2(0) NOT NULL
+        CONSTRAINT DF_MMQ_Enq DEFAULT SYSUTCDATETIME()
 );
+CREATE INDEX IX_MMQ_Status ON dbo.ModelMigrationQueue (Status, QueueId);
+-- Seed: one row per chunk. Workers claim with UPDATE TOP ... OUTPUT
+-- (Chapter 29.3 pattern), embed with the NEW model, and:
+-- UPDATE dbo.Documents SET Embedding_v2 = CAST(@vec AS VECTOR(3072))
+-- WHERE ChunkId = @chunkId;
+-- Throttle: run fewer workers during business hours; the old column
+-- keeps serving, so backfill speed is a cost decision, not an outage.
+</code></pre>
 
-CREATE TABLE embedding_backfill_progress (
-    progress_id     BIGSERIAL PRIMARY KEY,
-    job_id          INTEGER NOT NULL REFERENCES embedding_backfill_jobs(job_id),
-    batch_number    INTEGER NOT NULL,
-    doc_id_min      TEXT NOT NULL,     -- first doc id in this batch (for resume cursor)
-    doc_id_max      TEXT NOT NULL,     -- last doc id in this batch
-    docs_in_batch   INTEGER NOT NULL,
-    completed_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    duration_ms     INTEGER,
-    UNIQUE (job_id, batch_number)
-);
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: backfill progress dashboard
+SELECT Status, COUNT(*) AS Items,
+       MIN(EnqueuedAt) AS OldestItem
+FROM dbo.ModelMigrationQueue
+GROUP BY Status;
+-- And verify no NULLs remain before building the v2 index:
+-- SELECT COUNT(*) FROM dbo.Documents WHERE Embedding_v2 IS NULL;
+</code></pre>
 
-CREATE INDEX idx_backfill_progress_job ON embedding_backfill_progress (job_id, batch_number DESC);
-
--- View: current backfill status
-CREATE VIEW v_backfill_status AS
-SELECT
-    j.job_id,
-    j.job_name,
-    j.source_model,
-    j.target_model,
-    j.status,
-    j.total_docs,
-    COALESCE(SUM(p.docs_in_batch), 0) AS docs_completed,
-    CASE
-        WHEN j.total_docs &gt; 0
-        THEN ROUND(100.0 * COALESCE(SUM(p.docs_in_batch), 0) / j.total_docs, 2)
-        ELSE 0
-    END AS pct_complete,
-    MAX(p.completed_at) AS last_batch_at,
-    j.started_at,
-    EXTRACT(EPOCH FROM (COALESCE(j.completed_at, NOW()) - j.started_at)) / 3600
-        AS elapsed_hours
-FROM embedding_backfill_jobs j
-LEFT JOIN embedding_backfill_progress p USING (job_id)
-GROUP BY j.job_id, j.job_name, j.source_model, j.target_model,
-         j.status, j.total_docs, j.started_at, j.completed_at;</code></pre>
-
-<p class="text-gray-300 leading-relaxed">The corresponding Python job runner reads the checkpoint, processes in batches, and writes progress atomically with the embedding upsert:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
-# Resumable backfill runner for pgvector dual-column migration
-# Uses a cursor-based approach rather than OFFSET to avoid slow deep pagination
-
-import asyncio
-import asyncpg
-import time
-from openai import AsyncOpenAI
-
-openai_client = AsyncOpenAI()
-
-async def get_or_create_job(
-    conn: asyncpg.Connection,
-    job_name: str,
-    source_model: str,
-    target_model: str,
-    target_column: str,
-) -&gt; dict:
-    row = await conn.fetchrow(
-        "SELECT * FROM embedding_backfill_jobs WHERE job_name = $1",
-        job_name
-    )
-    if row:
-        return dict(row)
-    
-    total_docs = await conn.fetchval(
-        f"SELECT COUNT(*) FROM documents WHERE {target_column} IS NULL"
-    )
-    job_id = await conn.fetchval(
-        """
-        INSERT INTO embedding_backfill_jobs
-            (job_name, source_model, target_model, target_column, total_docs)
-        VALUES ($1, $2, $3, $4, $5)
-        RETURNING job_id
-        """,
-        job_name, source_model, target_model, target_column, total_docs
-    )
-    return {"job_id": job_id, "job_name": job_name, "total_docs": total_docs}
-
-async def get_resume_cursor(
-    conn: asyncpg.Connection,
-    job_id: int
-) -&gt; str | None:
-    """Return the doc_id_max of the last completed batch, or None to start from beginning."""
-    row = await conn.fetchrow(
-        """
-        SELECT doc_id_max
-        FROM embedding_backfill_progress
-        WHERE job_id = $1
-        ORDER BY batch_number DESC
-        LIMIT 1
-        """,
-        job_id
-    )
-    return row["doc_id_max"] if row else None
-
-async def run_backfill(
-    conn: asyncpg.Connection,
-    job_name: str,
-    target_model: str,
-    target_column: str,
-    source_model: str = "text-embedding-ada-002",
-    batch_size: int = 50,
-    max_retries: int = 3,
-):
-    job = await get_or_create_job(
-        conn, job_name, source_model, target_model, target_column
-    )
-    job_id = job["job_id"]
-    
-    cursor = await get_resume_cursor(conn, job_id)
-    batch_number = await conn.fetchval(
-        "SELECT COALESCE(MAX(batch_number), 0) FROM embedding_backfill_progress WHERE job_id = $1",
-        job_id
-    ) or 0
-    
-    print(f"Starting backfill job '{job_name}' (id={job_id})")
-    print(f"Resuming from cursor: {cursor or 'beginning'}")
-    print(f"Total documents: {job['total_docs']}")
-    
-    while True:
-        # Cursor-based pagination: always faster than OFFSET on large tables
-        if cursor is None:
-            rows = await conn.fetch(
-                f"""
-                SELECT id, content FROM documents
-                WHERE {target_column} IS NULL
-                ORDER BY id
-                LIMIT $1
-                """,
-                batch_size
-            )
-        else:
-            rows = await conn.fetch(
-                f"""
-                SELECT id, content FROM documents
-                WHERE {target_column} IS NULL
-                  AND id &gt; $1
-                ORDER BY id
-                LIMIT $2
-                """,
-                cursor, batch_size
-            )
-        
-        if not rows:
-            break  # All documents processed
-        
-        texts = [r["content"] for r in rows]
-        doc_ids = [r["id"] for r in rows]
-        
-        # Retry loop for embedding API failures
-        embeddings = None
-        for attempt in range(max_retries):
-            try:
-                t0 = time.perf_counter()
-                response = await openai_client.embeddings.create(
-                    input=texts,
-                    model=target_model
-                )
-                embeddings = [e.embedding for e in response.data]
-                elapsed_ms = int((time.perf_counter() - t0) * 1000)
-                break
-            except Exception as e:
-                wait = 2 ** attempt * 5
-                print(f"Attempt {attempt+1} failed: {e}. Retrying in {wait}s...")
-                await asyncio.sleep(wait)
-        
-        if embeddings is None:
-            await conn.execute(
-                "UPDATE embedding_backfill_jobs SET status='failed', last_error=$1 WHERE job_id=$2",
-                f"Embedding API failed after {max_retries} retries on cursor {cursor}",
-                job_id
-            )
-            raise RuntimeError("Embedding API permanently failed. Job marked failed.")
-        
-        # Write embeddings and checkpoint in a single transaction
-        async with conn.transaction():
-            for doc_id, embedding in zip(doc_ids, embeddings):
-                await conn.execute(
-                    f"""
-                    UPDATE documents
-                    SET {target_column} = $1::vector,
-                        {target_column}_at = NOW()
-                    WHERE id = $2
-                    """,
-                    str(embedding), doc_id
-                )
-            
-            batch_number += 1
-            await conn.execute(
-                """
-                INSERT INTO embedding_backfill_progress
-                    (job_id, batch_number, doc_id_min, doc_id_max, docs_in_batch, duration_ms)
-                VALUES ($1, $2, $3, $4, $5, $6)
-                """,
-                job_id, batch_number,
-                doc_ids[0], doc_ids[-1],
-                len(doc_ids), elapsed_ms
-            )
-        
-        cursor = doc_ids[-1]
-        print(f"Batch {batch_number} complete: {len(doc_ids)} docs, cursor={cursor}")
-    
-    await conn.execute(
-        "UPDATE embedding_backfill_jobs SET status='completed', completed_at=NOW() WHERE job_id=$1",
-        job_id
-    )
-    print(f"Backfill '{job_name}' complete.")</code></pre>
-
-<p class="text-gray-300 leading-relaxed">One detail worth highlighting: the embedding update and the checkpoint write happen inside the same transaction. If the process crashes after writing the embeddings but before writing the checkpoint, the transaction rolls back entirely. On restart, the cursor will land on a batch that was already partially written, and those documents get re-embedded (an idempotent operation). If the process crashes after writing the checkpoint, the transaction was committed, so those documents are correctly skipped on restart. The cursor-based pagination via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">id > $cursor</code> avoids the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">OFFSET</code> performance cliff that hits hard once you are millions of rows into a table.</p>
+<p class="text-gray-300 leading-relaxed">Rate-limit against the embedding provider's quota, not your database's throughput — the API is always the bottleneck. Checkpoint per batch so a killed worker resumes instead of restarting, and keep the backfill's transaction scope small: one batch per transaction, never the whole corpus.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Handling Dimension Changes: The Hard Case</h3>
 
-<p class="text-gray-300 leading-relaxed">When the new model produces vectors of a different dimension, you cannot use the dual-column approach above without schema changes. Cohere's transition from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">embed-english-v2.0</code> (4096 dimensions) to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">embed-english-v3.0</code> (1024 dimensions) is a real example of this. The same challenge applies if you move from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-3-small</code> (1536 or configurable lower) to a model with a fundamentally different dimensionality.</p>
+<p class="text-gray-300 leading-relaxed">In SQL Server, vector columns are typed with a fixed dimension: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR(1536)</code> will reject a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR(1024)</code> insert with a hard error. You have two options:</p>
 
-<p class="text-gray-300 leading-relaxed">In pgvector, vector columns are typed with a fixed dimension: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">vector(1536)</code> will reject a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">vector(1024)</code> insert. You have two options:</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Option A: side-by-side column with the new dimension</strong> (recommended). <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALTER TABLE ... ADD Embedding_v2 VECTOR(1024)</code> — the pattern from Section 30.3. Clean, explicit, and the old column remains a rollback target. The cost is temporary double storage during migration.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Option A: Add a new typed column</strong></p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Option B: in-place migration with downtime.</strong> Drop the vector index, alter the column type, re-embed everything, rebuild. Only acceptable for small corpora in maintenance windows — and even then, Option A's safety margin usually justifies its storage cost.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL
--- Adding a second vector column for a model with different dimensions
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: dimension change via side-by-side column
+-- Old: Embedding VECTOR(1536)  |  New model: 1024 dimensions
+ALTER TABLE dbo.Documents ADD Embedding_v2 VECTOR(1024) NULL;
+-- Backfill Embedding_v2 with the new model (Section 30.4 pattern),
+-- then index and cut over exactly as in Section 30.3.
+-- The fixed-dimension type is doing its job: a 1536-d vector can never
+-- silently land in the 1024-d column. That strictness is the feature
+-- that makes Option A safe.
+</code></pre>
 
-ALTER TABLE documents
-    ADD COLUMN embedding_cohere_v3 vector(1024),
-    ADD COLUMN embedding_cohere_v3_at TIMESTAMPTZ;
-
--- Build the HNSW index only after backfill completes
--- (building during backfill is wasteful; rows without embeddings
---  are ignored by the index but each INSERT triggers maintenance)
--- Use CREATE INDEX CONCURRENTLY to avoid locking the table
-CREATE INDEX CONCURRENTLY idx_docs_cohere_v3
-    ON documents USING hnsw (embedding_cohere_v3 vector_cosine_ops)
-    WITH (m = 16, ef_construction = 64);</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Option B: Separate table per model</strong></p>
-
-<p class="text-gray-300 leading-relaxed">For very large dimension changes or when you want full index independence, maintain a separate embeddings table that joins back to the primary document table:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL
--- Normalized embedding storage: one row per (document, model) pair
--- Supports arbitrary dimension changes without altering the documents table
-
-CREATE TABLE document_embeddings (
-    doc_id          TEXT NOT NULL,
-    model_id        INTEGER NOT NULL REFERENCES embedding_model_registry(model_id),
-    embedding       vector,          -- untyped vector; dimension enforced by constraint
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (doc_id, model_id)
-);
-
--- Dimension guard: enforce at the application layer or via a trigger
--- pgvector does not support a per-row dimension constraint on untyped vector columns,
--- so use a check constraint paired with model registry
-
--- For typed storage with a known dimension, use a partitioned approach:
-CREATE TABLE document_embeddings_1536 (
-    doc_id      TEXT NOT NULL,
-    model_id    INTEGER NOT NULL,
-    embedding   vector(1536) NOT NULL,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (doc_id, model_id)
-);
-
-CREATE TABLE document_embeddings_1024 (
-    doc_id      TEXT NOT NULL,
-    model_id    INTEGER NOT NULL,
-    embedding   vector(1024) NOT NULL,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (doc_id, model_id)
-);
-
--- HNSW indexes on each dimension table
-CREATE INDEX idx_emb_1536_hnsw
-    ON document_embeddings_1536 USING hnsw (embedding vector_cosine_ops)
-    WITH (m = 16, ef_construction = 64);
-
-CREATE INDEX idx_emb_1024_hnsw
-    ON document_embeddings_1024 USING hnsw (embedding vector_cosine_ops)
-    WITH (m = 16, ef_construction = 64);</code></pre>
-
-<p class="text-gray-300 leading-relaxed">The separate-table approach is more operationally complex but gives you complete index independence. You can drop <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">document_embeddings_1536</code> (and its HNSW index, which can be enormous) once the migration to the 1024-dimension model is complete, reclaiming storage without any structural change to the documents table.</p>
-
-<p class="text-gray-300 leading-relaxed">In Weaviate, dimension changes require a new collection entirely — Weaviate's schema is class-level and the vector dimension is fixed at class creation. The migration pattern is:</p>
-
-<p class="text-gray-300 leading-relaxed">1. Create a new Weaviate class with the target model configured as the vectorizer.</p>
-<p class="text-gray-300 leading-relaxed">2. Run a batch import job that reads objects from the old class and imports them into the new class. Weaviate will automatically call the configured vectorizer for each object during import, so you do not need to manage embeddings explicitly if you use Weaviate's built-in vectorizer modules.</p>
-<p class="text-gray-300 leading-relaxed">3. Validate quality against the new class.</p>
-<p class="text-gray-300 leading-relaxed">4. Update your application's class name reference (typically a configuration value) and delete the old class.</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
-# Weaviate collection migration for model dimension change
-# Requires: weaviate-client&gt;=4.0
-
-import weaviate
-from weaviate.classes.config import Configure, VectorDistances
-from weaviate.classes.query import MetadataQuery
-import time
-
-client = weaviate.connect_to_local()  # or connect_to_wcs(...)
-
-OLD_CLASS = "DocumentAda002"
-NEW_CLASS = "DocumentCohere3"
-
-def create_new_collection():
-    """Create target collection with new vectorizer."""
-    # Check if already exists (supports resumable migration)
-    if client.collections.exists(NEW_CLASS):
-        print(f"Collection {NEW_CLASS} already exists, skipping creation.")
-        return
-    
-    client.collections.create(
-        name=NEW_CLASS,
-        vectorizer_config=Configure.Vectorizer.text2vec_cohere(
-            model="embed-english-v3.0",
-            truncate="RIGHT",
-        ),
-        vector_index_config=Configure.VectorIndex.hnsw(
-            distance_metric=VectorDistances.COSINE,
-            ef_construction=128,
-            max_connections=16,
-        ),
-        # Mirror properties from old collection
-        properties=[
-            weaviate.classes.config.Property(name="doc_id", data_type=weaviate.classes.config.DataType.TEXT),
-            weaviate.classes.config.Property(name="content", data_type=weaviate.classes.config.DataType.TEXT),
-            weaviate.classes.config.Property(name="source", data_type=weaviate.classes.config.DataType.TEXT),
-        ]
-    )
-    print(f"Created collection {NEW_CLASS}")
-
-def migrate_objects(batch_size: int = 200):
-    """
-    Read all objects from old collection and import into new collection.
-    Weaviate re-vectorizes automatically via the configured vectorizer.
-    """
-    old_collection = client.collections.get(OLD_CLASS)
-    new_collection = client.collections.get(NEW_CLASS)
-    
-    # Get already-migrated IDs for resumability
-    existing_ids = set()
-    for obj in new_collection.iterator(include_vector=False):
-        # Use the stored doc_id property as the dedup key
-        existing_ids.add(obj.properties.get("doc_id"))
-    
-    print(f"Already migrated: {len(existing_ids)} objects")
-    
-    total_migrated = 0
-    batch_buffer = []
-    
-    for obj in old_collection.iterator(include_vector=False):
-        doc_id = obj.properties.get("doc_id")
-        if doc_id in existing_ids:
-            continue
-        
-        batch_buffer.append({
-            "doc_id": doc_id,
-            "content": obj.properties.get("content", ""),
-            "source": obj.properties.get("source", ""),
-        })
-        
-        if len(batch_buffer) &gt;= batch_size:
-            with new_collection.batch.fixed_size(batch_size=batch_size) as batch:
-                for props in batch_buffer:
-                    batch.add_object(properties=props)
-            
-            total_migrated += len(batch_buffer)
-            batch_buffer = []
-            print(f"Migrated {total_migrated} objects so far...")
-            time.sleep(0.5)  # Brief pause to respect vectorizer API rate limits
-    
-    # Flush remaining
-    if batch_buffer:
-        with new_collection.batch.fixed_size(batch_size=len(batch_buffer)) as batch:
-            for props in batch_buffer:
-                batch.add_object(properties=props)
-        total_migrated += len(batch_buffer)
-    
-    print(f"Migration complete. Total migrated: {total_migrated}")
-    return total_migrated
-
-def validate_and_cutover():
-    """
-    Run a spot-check query against both collections and compare result counts.
-    Replace with your full Recall@K evaluation before production cutover.
-    """
-    new_collection = client.collections.get(NEW_CLASS)
-    test_queries = [
-        "password reset instructions",
-        "billing and payment questions",
-        "API authentication errors",
-    ]
-    
-    all_have_results = True
-    for query_text in test_queries:
-        results = new_collection.query.near_text(
-            query=query_text,
-            limit=5,
-            return_metadata=MetadataQuery(score=True)
-        )
-        if not results.objects:
-            print(f"WARNING: No results for '{query_text}' in new collection")
-            all_have_results = False
-        else:
-            top_score = results.objects[0].metadata.score
-            print(f"'{query_text}': {len(results.objects)} results, top score={top_score:.4f}")
-    
-    if all_have_results:
-        print("Spot check passed. Update your application's WEAVIATE_COLLECTION env var to:", NEW_CLASS)
-        print("Then delete old collection with: client.collections.delete(OLD_CLASS)")
-    else:
-        print("Spot check failed. Do not cut over.")
-
-if __name__ == "__main__":
-    create_new_collection()
-    migrate_objects(batch_size=200)
-    validate_and_cutover()
-    client.close()</code></pre>
+<p class="text-gray-300 leading-relaxed">Never "pad" or "truncate" vectors to force a dimension fit — zero-padding a 1024-d vector into a 1536-d column produces vectors that compare meaninglessly against true 1536-d vectors. Dimension is identity; treat it as such.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Version Pinning and Model Deprecation Tracking</h3>
 
-<p class="text-gray-300 leading-relaxed">The least glamorous part of embedding model management is also the part that saves you the most pain: knowing in advance that a model is going to be deprecated so you can migrate on your own schedule instead of under a deadline.</p>
+<p class="text-gray-300 leading-relaxed">Pin exact model versions in configuration — <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-3-small</code> today may resolve to a different snapshot tomorrow if the vendor updates the alias. Store the resolved version (model name plus version date or snapshot ID) in the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ModelName</code> column at ingest time, so every vector carries its provenance.</p>
 
-<p class="text-gray-300 leading-relaxed">Store the model identifier alongside every vector you produce. This is good practice regardless of migration concerns — it lets you audit which documents were embedded with which model and prioritize backfill for the most-queried content.</p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: model deprecation tracking
+CREATE TABLE dbo.EmbeddingModelRegistry (
+    ModelName    NVARCHAR(100) NOT NULL
+        CONSTRAINT PK_EmbeddingModelRegistry PRIMARY KEY,
+    Vendor       NVARCHAR(60) NOT NULL,
+    Dimensions   INT NOT NULL,
+    DeprecatedAt DATETIME2(0) NULL,      -- vendor deprecation notice date
+    RetireAt     DATETIME2(0) NULL,      -- when the API goes dark
+    ReplacedBy   NVARCHAR(100) NULL,
+    MigrationStatus NVARCHAR(20) NOT NULL
+        CONSTRAINT DF_EMR_Status DEFAULT ('current')
+);
+-- Ops review query: which models in production are on a deprecation clock?
+SELECT r.ModelName, r.RetireAt, r.ReplacedBy,
+       (SELECT COUNT(*) FROM dbo.Documents AS d
+        WHERE d.ModelName = r.ModelName) AS VectorsAffected
+FROM dbo.EmbeddingModelRegistry AS r
+WHERE r.RetireAt IS NOT NULL
+ORDER BY r.RetireAt;
+-- A vendor deprecation notice starts the migration clock in Section 30.3:
+-- the RetireAt date is your backfill deadline.
+</code></pre>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL
--- Embedding provenance tracking via a metadata column
-
-ALTER TABLE documents
-    ADD COLUMN IF NOT EXISTS embedding_model   TEXT,
-    ADD COLUMN IF NOT EXISTS embedding_model_version TEXT,
-    ADD COLUMN IF NOT EXISTS embedded_at       TIMESTAMPTZ;
-
--- Update when embedding is written
--- (shown as part of an upsert trigger for automatic tracking)
-
-CREATE OR REPLACE FUNCTION trg_set_embedding_provenance()
-RETURNS TRIGGER LANGUAGE plpgsql AS $$
-BEGIN
-    IF NEW.embedding_ada002 IS DISTINCT FROM OLD.embedding_ada002 THEN
-        NEW.embedding_model         := 'text-embedding-ada-002';
-        NEW.embedding_model_version := 'v1';
-        NEW.embedded_at             := NOW();
-    END IF;
-    IF NEW.embedding_3small IS DISTINCT FROM OLD.embedding_3small THEN
-        NEW.embedding_model         := 'text-embedding-3-small';
-        NEW.embedding_model_version := 'v1';
-        NEW.embedded_at             := NOW();
-    END IF;
-    RETURN NEW;
-END;
-$$;
-
-CREATE TRIGGER trg_embedding_provenance
-    BEFORE INSERT OR UPDATE ON documents
-    FOR EACH ROW EXECUTE FUNCTION trg_set_embedding_provenance();
-
--- Query: how many documents are on each model version?
-SELECT
-    embedding_model,
-    embedding_model_version,
-    COUNT(*) AS doc_count,
-    MIN(embedded_at) AS first_embedded,
-    MAX(embedded_at) AS last_embedded
-FROM documents
-WHERE embedding_model IS NOT NULL
-GROUP BY embedding_model, embedding_model_version
-ORDER BY doc_count DESC;</code></pre>
-
-<p class="text-gray-300 leading-relaxed">For the SQL Server side, the equivalent uses a computed column with a default and an <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">AFTER UPDATE</code> trigger, since SQL Server does not have <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">BEFORE</code> triggers:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server
--- Embedding provenance tracking
-
-ALTER TABLE documents
-    ADD embedding_model          NVARCHAR(100)  NULL,
-    ADD embedding_model_version  NVARCHAR(50)   NULL,
-    ADD embedded_at              DATETIMEOFFSET NULL;
-
--- SQL Server uses AFTER triggers; capture the change via UPDATE()
-CREATE OR ALTER TRIGGER trg_embedding_provenance
-ON documents
-AFTER INSERT, UPDATE
-AS
-BEGIN
-    SET NOCOUNT ON;
-    
-    IF UPDATE(embedding_ada002)
-    BEGIN
-        UPDATE d
-        SET
-            d.embedding_model         = 'text-embedding-ada-002',
-            d.embedding_model_version = 'v1',
-            d.embedded_at             = SYSDATETIMEOFFSET()
-        FROM documents d
-        INNER JOIN inserted i ON d.id = i.id;
-    END
-    
-    -- SQL Server evaluates both IF blocks; last one wins if both columns updated.
-    -- In practice, only one embedding column changes per write.
-    IF UPDATE(embedding_3small)
-    BEGIN
-        UPDATE d
-        SET
-            d.embedding_model         = 'text-embedding-3-small',
-            d.embedding_model_version = 'v1',
-            d.embedded_at             = SYSDATETIMEOFFSET()
-        FROM documents d
-        INNER JOIN inserted i ON d.id = i.id;
-    END
-END;
-GO
-
--- Query: distribution of documents by model
-SELECT
-    embedding_model,
-    embedding_model_version,
-    COUNT(*) AS doc_count,
-    MIN(embedded_at) AS first_embedded,
-    MAX(embedded_at) AS last_embedded
-FROM documents
-WHERE embedding_model IS NOT NULL
-GROUP BY embedding_model, embedding_model_version
-ORDER BY doc_count DESC;</code></pre>
-
-<p class="text-gray-300 leading-relaxed">Pair this provenance tracking with a deprecation calendar. When OpenAI announces a model retirement date, create a row in your <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">embedding_model_registry</code> table with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">deprecated_at</code> set to that date and configure an alert that fires 90 days before deprecation if any documents still carry that model's identifier. The combination of provenance data and a deprecation alert turns a potential emergency migration into a planned project.</p>
+<p class="text-gray-300 leading-relaxed">Treat vendor deprecation notices like certificate expirations: they arrive with a deadline, the migration takes longer than you expect, and the cost of missing the deadline is an outage. The registry turns a surprise into a scheduled project.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Silent degradation is the primary risk.** A model swap that changes the latent space without changing vector dimensions will produce plausible-looking but semantically wrong results with no error signals from the database layer. Recall@K monitoring against a static evaluation set is your only reliable early warning system.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Dimension mismatch fails loud; semantic drift fails silent.</strong> The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR(n)</code> type catches the first; only eval-gated migrations catch the second.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Establish quality baselines before you migrate.** Build a ground-truth evaluation set during your current model's healthy operation. Without a baseline, you cannot distinguish a migration regression from preexisting retrieval quality problems.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Migrate side-by-side, never in place.</strong> New column, throttled resumable backfill, second DiskANN index, eval-gated flag flip, old column retained as rollback for a full business cycle.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Dual-model shadow writing decouples deployment from migration.** Writing new documents to both the old and new embedding columns simultaneously means that by the time your backfill completes, the most-recently-created (and typically most-queried) documents are already on the new model. The final cutover touches only older, lower-traffic content.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Make retrieval model-aware from day one</strong> — a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">@modelVersion</code> parameter selecting column and predicate turns migrations into flag flips instead of code deploys.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Make backfill jobs resumable from the first design.** Cursor-based pagination combined with transactional checkpoint writes means any crash is recoverable without reprocessing the entire corpus. Embedding API costs and clock time are too significant to pay twice on a multi-million-document corpus.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Never pad or truncate vectors to force a dimension fit.</strong> Dimension is identity; a mismatched vector in the wrong column is silent corruption.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Track embedding provenance on every row.** Storing which model produced each vector transforms deprecation management from a fire drill into a scheduled maintenance task. When you know exactly which documents need re-embedding and how many remain, you can plan compute cost, schedule backfill windows, and build accurate progress dashboards without guesswork.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Track deprecations like certificate expirations.</strong> Pin exact model versions, record vendor retirement dates in a registry, and let the retirement date set your backfill deadline.</li>
     </div>
     <div class="mt-14 bg-cyan-950/40 border border-cyan-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
-        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · SQL Server</p>
       </div>
       <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
          class="shrink-0 px-6 py-3 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold rounded-xl text-sm transition">
         Download Free
       </a>
     </div>
-    <div class="mt-8 text-xs">
-      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a>
+    <div class="mt-10 flex items-center justify-between text-xs">
+      <a href="b4-ch29-realtime-vs-batch.html" class="text-gray-500 hover:text-gray-300 transition">← Previous Chapter</a>
+      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">All Chapters</a>
+      <a href="b4-ch31-multimodal-search.html" class="text-cyan-400 hover:text-cyan-300 transition">Next Chapter →</a>
     </div>
   </article>
   <footer class="border-t border-gray-800/50 px-6 py-8">

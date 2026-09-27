@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Chapter 34: Access Control on Vector Data — Vector Databases & AI</title>
-  <meta name="description" content="Vector Databases & AI Chapter 34: Access Control on Vector Data. pgvector, Pinecone, Weaviate, RAG pipelines — by Rajesh Guntupalli." />
+  <title>Chapter 34: Access Control for Vector Data — Vector Databases & AI</title>
+  <meta name="description" content="Vector Databases & AI Chapter 34: Access control for vector data — SQL Server Row-Level Security on vector tables, namespace isolation, metadata filtering, API key scoping, audit logging, and a unified authorization layer. By Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
   <script type="module">
     import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
@@ -16,7 +16,7 @@
     <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
       <a href="../index.html" class="flex items-center gap-2 group">
         <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-cyan-500 to-cyan-700 flex items-center justify-center">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
         </div>
         <span class="text-sm font-bold text-white group-hover:text-cyan-300 transition">Rajesh Guntupalli</span>
       </a>
@@ -41,1043 +41,247 @@
       <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">Vector Databases & AI</span>
     </div>
     <div class="space-y-4 text-sm">
-<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 34: Access Control on Vector Data</h2>
-
-<p class="text-gray-300 leading-relaxed">Vector databases introduce a category of access control problems that traditional RBAC models weren't designed to solve. A row in a relational table is discrete and bounded — you can grant SELECT on a specific table, filter rows by tenant ID, and call it done. A vector embedding is a compressed semantic fingerprint of content that may span topics, contain implicit references to sensitive material, or be retrievable through queries that have no obvious surface-level connection to the underlying data. When a similarity search returns the top-k nearest neighbors, you cannot predict at query time which documents will surface. This chapter covers how to apply row-level security, namespace isolation, API key scoping, and query-time filtering to vector data across pgvector, Pinecone, Weaviate, and Qdrant — and how to build a unified authorization layer that treats vector search as a first-class security boundary.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 34: Access Control for Vector Data</h2>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Why Vector Access Control Is Different</h3>
 
-<p class="text-gray-300 leading-relaxed">In a traditional database, access control answers a simple question: does this user have permission to read this row? The data model is explicit. You can enumerate rows, apply predicates, and reason about what any given query will return before it executes.</p>
-
-<p class="text-gray-300 leading-relaxed">Vector search inverts this relationship. You start with a query embedding and find what's similar. The result set is determined by geometric proximity in high-dimensional space, not by a filter predicate written at design time. A user querying for "quarterly financial projections" might pull a document fragment that was never explicitly tagged as sensitive but happens to be semantically close to their query vector. Conversely, strict keyword-based filtering might block a legitimate user from finding a document because the metadata doesn't match even though the content is relevant.</p>
-
-<p class="text-gray-300 leading-relaxed">Three properties of vector data create novel access control challenges:</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Semantic bleed.</strong> Embeddings from different security domains can cluster near each other if the underlying content is topically adjacent. A public FAQ about drug interactions and a restricted clinical trial protocol might embed within similar vector space because they share vocabulary. Namespace separation prevents this — you don't filter after the fact, you never allow the query to reach restricted vectors.</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Inference risk.</strong> Even if a user cannot read a document directly, the fact that a similarity search returns zero results from a namespace they have permission to query can reveal that certain content exists. This is a vector analogue of a timing side-channel. Designing around it requires either returning null results uniformly regardless of permission state or ensuring the user never knows a restricted namespace exists.</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Metadata exposure.</strong> Most vector databases store metadata payloads alongside embeddings. The embedding itself may be meaningless to an attacker, but the metadata often contains document titles, author IDs, timestamps, and excerpts. Access control that secures the embedding but exposes the payload is incomplete.</p>
-
-<p class="text-gray-300 leading-relaxed">The practical architecture for addressing these challenges combines three layers: storage-level isolation (namespaces and collections), query-time filtering (metadata predicates applied before returning results), and application-level enforcement (authorization checks before the vector query is even dispatched).</p>
-
-<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
-    A[Query request] --> B[Verified identity<br/>JWT / token]
-    B --> C[Storage-level isolation:<br/>namespace / collection / RLS]
-    C --> D[Query-time filtering:<br/>classification metadata predicate]
-    D --> E[Application-layer verification:<br/>defense-in-depth re-check]
-    E --> F[Audit log write]
-    F --> G[Results returned]
-    style C fill:#e3f2fd
-    style D fill:#e3f2fd
-    style E fill:#e3f2fd</pre></div>
-<p class="text-gray-300 leading-relaxed">*No single layer is sufficient alone — a misconfiguration in one is caught by the next.*</p>
+<p class="text-gray-300 leading-relaxed">Vector databases introduce a category of access control problems that traditional RBAC models weren't designed to solve. A row in a relational table is discrete and bounded — you can grant SELECT on a specific table, filter rows by tenant ID, and call it done. A vector embedding is a compressed semantic fingerprint of content that may span topics, contain implicit references to sensitive material, or be retrievable through queries that have no obvious surface-level connection to the underlying data. When a similarity search returns the top-k nearest neighbors, you cannot predict at query time which documents will surface. This chapter covers how to apply SQL Server Row-Level Security, namespace isolation, API key scoping, and query-time filtering to vector data across SQL Server native vectors, Pinecone, Weaviate, and Qdrant — and how to build a unified authorization layer that treats vector search as a first-class security boundary.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">Row-Level Security in pgvector</h3>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Row-Level Security on SQL Server Vector Tables</h3>
 
-<p class="text-gray-300 leading-relaxed">PostgreSQL's Row-Level Security (RLS) is the most mature access control mechanism available in the vector database ecosystem because pgvector is a PostgreSQL extension. Every security primitive PostgreSQL exposes — roles, policies, column-level grants, views — applies directly to vector data.</p>
+<p class="text-gray-300 leading-relaxed">SQL Server's Row-Level Security (RLS) applies directly to vector tables: a security policy with a predicate function filters rows before the similarity ranking ever sees them. Every security primitive SQL Server exposes — roles, schemas, column-level grants, views — applies to vector data exactly as it does to relational data.</p>
 
-<p class="text-gray-300 leading-relaxed">The baseline pattern stores a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">tenant_id</code> or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">user_id</code> alongside the embedding vector and attaches RLS policies that automatically filter queries to rows the current user owns.</p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server 2025: RLS on a vector chunk table
+-- 1. Predicate function: which tenant is calling?
+CREATE FUNCTION dbo.fn_TenantPredicate(@TenantId INT)
+RETURNS TABLE
+WITH SCHEMABINDING
+AS RETURN SELECT 1 AS AccessGranted
+WHERE @TenantId = CAST(SESSION_CONTEXT(N'TenantId') AS INT)
+   OR CAST(SESSION_CONTEXT(N'TenantId') AS INT) = 0;  -- 0 = service admin
+GO
+-- 2. Security policy binding the predicate to the vector table
+CREATE SECURITY POLICY dbo.TenantFilterPolicy
+ADD FILTER PREDICATE dbo.fn_TenantPredicate(TenantId)
+    ON dbo.DocumentChunks,
+ADD BLOCK PREDICATE dbo.fn_TenantPredicate(TenantId)
+    ON dbo.DocumentChunks AFTER INSERT;
+GO
+-- 3. Application sets context once per session:
+-- EXEC sp_set_session_context 'TenantId', @tenantId;
+-- Every vector query below now silently filters to the tenant:
+DECLARE @q VECTOR(1536) = '[0.12, 0.87, ...]';
+SELECT TOP (10) ChunkId, ChunkText,
+       VECTOR_DISTANCE('cosine', Embedding, @q) AS Distance
+FROM dbo.DocumentChunks
+ORDER BY Distance;
+-- No WHERE TenantId needed: the policy injects it. Forget the
+-- sp_set_session_context call and the query returns zero rows —
+-- fail-closed by design.</code></pre>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
+<p class="text-gray-300 leading-relaxed">A frequent performance pitfall: when RLS adds a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">TenantId = X</code> predicate to a DiskANN scan, the filter applies after the ANN index returns candidates, not before. If the index returns 200 candidates but only 3 belong to the current tenant, effective recall collapses and you waste I/O on irrelevant rows.</p>
 
--- Create the documents table with tenant isolation
-CREATE TABLE document_embeddings (
-    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    tenant_id   TEXT NOT NULL,
-    content     TEXT NOT NULL,
-    embedding   vector(1536),
-    metadata    JSONB DEFAULT '{}',
-    created_at  TIMESTAMPTZ DEFAULT now()
-);
+<p class="text-gray-300 leading-relaxed">The solution is tenant-aware physical design: partition the chunk table by tenant (partitioned table with one DiskANN index per partition is not supported in preview — so instead maintain separate chunk tables per tenant tier, or over-fetch aggressively with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">TOP_N</code> and filter in the outer query):</p>
 
--- Index for ANN search
-CREATE INDEX ON document_embeddings 
-USING ivfflat (embedding vector_cosine_ops) 
-WITH (lists = 100);
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: tenant-safe ANN retrieval with over-fetch + filter
+-- RLS narrows to the tenant; TOP_N over-fetch compensates for
+-- post-index filtering so recall survives.
+DECLARE @q VECTOR(1536) = '[0.12, 0.87, ...]';
+EXEC sp_set_session_context 'TenantId', @tenantId;
 
--- Index for tenant filtering (critical for performance)
-CREATE INDEX ON document_embeddings (tenant_id);
+SELECT TOP (10) s.ChunkId, c.ChunkText, s.Distance
+FROM (
+    SELECT TOP (200) ChunkId,
+           VECTOR_DISTANCE('cosine', Embedding, @q) AS Distance
+    FROM dbo.DocumentChunks          -- RLS predicate applies here
+    ORDER BY Distance
+) AS s
+JOIN dbo.DocumentChunks AS c ON c.ChunkId = s.ChunkId
+ORDER BY s.Distance;
+-- Rule of thumb: over-fetch 10–20x the final k when a tenant filter
+-- follows the ANN scan; measure recall@k per tenant (Chapter 20).</code></pre>
 
--- Enable RLS
-ALTER TABLE document_embeddings ENABLE ROW LEVEL SECURITY;
-
--- Policy: tenants can only read their own rows
-CREATE POLICY tenant_isolation ON document_embeddings
-    FOR ALL
-    USING (tenant_id = current_setting('app.current_tenant', true));
-
--- Policy: service role bypasses RLS for admin operations
-CREATE POLICY service_bypass ON document_embeddings
-    FOR ALL
-    TO service_role
-    USING (true);
-
--- Grant table access to application role (RLS handles row filtering)
-GRANT SELECT, INSERT ON document_embeddings TO app_role;</code></pre>
-
-<p class="text-gray-300 leading-relaxed">At query time, the application sets the tenant context before issuing the vector search:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
-
--- Set tenant context for the current session
-SET LOCAL app.current_tenant = 'tenant_acme_corp';
-
--- Similarity search — RLS automatically scopes to tenant_acme_corp rows
-SELECT 
-    id,
-    content,
-    metadata,
-    1 - (embedding &lt;=&gt; $1::vector) AS similarity_score
-FROM document_embeddings
-WHERE 1 - (embedding &lt;=&gt; $1::vector) &gt; 0.75
-ORDER BY embedding &lt;=&gt; $1::vector
-LIMIT 10;
-
--- Verify the plan respects RLS (check for Filter on tenant_id)
-EXPLAIN (ANALYZE, BUFFERS)
-SELECT id, content, 1 - (embedding &lt;=&gt; $1::vector) AS score
-FROM document_embeddings
-ORDER BY embedding &lt;=&gt; $1::vector
-LIMIT 10;</code></pre>
-
-<p class="text-gray-300 leading-relaxed">A frequent performance pitfall: when RLS adds a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WHERE tenant_id = X</code> predicate to an IVFFlat or HNSW scan, PostgreSQL must evaluate the policy after the ANN index returns candidates, not before. If your <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">lists = 100</code> index returns 200 candidates but only 3 belong to the current tenant, your effective recall is severely degraded and you've wasted I/O on irrelevant rows.</p>
-
-<p class="text-gray-300 leading-relaxed">The solution is to use a composite index that includes the tenant ID as a partition key, or to maintain separate IVFFlat indexes per tenant using table partitioning:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
-
--- Partition by tenant for performance isolation
-CREATE TABLE document_embeddings_partitioned (
-    id          UUID NOT NULL DEFAULT gen_random_uuid(),
-    tenant_id   TEXT NOT NULL,
-    content     TEXT NOT NULL,
-    embedding   vector(1536),
-    metadata    JSONB DEFAULT '{}'
-) PARTITION BY LIST (tenant_id);
-
--- Create per-tenant partitions
-CREATE TABLE doc_embeddings_acme 
-    PARTITION OF document_embeddings_partitioned
-    FOR VALUES IN ('tenant_acme_corp');
-
-CREATE TABLE doc_embeddings_globex
-    PARTITION OF document_embeddings_partitioned
-    FOR VALUES IN ('tenant_globex');
-
--- Per-partition IVFFlat indexes
-CREATE INDEX ON doc_embeddings_acme 
-USING ivfflat (embedding vector_cosine_ops) WITH (lists = 50);
-
-CREATE INDEX ON doc_embeddings_globex
-USING ivfflat (embedding vector_cosine_ops) WITH (lists = 50);
-
--- RLS still applies, but the planner now prunes to a single partition
-ALTER TABLE document_embeddings_partitioned ENABLE ROW LEVEL SECURITY;
-
-CREATE POLICY tenant_isolation_partitioned ON document_embeddings_partitioned
-    FOR ALL
-    USING (tenant_id = current_setting('app.current_tenant', true));</code></pre>
-
-<p class="text-gray-300 leading-relaxed">For Supabase deployments, which run managed PostgreSQL with pgvector, this RLS pattern works identically. Supabase's auth system automatically populates <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">auth.uid()</code> which you can use as the tenant identifier directly in policies:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector (Supabase)
-
--- Supabase-specific policy using auth context
-CREATE POLICY user_owns_documents ON document_embeddings
-    FOR SELECT
-    USING (user_id = auth.uid());
-
-CREATE POLICY user_inserts_own ON document_embeddings
-    FOR INSERT
-    WITH CHECK (user_id = auth.uid());</code></pre>
+<p class="text-gray-300 leading-relaxed">For Azure SQL Database, the same RLS pattern works identically — set the session context from your API's authenticated claims (Microsoft Entra ID) so the tenant flows from login to predicate without application code in between.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Namespace Isolation in Pinecone and Weaviate</h3>
 
-<p class="text-gray-300 leading-relaxed">Managed vector databases handle multi-tenancy through namespace and collection isolation rather than SQL-style policies. The security model is coarser — you're working at the API key and namespace level rather than per-row policies — but the operational simplicity trades off well for most SaaS applications.</p>
+<p class="text-gray-300 leading-relaxed">Pinecone namespaces partition one index into isolated vector spaces: queries against namespace <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">tenant-42</code> can never return vectors from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">tenant-43</code>, because the namespace is part of the storage key. Map one tenant to one namespace and the isolation is structural, not predicate-based — there is no filter to forget.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Pinecone namespaces</strong> partition vectors within an index so that operations on one namespace never touch vectors in another. All three operations — upsert, query, and delete — accept a namespace parameter. Vectors without a namespace land in the default namespace, which is a common source of tenant data leakage during development.</p>
+<p class="text-gray-300 leading-relaxed">Weaviate offers the same shape via tenant-aware collections (multi-tenancy feature): each tenant gets isolated shards within a collection, with per-tenant activation so cold tenants consume no memory. Qdrant's payload filtering achieves tenant isolation with a mandatory <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">tenant_id</code> payload filter — effective, but predicate-based, so enforce it in a wrapper client rather than trusting every caller.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
-import os
-from pinecone import Pinecone, ServerlessSpec
-from openai import OpenAI
-
-pc = Pinecone(api_key=os.environ["PINECONE_API_KEY"])
-openai_client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-
-# Create index if it doesn't exist
-index_name = "document-store"
-if index_name not in pc.list_indexes().names():
-    pc.create_index(
-        name=index_name,
-        dimension=1536,
-        metric="cosine",
-        spec=ServerlessSpec(cloud="aws", region="us-east-1")
-    )
-
-index = pc.Index(index_name)
-
-def embed_text(text: str) -&gt; list[float]:
-    response = openai_client.embeddings.create(
-        input=text,
-        model="text-embedding-3-small"
-    )
-    return response.data[0].embedding
-
-def upsert_for_tenant(tenant_id: str, documents: list[dict]) -&gt; None:
-    """
-    All writes are scoped to the tenant's namespace.
-    Cross-namespace writes require separate API key issuance at the
-    infrastructure level — namespaces themselves are not credential-bound.
-    """
-    vectors = []
-    for doc in documents:
-        embedding = embed_text(doc["content"])
-        vectors.append({
-            "id": doc["id"],
-            "values": embedding,
-            "metadata": {
-                "content": doc["content"],
-                "source": doc.get("source", ""),
-                "tenant_id": tenant_id,   # redundant but useful for audit
-                "classification": doc.get("classification", "internal")
-            }
-        })
-    
-    # namespace= is the hard isolation boundary
-    index.upsert(vectors=vectors, namespace=tenant_id)
-
-def query_for_tenant(
-    tenant_id: str, 
-    query_text: str, 
-    top_k: int = 10,
-    classification_filter: str | None = None
-) -&gt; list[dict]:
-    """
-    Query is restricted to tenant namespace.
-    Optional metadata filter further restricts by classification.
-    """
-    query_embedding = embed_text(query_text)
-    
-    # Build metadata filter if classification scope is provided
-    filter_dict = None
-    if classification_filter:
-        filter_dict = {"classification": {"$eq": classification_filter}}
-    
-    results = index.query(
-        vector=query_embedding,
-        top_k=top_k,
-        namespace=tenant_id,          # hard namespace isolation
-        filter=filter_dict,            # optional metadata predicate
-        include_metadata=True
-    )
-    
-    return [
-        {
-            "id": match.id,
-            "score": match.score,
-            "content": match.metadata.get("content", ""),
-            "classification": match.metadata.get("classification", "")
-        }
-        for match in results.matches
-    ]
-
-# Usage
-upsert_for_tenant("acme_corp", [
-    {"id": "doc-001", "content": "Q3 revenue targets", "classification": "confidential"},
-    {"id": "doc-002", "content": "Employee handbook", "classification": "internal"}
-])
-
-# This query cannot reach globex_corp documents — namespace enforces that
-results = query_for_tenant("acme_corp", "financial targets", classification_filter="confidential")</code></pre>
-
-<p class="text-gray-300 leading-relaxed">Pinecone's namespace model has a significant architectural constraint: there is no native per-namespace API key. A single API key has access to all namespaces in the index. This means namespace isolation is enforced entirely by your application layer — if your query function is called with the wrong tenant ID, you'll get cross-tenant data. The architecture that addresses this is a server-side authorization proxy that validates the caller's identity before injecting the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">namespace</code> parameter:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
-# Authorization proxy pattern — never trust client-supplied tenant_id
-import jwt
-from functools import wraps
-from fastapi import FastAPI, HTTPException, Depends
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-
-app = FastAPI()
-security = HTTPBearer()
-
-SECRET_KEY = os.environ["JWT_SECRET"]
-
-def get_verified_tenant(
-    credentials: HTTPAuthorizationCredentials = Depends(security)
-) -&gt; str:
-    """
-    Validate JWT and extract tenant claim.
-    The tenant_id used in Pinecone namespace queries comes ONLY
-    from the verified token, never from the request body.
-    """
-    try:
-        payload = jwt.decode(
-            credentials.credentials, 
-            SECRET_KEY, 
-            algorithms=["HS256"]
-        )
-        tenant_id = payload.get("tenant_id")
-        if not tenant_id:
-            raise HTTPException(status_code=403, detail="No tenant claim in token")
-        return tenant_id
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token expired")
-    except jwt.InvalidTokenError:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-@app.post("/search")
-async def search_documents(
-    query: str,
-    top_k: int = 10,
-    tenant_id: str = Depends(get_verified_tenant)  # extracted from JWT, not request
-):
-    results = query_for_tenant(tenant_id, query, top_k=top_k)
-    return {"results": results, "tenant": tenant_id}</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Weaviate</strong> organizes data into classes (schema types) and supports multi-tenancy as a first-class feature. In modern Weaviate versions, tenant isolation can be enabled at the class level, after which each tenant's data is stored in separate segments and queries must specify a tenant key:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
-import weaviate
-from weaviate.classes.config import Configure, Property, DataType
-from weaviate.classes.tenants import Tenant
-
-client = weaviate.connect_to_cloud(
-    cluster_url=os.environ["WEAVIATE_URL"],
-    auth_credentials=weaviate.auth.AuthApiKey(os.environ["WEAVIATE_API_KEY"])
-)
-
-# Create a multi-tenant collection
-documents = client.collections.create(
-    name="Document",
-    multi_tenancy_config=Configure.multi_tenancy(enabled=True),
-    properties=[
-        Property(name="content", data_type=DataType.TEXT),
-        Property(name="source", data_type=DataType.TEXT),
-        Property(name="classification", data_type=DataType.TEXT),
-    ],
-    vectorizer_config=Configure.Vectorizer.text2vec_openai(
-        model="text-embedding-3-small"
-    )
-)
-
-# Register tenants explicitly
-documents.tenants.create([
-    Tenant(name="acme_corp"),
-    Tenant(name="globex"),
-])
-
-# Insert objects scoped to a tenant
-acme_collection = client.collections.get("Document").with_tenant("acme_corp")
-acme_collection.data.insert({
-    "content": "Annual security audit findings for ACME infrastructure",
-    "source": "security-team",
-    "classification": "restricted"
-})
-
-# Query scoped to a tenant — physically isolated from other tenants
-def search_weaviate(tenant_id: str, query: str, top_k: int = 5) -&gt; list[dict]:
-    collection = client.collections.get("Document").with_tenant(tenant_id)
-    
-    results = collection.query.near_text(
-        query=query,
-        limit=top_k,
-        filters=weaviate.classes.query.Filter.by_property("classification").equal("restricted"),
-        return_properties=["content", "source", "classification"]
-    )
-    
-    return [
-        {
-            "content": obj.properties["content"],
-            "classification": obj.properties["classification"],
-            "distance": obj.metadata.distance if obj.metadata else None
-        }
-        for obj in results.objects
-    ]
-
-results = search_weaviate("acme_corp", "security vulnerabilities")
-client.close()</code></pre>
-
-<p class="text-gray-300 leading-relaxed">Weaviate's multi-tenancy implementation physically separates tenant data into different segments on disk, which means a misconfigured query that omits the tenant key raises an error rather than silently returning cross-tenant data. This fail-closed behavior is architecturally superior to Pinecone's namespace model for high-assurance environments.</p>
+<p class="text-gray-300 leading-relaxed">The hierarchy of assurance, strongest first: separate indexes per tenant → namespaces/tenant-shards → mandatory metadata filters → RLS predicates. Choose based on tenant count and isolation requirements; a hundred tenants with strict data residency get separate indexes, ten thousand SaaS tenants get namespaces or RLS.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Metadata Filtering as a Security Predicate</h3>
 
-<p class="text-gray-300 leading-relaxed">Namespace and collection isolation enforces coarse-grained boundaries between tenants. Within a tenant's namespace, you often need finer-grained access control: a user in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">acme_corp</code> should only see documents classified at or below their clearance level, or only documents in projects they're assigned to.</p>
+<p class="text-gray-300 leading-relaxed">Beyond tenant isolation, document-level permissions (this user may see these documents) belong in the retrieval query as metadata predicates. Store the access control list as columns — <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">AllowedRoles</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">OwnerId</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Classification</code> — and apply them in the same query as the similarity ranking:</p>
 
-<p class="text-gray-300 leading-relaxed">Metadata filters serve this purpose, but they carry an important caveat: <strong class="text-white">metadata filters are not a substitute for namespace isolation.</strong> They operate after the ANN index has already identified candidate vectors. If a metadata filter is the only barrier between a user and restricted data, a misconfigured filter or a library bug that drops the filter predicate is a security incident.</p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: document-level permission predicate in the retrieval query
+DECLARE @q VECTOR(1536) = '[0.12, 0.87, ...]';
+DECLARE @userRoles NVARCHAR(400) = '|analyst|auditor|';  -- from auth context
 
-<p class="text-gray-300 leading-relaxed">The correct architecture stacks both controls:</p>
+SELECT TOP (10) ChunkId, ChunkText,
+       VECTOR_DISTANCE('cosine', Embedding, @q) AS Distance
+FROM dbo.DocumentChunks
+WHERE TenantId = CAST(SESSION_CONTEXT(N'TenantId') AS INT)
+  AND (Classification &lt;&gt; 'Restricted'
+       OR OwnerId = CAST(SESSION_CONTEXT(N'UserId') AS INT)
+       OR EXISTS (SELECT 1 FROM STRING_SPLIT(AllowedRoles, ',') AS r
+                  WHERE @userRoles LIKE '%|' + LTRIM(RTRIM(r.value)) + '|%'))
+ORDER BY Distance;
+-- Permission logic lives in the query, not in post-retrieval application
+-- code: a chunk the user may not see is never returned, never embedded
+-- in a prompt, never summarized by the LLM.</code></pre>
 
-<p class="text-gray-300 leading-relaxed">1. Namespace/collection isolation prevents cross-tenant data access unconditionally.</p>
-<p class="text-gray-300 leading-relaxed">2. Metadata filters enforce within-tenant access control.</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
-# Qdrant with payload filtering for within-tenant access control
-from qdrant_client import QdrantClient
-from qdrant_client.models import (
-    Distance, VectorParams, PointStruct,
-    Filter, FieldCondition, MatchValue, MatchAny,
-    models
-)
-
-client = QdrantClient(
-    url=os.environ["QDRANT_URL"],
-    api_key=os.environ["QDRANT_API_KEY"]
-)
-
-# Create collection
-client.recreate_collection(
-    collection_name="documents_acme_corp",  # collection per tenant
-    vectors_config=VectorParams(size=1536, distance=Distance.COSINE)
-)
-
-def build_access_filter(user_roles: list[str], clearance_level: int) -&gt; Filter:
-    """
-    Build a Qdrant filter from user's authorization attributes.
-    This filter is constructed server-side from the verified identity —
-    the calling user never constructs this directly.
-    """
-    # Map clearance levels: 1=public, 2=internal, 3=confidential, 4=restricted
-    allowed_classifications = []
-    level_map = {1: "public", 2: "internal", 3: "confidential", 4: "restricted"}
-    for level in range(1, clearance_level + 1):
-        if level in level_map:
-            allowed_classifications.append(level_map[level])
-    
-    conditions = [
-        FieldCondition(
-            key="classification",
-            match=MatchAny(any=allowed_classifications)
-        )
-    ]
-    
-    # Role-based project access
-    if "engineering" in user_roles:
-        conditions.append(
-            FieldCondition(key="department", match=MatchAny(any=["engineering", "all"]))
-        )
-    elif "finance" in user_roles:
-        conditions.append(
-            FieldCondition(key="department", match=MatchAny(any=["finance", "all"]))
-        )
-    
-    return Filter(must=conditions)
-
-
-def authorized_search(
-    collection_name: str,
-    query_vector: list[float],
-    user_roles: list[str],
-    clearance_level: int,
-    top_k: int = 10
-) -&gt; list[dict]:
-    access_filter = build_access_filter(user_roles, clearance_level)
-    
-    results = client.search(
-        collection_name=collection_name,
-        query_vector=query_vector,
-        query_filter=access_filter,
-        limit=top_k,
-        with_payload=True
-    )
-    
-    # Secondary enforcement: verify returned results match expected criteria
-    # Defense in depth — catch any filter bypass at application layer
-    verified_results = []
-    for result in results:
-        payload = result.payload or {}
-        doc_classification = payload.get("classification", "restricted")
-        
-        if doc_classification not in [
-            "public", "internal", "confidential", "restricted"
-        ][:clearance_level]:
-            # Log this as a potential security anomaly and skip
-            print(f"SECURITY: Unexpected classification {doc_classification} for user clearance {clearance_level}")
-            continue
-        
-        verified_results.append({
-            "id": result.id,
-            "score": result.score,
-            "content": payload.get("content", ""),
-            "classification": doc_classification
-        })
-    
-    return verified_results</code></pre>
-
-<p class="text-gray-300 leading-relaxed">The double-verification pattern — filter at the database level AND check again at the application layer — is defense in depth. It adds a small amount of application-side overhead but ensures that a misconfigured index, a library version change that silently drops filter syntax, or an API contract change doesn't result in unauthorized data exposure.</p>
+<p class="text-gray-300 leading-relaxed">The critical rule: <strong class="text-white">enforce permissions before retrieval, never after.</strong> Filtering the top-k in application code is both a security hole (the LLM already saw the text if you re-rank first) and a quality bug (you return fewer than k results). The predicate belongs in the database query.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">API Key Management and Least-Privilege Design</h3>
 
-<p class="text-gray-300 leading-relaxed">Every managed vector database issues API keys that carry full read/write/delete privileges by default. For production systems serving multiple users or integration points, this is architecturally equivalent to sharing a database superuser password. The correct approach is to issue the minimum credential required for each integration point.</p>
-
-<p class="text-gray-300 leading-relaxed">Pinecone distinguishes between Admin keys (can create/delete indexes) and project-scoped keys (read/write to indexes within a project). Weaviate supports API key authentication with role assignments. Qdrant Cloud has JWT-based API keys with optional scope restrictions.</p>
-
-<p class="text-gray-300 leading-relaxed">For systems where the vector database doesn't offer per-namespace API key scoping, the standard pattern is a service mesh or API gateway that:</p>
-
-<p class="text-gray-300 leading-relaxed">1. Authenticates the calling service or user with your identity provider</p>
-<p class="text-gray-300 leading-relaxed">2. Maps the identity to permitted namespaces and operations</p>
-<p class="text-gray-300 leading-relaxed">3. Injects the appropriate vector DB API key into the upstream request</p>
-<p class="text-gray-300 leading-relaxed">4. Logs the operation for audit</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
-# Centralized credential and namespace management
-import boto3
-import json
-from dataclasses import dataclass
-from enum import Enum
-
-class VectorOperation(Enum):
-    READ = "read"
-    WRITE = "write"
-    DELETE = "delete"
-    ADMIN = "admin"
-
-@dataclass
-class VectorAccess:
-    tenant_namespace: str
-    permitted_operations: list[VectorOperation]
-    classification_ceiling: str  # maximum classification this credential can access
-
-class VectorAccessController:
-    """
-    Mediates all vector database access.
-    API keys are stored in AWS Secrets Manager.
-    Access decisions are driven by IAM role of the calling service.
-    """
-    
-    def __init__(self):
-        self.secrets_client = boto3.client("secretsmanager", region_name="us-east-1")
-        self._key_cache = {}
-    
-    def _get_pinecone_key(self, key_type: str = "app") -&gt; str:
-        """Retrieve Pinecone API key from Secrets Manager."""
-        secret_name = f"vector-db/pinecone/{key_type}"
-        if secret_name not in self._key_cache:
-            response = self.secrets_client.get_secret_value(SecretId=secret_name)
-            secret = json.loads(response["SecretString"])
-            self._key_cache[secret_name] = secret["api_key"]
-        return self._key_cache[secret_name]
-    
-    def get_access_context(self, jwt_payload: dict) -&gt; VectorAccess:
-        """
-        Map a verified JWT to a VectorAccess context.
-        The JWT comes from your IdP (Okta, Auth0, Cognito, etc.)
-        """
-        tenant_id = jwt_payload["tenant_id"]
-        user_roles = jwt_payload.get("roles", [])
-        
-        # Determine permitted operations from roles
-        ops = [VectorOperation.READ]
-        if "data-engineer" in user_roles or "service-account" in user_roles:
-            ops.append(VectorOperation.WRITE)
-        if "data-admin" in user_roles:
-            ops.append(VectorOperation.DELETE)
-        if "vector-admin" in user_roles:
-            ops.append(VectorOperation.ADMIN)
-        
-        # Determine classification ceiling from clearance attribute
-        clearance = jwt_payload.get("clearance_level", 1)
-        ceiling_map = {1: "public", 2: "internal", 3: "confidential", 4: "restricted"}
-        classification_ceiling = ceiling_map.get(clearance, "public")
-        
-        return VectorAccess(
-            tenant_namespace=tenant_id,
-            permitted_operations=ops,
-            classification_ceiling=classification_ceiling
-        )
-    
-    def can_perform(self, access: VectorAccess, operation: VectorOperation) -&gt; bool:
-        return operation in access.permitted_operations
-    
-    def execute_query(
-        self,
-        access: VectorAccess,
-        query_vector: list[float],
-        top_k: int = 10
-    ) -&gt; list[dict]:
-        """
-        Execute a read operation if the access context permits it.
-        The Pinecone API key is retrieved from Secrets Manager,
-        never passed through the calling code.
-        """
-        if not self.can_perform(access, VectorOperation.READ):
-            raise PermissionError(f"Tenant {access.tenant_namespace} lacks READ permission")
-        
-        api_key = self._get_pinecone_key(key_type="app")
-        pc = Pinecone(api_key=api_key)
-        index = pc.Index("document-store")
-        
-        # Classification filter derived from access context, not caller input
-        classification_filter = self._classification_filter(access.classification_ceiling)
-        
-        results = index.query(
-            vector=query_vector,
-            top_k=top_k,
-            namespace=access.tenant_namespace,
-            filter=classification_filter,
-            include_metadata=True
-        )
-        
-        return [
-            {
-                "id": match.id,
-                "score": match.score,
-                "content": match.metadata.get("content", ""),
-                "classification": match.metadata.get("classification", "")
-            }
-            for match in results.matches
-        ]
-    
-    def _classification_filter(self, ceiling: str) -&gt; dict:
-        allowed = {
-            "public": ["public"],
-            "internal": ["public", "internal"],
-            "confidential": ["public", "internal", "confidential"],
-            "restricted": ["public", "internal", "confidential", "restricted"]
-        }
-        return {"classification": {"$in": allowed.get(ceiling, ["public"])}}</code></pre>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Separate keys per trust boundary.</strong> Ingest workers get write-only credentials; the retrieval API gets read-only; humans get nothing — they authenticate through the application. A leaked read-only key cannot poison the index.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Scope managed-service keys.</strong> Pinecone API keys should be scoped to the project and rotated on a schedule; store them in Azure Key Vault, not in application configuration.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">SQL Server: use contained database users or Entra ID.</strong> The retrieval service connects as a low-privilege database user with SELECT on the chunk tables and nothing else — no DDL, no access to the embedding queue or eval tables.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Rotate on a schedule, not on incident.</strong> Quarterly rotation with dual-key support (accept N and N+1 during rollover) turns rotation into a routine instead of a fire drill.</li>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Audit Logging for Vector Queries</h3>
 
-<p class="text-gray-300 leading-relaxed">Access control without audit logging is incomplete. In regulated environments — HIPAA, SOC 2, FedRAMP — you must be able to answer: who queried what, when, and what did they receive? For vector databases this is non-trivial because the query is a floating-point vector and the result is a ranked list, neither of which is easily stored in a traditional audit log.</p>
+<p class="text-gray-300 leading-relaxed">Vector queries need auditing like any data access — which tenant asked what, which chunks were returned, and whether permission predicates were active. Log at the retrieval-procedure boundary, not in the application:</p>
 
-<p class="text-gray-300 leading-relaxed">A practical audit schema stores the semantic query (the text before embedding), the resolved tenant and access context, and enough result metadata to reconstruct what was exposed without storing the full document contents:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL audit log table
-CREATE TABLE vector_query_audit (
-    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    occurred_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
-    tenant_id       TEXT NOT NULL,
-    user_id         TEXT NOT NULL,
-    query_text      TEXT,               -- the original natural language query
-    query_hash      TEXT,               -- SHA-256 of the embedding for deduplication
-    top_k           INTEGER,
-    namespace       TEXT,
-    classification_ceiling  TEXT,
-    result_count    INTEGER,
-    result_ids      TEXT[],             -- IDs of returned documents
-    result_scores   FLOAT[],            -- similarity scores
-    request_ip      INET,
-    user_agent      TEXT,
-    duration_ms     INTEGER
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: audit log table for vector retrieval
+CREATE TABLE dbo.VectorQueryAudit (
+    AuditId    BIGINT IDENTITY(1,1) NOT NULL
+        CONSTRAINT PK_VectorQueryAudit PRIMARY KEY,
+    OccurredAt DATETIME2(0) NOT NULL
+        CONSTRAINT DF_VQA_Occurred DEFAULT SYSUTCDATETIME(),
+    TenantId   INT NOT NULL,
+    UserId     INT NULL,
+    Namespace  NVARCHAR(60) NOT NULL,
+    TopK       INT NOT NULL,
+    ReturnedIds NVARCHAR(MAX) NOT NULL,  -- JSON array of ChunkIds served
+    MinDistance FLOAT NULL,              -- top-1 distance: quality signal
+    ClientIp   NVARCHAR(45) NULL
 );
+CREATE INDEX IX_VQA_Tenant_Time ON dbo.VectorQueryAudit (TenantId, OccurredAt);
+-- Write one row per retrieval call from the stored procedure that serves
+-- vector search. Partition by month; retention per compliance policy.
+-- The ReturnedIds JSON lets incident response answer "who saw chunk X?"
+-- with a single query.</code></pre>
 
--- Index for compliance queries
-CREATE INDEX ON vector_query_audit (tenant_id, occurred_at DESC);
-CREATE INDEX ON vector_query_audit (user_id, occurred_at DESC);
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python — audited retrieval wrapper (pyodbc)
+import json, pyodbc
 
--- Retention policy: audit rows are append-only
--- Use pg_partman or a cron job to archive/drop old partitions
-ALTER TABLE vector_query_audit ENABLE ROW LEVEL SECURITY;
+conn = pyodbc.connect("DRIVER={ODBC Driver 18 for SQL Server};"
+                      "SERVER=localhost;DATABASE=ragdb;Trusted_Connection=yes;"
+                      "Encrypt=yes;TrustServerCertificate=yes")
 
--- Only audit readers (compliance role) and service accounts can read audit rows
-CREATE POLICY audit_read ON vector_query_audit
-    FOR SELECT
-    TO compliance_role, service_role
-    USING (true);
-
--- Application role can only insert, never update or delete
-CREATE POLICY audit_insert ON vector_query_audit
-    FOR INSERT
-    TO app_role
-    WITH CHECK (true);</code></pre>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
-# Audit logging wrapper around vector search
-import hashlib
-import time
-import psycopg2
-from contextlib import contextmanager
-
-class AuditedVectorSearch:
-    def __init__(self, vector_client, audit_db_conn_string: str):
-        self.vector_client = vector_client
-        self.audit_conn_string = audit_db_conn_string
-    
-    def search(
-        self,
-        tenant_id: str,
-        user_id: str,
-        query_text: str,
-        query_vector: list[float],
-        namespace: str,
-        classification_ceiling: str,
-        top_k: int = 10,
-        request_ip: str = None,
-        user_agent: str = None
-    ) -&gt; list[dict]:
-        start = time.monotonic()
-        
-        # Compute query fingerprint for deduplication analysis
-        query_hash = hashlib.sha256(
-            bytes(str(query_vector), "utf-8")
-        ).hexdigest()
-        
-        # Execute vector search
-        results = self.vector_client.execute_query(
-            access=VectorAccess(
-                tenant_namespace=tenant_id,
-                permitted_operations=[VectorOperation.READ],
-                classification_ceiling=classification_ceiling
-            ),
-            query_vector=query_vector,
-            top_k=top_k
-        )
-        
-        duration_ms = int((time.monotonic() - start) * 1000)
-        
-        # Write audit record — this happens regardless of result content
-        self._write_audit(
-            tenant_id=tenant_id,
-            user_id=user_id,
-            query_text=query_text,
-            query_hash=query_hash,
-            top_k=top_k,
-            namespace=namespace,
-            classification_ceiling=classification_ceiling,
-            result_count=len(results),
-            result_ids=[r["id"] for r in results],
-            result_scores=[r["score"] for r in results],
-            request_ip=request_ip,
-            user_agent=user_agent,
-            duration_ms=duration_ms
-        )
-        
-        return results
-    
-    def _write_audit(self, **kwargs) -&gt; None:
-        with psycopg2.connect(self.audit_conn_string) as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO vector_query_audit (
-                        tenant_id, user_id, query_text, query_hash,
-                        top_k, namespace, classification_ceiling,
-                        result_count, result_ids, result_scores,
-                        request_ip, user_agent, duration_ms
-                    ) VALUES (
-                        %(tenant_id)s, %(user_id)s, %(query_text)s, %(query_hash)s,
-                        %(top_k)s, %(namespace)s, %(classification_ceiling)s,
-                        %(result_count)s, %(result_ids)s, %(result_scores)s,
-                        %(request_ip)s, %(user_agent)s, %(duration_ms)s
-                    )
-                """, kwargs)
-            conn.commit()</code></pre>
-
-<p class="text-gray-300 leading-relaxed">One important design decision: whether to log the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">query_text</code> (the natural language query before embedding) depends on your data classification policy. In some environments, the query itself — "show me documents about patient discharge against medical advice" — is as sensitive as the returned content. In those cases, log only the hash, and ensure the hash-to-text mapping is stored in a separate, higher-classification system accessible only to the compliance team.</p>
+def audited_retrieve(question_emb, tenant_id, user_id, namespace, top_k=10):
+    vec = "[" + ",".join(str(v) for v in question_emb) + "]"
+    cur = conn.cursor()
+    cur.execute("EXEC sp_set_session_context 'TenantId', ?",
+                (tenant_id,))   # RLS context: fail-closed per Section 34.2
+    rows = cur.execute("""SELECT TOP (?) ChunkId, ChunkText,
+                VECTOR_DISTANCE('cosine', Embedding,
+                    CAST(? AS VECTOR(1536))) AS Distance
+            FROM dbo.DocumentChunks
+            ORDER BY Distance""", (top_k, vec)).fetchall()
+    cur.execute("""INSERT INTO dbo.VectorQueryAudit
+                       (TenantId, UserId, Namespace, TopK, ReturnedIds,
+                        MinDistance)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (tenant_id, user_id, namespace, top_k,
+                 json.dumps([r[0] for r in rows]),
+                 rows[0][2] if rows else None))
+    conn.commit()
+    return rows
+</code></pre>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Handling Sensitive Data in Embedding Pipelines</h3>
 
-<p class="text-gray-300 leading-relaxed">Access control at the vector database level is the last line of defense. The embedding pipeline — where raw text is converted to vectors — is an earlier and often overlooked attack surface. If your pipeline sends data to a third-party embedding API (OpenAI, Cohere, Google), that data leaves your security boundary.</p>
+<p class="text-gray-300 leading-relaxed">Embeddings are not anonymized data. A vector preserves enough semantic content that sensitive text can be partially reconstructed, and the chunk text stored alongside it is the original sensitive content in full. Treat the vector store with the same classification as the source documents:</p>
 
-<p class="text-gray-300 leading-relaxed">The mitigations depend on your threat model:</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Private embedding models</strong> eliminate the third-party exposure entirely. Running an open-source model like <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">all-MiniLM-L6-v2</code> from sentence-transformers on infrastructure you control means the raw text never leaves your network. The embedding quality may differ from frontier models, but for most enterprise retrieval tasks the gap is acceptable.</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
-# On-premises embedding with sentence-transformers
-from sentence_transformers import SentenceTransformer
-import torch
-
-class PrivateEmbedder:
-    """
-    Embed text using a locally-hosted model.
-    No data leaves the network boundary.
-    """
-    def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.model = SentenceTransformer(model_name, device=device)
-        self.dimension = self.model.get_sentence_embedding_dimension()
-    
-    def embed(self, texts: list[str]) -&gt; list[list[float]]:
-        embeddings = self.model.encode(
-            texts,
-            batch_size=64,
-            normalize_embeddings=True,  # unit vectors for cosine similarity
-            show_progress_bar=False
-        )
-        return embeddings.tolist()
-    
-    def embed_one(self, text: str) -&gt; list[float]:
-        return self.embed([text])[0]
-
-embedder = PrivateEmbedder()</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Data masking before embedding</strong> applies when you must use a third-party API but some fields in your documents are sensitive PII or proprietary content. Before sending text to the embedding API, strip or replace the sensitive spans with placeholder tokens:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
-import re
-
-class DataMaskingPreprocessor:
-    """
-    Remove or replace sensitive patterns before embedding.
-    Masking is irreversible — the stored vector reflects the masked text,
-    so exact-match retrieval on original PII is not possible.
-    Use this only when semantic retrieval on non-PII context is sufficient.
-    """
-    
-    PATTERNS = {
-        "ssn": (r"\b\d{3}-\d{2}-\d{4}\b", "[SSN]"),
-        "credit_card": (r"\b(?:\d{4}[- ]?){3}\d{4}\b", "[CARD]"),
-        "email": (r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b", "[EMAIL]"),
-        "phone": (r"\b(?:\+1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b", "[PHONE]"),
-    }
-    
-    def mask(self, text: str) -&gt; tuple[str, dict]:
-        """
-        Returns masked text and a record of replacements.
-        The replacement record should be stored in your secure vault,
-        not alongside the vector.
-        """
-        replacements = {}
-        masked = text
-        
-        for pattern_name, (pattern, placeholder) in self.PATTERNS.items():
-            matches = re.findall(pattern, masked)
-            if matches:
-                replacements[pattern_name] = matches
-                masked = re.sub(pattern, placeholder, masked)
-        
-        return masked, replacements
-
-preprocessor = DataMaskingPreprocessor()
-masked_text, pii_record = preprocessor.mask(
-    "Contact John at john.doe@acme.com or 555-123-4567 about invoice #A-4492"
-)
-# masked_text: "Contact John at [EMAIL] or [PHONE] about invoice #A-4492"
-# pii_record stored separately in your secrets vault</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">VPC endpoints and private links</strong> are the network-level complement to data masking. AWS PrivateLink for Bedrock, Azure Private Endpoints for Azure OpenAI, and GCP Private Service Connect for Vertex AI all allow your embedding calls to traverse private network paths rather than the public internet, reducing the exposure surface even when using managed embedding APIs.</p>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Encrypt at rest and in transit.</strong> TDE for the database, TLS for every connection — including the embedding API calls that carry raw text off-network.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Redact before embedding.</strong> PII scrubbing belongs in the ingest pipeline, before the embedding call — once PII is embedded and stored, every copy (cache, backup, replica) carries it.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Prefer local embedding models for regulated data.</strong> Sentence Transformers on your own infrastructure keeps text in-network; API embedding sends it to a third party under their retention policy.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Backups inherit classification.</strong> A backup of the vector database is a backup of the sensitive corpus — same encryption, same access controls, same retention policy (Chapter 36).</li>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">A Unified Authorization Layer</h3>
 
-<p class="text-gray-300 leading-relaxed">Production systems rarely use a single vector database. A typical architecture might use pgvector for low-latency operational queries, Pinecone for high-scale semantic search, and Weaviate for knowledge graph traversal with vector similarity. Each database has its own access control model. Building authorization logic independently for each creates inconsistency and maintenance burden.</p>
+<p class="text-gray-300 leading-relaxed">Production systems rarely use a single vector database. A typical architecture might use SQL Server native vectors for low-latency operational queries, Pinecone for high-scale semantic search, and Weaviate for knowledge graph traversal with vector similarity. Each database has its own access control model. Building authorization logic independently for each creates inconsistency and maintenance burden.</p>
 
-<p class="text-gray-300 leading-relaxed">A unified authorization layer abstracts the vector database behind a policy engine that speaks a single language regardless of the underlying store:</p>
+<p class="text-gray-300 leading-relaxed">The unified layer is a policy decision point in front of all of them: one function that maps (user, tenant, roles) to (allowed namespaces, filters, top-k limits), called by every retrieval path regardless of backend:</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
-from abc import ABC, abstractmethod
-from typing import Protocol
-import opa_client  # Open Policy Agent Python client
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python — unified authorization layer across vector backends
+from dataclasses import dataclass
 
-class VectorSearchBackend(Protocol):
-    def search(
-        self, 
-        collection: str, 
-        vector: list[float], 
-        filter_: dict,
-        top_k: int
-    ) -&gt; list[dict]: ...
+@dataclass
+class AuthzDecision:
+    tenant_id: int
+    namespace: str        # Pinecone namespace / Weaviate tenant / SQL predicate
+    max_top_k: int
+    classification_ceiling: str   # highest classification the user may see
+    sql_tenant_filter: str        # fragment for SQL Server queries
 
-class PineconeBackend:
-    def __init__(self, api_key: str, index_name: str):
-        self.pc = Pinecone(api_key=api_key)
-        self.index = self.pc.Index(index_name)
-    
-    def search(self, collection: str, vector: list[float], filter_: dict, top_k: int) -&gt; list[dict]:
-        results = self.index.query(
-            vector=vector,
-            top_k=top_k,
-            namespace=collection,
-            filter=filter_,
-            include_metadata=True
-        )
-        return [{"id": m.id, "score": m.score, **m.metadata} for m in results.matches]
-
-class QdrantBackend:
-    def __init__(self, url: str, api_key: str):
-        self.client = QdrantClient(url=url, api_key=api_key)
-    
-    def search(self, collection: str, vector: list[float], filter_: dict, top_k: int) -&gt; list[dict]:
-        # Convert unified filter dict to Qdrant filter model
-        qdrant_filter = self._translate_filter(filter_)
-        results = self.client.search(
-            collection_name=collection,
-            query_vector=vector,
-            query_filter=qdrant_filter,
-            limit=top_k,
-            with_payload=True
-        )
-        return [{"id": str(r.id), "score": r.score, **(r.payload or {})} for r in results]
-    
-    def _translate_filter(self, filter_dict: dict) -&gt; Filter | None:
-        if not filter_dict:
-            return None
-        conditions = []
-        for key, value in filter_dict.items():
-            if isinstance(value, list):
-                conditions.append(FieldCondition(key=key, match=MatchAny(any=value)))
-            else:
-                conditions.append(FieldCondition(key=key, match=MatchValue(value=value)))
-        return Filter(must=conditions)
-
-
-class UnifiedVectorAuthority:
-    """
-    Single entry point for all vector search operations.
-    Policy decisions are delegated to Open Policy Agent.
-    Backend selection is driven by routing configuration.
-    """
-    
-    def __init__(self, opa_url: str, backends: dict[str, VectorSearchBackend]):
-        self.opa = opa_client.OpaClient(opa_url)
-        self.backends = backends  # e.g., {"pinecone": PineconeBackend(...), "qdrant": QdrantBackend(...)}
-    
-    def _evaluate_policy(self, identity: dict, resource: dict, action: str) -&gt; dict:
-        """
-        Query OPA for access decision.
-        Returns {"allow": bool, "filter": dict, "redact_fields": list[str]}
-        """
-        input_data = {
-            "identity": identity,
-            "resource": resource,
-            "action": action
-        }
-        result = self.opa.check_policy_rule(
-            policy_name="vector/authz",
-            rule_name="decision",
-            input_data=input_data
-        )
-        return result.get("result", {"allow": False, "filter": {}, "redact_fields": []})
-    
-    def search(
-        self,
-        identity: dict,          # {tenant_id, user_id, roles, clearance_level}
-        backend_name: str,       # "pinecone" | "qdrant" | "pgvector"
-        collection: str,
-        query_vector: list[float],
-        top_k: int = 10
-    ) -&gt; list[dict]:
-        # Step 1: Policy evaluation
-        decision = self._evaluate_policy(
-            identity=identity,
-            resource={"backend": backend_name, "collection": collection},
-            action="vector:search"
-        )
-        
-        if not decision["allow"]:
-            raise PermissionError(
-                f"User {identity['user_id']} is not permitted to search {collection}"
-            )
-        
-        # Step 2: Backend selection and query execution
-        backend = self.backends.get(backend_name)
-        if not backend:
-            raise ValueError(f"Unknown backend: {backend_name}")
-        
-        # filter_ comes from OPA policy, never from caller
-        results = backend.search(
-            collection=collection,
-            vector=query_vector,
-            filter_=decision.get("filter", {}),
-            top_k=top_k
-        )
-        
-        # Step 3: Field-level redaction based on policy output
-        redact_fields = decision.get("redact_fields", [])
-        if redact_fields:
-            results = [
-                {k: ("[REDACTED]" if k in redact_fields else v) for k, v in r.items()}
-                for r in results
-            ]
-        
-        return results</code></pre>
-
-<p class="text-gray-300 leading-relaxed">The OPA policy file that governs these decisions is written in Rego and lives in your policy repository, version-controlled alongside your application code:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># rego
-# policy: vector/authz.rego
-
-package vector.authz
-
-import future.keywords.if
-import future.keywords.in
-
-# Default deny
-default decision = {"allow": false, "filter": {}, "redact_fields": []}
-
-decision = result if {
-    is_allowed
-    result := {
-        "allow": true,
-        "filter": access_filter,
-        "redact_fields": fields_to_redact
-    }
-}
-
-# Allow if tenant matches collection prefix and user has read role
-is_allowed if {
-    startswith(input.resource.collection, input.identity.tenant_id)
-    "read" in input.identity.roles
-    input.action == "vector:search"
-}
-
-# Build the metadata filter from clearance level
-access_filter := filter if {
-    level := input.identity.clearance_level
-    allowed := classification_for_level[level]
-    filter := {"classification": allowed}
-}
-
-classification_for_level := {
-    1: ["public"],
-    2: ["public", "internal"],
-    3: ["public", "internal", "confidential"],
-    4: ["public", "internal", "confidential", "restricted"]
-}
-
-# Redact PII fields for users without the data-steward role
-fields_to_redact := fields if {
-    not "data-steward" in input.identity.roles
-    fields := ["author_email", "author_phone", "employee_id"]
-} else := []</code></pre>
-
-<p class="text-gray-300 leading-relaxed">This architecture provides a clean separation of concerns: the vector database handles geometry, the policy engine handles authorization, and the application handles business logic. Rotating a credential, tightening a classification rule, or adding a new backend requires changes in exactly one place.</p>
+def authorize(user, backend_name: str) -> AuthzDecision:
+    """Single policy decision point. backend_name: "sqlserver" | "pinecone"
+    | "qdrant" | "weaviate". Every retrieval path calls this first."""
+    tenant_id = user.tenant_id
+    roles = set(user.roles)
+    ceiling = "Restricted" if "auditor" in roles else "Internal"
+    max_k = 50 if "analyst" in roles else 10
+    namespace = f"tenant-{tenant_id}" if backend_name == "pinecone" \
+        else "default"
+    return AuthzDecision(
+        tenant_id=tenant_id, namespace=namespace, max_top_k=max_k,
+        classification_ceiling=ceiling,
+        sql_tenant_filter=f"TenantId = {tenant_id}")
+# SQL Server path: sp_set_session_context + RLS (Section 34.2)
+# Pinecone path:   namespace=decision.namespace, top_k=min(k, decision.max_top_k)
+# Weaviate path:   tenant filter + top_k cap
+# One policy, every backend — audit once, at this layer.
+</code></pre>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Vector access control requires layered defenses.** Namespace or collection isolation prevents cross-tenant data access at the storage level; metadata filters enforce within-tenant classification controls; application-layer verification catches filter bypass scenarios. No single layer is sufficient on its own.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">SQL Server RLS integrates directly with vector tables</strong> via security policies and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SESSION_CONTEXT</code> — but ANN index performance degrades when tenant predicates apply post-scan, so over-fetch 10–20x and measure recall@k per tenant.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **PostgreSQL RLS integrates directly with pgvector**, but ANN index performance degrades when RLS predicates are applied post-scan. Partition by tenant to ensure the query planner prunes to a single partition before scanning the vector index.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Enforce permissions before retrieval, never after.</strong> Predicates belong in the database query; post-retrieval filtering is a security hole and a quality bug.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Managed vector databases (Pinecone, Weaviate, Qdrant) have different isolation guarantees.** Weaviate's multi-tenancy model is fail-closed — queries without a tenant key raise an error. Pinecone's namespace model is fail-open — omitting the namespace silently queries the default namespace. Design your application wrapper to enforce namespace injection server-side from a verified identity token, never from client-supplied input.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Choose isolation strength by tenant reality:</strong> separate indexes for strict residency, namespaces/tenant-shards for SaaS scale, RLS predicates where the database is SQL Server.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **API keys should follow least-privilege principles.** Store keys in a secrets manager, scope them to the minimum required operations, and retrieve them at runtime through an authorization proxy rather than distributing them to calling services or clients directly.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Audit at the retrieval boundary</strong> — tenant, user, returned chunk IDs, top-1 distance — so incident response can answer "who saw chunk X?" with one query.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Audit logs for vector queries must capture the semantic intent, not just the raw vector.** Log the natural language query text (or its hash if the query itself is sensitive), the resolved access context, the result document IDs, and the similarity scores. This record supports compliance investigations, anomaly detection on unusual query patterns, and incident response when a potential data exposure needs to be scoped.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Treat embeddings as sensitive as source text:</strong> redact before embedding, prefer local models for regulated data, and give backups the corpus's classification.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Unify authorization in one policy decision point</strong> across backends — one function mapping user to namespaces, filters, and limits, audited once.</li>
     </div>
     <div class="mt-14 bg-cyan-950/40 border border-cyan-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
-        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · SQL Server</p>
       </div>
       <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
          class="shrink-0 px-6 py-3 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold rounded-xl text-sm transition">
         Download Free
       </a>
     </div>
-    <div class="mt-8 text-xs">
-      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a>
+    <div class="mt-10 flex items-center justify-between text-xs">
+      <a href="b4-ch33-semantic-caching.html" class="text-gray-500 hover:text-gray-300 transition">← Previous Chapter</a>
+      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">All Chapters</a>
+      <a href="b4-ch35-disaster-recovery-vectors.html" class="text-cyan-400 hover:text-cyan-300 transition">Next Chapter →</a>
     </div>
   </article>
   <footer class="border-t border-gray-800/50 px-6 py-8">
