@@ -57,94 +57,7 @@
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">18.2 Extracting Query Cost Data: pg_stat_statements, Performance Insights, and sys.dm_exec_query_stats</h3>
-
-<p class="text-gray-300 leading-relaxed">#### PostgreSQL: pg_stat_statements</p>
-
-<p class="text-gray-300 leading-relaxed"><code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> is the foundational tool for PostgreSQL cost attribution on RDS, Aurora PostgreSQL, and Cloud SQL. Enable it in the parameter group:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Enable pg_stat_statements (requires rds.force_ssl=1 on RDS)
--- Add to parameter group: shared_preload_libraries = pg_stat_statements
--- Then run:
-CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
-
--- Reset statistics at the start of a billing cycle measurement window
-SELECT pg_stat_statements_reset();</code></pre>
-
-<p class="text-gray-300 leading-relaxed">Once you have a week or more of data, the following query converts raw execution statistics into a cost estimate. The per-vCPU-hour figure is derived from your actual instance cost divided by vCPU count and a utilization assumption.</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Query cost attribution for PostgreSQL
--- Assumes db.r6g.4xlarge: $1.056/hr, 16 vCPUs, 75% avg utilization
--- Effective cost per vCPU-hour = $1.056 / 16 = $0.066
--- Adjust cost_per_vcpu_hour and iops_cost_per_million to match your setup
-
-WITH constants AS (
-    SELECT
-        0.066  AS cost_per_vcpu_hour,    -- $/vCPU-hr for your instance class
-        0.08   AS iops_cost_per_million, -- RDS gp3 I/O cost approximation
-        720    AS hours_per_month
-),
-query_stats AS (
-    SELECT
-        queryid,
-        LEFT(query, 120)                                    AS query_preview,
-        calls,
-        total_exec_time / 1000.0                            AS total_exec_seconds,
-        mean_exec_time / 1000.0                             AS mean_exec_seconds,
-        stddev_exec_time / 1000.0                           AS stddev_exec_seconds,
-        rows,
-        shared_blks_hit + shared_blks_read                  AS total_blocks_accessed,
-        shared_blks_read                                    AS disk_blocks_read,
-        shared_blks_written + local_blks_written            AS blocks_written,
-        blk_read_time / 1000.0                              AS blk_read_seconds,
-        blk_write_time / 1000.0                             AS blk_write_seconds,
-        -- CPU time approximation: total time minus I/O wait time
-        GREATEST(0, (total_exec_time - blk_read_time - blk_write_time) / 1000.0)
-                                                            AS cpu_seconds
-    FROM pg_stat_statements
-    WHERE calls &gt; 100  -- filter noise
-),
-cost_calc AS (
-    SELECT
-        qs.queryid,
-        qs.query_preview,
-        qs.calls,
-        qs.total_exec_seconds,
-        qs.mean_exec_seconds,
-        qs.disk_blocks_read,
-        qs.rows,
-        -- Compute cost: CPU seconds consumed * per-second vCPU cost
-        ROUND((qs.cpu_seconds * c.cost_per_vcpu_hour / 3600.0)::numeric, 4)
-                                                            AS compute_cost_usd,
-        -- I/O cost: blocks read from disk (8KB blocks = IOPS approximation)
-        ROUND((qs.disk_blocks_read / 1000000.0 * c.iops_cost_per_million)::numeric, 4)
-                                                            AS io_cost_usd,
-        -- Total estimated monthly cost (scaled from observation window)
-        -- Assumes stats cover exactly 7 days; scale to 30 days
-        ROUND(((qs.cpu_seconds * c.cost_per_vcpu_hour / 3600.0)
-             + (qs.disk_blocks_read / 1000000.0 * c.iops_cost_per_million))
-             * (30.0 / 7.0)::numeric, 2)                   AS estimated_monthly_cost_usd
-    FROM query_stats qs
-    CROSS JOIN constants c
-)
-SELECT
-    queryid,
-    query_preview,
-    calls,
-    ROUND(total_exec_seconds::numeric, 2)                   AS total_exec_sec,
-    ROUND(mean_exec_seconds * 1000::numeric, 2)             AS avg_ms,
-    disk_blocks_read,
-    rows                                                    AS total_rows_returned,
-    compute_cost_usd,
-    io_cost_usd,
-    estimated_monthly_cost_usd,
-    ROUND(100.0 * estimated_monthly_cost_usd
-          / SUM(estimated_monthly_cost_usd) OVER (), 2)     AS pct_of_total_cost
-FROM cost_calc
-ORDER BY estimated_monthly_cost_usd DESC
-LIMIT 25;</code></pre>
-
-<p class="text-gray-300 leading-relaxed">This query returns a ranked list showing each query's estimated monthly dollar contribution. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pct_of_total_cost</code> column is the number that matters to a CTO: it answers "what fraction of our database bill does this query own?"</p>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">18.2 Extracting Query Cost Data: Query Store, Performance Insights, and sys.dm_exec_query_stats</h3>
 
 <p class="text-gray-300 leading-relaxed">#### SQL Server: sys.dm_exec_query_stats</p>
 
@@ -188,44 +101,7 @@ OUTER APPLY sys.dm_exec_query_plan(qs.plan_handle) qp
 WHERE qs.execution_count &gt; 50
 ORDER BY est_monthly_cost_usd DESC;</code></pre>
 
-<p class="text-gray-300 leading-relaxed">#### MySQL and Aurora MySQL</p>
 
-<p class="text-gray-300 leading-relaxed">Aurora MySQL and RDS MySQL expose per-query metrics through the Performance Schema. Enable the statement digest:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Aurora MySQL / RDS MySQL query cost attribution
--- Requires performance_schema = ON and events_statements_summary_by_digest enabled
--- performance-schema-instrument = 'statement/sql/%=ON' in parameter group
-
-SELECT
-    SCHEMA_NAME,
-    LEFT(DIGEST_TEXT, 120)                                  AS query_preview,
-    COUNT_STAR                                              AS executions,
-    ROUND(SUM_TIMER_WAIT / 1e12, 2)                         AS total_exec_seconds,
-    ROUND(AVG_TIMER_WAIT / 1e9, 2)                          AS avg_exec_ms,
-    SUM_ROWS_EXAMINED                                       AS rows_examined,
-    SUM_ROWS_SENT                                           AS rows_sent,
-    SUM_NO_INDEX_USED                                       AS full_scans,
-    SUM_NO_GOOD_INDEX_USED                                  AS bad_index_uses,
-    -- Efficiency ratio: lower is worse (ideal = 1.0)
-    ROUND(SUM_ROWS_SENT * 1.0 / NULLIF(SUM_ROWS_EXAMINED, 0), 4)
-                                                            AS row_efficiency,
-    -- Compute cost approximation (db.r6g.2xlarge Aurora: $0.48/hr, 8 vCPUs)
-    ROUND(SUM_TIMER_WAIT / 1e12 * (0.48 / 8.0 / 3600.0), 4)
-                                                            AS compute_cost_usd,
-    -- I/O approximation via rows examined (Aurora charges per I/O request)
-    -- Aurora I/O = $0.20 per 1M requests
-    ROUND(SUM_ROWS_EXAMINED / 1000000.0 * 0.20, 4)          AS aurora_io_cost_usd,
-    ROUND((SUM_TIMER_WAIT / 1e12 * (0.48 / 8.0 / 3600.0)
-          + SUM_ROWS_EXAMINED / 1000000.0 * 0.20)
-          * (30.0 / 7.0), 2)                                AS est_monthly_cost_usd
-FROM performance_schema.events_statements_summary_by_digest
-WHERE SCHEMA_NAME IS NOT NULL
-  AND COUNT_STAR &gt; 50
-  AND LAST_SEEN &gt; DATE_SUB(NOW(), INTERVAL 7 DAY)
-ORDER BY est_monthly_cost_usd DESC
-LIMIT 25;</code></pre>
-
-<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">aurora_io_cost_usd</code> column is particularly important for Aurora Serverless v1 and Aurora standard configurations on the I/O-optimized pricing plan decision. If your I/O cost exceeds 25% of total Aurora storage + I/O costs, switching to Aurora I/O-Optimized pricing ($0.225/GB-month, no separate I/O charge) typically saves money—and reducing row examination in these queries accelerates that crossover point.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
@@ -240,7 +116,7 @@ LIMIT 25;</code></pre>
 # Requires: aws cli v2, jq, Performance Insights enabled on the RDS instance
 # Run this daily via cron or EventBridge to populate a cost attribution table
 
-DB_INSTANCE_ID="prod-postgres-01"
+DB_INSTANCE_ID="prod-sqlserver-01"
 REGION="us-east-1"
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 
@@ -299,7 +175,7 @@ aws ce get-cost-and-usage \
             {
                 "Tags": {
                     "Key": "db-instance",
-                    "Values": ["prod-postgres-01"]
+                    "Values": ["prod-sqlserver-01"]
                 }
             }
         ]
@@ -373,7 +249,7 @@ echo "Slow query log exported. Lines: $(wc -l &lt; /tmp/cloudsql_slow_queries_$(
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">18.4 Building an Automated Query Cost Attribution Pipeline</h3>
 
-<p class="text-gray-300 leading-relaxed">Manual query analysis is a one-time exercise. The organizations that consistently control costs automate the attribution process and integrate it into their observability stack. The following Python pipeline runs on a daily schedule (via AWS Lambda, Cloud Functions, or a cron job on an EC2 instance) and writes results to a PostgreSQL tracking table and optionally to Slack or PagerDuty.</p>
+<p class="text-gray-300 leading-relaxed">Manual query analysis is a one-time exercise. The organizations that consistently control costs automate the attribution process and integrate it into their observability stack. The following Python pipeline runs on a daily schedule (via AWS Lambda, Cloud Functions, or a cron job on an EC2 instance) and writes results to a SQL Server tracking table and optionally to Slack or PagerDuty.</p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/usr/bin/env python3
 """
@@ -381,11 +257,11 @@ query_cost_attribution.py
 
 Automated query cost attribution pipeline.
 Runs daily via EventBridge Scheduler or cron.
-Writes results to a PostgreSQL attribution table.
+Writes results to a SQL Server attribution table.
 Sends Slack alerts when a query's estimated monthly cost exceeds threshold.
 
 Requirements:
-    pip install psycopg2-binary boto3 requests python-dotenv
+    pip install pyodbc boto3 requests python-dotenv
 
 Environment variables:
     DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD
@@ -402,8 +278,7 @@ import os
 import json
 import logging
 import datetime
-import psycopg2
-import psycopg2.extras
+import pyodbc
 import boto3
 import requests
 from decimal import Decimal
@@ -416,21 +291,28 @@ log = logging.getLogger(__name__)
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
-DB_CONFIG = {
-    "host":     os.environ["DB_HOST"],
-    "port":     int(os.environ.get("DB_PORT", 5432)),
-    "dbname":   os.environ["DB_NAME"],
-    "user":     os.environ["DB_USER"],
-    "password": os.environ["DB_PASSWORD"],
-}
+def _conn_str(host, port, dbname, user, password):
+    return (
+        "DRIVER={ODBC Driver 18 for SQL Server};"
+        f"SERVER={host},{port};DATABASE={dbname};"
+        f"UID={user};PWD={password};"
+        "Encrypt=yes;TrustServerCertificate=yes;Connection Timeout=30;"
+    )
 
-TRACKING_DB_CONFIG = {
-    "host":     os.environ.get("TRACKING_DB_HOST", os.environ["DB_HOST"]),
-    "port":     int(os.environ.get("TRACKING_DB_PORT", 5432)),
-    "dbname":   os.environ.get("TRACKING_DB_NAME", "finops_tracking"),
-    "user":     os.environ["DB_USER"],
-    "password": os.environ["DB_PASSWORD"],
-}
+DB_CONN_STR = _conn_str(
+    os.environ["DB_HOST"],
+    int(os.environ.get("DB_PORT", 1433)),
+    os.environ["DB_NAME"],
+    os.environ["DB_USER"],
+    os.environ["DB_PASSWORD"],
+)
+TRACKING_CONN_STR = _conn_str(
+    os.environ.get("TRACKING_DB_HOST", os.environ["DB_HOST"]),
+    int(os.environ.get("TRACKING_DB_PORT", 1433)),
+    os.environ.get("TRACKING_DB_NAME", "finops_tracking"),
+    os.environ["DB_USER"],
+    os.environ["DB_PASSWORD"],
+)
 
 INSTANCE_COST_PER_HOUR = float(os.environ.get("INSTANCE_COST_PER_HOUR", "1.056"))
 VCPU_COUNT             = int(os.environ.get("VCPU_COUNT", "16"))
@@ -448,12 +330,13 @@ PI_RESOURCE_ID         = os.environ.get("PI_RESOURCE_ID", "")
 # ─── DDL for tracking table ────────────────────────────────────────────────────
 
 TRACKING_TABLE_DDL = """
-CREATE TABLE IF NOT EXISTS query_cost_attribution (
-    id                      BIGSERIAL PRIMARY KEY,
-    captured_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+IF OBJECT_ID('dbo.query_cost_attribution', 'U') IS NULL
+CREATE TABLE dbo.query_cost_attribution (
+    id                      BIGINT IDENTITY(1,1) PRIMARY KEY,
+    captured_at             DATETIME2 NOT NULL DEFAULT SYSDATETIME(),
     observation_window_days INT         NOT NULL,
-    queryid                 BIGINT,
-    query_preview           TEXT,
+    query_id                BIGINT,
+    query_preview           NVARCHAR(4000),
     calls                   BIGINT,
     total_exec_seconds      NUMERIC(18,4),
     avg_exec_ms             NUMERIC(18,4),
@@ -463,92 +346,83 @@ CREATE TABLE IF NOT EXISTS query_cost_attribution (
     io_cost_usd             NUMERIC(12,4),
     est_monthly_cost_usd    NUMERIC(12,2),
     pct_of_total_cost       NUMERIC(6,2),
-    alerted                 BOOLEAN DEFAULT FALSE
+    alerted                 BIT NOT NULL DEFAULT 0
 );
 
-CREATE INDEX IF NOT EXISTS idx_qca_captured_at
-    ON query_cost_attribution (captured_at DESC);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'idx_qca_captured_at')
+    CREATE INDEX idx_qca_captured_at ON dbo.query_cost_attribution (captured_at DESC);
 
-CREATE INDEX IF NOT EXISTS idx_qca_monthly_cost
-    ON query_cost_attribution (est_monthly_cost_usd DESC);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'idx_qca_monthly_cost')
+    CREATE INDEX idx_qca_monthly_cost ON dbo.query_cost_attribution (est_monthly_cost_usd DESC);
 """
 
-# ─── SQL: pull attribution data from pg_stat_statements ───────────────────────
-
 ATTRIBUTION_SQL = """
-WITH constants AS (
+-- Query Store must be enabled on the source database
+WITH query_stats AS (
     SELECT
-        %(cost_per_cpu_second)s::float   AS cost_per_cpu_second,
-        %(iops_cost_per_block)s::float   AS iops_cost_per_block
-),
-query_stats AS (
-    SELECT
-        queryid,
-        LEFT(query, 200)                                        AS query_preview,
-        calls,
-        total_exec_time / 1000.0                                AS total_exec_seconds,
-        mean_exec_time / 1000.0                                 AS mean_exec_seconds,
-        rows,
-        shared_blks_read                                        AS disk_blocks_read,
-        GREATEST(0,
-            (total_exec_time - blk_read_time - blk_write_time)
-            / 1000.0)                                           AS cpu_seconds
-    FROM pg_stat_statements
-    WHERE calls &gt; 50
-      AND query NOT LIKE '%%pg_stat_statements%%'
-      AND query NOT LIKE '%%pg_catalog%%'
+        q.query_id,
+        LEFT(qt.query_sql_text, 200)                       AS query_preview,
+        SUM(rs.count_executions)                           AS calls,
+        SUM(rs.avg_cpu_time * rs.count_executions)
+            / 1000000.0                                    AS total_exec_seconds,
+        AVG(rs.avg_duration) / 1000.0                      AS avg_exec_ms,
+        SUM(rs.avg_physical_io_reads * rs.count_executions) AS disk_blocks_read,
+        SUM(rs.avg_rowcount * rs.count_executions)         AS total_rows_returned
+    FROM sys.query_store_query q
+    JOIN sys.query_store_query_text qt ON q.query_text_id = qt.query_text_id
+    JOIN sys.query_store_plan pl       ON pl.query_id = q.query_id
+    JOIN sys.query_store_runtime_stats rs ON rs.plan_id = pl.plan_id
+    WHERE rs.last_execution_time &gt;= DATEADD(DAY, -7, SYSDATETIME())
+    GROUP BY q.query_id, qt.query_sql_text
+    HAVING SUM(rs.count_executions) &gt; 50
 ),
 cost_calc AS (
     SELECT
         qs.*,
-        ROUND((qs.cpu_seconds
-               * c.cost_per_cpu_second)::numeric, 6)           AS compute_cost_usd,
-        ROUND((qs.disk_blocks_read
-               * c.iops_cost_per_block)::numeric, 6)           AS io_cost_usd,
-        ROUND(((qs.cpu_seconds * c.cost_per_cpu_second)
-             + (qs.disk_blocks_read * c.iops_cost_per_block))
-             * %(scale_to_monthly)s::float, 2)                 AS est_monthly_cost_usd
+        ROUND(qs.total_exec_seconds * ? , 6)                AS compute_cost_usd,
+        ROUND(qs.disk_blocks_read * ? , 6)                 AS io_cost_usd,
+        ROUND((qs.total_exec_seconds * ?
+             + qs.disk_blocks_read * ?) * ?, 2)             AS est_monthly_cost_usd
     FROM query_stats qs
-    CROSS JOIN constants c
 )
-SELECT
-    queryid,
+SELECT TOP 50
+    query_id,
     query_preview,
     calls,
-    ROUND(total_exec_seconds::numeric, 4)                       AS total_exec_seconds,
-    ROUND(mean_exec_seconds * 1000::numeric, 4)                 AS avg_exec_ms,
+    ROUND(total_exec_seconds, 4)                           AS total_exec_seconds,
+    ROUND(avg_exec_ms, 4)                                  AS avg_exec_ms,
     disk_blocks_read,
-    rows                                                        AS total_rows_returned,
+    total_rows_returned,
     compute_cost_usd,
     io_cost_usd,
     est_monthly_cost_usd,
     ROUND(100.0 * est_monthly_cost_usd
-          / NULLIF(SUM(est_monthly_cost_usd) OVER (), 0), 2)   AS pct_of_total_cost
+          / NULLIF(SUM(est_monthly_cost_usd) OVER (), 0), 2) AS pct_of_total_cost
 FROM cost_calc
-ORDER BY est_monthly_cost_usd DESC
-LIMIT 50;
+ORDER BY est_monthly_cost_usd DESC;
 """
+
 
 # ─── Functions ────────────────────────────────────────────────────────────────
 
 def get_attribution_rows(conn) -&gt; list[dict]:
-    """Pull ranked query cost attribution from pg_stat_statements."""
-    params = {
-        "cost_per_cpu_second": COST_PER_CPU_SECOND,
-        "iops_cost_per_block": IOPS_COST_PER_BLOCK,
-        "scale_to_monthly":    SCALE_TO_MONTHLY,
-    }
-    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute(ATTRIBUTION_SQL, params)
-        rows = cur.fetchall()
-    log.info("Retrieved %d attribution rows from pg_stat_statements", len(rows))
-    return [dict(r) for r in rows]
+    """Pull ranked query cost attribution from Query Store."""
+    params = (COST_PER_CPU_SECOND, IOPS_COST_PER_BLOCK,
+              COST_PER_CPU_SECOND, IOPS_COST_PER_BLOCK, SCALE_TO_MONTHLY)
+    cur = conn.cursor()
+    cur.execute(ATTRIBUTION_SQL, params)
+    cols = [c[0] for c in cur.description]
+    rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+    cur.close()
+    log.info("Retrieved %d attribution rows from Query Store", len(rows))
+    return rows
 
 
 def ensure_tracking_table(tracking_conn) -&gt; None:
     """Create the tracking table if it does not exist."""
-    with tracking_conn.cursor() as cur:
-        cur.execute(TRACKING_TABLE_DDL)
+    cur = tracking_conn.cursor()
+    cur.execute(TRACKING_TABLE_DDL)
+    cur.close()
     tracking_conn.commit()
     log.info("Tracking table verified / created")
 
@@ -556,9 +430,9 @@ def ensure_tracking_table(tracking_conn) -&gt; None:
 def write_attribution_rows(tracking_conn, rows: list[dict]) -&gt; None:
     """Insert attribution rows into the tracking table."""
     insert_sql = """
-        INSERT INTO query_cost_attribution (
+        INSERT INTO dbo.query_cost_attribution (
             observation_window_days,
-            queryid,
+            query_id,
             query_preview,
             calls,
             total_exec_seconds,
@@ -569,27 +443,19 @@ def write_attribution_rows(tracking_conn, rows: list[dict]) -&gt; None:
             io_cost_usd,
             est_monthly_cost_usd,
             pct_of_total_cost
-        ) VALUES (
-            %(observation_window_days)s,
-            %(queryid)s,
-            %(query_preview)s,
-            %(calls)s,
-            %(total_exec_seconds)s,
-            %(avg_exec_ms)s,
-            %(disk_blocks_read)s,
-            %(total_rows_returned)s,
-            %(compute_cost_usd)s,
-            %(io_cost_usd)s,
-            %(est_monthly_cost_usd)s,
-            %(pct_of_total_cost)s
-        )
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
-    enriched = [
-        {**row, "observation_window_days": OBSERVATION_DAYS}
+    params = [
+        (OBSERVATION_DAYS, row["query_id"], row["query_preview"][:4000],
+         row["calls"], row["total_exec_seconds"], row["avg_exec_ms"],
+         row["disk_blocks_read"], row["total_rows_returned"],
+         row["compute_cost_usd"], row["io_cost_usd"],
+         row["est_monthly_cost_usd"], row["pct_of_total_cost"])
         for row in rows
     ]
-    with tracking_conn.cursor() as cur:
-        psycopg2.extras.execute_batch(cur, insert_sql, enriched, page_size=50)
+    cur = tracking_conn.cursor()
+    cur.executemany(insert_sql, params)
+    cur.close()
     tracking_conn.commit()
     log.info("Wrote %d rows to query_cost_attribution", len(rows))
 
@@ -612,7 +478,7 @@ def send_slack_alert(row: dict) -&gt; None:
     try:
         resp = requests.post(SLACK_WEBHOOK_URL, json=message, timeout=10)
         resp.raise_for_status()
-        log.info("Slack alert sent for queryid=%s", row.get("queryid"))
+        log.info("Slack alert sent for query_id=%s", row.get("query_id"))
     except requests.RequestException as exc:
         log.warning("Failed to send Slack alert: %s", exc)
 
@@ -624,30 +490,31 @@ def check_and_alert(tracking_conn, rows: list[dict]) -&gt; None:
     """
     today = datetime.date.today()
     check_sql = """
-        SELECT 1
-        FROM query_cost_attribution
-        WHERE queryid = %(queryid)s
-          AND DATE(captured_at) = %(today)s
-          AND alerted = TRUE
-        LIMIT 1
+        SELECT TOP 1 1
+        FROM dbo.query_cost_attribution
+        WHERE query_id = ?
+          AND CAST(captured_at AS DATE) = ?
+          AND alerted = 1
     """
     mark_sql = """
-        UPDATE query_cost_attribution
-        SET alerted = TRUE
-        WHERE queryid = %(queryid)s
-          AND DATE(captured_at) = %(today)s
-          AND alerted = FALSE
+        UPDATE dbo.query_cost_attribution
+        SET alerted = 1
+        WHERE query_id = ?
+          AND CAST(captured_at AS DATE) = ?
+          AND alerted = 0
     """
     for row in rows:
         if float(row.get("est_monthly_cost_usd") or 0) &lt; ALERT_THRESHOLD_USD:
             continue
-        with tracking_conn.cursor() as cur:
-            cur.execute(check_sql, {"queryid": row["queryid"], "today": today})
-            already_alerted = cur.fetchone() is not None
+        cur = tracking_conn.cursor()
+        cur.execute(check_sql, (row["query_id"], today))
+        already_alerted = cur.fetchone() is not None
+        cur.close()
         if not already_alerted:
             send_slack_alert(row)
-            with tracking_conn.cursor() as cur:
-                cur.execute(mark_sql, {"queryid": row["queryid"], "today": today})
+            cur = tracking_conn.cursor()
+            cur.execute(mark_sql, (row["query_id"], today))
+            cur.close()
             tracking_conn.commit()
 
 
@@ -656,20 +523,23 @@ def lambda_handler(event: dict, context) -&gt; dict:
     AWS Lambda entry point.
     Also callable as a plain Python script main().
     """
-    log.info("Starting query cost attribution run at %s", datetime.datetime.utcnow())
+    log.info("Starting query cost attribution run at %s", datetime.datetime.now(datetime.timezone.utc))
 
-    with psycopg2.connect(**DB_CONFIG) as src_conn, \
-         psycopg2.connect(**TRACKING_DB_CONFIG) as trk_conn:
-
+    src_conn = pyodbc.connect(DB_CONN_STR, autocommit=True)
+    trk_conn = pyodbc.connect(TRACKING_CONN_STR, autocommit=True)
+    try:
         ensure_tracking_table(trk_conn)
         rows = get_attribution_rows(src_conn)
         write_attribution_rows(trk_conn, rows)
         check_and_alert(trk_conn, rows)
+    finally:
+        src_conn.close()
+        trk_conn.close()
 
     top = rows[0] if rows else {}
     log.info(
-        "Run complete. Top query: queryid=%s, est_monthly=$%s",
-        top.get("queryid"), top.get("est_monthly_cost_usd")
+        "Run complete. Top query: query_id=%s, est_monthly=$%s",
+        top.get("query_id"), top.get("est_monthly_cost_usd")
     )
     return {
         "statusCode": 200,
@@ -701,17 +571,6 @@ est_monthly:    $2,847</code></pre>
 
 <p class="text-gray-300 leading-relaxed">A row efficiency below 0.10 combined with high disk block reads is the signature of a missing or ineffective index. The fix is almost always a composite index on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">(customer_id, status)</code>. For this query, adding that index would reduce <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">disk_blocks_read</code> from 94 million to roughly 1.8 million—a 98% reduction in I/O cost, dropping the monthly estimate from $2,847 to under $60.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: diagnose the missing index
-EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
-SELECT * FROM orders WHERE customer_id = 42 AND status = 'pending';
-
--- Look for "Seq Scan" or "Bitmap Heap Scan" with high "Buffers: shared hit/read"
--- Then create the composite index:
-CREATE INDEX CONCURRENTLY idx_orders_customer_status
-    ON orders (customer_id, status)
-    INCLUDE (order_date, total_amount);
--- INCLUDE adds covering columns to avoid a second heap fetch</code></pre>
-
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server equivalent
 -- Check missing index DMV first
 SELECT
@@ -742,20 +601,7 @@ avg_exec_ms:    0.3
 disk_blocks_read: 2,800,000
 est_monthly:    $1,140</code></pre>
 
-<p class="text-gray-300 leading-relaxed">This pattern—often called a "chatty query"—is common in ORM-heavy applications that issue individual lookups inside loops. The query is fast and well-indexed, but the sheer call volume adds up. The fix is application-side: batch the lookups using <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WHERE id = ANY($1)</code> (PostgreSQL) or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WHERE id IN (...)</code> (all platforms), or introduce an application-level cache for frequently-requested user records.</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: replace per-row lookups with a batch fetch
--- Instead of issuing 1000 individual queries:
---   SELECT id, name, email FROM users WHERE id = 1;
---   SELECT id, name, email FROM users WHERE id = 2; ...
-
--- Issue one query:
-SELECT id, name, email
-FROM users
-WHERE id = ANY(%(user_ids)s::bigint[]);
-
--- The query plan uses an index scan on the primary key for each element
--- of the array, eliminating the per-round-trip overhead</code></pre>
+<p class="text-gray-300 leading-relaxed">This pattern—often called a "chatty query"—is common in ORM-heavy applications that issue individual lookups inside loops. The query is fast and well-indexed, but the sheer call volume adds up. The fix is application-side: batch the lookups using <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WHERE id IN (...)</code> or a table-valued parameter, or introduce an application-level cache for frequently-requested user records.</p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server equivalent using a table-valued parameter
 -- Define the TVP type once:
@@ -785,36 +631,6 @@ est_monthly:    $28,500</code></pre>
 <p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Partial indexes</strong> that restrict the scan to recent data</p>
 <p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Read replica offloading</strong> if the query is analytical and can tolerate slight staleness</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: materialized view to pre-compute the aggregation
-CREATE MATERIALIZED VIEW mv_customer_transaction_summary AS
-SELECT
-    customer_id,
-    DATE_TRUNC('day', created_at)   AS summary_date,
-    SUM(amount)                     AS total_amount,
-    COUNT(*)                        AS tx_count,
-    AVG(amount)                     AS avg_amount
-FROM transactions
-GROUP BY customer_id, DATE_TRUNC('day', created_at)
-WITH DATA;
-
-CREATE UNIQUE INDEX ON mv_customer_transaction_summary
-    (customer_id, summary_date);
-
--- Refresh concurrently (no lock) at the start of each hour via pg_cron:
--- SELECT cron.schedule('refresh-tx-summary', '0 * * * *',
---     'REFRESH MATERIALIZED VIEW CONCURRENTLY mv_customer_transaction_summary');
-
--- Rewrite the application query against the materialized view:
-SELECT
-    customer_id,
-    SUM(total_amount)               AS total_amount,
-    SUM(tx_count)                   AS tx_count,
-    SUM(total_amount) / NULLIF(SUM(tx_count), 0)  AS avg_amount
-FROM mv_customer_transaction_summary
-WHERE summary_date BETWEEN $1::date AND $2::date
-GROUP BY customer_id
-ORDER BY total_amount DESC;</code></pre>
-
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: indexed view equivalent
 CREATE VIEW dbo.vw_customer_tx_daily
 WITH SCHEMABINDING AS
@@ -841,19 +657,6 @@ queryid: 9012  calls: 1,500    query: SELECT * FROM products WHERE page = $1 LIM
 
 <p class="text-gray-300 leading-relaxed">The 1,500 page queries each trigger 30 product lookups (45,000 total) which each trigger a category lookup—the classic ORM N+1. The fix is to rewrite the page-level query with JOINs or to configure eager loading in the ORM.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: replace N+1 with a single JOIN query
-SELECT
-    p.id,
-    p.name,
-    p.price,
-    c.id            AS category_id,
-    c.name          AS category_name
-FROM products p
-JOIN categories c ON c.id = p.category_id
-WHERE p.page = $1
-ORDER BY p.sort_order
-LIMIT 30;</code></pre>
-
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server equivalent
 SELECT
     p.id,
@@ -873,33 +676,33 @@ OFFSET 0 ROWS FETCH NEXT 30 ROWS ONLY;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">A single snapshot of query costs is useful. A time-series of snapshots is how you catch regressions before they appear as billing surprises. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">query_cost_attribution</code> tracking table written by the pipeline in section 18.4 supports trend analysis directly.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: week-over-week cost trend for top queries
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: week-over-week cost trend for top queries
 -- Detects queries whose monthly cost estimate has grown by more than 20%
 WITH this_week AS (
     SELECT
-        queryid,
+        query_id,
         query_preview,
         AVG(est_monthly_cost_usd)       AS avg_cost
-    FROM query_cost_attribution
-    WHERE captured_at &gt;= NOW() - INTERVAL '7 days'
-    GROUP BY queryid, query_preview
+    FROM dbo.query_cost_attribution
+    WHERE captured_at &gt;= DATEADD(DAY, -7, SYSDATETIME())
+    GROUP BY query_id, query_preview
 ),
 last_week AS (
     SELECT
-        queryid,
+        query_id,
         AVG(est_monthly_cost_usd)       AS avg_cost
-    FROM query_cost_attribution
-    WHERE captured_at &gt;= NOW() - INTERVAL '14 days'
-      AND captured_at &lt;  NOW() - INTERVAL '7 days'
-    GROUP BY queryid
+    FROM dbo.query_cost_attribution
+    WHERE captured_at &gt;= DATEADD(DAY, -14, SYSDATETIME())
+      AND captured_at &lt;  DATEADD(DAY, -7, SYSDATETIME())
+    GROUP BY query_id
 )
 SELECT
-    tw.queryid,
+    tw.query_id,
     tw.query_preview,
-    ROUND(lw.avg_cost::numeric, 2)      AS last_week_usd,
-    ROUND(tw.avg_cost::numeric, 2)      AS this_week_usd,
-    ROUND(((tw.avg_cost - lw.avg_cost)
-           / NULLIF(lw.avg_cost, 0) * 100)::numeric, 1)
+    ROUND(lw.avg_cost, 2)               AS last_week_usd,
+    ROUND(tw.avg_cost, 2)               AS this_week_usd,
+    ROUND((tw.avg_cost - lw.avg_cost)
+           / NULLIF(lw.avg_cost, 0) * 100, 1)
                                         AS pct_change,
     CASE
         WHEN tw.avg_cost - lw.avg_cost &gt; 200  THEN 'HIGH'
@@ -907,7 +710,7 @@ SELECT
         ELSE 'LOW'
     END                                 AS regression_severity
 FROM this_week tw
-JOIN last_week lw USING (queryid)
+JOIN last_week lw ON lw.query_id = tw.query_id
 WHERE tw.avg_cost &gt; lw.avg_cost * 1.20  -- 20% cost increase
 ORDER BY (tw.avg_cost - lw.avg_cost) DESC;</code></pre>
 
@@ -955,27 +758,26 @@ ORDER BY (tw.avg_cost - lw.avg_cost) DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">If your organization uses Grafana, the tracking table makes a natural data source. The following Grafana panel query renders a stacked area chart of the top 10 queries by estimated monthly cost over the past 30 days:</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Grafana: top 10 queries by cost over time (PostgreSQL data source)
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Grafana: top 10 queries by cost over time (SQL Server / MSSQL data source)
 -- Use $__timeFilter(captured_at) for the Grafana time range variable
 SELECT
-    DATE_TRUNC('day', captured_at)      AS time,
+    CAST(captured_at AS DATE)           AS time,
     LEFT(query_preview, 60)             AS metric,
     AVG(est_monthly_cost_usd)           AS value
-FROM query_cost_attribution
+FROM dbo.query_cost_attribution
 WHERE captured_at IN (
-    SELECT DISTINCT DATE_TRUNC('day', captured_at)
-    FROM query_cost_attribution
+    SELECT DISTINCT CAST(captured_at AS DATE)
+    FROM dbo.query_cost_attribution
     WHERE $__timeFilter(captured_at)
 )
-AND queryid IN (
-    SELECT queryid
-    FROM query_cost_attribution
+AND query_id IN (
+    SELECT TOP 10 query_id
+    FROM dbo.query_cost_attribution
     WHERE $__timeFilter(captured_at)
-    GROUP BY queryid
+    GROUP BY query_id
     ORDER BY SUM(est_monthly_cost_usd) DESC
-    LIMIT 10
 )
-GROUP BY 1, 2
+GROUP BY CAST(captured_at AS DATE), LEFT(query_preview, 60)
 ORDER BY 1, 3 DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Set the panel type to <strong class="text-white">Time series</strong>, enable stacking, and label it "Estimated Monthly Query Cost by Query (USD)". Over time this chart becomes a visual changelog: deploy-induced cost spikes appear as step changes in specific query series, and optimization work shows up as a visible drop.</p>
@@ -1007,205 +809,112 @@ ORDER BY 1, 3 DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">*The correct sequence: optimize and right-size before committing — reversing this order locks in spend at an inflated instance size.*</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: estimate post-optimization compute savings
--- Assumes you have identified which queryids to fix and their expected improvement
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: estimate post-optimization compute savings
+-- Assumes you have identified which query_ids to fix and their expected improvement
 WITH optimization_scenarios AS (
-    SELECT
-        queryid,
+    SELECT TOP 10
+        query_id,
         query_preview,
         est_monthly_cost_usd                            AS current_monthly_cost,
         -- Conservative: assume 70% reduction in compute cost for an index fix
-        -- Adjust improvement_factor per query based on EXPLAIN analysis
+        -- Adjust improvement_factor per query based on plan analysis
         CASE
-            WHEN query_preview ILIKE '%WHERE%AND%'
-             AND query_preview NOT ILIKE '%JOIN%'
+            WHEN query_preview LIKE '%WHERE%AND%'
+             AND query_preview NOT LIKE '%JOIN%'
              THEN 0.70   -- likely missing composite index
-            WHEN query_preview ILIKE '%GROUP BY%'
-             AND query_preview ILIKE '%SUM%'
-             THEN 0.60   -- aggregation, materialized view candidate
+            WHEN query_preview LIKE '%GROUP BY%'
+             AND query_preview LIKE '%SUM%'
+             THEN 0.60   -- aggregation, indexed view candidate
             ELSE 0.40    -- conservative default
         END                                             AS improvement_factor
-    FROM query_cost_attribution
-    WHERE captured_at &gt;= NOW() - INTERVAL '7 days'
+    FROM dbo.query_cost_attribution
+    WHERE captured_at &gt;= DATEADD(DAY, -7, SYSDATETIME())
     ORDER BY est_monthly_cost_usd DESC
-    LIMIT 10
 )
 SELECT
-    queryid,
+    query_id,
     LEFT(query_preview, 80)                             AS query_preview,
-    ROUND(current_monthly_cost::numeric, 2)             AS current_usd,
-    ROUND((current_monthly_cost
-           * improvement_factor)::numeric, 2)           AS projected_savings_usd,
-    ROUND((current_monthly_cost
-           * (1 - improvement_factor))::numeric, 2)     AS post_opt_cost_usd
+    ROUND(current_monthly_cost, 2)                       AS current_usd,
+    ROUND(current_monthly_cost * improvement_factor, 2) AS projected_savings_usd,
+    ROUND(current_monthly_cost * (1 - improvement_factor), 2)
+                                                        AS post_opt_cost_usd
 FROM optimization_scenarios
 UNION ALL
 SELECT
     NULL,
     '=== TOTAL ===',
-    ROUND(SUM(current_monthly_cost)::numeric, 2),
-    ROUND(SUM(current_monthly_cost * improvement_factor)::numeric, 2),
-    ROUND(SUM(current_monthly_cost * (1 - improvement_factor))::numeric, 2)
+    ROUND(SUM(current_monthly_cost), 2),
+    ROUND(SUM(current_monthly_cost * improvement_factor), 2),
+    ROUND(SUM(current_monthly_cost * (1 - improvement_factor)), 2)
 FROM optimization_scenarios;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The output of this query gives you the business case document for optimization work: total projected savings, per-query savings, and the residual cost after optimization. Pair it with the instance right-sizing model from Chapter 12 and you have a full cost reduction roadmap that connects query-level work to infrastructure spend.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">18.8 Special Considerations for Aurora Serverless, BigQuery, and Redshift</h3>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">18.8 Special Considerations for Azure SQL Serverless, Elastic Pools, and Managed Instance</h3>
 
-<p class="text-gray-300 leading-relaxed">The attribution model described above assumes a provisioned instance where compute cost is primarily a function of time and CPU utilization. Three managed database services have different billing models that require adjusted attribution logic.</p>
+<p class="text-gray-300 leading-relaxed">The attribution model described above assumes a provisioned instance where compute cost is primarily a function of time and CPU utilization. Three Azure SQL deployment options have different billing models that require adjusted attribution logic.</p>
 
-<p class="text-gray-300 leading-relaxed">#### Aurora Serverless v2</p>
+<p class="text-gray-300 leading-relaxed">#### Azure SQL Database serverless</p>
 
-<p class="text-gray-300 leading-relaxed">Aurora Serverless v2 bills in ACU-hours (Aurora Capacity Units). One ACU provides approximately 2 GB of memory and a proportional share of CPU. Attribution for Serverless v2 should track ACU consumption rather than vCPU time:</p>
+<p class="text-gray-300 leading-relaxed">Serverless bills in vCore-seconds: each second the database is unpaused, you pay for the vCores actually used (between the configured minimum and maximum), and a paused database bills nothing for compute. Attribution for serverless should therefore track two things per query: its share of vCore-seconds, and whether its execution pattern is what keeps the database from auto-pausing.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Aurora Serverless v2: approximate cost attribution via Performance Schema
--- Current ACU price: $0.12/ACU-hour (us-east-1, as of this writing)
--- ACU-hours consumed ≈ (CPU time of query / total CPU time) * actual ACU-hours billed
--- Pull actual ACU-hours from CloudWatch: ServerlessDatabaseCapacity metric
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Azure SQL serverless: attribute vCore-second cost per query
+-- Query Store must be enabled; pull billed vCore-seconds from Azure Cost Management
+-- for the same window and pass it in as @billed_vcore_seconds and @total_cost_usd
 
-SELECT
-    LEFT(DIGEST_TEXT, 120)              AS query_preview,
-    COUNT_STAR                          AS calls,
-    ROUND(SUM_TIMER_WAIT / 1e12, 2)     AS total_exec_sec,
-    ROUND(SUM_TIMER_WAIT / 1e12
-          / NULLIF(
-              (SELECT SUM(SUM_TIMER_WAIT) / 1e12
-               FROM performance_schema.events_statements_summary_by_digest
-               WHERE SCHEMA_NAME IS NOT NULL), 0
-            ) * 100, 2)                AS pct_of_db_time,
-    -- Multiply pct_of_db_time by actual ACU-hour cost from CloudWatch
-    -- to get per-query cost attribution
-    ROUND(SUM_TIMER_WAIT / 1e12
-          / NULLIF(
-              (SELECT SUM(SUM_TIMER_WAIT) / 1e12
-               FROM performance_schema.events_statements_summary_by_digest
-               WHERE SCHEMA_NAME IS NOT NULL), 0
-            ) * %(total_acu_cost_7d)s, 2)
-                                        AS attributed_cost_usd
-FROM performance_schema.events_statements_summary_by_digest
-WHERE SCHEMA_NAME IS NOT NULL
-  AND COUNT_STAR &gt; 50
-ORDER BY attributed_cost_usd DESC
-LIMIT 25;</code></pre>
+DECLARE @billed_vcore_seconds FLOAT = 1296000;  -- e.g. 15 vCore-hours in the window
+DECLARE @total_cost_usd       FLOAT = 84.50;    -- billed compute cost for the window
 
-<p class="text-gray-300 leading-relaxed">Pass the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">total_acu_cost_7d</code> parameter from a CloudWatch query that sums <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ServerlessDatabaseCapacity</code> (in ACUs) over the 7-day window and multiplies by $0.12/ACU-hour. This gives you a true dollar-denominated attribution that accounts for the auto-scaling behavior of Serverless v2.</p>
-
-<p class="text-gray-300 leading-relaxed">#### BigQuery: Slot-Based Cost Attribution</p>
-
-<p class="text-gray-300 leading-relaxed">BigQuery charges per byte scanned (on-demand: $6.25/TB) or per slot-hour (capacity pricing). For on-demand pricing, attribution is straightforward: bytes scanned is the cost driver.</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- BigQuery: query cost attribution from INFORMATION_SCHEMA
--- Run in the region where your datasets live
-SELECT
-    job_id,
-    user_email,
-    LEFT(query, 200)                                AS query_preview,
-    total_bytes_processed / 1e12                    AS tb_scanned,
-    ROUND(total_bytes_processed / 1e12 * 6.25, 4)  AS est_cost_usd,
-    total_slot_ms / 1000.0                        AS total_slot_seconds,
-    creation_time,
-    end_time,
-    TIMESTAMP_DIFF(end_time, creation_time, SECOND) AS wall_seconds,
-    cache_hit
-FROM `region-us`.INFORMATION_SCHEMA.JOBS_BY_PROJECT
-WHERE creation_time &gt;= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)
-  AND job_type = 'QUERY'
-  AND state = 'DONE'
-  AND error_result IS NULL
-ORDER BY est_cost_usd DESC
-LIMIT 50;</code></pre>
-
-<p class="text-gray-300 leading-relaxed">For BigQuery cost attribution, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">cache_hit = TRUE</code> rows cost nothing—filter them in when computing totals but remember they represent zero incremental cost. Queries that repeatedly scan the same large table without hitting cache are prime candidates for partitioning and clustering:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- BigQuery: partition and cluster to reduce bytes scanned
--- Before: a full scan of a 10 TB events table costs ~$62.50 per query
--- After: partitioned on event_date, clustered on user_id reduces scan to ~50GB for typical filters
-
-CREATE OR REPLACE TABLE `project.dataset.events_optimized`
-PARTITION BY DATE(event_timestamp)
-CLUSTER BY user_id, event_type
-AS SELECT * FROM `project.dataset.events_raw`;
-
--- A query with WHERE DATE(event_timestamp) = '2024-01-15' AND user_id = 'abc'
--- now scans only the matching partition and the first N gigabytes of clustered blocks
--- rather than the full 10 TB</code></pre>
-
-<p class="text-gray-300 leading-relaxed">#### Amazon Redshift: WLM Queue Attribution</p>
-
-<p class="text-gray-300 leading-relaxed">Redshift cost attribution uses the WLM (Workload Management) query queue metrics combined with per-node pricing:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Redshift: query cost attribution via STL_QUERY and SVL_QUERY_SUMMARY
--- Adjust cost_per_node_hour to match your node type
--- ra3.4xlarge: $3.26/node-hour (on-demand)
--- 2-node cluster = $6.52/hr total
-
-WITH cluster_cost AS (
+WITH query_cpu AS (
     SELECT
-        3.26 * 2    AS cluster_cost_per_hour,  -- adjust for your node count/type
-        720         AS hours_per_month
-),
-query_stats AS (
-    SELECT
-        q.query,
-        q.userid,
-        q.starttime,
-        q.endtime,
-        DATEDIFF(seconds, q.starttime, q.endtime)   AS duration_seconds,
-        qs.rows,
-        qs.bytes,
-        q.label
-    FROM stl_query q
-    JOIN svl_query_summary qs ON q.query = qs.query
-    WHERE q.starttime &gt;= DATEADD(day, -7, GETDATE())
-      AND q.aborted = 0
-      AND q.userid &gt; 1  -- exclude internal queries
-),
-cost_calc AS (
-    SELECT
-        query,
-        userid,
-        label,
-        duration_seconds,
-        bytes / 1073741824.0                            AS gb_processed,
-        -- Cost = fraction of cluster time this query consumed * cluster hourly cost
-        ROUND(duration_seconds / 3600.0
-              * (SELECT cluster_cost_per_hour FROM cluster_cost), 4)
-                                                        AS query_cost_usd,
-        -- Annualized if this ran daily
-        ROUND(duration_seconds / 3600.0
-              * (SELECT cluster_cost_per_hour FROM cluster_cost)
-              * 30, 2)                                  AS est_monthly_if_daily_usd
-    FROM query_stats
-),
-aggregated AS (
-    SELECT
-        label,
-        COUNT(*)                                        AS executions,
-        ROUND(AVG(duration_seconds), 1)                 AS avg_duration_sec,
-        ROUND(SUM(query_cost_usd), 2)                   AS total_cost_7d_usd,
-        ROUND(AVG(gb_processed), 2)                     AS avg_gb_scanned,
-        ROUND(SUM(query_cost_usd) * (30.0 / 7.0), 2)   AS est_monthly_cost_usd
-    FROM cost_calc
-    GROUP BY label
+        q.query_id,
+        LEFT(qt.query_sql_text, 120)              AS query_preview,
+        SUM(rs.count_executions)                  AS calls,
+        SUM(rs.avg_cpu_time * rs.count_executions)
+            / 1000000.0                           AS cpu_seconds
+    FROM sys.query_store_query q
+    JOIN sys.query_store_query_text qt ON q.query_text_id = qt.query_text_id
+    JOIN sys.query_store_plan pl       ON pl.query_id = q.query_id
+    JOIN sys.query_store_runtime_stats rs ON rs.plan_id = pl.plan_id
+    WHERE rs.last_execution_time &gt;= DATEADD(DAY, -7, SYSDATETIME())
+    GROUP BY q.query_id, qt.query_sql_text
 )
+SELECT TOP 25
+    query_id,
+    query_preview,
+    calls,
+    ROUND(cpu_seconds, 2)                         AS cpu_seconds,
+    ROUND(cpu_seconds / NULLIF(SUM(cpu_seconds) OVER (), 0) * 100, 2)
+                                                  AS pct_of_cpu,
+    -- Pro-rata share of the billed vCore-second cost
+    ROUND(cpu_seconds / NULLIF(SUM(cpu_seconds) OVER (), 0)
+          * @total_cost_usd, 2)                    AS attributed_cost_usd
+FROM query_cpu
+ORDER BY attributed_cost_usd DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Separately, check whether scheduled jobs or keep-alive probes are preventing auto-pause: any query that executes at least once inside every auto-pause delay window (commonly one hour to seven days) keeps the database awake and converts a near-zero compute bill into a 24/7 one. Those queries deserve attribution for the <em>entire</em> unpaused cost, not just their own vCore-seconds.</p>
+
+<p class="text-gray-300 leading-relaxed">#### Azure SQL elastic pools</p>
+
+<p class="text-gray-300 leading-relaxed">In an elastic pool, vCores (or eDTUs) are shared across databases and billed at the pool level. Attribute the pool&apos;s cost to individual databases first — using per-database CPU percent from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.elastic_pool_resource_stats</code> (logical server master) or Azure Metrics — then run the standard per-query attribution inside each database. A database that consistently uses 2% of the pool should carry roughly 2% of the pool&apos;s bill, which often reveals that one noisy database is subsidized by nineteen quiet ones.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Elastic pool: per-database share of pool CPU (run on the logical server master)
 SELECT
-    label,
-    executions,
-    avg_duration_sec,
-    avg_gb_scanned,
-    total_cost_7d_usd,
-    est_monthly_cost_usd,
-    ROUND(100.0 * est_monthly_cost_usd
-          / NULLIF(SUM(est_monthly_cost_usd) OVER (), 0), 2)
-                                                        AS pct_of_total
-FROM aggregated
-ORDER BY est_monthly_cost_usd DESC;</code></pre>
+    database_name,
+    AVG(avg_cpu_percent)                          AS avg_cpu_pct,
+    MAX(avg_cpu_percent)                          AS max_cpu_pct,
+    -- Multiply avg_cpu_pct / 100 by the pool's monthly cost for a dollar share
+    ROUND(AVG(avg_cpu_percent), 2)                AS pool_share_pct
+FROM sys.elastic_pool_resource_stats
+WHERE end_time &gt;= DATEADD(DAY, -7, SYSDATETIME())
+GROUP BY database_name
+ORDER BY avg_cpu_pct DESC;</code></pre>
 
-<p class="text-gray-300 leading-relaxed">For Redshift, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">label</code> is set by the application using <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SET query_group TO 'report-generation'</code> before running the query—a practice that makes attribution far more actionable by tying costs to business features rather than anonymous SQL text.</p>
+<p class="text-gray-300 leading-relaxed">#### Azure SQL Managed Instance</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
+<p class="text-gray-300 leading-relaxed">Managed Instance bills like a provisioned instance (vCores per hour plus storage), so the standard attribution model applies directly. The one adjustment: Query Store is available per database, and cross-database queries are common on Managed Instance. Aggregate <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">query_id</code> values are only unique per database, so include <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DB_NAME()</code> in the attribution extract when consolidating across databases on the same instance.</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">18.9 Presenting Attribution Data to Engineering and Finance Teams</h3>
 
@@ -1219,7 +928,7 @@ ORDER BY est_monthly_cost_usd DESC;</code></pre>
     """
     lines = [
         "# Query Cost Attribution Report",
-        f"Generated: {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}",
+        f"Generated: {datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
         f"Observation window: {OBSERVATION_DAYS} days | Scaled to 30-day estimate",
         "",
         "## Top Queries by Estimated Monthly Cost",
@@ -1253,34 +962,6 @@ ORDER BY est_monthly_cost_usd DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">For finance teams</strong>, the artifact is a cost allocation summary that maps query costs to engineering teams or product features. This requires tagging—either via application-level query comments or by maintaining a mapping table from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">queryid</code> to team:</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: team-level cost rollup
--- Requires a query_team_mapping table populated by the engineering team
--- or populated automatically by matching query_preview patterns to known feature areas
-
-CREATE TABLE IF NOT EXISTS query_team_mapping (
-    queryid         BIGINT      PRIMARY KEY,
-    team_name       TEXT        NOT NULL,
-    feature_area    TEXT,
-    ticket_ref      TEXT,
-    last_updated    TIMESTAMPTZ DEFAULT NOW()
-);
-
--- Cost rollup by team for the current month
-SELECT
-    COALESCE(qtm.team_name, 'unattributed')     AS team,
-    COALESCE(qtm.feature_area, 'unknown')        AS feature_area,
-    COUNT(DISTINCT qca.queryid)                  AS unique_queries,
-    ROUND(SUM(qca.est_monthly_cost_usd)::numeric, 2)
-                                                 AS total_monthly_cost_usd,
-    ROUND(100.0 * SUM(qca.est_monthly_cost_usd)
-          / NULLIF(SUM(SUM(qca.est_monthly_cost_usd)) OVER (), 0)::numeric, 2)
-                                                 AS pct_of_total
-FROM query_cost_attribution qca
-LEFT JOIN query_team_mapping qtm USING (queryid)
-WHERE qca.captured_at &gt;= DATE_TRUNC('month', NOW())
-GROUP BY qtm.team_name, qtm.feature_area
-ORDER BY total_monthly_cost_usd DESC;</code></pre>
-
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server equivalent
 SELECT
     COALESCE(qtm.team_name, 'unattributed')     AS team,
@@ -1302,20 +983,20 @@ ORDER BY total_monthly_cost_usd DESC;</code></pre>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Query attribution quantifies invisible costs**: most cloud database overspend is driven by a small number of queries whose individual costs are invisible until converted to a per-query monthly dollar figure; `pg_stat_statements`, `sys.dm_exec_query_stats`, and Performance Schema provide the raw data needed to build that figure.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Query attribution quantifies invisible costs**: most cloud database overspend is driven by a small number of queries whose individual costs are invisible until converted to a per-query monthly dollar figure; Query Store and `sys.dm_exec_query_stats` provide the raw data needed to build that figure.</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Three cost signals matter most**: disk blocks read (I/O cost), CPU seconds consumed (compute cost), and call count (aggregate cost from individually cheap queries); ranking queries on the combination of these three rather than on latency alone surfaces the true budget drivers.</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Automate daily attribution and trend detection**: a single attribution snapshot is a debugging tool; a daily time series written to a tracking table becomes a regression detector that surfaces new full-table scans or N+1 patterns within 24 hours of a problematic deploy, long before they appear on the monthly bill.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Different billing models require adjusted attribution logic**: Aurora Serverless v2 attributes cost via ACU-hours weighted by query CPU share, BigQuery via bytes scanned, and Redshift via fraction of cluster time—the correct cost formula depends on the billing model of the service, not a generic CPU/IOPS proxy.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Different billing models require adjusted attribution logic**: Azure SQL serverless attributes cost via vCore-seconds weighted by query CPU share, elastic pools via per-database CPU share of pool cost, and Managed Instance via the standard provisioned model—the correct cost formula depends on the billing model of the service, not a generic CPU/IOPS proxy.</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Sequence matters for RI and Savings Plan purchases**: committing to Reserved Instances before optimizing queries locks in spend at an inflated instance size; the correct order is attribute, optimize, observe, right-size, then commit—turning query-level engineering work directly into durable infrastructure savings.</li></div>
     <div class="mt-14 bg-amber-950/40 border border-amber-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
-        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+        <p class="text-xs text-gray-400">Query plan visualizer · Index advisor · Slow query dashboard · SQL Server</p>
       </div>
       <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
          class="shrink-0 px-6 py-3 bg-amber-600 hover:bg-amber-500 text-white font-semibold rounded-xl text-sm transition">Download Free</a>
     </div>
-    <div class="mt-8 text-xs"><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a></div>
+    <nav class="mt-8 flex flex-col sm:flex-row items-center justify-between gap-3 text-xs"><span><a href="b7-ch17-tiered-storage.html" class="text-gray-400 hover:text-amber-300 transition">← Tiered Storage: Moving Cold Data Cheaply</a></span><span><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">All Chapters</a></span><span><a href="b7-ch19-read-replica-economics.html" class="text-gray-400 hover:text-amber-300 transition">Read Replica Economics: When They Pay Off vs Waste Money →</a></span></nav>
   </article>
   <footer class="border-t border-gray-800/50 px-6 py-8">
     <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · Database FinOps</div>

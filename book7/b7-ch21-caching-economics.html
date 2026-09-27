@@ -39,7 +39,7 @@
     </div>
     <div class="space-y-4 text-sm"><h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 21: Caching Layer Economics: ElastiCache vs Database Direct</h2>
 
-<p class="text-gray-300 leading-relaxed">Organizations that add a properly sized Redis caching layer in front of their RDS or Aurora clusters typically see database costs drop by 30–60% within the first billing cycle. A mid-size SaaS company running an <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">r6g.2xlarge</code> RDS PostgreSQL instance at $876/month can often drop to an <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">r6g.xlarge</code> at $438/month after offloading read traffic to ElastiCache for Redis — a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">cache.r6g.large</code> at $104/month — netting $334/month in savings on a $542/month combined workload. That math gets even more compelling at scale. This chapter walks through the economics of caching layer decisions: when adding cache actually saves money, when it just adds complexity and cost, how to right-size ElastiCache clusters, and how to automate cache hit rate monitoring so you catch degradation before it shows up on your AWS bill.</p>
+<p class="text-gray-300 leading-relaxed">Organizations that add a properly sized Redis caching layer in front of their RDS for SQL Server instances typically see database costs drop by 30–60% within the first billing cycle. A mid-size SaaS company running a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.r5.2xlarge</code> RDS for SQL Server instance at roughly $1,400/month (License Included) can often drop to a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.r5.xlarge</code> at roughly $700/month after offloading read traffic to ElastiCache for Redis — a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">cache.r6g.large</code> at $104/month — netting around $600/month in savings. Rates are illustrative — verify current pricing for your region and edition. That math gets even more compelling at scale. This chapter walks through the economics of caching layer decisions: when adding cache actually saves money, when it just adds complexity and cost, how to right-size ElastiCache clusters, and how to automate cache hit rate monitoring so you catch degradation before it shows up on your AWS bill.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
@@ -53,43 +53,49 @@
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Scenario C — Mixed workload with hot data concentration:</strong> 80% of reads hit 20% of rows. This is the most common production pattern and the most nuanced to optimize.</p>
 
-<p class="text-gray-300 leading-relaxed">The first diagnostic step is measuring your current read/write ratio and query repetition rate directly from the database engine. This query runs against PostgreSQL and gives you the data needed to build the business case:</p>
+<p class="text-gray-300 leading-relaxed">The first diagnostic step is measuring your current read/write ratio and query repetition rate directly from the database engine. This query runs against SQL Server Query Store and gives you the data needed to build the business case:</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify top repeated queries and estimate cache value
--- Run on PostgreSQL with pg_stat_statements enabled
-SELECT
-    left(query, 80)                                      AS query_preview,
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: read/write ratio and query repetition from Query Store
+-- Run on the database with Query Store enabled
+WITH query_agg AS (
+    SELECT
+        q.query_id,
+        LEFT(qt.query_sql_text, 80)                     AS query_preview,
+        SUM(rs.count_executions)                        AS calls,
+        SUM(rs.avg_duration * rs.count_executions)
+            / 1000.0                                    AS total_exec_ms,
+        SUM(rs.avg_rowcount * rs.count_executions)      AS total_rows,
+        SUM(rs.avg_logical_io_reads * rs.count_executions)
+                                                        AS total_logical_reads
+    FROM sys.query_store_query q
+    JOIN sys.query_store_query_text qt ON q.query_text_id = qt.query_text_id
+    JOIN sys.query_store_plan pl       ON pl.query_id = q.query_id
+    JOIN sys.query_store_runtime_stats rs ON rs.plan_id = pl.plan_id
+    WHERE rs.last_execution_time &gt;= DATEADD(DAY, -7, SYSDATETIME())
+    GROUP BY q.query_id, qt.query_sql_text
+    HAVING SUM(rs.count_executions) &gt; 100
+)
+SELECT TOP 50
+    query_preview,
     calls,
-    round(total_exec_time::numeric / calls, 2)           AS avg_ms,
-    round((total_exec_time / 1000)::numeric, 2)          AS total_exec_sec,
-    rows,
-    round(rows::numeric / calls, 1)                      AS avg_rows_returned,
-    shared_blks_hit + shared_blks_read                   AS total_blocks_accessed,
-    round(
-        shared_blks_hit::numeric /
-        NULLIF(shared_blks_hit + shared_blks_read, 0) * 100,
-        1
-    )                                                    AS buffer_hit_pct,
-    -- Queries returning same avg rows are cache candidates
+    ROUND(total_exec_ms / NULLIF(calls, 0), 2)          AS avg_ms,
+    ROUND(total_exec_ms / 1000.0, 2)                    AS total_exec_sec,
+    total_rows,
+    ROUND(CAST(total_rows AS FLOAT) / NULLIF(calls, 0), 1)
+                                                        AS avg_rows_returned,
+    total_logical_reads,
+    -- Queries returning a stable small row set are cache candidates
     CASE
-        WHEN round(rows::numeric / calls, 1) BETWEEN 1 AND 50
-         AND calls &gt; 1000
-         AND round(rows::numeric / calls, 1) = round(rows::numeric / calls, 0)
-        THEN 'HIGH cache candidate'
-        WHEN calls &gt; 500 AND avg_rows_returned &lt; 100
-        THEN 'MEDIUM cache candidate'
+        WHEN calls &gt; 1000
+         AND CAST(total_rows AS FLOAT) / NULLIF(calls, 0) BETWEEN 1 AND 50
+            THEN 'HIGH cache candidate'
+        WHEN calls &gt; 500
+         AND CAST(total_rows AS FLOAT) / NULLIF(calls, 0) &lt; 100
+            THEN 'MEDIUM cache candidate'
         ELSE 'LOW cache value'
-    END                                                  AS cache_recommendation
-FROM
-    pg_stat_statements
-WHERE
-    calls &gt; 100
-    AND query NOT LIKE '%pg_stat%'
-    AND query NOT LIKE 'COMMIT%'
-    AND query NOT LIKE 'BEGIN%'
-ORDER BY
-    calls DESC
-LIMIT 40;</code></pre>
+    END                                                 AS cache_recommendation
+FROM query_agg
+ORDER BY calls DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">For SQL Server on RDS or Azure SQL, the equivalent analysis pulls from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_query_stats</code>:</p>
 
@@ -125,7 +131,7 @@ ORDER BY
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Cache ROI = (Database instance savings per month) − (ElastiCache cost per month)</strong></p>
 
-<p class="text-gray-300 leading-relaxed">A real example: An <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">r6g.4xlarge</code> RDS PostgreSQL Multi-AZ at $3,504/month, processing 45,000 queries/minute with 72% of those being repetitive reads, can be right-sized to an <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">r6g.2xlarge</code> at $1,752/month after caching. Adding a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">cache.r6g.xlarge</code> Redis node at $208/month still nets you $1,544/month in savings (or $1,336/month with a Multi-AZ pair at $416/month for cache redundancy). Cache pays for itself in under one week.</p>
+<p class="text-gray-300 leading-relaxed">A real example: a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.r5.4xlarge</code> RDS for SQL Server Multi-AZ at roughly $5,600/month (License Included, illustrative), processing 45,000 queries/minute with 72% of those being repetitive reads, can be right-sized to a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.r5.2xlarge</code> at roughly $2,800/month after caching. Adding a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">cache.r6g.xlarge</code> Redis node at $208/month still nets roughly $2,590/month in savings (or $2,380/month with a Multi-AZ pair at $416/month for cache redundancy). Cache pays for itself in under one week. Verify current rates for your region and edition.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
@@ -133,55 +139,49 @@ ORDER BY
 
 <p class="text-gray-300 leading-relaxed">The single most common ElastiCache mistake is over-provisioning. Teams spin up <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">cache.r6g.2xlarge</code> nodes because their database is large, when the working set of frequently accessed data is often a fraction of total database size. A 500GB database might have a hot working set of only 8–12GB.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Measuring your actual working set size in PostgreSQL:</strong></p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Measuring your actual working set size in SQL Server:</strong></p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Estimate hot data working set: tables accessed most frequently
--- and their actual size in shared_buffers
-SELECT
-    schemaname,
-    relname                                                     AS table_name,
-    pg_size_pretty(pg_relation_size(relid))                    AS table_size,
-    pg_size_pretty(pg_total_relation_size(relid))              AS total_size_with_indexes,
-    heap_blks_read                                             AS disk_reads,
-    heap_blks_hit                                              AS buffer_hits,
-    round(
-        heap_blks_hit::numeric /
-        NULLIF(heap_blks_hit + heap_blks_read, 0) * 100, 1
-    )                                                          AS buffer_hit_pct,
-    idx_blks_hit,
-    idx_blks_read,
-    -- Tables with high hit rates are already cached in PG buffer pool
-    -- Tables with low hit rates are the cache opportunity
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: estimate hot data working set from index usage and table sizes
+-- Tables with heavy user seeks/scans but low buffer-pool residency are cache candidates
+SELECT TOP 30
+    OBJECT_SCHEMA_NAME(i.object_id)                       AS schema_name,
+    OBJECT_NAME(i.object_id)                               AS table_name,
+    i.name                                                 AS index_name,
+    ius.user_seeks + ius.user_scans                        AS read_operations,
+    ius.user_updates                                       AS write_operations,
+    CAST(SUM(a.total_pages) * 8.0 / 1024 AS DECIMAL(12,2)) AS table_size_mb,
+    -- High reads with low buffer residency = cache opportunity
     CASE
-        WHEN round(heap_blks_hit::numeric /
-             NULLIF(heap_blks_hit + heap_blks_read, 0) * 100, 1) &lt; 80
-        THEN pg_relation_size(relid)
-        ELSE 0
-    END                                                        AS bytes_needing_cache
-FROM
-    pg_statio_user_tables
-WHERE
-    heap_blks_hit + heap_blks_read &gt; 1000
-ORDER BY
-    heap_blks_read DESC
-LIMIT 30;
+        WHEN ius.user_seeks + ius.user_scans &gt; 10000
+         AND ius.user_updates &lt; (ius.user_seeks + ius.user_scans) / 10
+            THEN 'HIGH cache candidate'
+        ELSE 'LOW cache value'
+    END                                                    AS cache_recommendation
+FROM sys.indexes i
+JOIN sys.dm_db_index_usage_stats ius
+    ON ius.object_id = i.object_id AND ius.index_id = i.index_id
+    AND ius.database_id = DB_ID()
+JOIN sys.partitions p ON p.object_id = i.object_id AND p.index_id = i.index_id
+JOIN sys.allocation_units a ON a.container_id = p.hobt_id
+WHERE ius.user_seeks + ius.user_scans &gt; 1000
+GROUP BY i.object_id, i.name, ius.user_seeks, ius.user_scans, ius.user_updates
+ORDER BY read_operations DESC;
 
--- Total estimated cache requirement
+-- Total estimated cache requirement: sum of hot-table data sizes
+WITH hot_tables AS (
+    SELECT DISTINCT i.object_id
+    FROM sys.indexes i
+    JOIN sys.dm_db_index_usage_stats ius
+        ON ius.object_id = i.object_id AND ius.index_id = i.index_id
+        AND ius.database_id = DB_ID()
+    WHERE ius.user_seeks + ius.user_scans &gt; 10000
+)
 SELECT
-    pg_size_pretty(
-        SUM(
-            CASE
-                WHEN round(heap_blks_hit::numeric /
-                     NULLIF(heap_blks_hit + heap_blks_read, 0) * 100, 1) &lt; 80
-                THEN pg_relation_size(relid)
-                ELSE 0
-            END
-        )
-    ) AS estimated_cache_requirement
-FROM
-    pg_statio_user_tables
-WHERE
-    heap_blks_hit + heap_blks_read &gt; 1000;</code></pre>
+    CAST(SUM(a.total_pages) * 8.0 / 1024 / 1024 AS DECIMAL(12,2))
+                                                       AS estimated_cache_requirement_gb
+FROM hot_tables ht
+JOIN sys.partitions p ON p.object_id = ht.object_id
+JOIN sys.allocation_units a ON a.container_id = p.hobt_id;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">With an estimated working set size in hand, the ElastiCache node selection follows a straightforward mapping. For Redis on AWS, target 75–80% memory utilization at steady state to leave headroom for replication buffers and key expiration overhead:</p>
 
@@ -471,7 +471,7 @@ if __name__ == "__main__":
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> At **80% hit rate**: 2,000 requests/minute hit the database. Database can be one tier smaller.</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> At **95% hit rate**: 500 requests/minute hit the database. Database can often drop two tiers.</li>
 
-<p class="text-gray-300 leading-relaxed">For an <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">r6g.4xlarge</code> RDS PostgreSQL Multi-AZ ($3,504/month) that can be right-sized based on cache effectiveness:</p>
+<p class="text-gray-300 leading-relaxed">For a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.r5.4xlarge</code> RDS for SQL Server Multi-AZ (roughly $5,600/month License Included, illustrative) that can be right-sized based on cache effectiveness:</p>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> 80% hit rate → `r6g.2xlarge` ($1,752/month) + `cache.r6g.xlarge` ($208/month) = **$1,544/month savings**</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> 95% hit rate → `r6g.xlarge` ($876/month) + `cache.r6g.xlarge` ($208/month) = **$2,420/month savings**</li>
 
@@ -661,35 +661,27 @@ if __name__ == "__main__":
 
 <p class="text-gray-300 leading-relaxed">4. <strong class="text-white">Deployment or code push flushed the cache</strong> — A common pattern where cache warming hasn't completed post-deployment. Hit rates will recover organically within minutes to hours, but the database spike during that window can trigger auto-scaling events or performance alerts.</p>
 
-<p class="text-gray-300 leading-relaxed">The following SQL query, run against PostgreSQL after a cache hit rate drop, helps identify which tables have suddenly started generating high disk read volume — a direct signal that previously cached data is now bypassing cache:</p>
+<p class="text-gray-300 leading-relaxed">The following SQL Server query, run after a cache hit rate drop, helps identify which tables have suddenly started generating high physical read volume — a direct signal that previously cached data is now bypassing cache:</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Detect tables with increased disk read activity (run periodically and compare)
--- Useful for diagnosing which data tier lost cache coverage
-SELECT
-    schemaname,
-    relname                                                       AS table_name,
-    pg_size_pretty(pg_relation_size(relid))                      AS table_size,
-    heap_blks_read                                               AS disk_reads_total,
-    heap_blks_hit                                                AS buffer_hits_total,
-    round(
-        heap_blks_read::numeric /
-        NULLIF(heap_blks_hit + heap_blks_read, 0) * 100, 2
-    )                                                            AS disk_read_pct,
-    -- Sudden high disk_read_pct on a table that "should" be cached
-    -- signals cache miss on that key pattern
-    CASE
-        WHEN round(heap_blks_read::numeric /
-             NULLIF(heap_blks_hit + heap_blks_read, 0) * 100, 2) &gt; 20
-        THEN 'INVESTIGATE — high disk read ratio'
-        ELSE 'ok'
-    END                                                          AS status
-FROM
-    pg_statio_user_tables
-WHERE
-    heap_blks_read + heap_blks_hit &gt; 500
-ORDER BY
-    disk_read_pct DESC
-LIMIT 25;</code></pre>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: which tables lost cache coverage (physical reads spiking)
+SELECT TOP 30
+    OBJECT_SCHEMA_NAME(i.object_id)                       AS schema_name,
+    OBJECT_NAME(i.object_id)                               AS table_name,
+    SUM(ius.user_seeks + ius.user_scans + ius.user_lookups) AS read_ops,
+    CAST(SUM(a.total_pages) * 8.0 / 1024 AS DECIMAL(12,2)) AS table_size_mb,
+    -- Sudden read-op growth on a table that "should" be cached
+    -- signals cache misses on that key pattern — compare to last week's baseline
+    ius.last_user_seek,
+    ius.last_user_scan
+FROM sys.indexes i
+JOIN sys.dm_db_index_usage_stats ius
+    ON ius.object_id = i.object_id AND ius.index_id = i.index_id
+    AND ius.database_id = DB_ID()
+JOIN sys.partitions p ON p.object_id = i.object_id AND p.index_id = i.index_id
+JOIN sys.allocation_units a ON a.container_id = p.hobt_id
+GROUP BY i.object_id, ius.last_user_seek, ius.last_user_scan
+HAVING SUM(ius.user_seeks + ius.user_scans + ius.user_lookups) &gt; 500
+ORDER BY read_ops DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">For SQL Server on RDS or Azure SQL, the buffer cache miss ratio surfaces through DMVs:</p>
 
@@ -737,7 +729,7 @@ ORDER BY
 
 <p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Application-level in-memory cache</strong> (e.g., a 256MB Python <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">functools.lru_cache</code> or a Go <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sync.Map</code>) absorbs the top 5–10% of the hottest keys with zero network overhead.</p>
 <p class="text-gray-300 leading-relaxed">2. <strong class="text-white">ElastiCache Redis</strong> absorbs the next tier — high-frequency data with moderate working set size.</p>
-<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">RDS/Aurora</strong> handles only cache misses from both layers above.</p>
+<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">RDS for SQL Server</strong> handles only cache misses from both layers above.</p>
 
 <p class="text-gray-300 leading-relaxed">The economics shift materially: the application-level cache costs nothing in AWS infrastructure dollars (it runs in your existing application server memory), so every request it absorbs is pure savings against both ElastiCache and RDS.</p>
 
@@ -746,7 +738,7 @@ ORDER BY
     B -->|"Yes — ~free"| Z[Response]
     B -->|No| C{"L2: Redis<br/>cache hit?"}
     C -->|"Yes — ElastiCache cost"| Z
-    C -->|No| D["L3: RDS/Aurora<br/>(most expensive tier)"]
+    C -->|No| D["L3: RDS SQL Server<br/>(most expensive tier)"]
     D --> Z</pre></div>
 
 <p class="text-gray-300 leading-relaxed">*Each layer above the database absorbs load at a lower marginal cost than the one below it — L1 is free, L2 is metered, L3 is the most expensive tier to hit.*</p>
@@ -759,7 +751,7 @@ ORDER BY
 Two-tier cache implementation with FinOps cost attribution.
 Tier 1: Local in-process LRU cache (zero AWS cost)
 Tier 2: ElastiCache Redis (metered AWS cost)
-Tier 3: RDS PostgreSQL (most expensive tier — minimize hits here)
+Tier 3: RDS for SQL Server (most expensive tier — minimize hits here)
 """
 
 import time
@@ -937,7 +929,7 @@ class TieredCache:
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">21.5 Google Cloud Memorystore vs Cloud SQL: The GCP Equivalent Analysis</h3>
 
-<p class="text-gray-300 leading-relaxed">The economic principles are identical on GCP, but the pricing structure and tooling differ enough to warrant explicit treatment. Google Cloud Memorystore for Redis is the managed caching layer that offloads Cloud SQL (PostgreSQL or MySQL) and AlloyDB workloads.</p>
+<p class="text-gray-300 leading-relaxed">The economic principles are identical on GCP, but the pricing structure and tooling differ enough to warrant explicit treatment. Google Cloud Memorystore for Redis is the managed caching layer that offloads Cloud SQL for SQL Server workloads.</p>
 
 <p class="text-gray-300 leading-relaxed">Memorystore for Redis pricing is capacity-based rather than node-type-based: you pay per GB of provisioned capacity per hour. As of this writing, the Standard Tier (with replication and automatic failover) runs approximately $0.049/GB/hour in us-central1, and the Basic Tier (no replication) runs approximately $0.016/GB/hour. A 10GB Standard Tier instance therefore costs roughly $0.49/hour or $357/month — comparable to an ElastiCache <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">cache.r6g.xlarge</code> for similar memory capacity.</p>
 
@@ -1124,9 +1116,9 @@ if __name__ == "__main__":
     project_id = sys.argv[1] if len(sys.argv) &gt; 1 else "your-gcp-project-id"
     main(project_id)</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">GCP-specific consideration: Memorystore vs AlloyDB Omni caching</strong></p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">GCP-specific consideration: Memorystore vs columnstore caching</strong></p>
 
-<p class="text-gray-300 leading-relaxed">AlloyDB has a columnar cache (the AlloyDB Columnar Engine) that functions as an integrated analytical cache within the database itself. For analytical workloads on AlloyDB, enabling the columnar engine can reduce Memorystore dependency for certain query patterns — but it serves a fundamentally different access pattern than Redis. AlloyDB's columnar cache accelerates scan-heavy analytical queries; Redis accelerates key-value lookups and session storage. They are complements, not substitutes, and the cost analysis should treat them as separate line items.</p>
+<p class="text-gray-300 leading-relaxed">SQL Server has its own integrated analytical cache: clustered columnstore indexes compress scan-heavy tables roughly 10x and serve them from the columnstore segment cache in memory. For analytical workloads on SQL Server, a columnstore index can reduce Memorystore dependency for certain query patterns — but it serves a fundamentally different access pattern than Redis. Columnstore accelerates scan-heavy analytical queries; Redis accelerates key-value lookups and session storage. They are complements, not substitutes, and the cost analysis should treat them as separate line items.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
@@ -1353,37 +1345,7 @@ ORDER BY
 
 <p class="text-gray-300 leading-relaxed">The financial impact of TTL misconfiguration is measurable. A product catalog with a 2-minute TTL instead of a 30-minute TTL will have its entire keyspace invalidated 30 times per hour instead of twice — 15x more often. If your catalog has 50,000 active keys and your database serves each miss in 10ms average, each full invalidation cycle generates 500 seconds of database query time. At 30 cycles per hour, that's 15,000 seconds of database load per hour from the 2-minute TTL, versus 1,000 seconds/hour at 30 minutes — often enough to push you into the next RDS instance tier.</p>
 
-<p class="text-gray-300 leading-relaxed">The following PostgreSQL query helps audit which tables are generating write volume that may be triggering over-eager cache invalidation:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: Identify write-heavy tables that may be driving
--- unnecessary cache invalidation through overly broad flush patterns
-SELECT
-    schemaname,
-    relname                                                      AS table_name,
-    n_tup_ins                                                    AS inserts,
-    n_tup_upd                                                    AS updates,
-    n_tup_del                                                    AS deletes,
-    n_tup_ins + n_tup_upd + n_tup_del                           AS total_writes,
-    n_live_tup                                                   AS live_rows,
-    -- Write rate relative to table size
-    -- High write ratio on small tables = frequent invalidation trigger
-    CASE
-        WHEN n_live_tup &gt; 0
-        THEN round(
-            (n_tup_ins + n_tup_upd + n_tup_del)::numeric
-            / n_live_tup * 100, 2)
-        ELSE 0
-    END                                                          AS write_to_size_ratio,
-    last_vacuum,
-    last_analyze,
-    pg_size_pretty(pg_relation_size(relid))                      AS table_size
-FROM
-    pg_stat_user_tables
-WHERE
-    n_tup_ins + n_tup_upd + n_tup_del &gt; 100
-ORDER BY
-    total_writes DESC
-LIMIT 30;</code></pre>
+<p class="text-gray-300 leading-relaxed">The following SQL Server query helps audit which tables are generating write volume that may be triggering over-eager cache invalidation:</p>
 
 <p class="text-gray-300 leading-relaxed">For SQL Server and Azure SQL, the same write audit against the Query Store and DMVs:</p>
 
@@ -1559,7 +1521,7 @@ output "dashboard_url" {
 <p class="text-gray-300 leading-relaxed">1. Is the average hit rate above the threshold (typically 85%) across all production clusters?</p>
 <p class="text-gray-300 leading-relaxed">2. Are eviction counts trending up — a leading indicator of memory pressure before hit rate degrades?</p>
 <p class="text-gray-300 leading-relaxed">3. Have any clusters been running at under 40% average memory utilization for more than two consecutive weeks? If so, they are candidates for the next right-sizing run.</p>
-<p class="text-gray-300 leading-relaxed">4. Are any new query patterns visible in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> or Query Store that are high-frequency but not yet cached?</p>
+<p class="text-gray-300 leading-relaxed">4. Are any new query patterns visible in Query Store that are high-frequency but not yet cached?</p>
 
 <p class="text-gray-300 leading-relaxed">Answering all four questions takes under 15 minutes when the dashboards are in place. The cumulative effect of this cadence — catching hit rate degradation early, right-sizing overprovisioned nodes quarterly, identifying new caching candidates as applications evolve — compounds over time into savings that substantially exceed the initial cache deployment benefit.</p>
 
@@ -1567,9 +1529,9 @@ output "dashboard_url" {
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Cache ROI is measurable before you deploy**: Query `pg_stat_statements` (PostgreSQL) or `sys.dm_exec_query_stats` and Query Store (SQL Server/Azure SQL) to identify high-frequency, low-row-count queries that are strong caching candidates. Build the savings case with actual execution counts before provisioning any cache infrastructure.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Cache ROI is measurable before you deploy**: Query Query Store or `sys.dm_exec_query_stats` (SQL Server/Azure SQL) to identify high-frequency, low-row-count queries that are strong caching candidates. Build the savings case with actual execution counts before provisioning any cache infrastructure.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Working set size, not total database size, determines cache node selection**: A 500GB database may have a hot working set of 8–12GB. Use `pg_statio_user_tables` or SQL Server buffer pool DMVs to measure the actual data being read frequently, then size ElastiCache, Memorystore, or Azure Cache for Redis to cover that working set at 75–80% utilization — not the full database footprint.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Working set size, not total database size, determines cache node selection**: A 500GB database may have a hot working set of 8–12GB. Use `sys.dm_db_index_usage_stats` and table-size DMVs to measure the actual data being read frequently, then size ElastiCache, Memorystore, or Azure Cache for Redis to cover that working set at 75–80% utilization — not the full database footprint.</li>
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Cache hit rate is the single most important financial control metric**: The difference between an 80% and 95% hit rate on a mid-tier RDS instance can represent hundreds of dollars per month in database sizing savings. Automate CloudWatch or Azure Monitor alarms on hit rate and evictions so degradation triggers notification within minutes, not after your next billing statement.</li>
 
@@ -1579,12 +1541,12 @@ output "dashboard_url" {
     <div class="mt-14 bg-amber-950/40 border border-amber-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
-        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+        <p class="text-xs text-gray-400">Query plan visualizer · Index advisor · Slow query dashboard · SQL Server</p>
       </div>
       <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
          class="shrink-0 px-6 py-3 bg-amber-600 hover:bg-amber-500 text-white font-semibold rounded-xl text-sm transition">Download Free</a>
     </div>
-    <div class="mt-8 text-xs"><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a></div>
+    <nav class="mt-8 flex flex-col sm:flex-row items-center justify-between gap-3 text-xs"><span><a href="b7-ch20-connection-pooling-cost.html" class="text-gray-400 hover:text-amber-300 transition">← Connection Pooling to Reduce Compute Overhead</a></span><span><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">All Chapters</a></span><span><a href="b7-ch22-oltp-vs-analytics.html" class="text-gray-400 hover:text-amber-300 transition">Separating Analytics from OLTP: The Financial Case →</a></span></nav>
   </article>
   <footer class="border-t border-gray-800/50 px-6 py-8">
     <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · Database FinOps</div>

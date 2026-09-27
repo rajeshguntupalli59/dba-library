@@ -47,7 +47,7 @@
 
 <p class="text-gray-300 leading-relaxed">The fundamental problem with running analytics on OLTP instances is a pricing mismatch. OLTP databases are sized for memory and IOPS — you pay premium prices for fast, consistent transaction throughput. Analytics workloads need CPU and sequential scan throughput, which is exactly what columnar stores and MPP engines provide at a fraction of the row-store cost.</p>
 
-<p class="text-gray-300 leading-relaxed">Consider a production setup on AWS: an <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.r6g.4xlarge</code> RDS PostgreSQL instance running in Multi-AZ. At US East pricing, that is approximately $1.53 per hour for the primary, or $2,196 per month for the pair. Now consider what actually runs on that instance. Performance Insights might reveal that 35% of active session time belongs to reporting queries — dashboard aggregations, month-end rollups, data export jobs. That 35% equates to roughly $769 per month in compute cost attributed purely to analytics.</p>
+<p class="text-gray-300 leading-relaxed">Consider a production setup on AWS: a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.r5.4xlarge</code> RDS for SQL Server instance running in Multi-AZ. At US East pricing (License Included, illustrative), that is roughly $2,800 per month for the pair. Now consider what actually runs on that instance. Performance Insights might reveal that 35% of active session time belongs to reporting queries — dashboard aggregations, month-end rollups, data export jobs. That 35% equates to roughly $769 per month in compute cost attributed purely to analytics.</p>
 
 <p class="text-gray-300 leading-relaxed">The same queries on Amazon Redshift Serverless, priced at $0.375 per RPU-hour, would consume perhaps 8–12 RPU-hours for a typical daily analytics batch. Monthly cost: $90–$135. The math alone closes the case before you have written a single line of migration code.</p>
 
@@ -55,29 +55,47 @@
 
 <p class="text-gray-300 leading-relaxed">The first step is measuring your current baseline with precision.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: Identify analytics queries consuming disproportionate resources
--- Run on RDS PostgreSQL or Aurora PostgreSQL with pg_stat_statements enabled
-SELECT
-    left(query, 120)                                         AS query_snippet,
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: identify analytics queries consuming disproportionate resources
+-- Run on RDS for SQL Server with Query Store enabled
+WITH query_totals AS (
+    SELECT
+        q.query_id,
+        LEFT(qt.query_sql_text, 120)                        AS query_snippet,
+        SUM(rs.count_executions)                             AS calls,
+        SUM(rs.avg_duration * rs.count_executions)
+            / 1000000.0                                      AS total_exec_sec,
+        AVG(rs.avg_duration) / 1000.0                        AS mean_exec_ms,
+        SUM(rs.avg_rowcount * rs.count_executions)           AS total_rows,
+        SUM(rs.avg_logical_io_reads * rs.count_executions)   AS total_blocks_accessed
+    FROM sys.query_store_query q
+    JOIN sys.query_store_query_text qt ON q.query_text_id = qt.query_text_id
+    JOIN sys.query_store_plan pl       ON pl.query_id = q.query_id
+    JOIN sys.query_store_runtime_stats rs ON rs.plan_id = pl.plan_id
+    WHERE rs.last_execution_time &gt;= DATEADD(DAY, -7, SYSDATETIME())
+    GROUP BY q.query_id, qt.query_sql_text
+    HAVING SUM(rs.count_executions) &gt; 10
+)
+SELECT TOP 40
+    query_snippet,
     calls,
-    round((total_exec_time / 1000)::numeric, 2)             AS total_exec_sec,
-    round((mean_exec_time  / 1000)::numeric, 4)             AS mean_exec_sec,
-    round((total_exec_time / sum(total_exec_time) OVER ()
-           * 100)::numeric, 2)                              AS pct_total_time,
-    round(rows / calls::numeric, 0)                         AS avg_rows_returned,
-    shared_blks_read + shared_blks_hit                      AS total_blocks_accessed,
+    ROUND(total_exec_sec, 2)                              AS total_exec_sec,
+    ROUND(mean_exec_ms / 1000.0, 4)                       AS mean_exec_sec,
+    ROUND(100.0 * total_exec_sec
+          / NULLIF(SUM(total_exec_sec) OVER (), 0), 2)    AS pct_total_time,
+    ROUND(CAST(total_rows AS FLOAT) / NULLIF(calls, 0), 0) AS avg_rows_returned,
+    total_blocks_accessed,
     -- High rows returned + long execution = likely analytics, not OLTP
     CASE
-        WHEN mean_exec_time &gt; 5000
-             AND rows / calls &gt; 10000 THEN 'ANALYTICS_CANDIDATE'
-        WHEN mean_exec_time &gt; 1000
-             AND rows / calls &gt; 1000  THEN 'REVIEW_NEEDED'
+        WHEN mean_exec_ms &gt; 5000
+         AND CAST(total_rows AS FLOAT) / NULLIF(calls, 0) &gt; 10000
+            THEN 'ANALYTICS_CANDIDATE'
+        WHEN mean_exec_ms &gt; 1000
+         AND CAST(total_rows AS FLOAT) / NULLIF(calls, 0) &gt; 1000
+            THEN 'REVIEW_NEEDED'
         ELSE 'OLTP'
-    END                                                     AS workload_classification
-FROM pg_stat_statements
-WHERE calls &gt; 10
-ORDER BY total_exec_time DESC
-LIMIT 40;</code></pre>
+    END                                                   AS workload_classification
+FROM query_totals
+ORDER BY total_exec_sec DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">This query gives you the classification foundation. Any query returning more than 10,000 rows on average or running longer than 5 seconds mean execution time is an analytics candidate that does not belong on an OLTP instance. Export this result set. It becomes the financial exhibit in your executive presentation.</p>
 
@@ -133,7 +151,7 @@ from dataclasses import dataclass
 from typing import Dict, List
 
 # ── Configuration ────────────────────────────────────────────────────────────
-DB_INSTANCE_ID  = "prod-postgres-01"
+DB_INSTANCE_ID  = "prod-sqlserver-01"
 REGION          = "us-east-1"
 INSTANCE_TYPE   = "db.r6g.4xlarge"
 MULTI_AZ        = True
@@ -202,7 +220,7 @@ def get_pi_metrics(client, db_id: str, hours: int = 24) -&gt; pd.DataFrame:
 
 def classify_query(sql: str) -&gt; str:
     """
-    Heuristic classification. Replace with pg_stat_statements
+    Heuristic classification. Replace with Query Store
     integration for production use.
     """
     sql_upper = sql.upper()
@@ -292,28 +310,27 @@ if __name__ == "__main__":
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Scenario 1 — Latency-tolerant batch analytics, large data volumes</strong>: Amazon Redshift Serverless (AWS), Azure Synapse Analytics serverless SQL pools (Azure), or BigQuery (GCP). These are columnar MPP engines billed per query or per RPU-hour. A query scanning 500 GB of Parquet in BigQuery costs $2.50 flat. The same query on an <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">r6g.4xlarge</code> RDS instance spending 45 minutes of CPU time costs roughly $1.15 in compute plus weeks of DBA time managing contention. Over a month of daily runs, BigQuery at $2.50 per day is $75; the RDS share is $840.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Scenario 2 — Near-real-time dashboards against production data, sub-minute lag tolerance</strong>: Aurora read replicas or RDS read replicas. The replica runs on a smaller instance — you do not need the same IOPS tier as primary. An Aurora PostgreSQL read replica on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.r6g.xlarge</code> at $0.384/hour costs $280/month versus the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.r6g.4xlarge</code> primary at $2,196/month. Dashboard queries go to the replica; primary stays clean for writes.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Scenario 2 — Near-real-time dashboards against production data, sub-minute lag tolerance</strong>: readable Always On secondaries or Azure SQL geo-replicas. The secondary runs on a smaller instance — you do not need the same IOPS tier as primary. An RDS for SQL Server readable secondary on a smaller instance class costs a fraction of the primary while dashboard queries stay off the primary; primary stays clean for writes. On Azure SQL, a readable geo-secondary billed at its own vCore size serves the same role.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Scenario 3 — Ad-hoc analyst queries against recent data already exported</strong>: Amazon Athena over S3. Export a daily snapshot of your OLTP tables to S3 in Parquet format. Athena charges $5 per TB scanned, and column pruning plus Parquet compression typically means analysts scan 90–95% less data than the raw row size. A 100 GB Parquet file holding 1 TB of logical data costs $0.50 per full scan instead of $5.00.</p>
 
-<p class="text-gray-300 leading-relaxed">The following script sets up a daily export from RDS PostgreSQL to S3 using <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_dump</code> via AWS CLI, enabling Athena queries without touching production:</p>
+<p class="text-gray-300 leading-relaxed">The following script sets up a daily export from RDS for SQL Server to S3 using native backup to S3 (or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">bcp</code> for table extracts) via AWS CLI, enabling Athena queries without touching production:</p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/usr/bin/env bash
 # daily_analytics_export.sh
-# Exports selected analytical tables from RDS to S3 as CSV,
+# Exports selected analytical tables from RDS for SQL Server to S3 as CSV,
 # convertible to Parquet via AWS Glue or Athena CTAS.
 # Schedule: cron 0 2 * * * (02:00 UTC daily)
+# Requires: sqlcmd (ODBC Driver 18 for SQL Server)
 
 set -euo pipefail
 
-DB_HOST="prod-postgres-01.cluster-xyz.us-east-1.rds.amazonaws.com"
+DB_HOST="prod-sqlserver-01.xyz.us-east-1.rds.amazonaws.com"
 DB_NAME="appdb"
 DB_USER="readonly_analytics"
+DB_PASS="&lt;redacted&gt;"
 S3_BUCKET="s3://my-company-analytics-lake"
 DATE_PREFIX=$(date +%Y/%m/%d)
-PGPASSWORD="${ANALYTICS_DB_PASSWORD}"   # sourced from SSM Parameter Store at runtime
-
-export PGPASSWORD
 
 TABLES=(
   "orders"
@@ -323,20 +340,15 @@ TABLES=(
   "events"
 )
 
-echo "[$(date -u +%FT%T)] Starting analytics export …"
+echo "[$(date -u +%FT%T)] Starting analytics export ..."
 
 for TABLE in "${TABLES[@]}"; do
   LOCAL_FILE="/tmp/${TABLE}_$(date +%Y%m%d).csv"
 
-  echo "  Exporting ${TABLE} …"
-  psql \
-    --host="${DB_HOST}" \
-    --username="${DB_USER}" \
-    --dbname="${DB_NAME}" \
-    --no-password \
-    --command="\COPY (SELECT * FROM ${TABLE} WHERE updated_at &gt;= NOW() - INTERVAL '1 day')
-               TO STDOUT WITH CSV HEADER" \
-    &gt; "${LOCAL_FILE}"
+  echo "  Exporting ${TABLE} ..."
+  sqlcmd -S "${DB_HOST},1433" -U "${DB_USER}" -P "${DB_PASS}" -d "${DB_NAME}" \
+    -Q "SET NOCOUNT ON; SELECT * FROM dbo.${TABLE} WHERE updated_at &gt;= DATEADD(DAY, -1, SYSDATETIME())" \
+    -s"," -W -k1 > "${LOCAL_FILE}"
 
   # Upload to date-partitioned S3 prefix
   aws s3 cp "${LOCAL_FILE}" \
@@ -345,14 +357,9 @@ for TABLE in "${TABLES[@]}"; do
     --sse aws:kms
 
   rm -f "${LOCAL_FILE}"
-  echo "  ✓ ${TABLE} uploaded."
 done
 
-# Optionally trigger Glue crawler to update Athena catalog
-aws glue start-crawler --name "analytics-lake-crawler" || true
-
-echo "[$(date -u +%FT%T)] Export complete."
-unset PGPASSWORD</code></pre>
+echo "[$(date -u +%FT%T)] Export complete."</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">--storage-class INTELLIGENT_TIERING</code> flag is intentional. Analytics data accessed heavily the day after export and rarely thereafter fits the Intelligent-Tiering pattern, which automatically moves objects to lower-cost tiers after 30 and 90 days of inactivity. For a 500 GB dataset, this can reduce S3 storage cost from $11.50/month (Standard) to $6.00/month within two months.</p>
 
@@ -431,7 +438,7 @@ PYEOF</code></pre>
 """
 workload_drift_monitor.py
 
-Monitors pg_stat_statements on RDS PostgreSQL via a read-only connection
+Monitors Query Store on RDS for SQL Server via a read-only connection
 and alerts via SNS when analytics query load exceeds threshold.
 
 Intended deployment: AWS Lambda, triggered every 15 minutes via EventBridge.
@@ -444,7 +451,7 @@ Environment variables:
 import json
 import os
 import boto3
-import psycopg2
+import pyodbc
 from datetime import datetime, timezone
 
 sns     = boto3.client("sns")
@@ -457,33 +464,43 @@ DB_SECRET_ARN   = os.environ["DB_SECRET_ARN"]
 ANALYTICS_CLASSIFICATION_QUERY = """
 WITH stmt_stats AS (
     SELECT
-        queryid,
-        left(query, 200)                                    AS query_snippet,
-        total_exec_time,
-        calls,
-        rows,
-        mean_exec_time,
-        rows / NULLIF(calls, 0)                            AS avg_rows_per_call,
+        q.query_id,
+        LEFT(qt.query_sql_text, 200)                        AS query_snippet,
+        SUM(rs.avg_duration * rs.count_executions)
+            / 1000.0                                        AS total_exec_time_ms,
+        SUM(rs.count_executions)                            AS calls,
+        SUM(rs.avg_rowcount * rs.count_executions)          AS rows,
+        AVG(rs.avg_duration) / 1000.0                       AS mean_exec_time_ms,
+        SUM(rs.avg_rowcount * rs.count_executions)
+            / NULLIF(SUM(rs.count_executions), 0)           AS avg_rows_per_call,
         -- Classify heuristically; tune thresholds for your workload
         CASE
-            WHEN mean_exec_time &gt; 3000
-                 AND rows / NULLIF(calls, 0) &gt; 5000        THEN 'ANALYTICS'
-            WHEN query ILIKE '%group by%'
-                 AND mean_exec_time &gt; 1000                 THEN 'ANALYTICS'
-            WHEN query ILIKE '%partition by%'              THEN 'ANALYTICS'
-            WHEN query ILIKE '%date_trunc%'
-                 AND rows / NULLIF(calls, 0) &gt; 500         THEN 'ANALYTICS'
+            WHEN AVG(rs.avg_duration) / 1000.0 &gt; 3000
+                 AND SUM(rs.avg_rowcount * rs.count_executions)
+                     / NULLIF(SUM(rs.count_executions), 0) &gt; 5000
+                                                              THEN 'ANALYTICS'
+            WHEN qt.query_sql_text LIKE '%GROUP BY%'
+                 AND AVG(rs.avg_duration) / 1000.0 &gt; 1000  THEN 'ANALYTICS'
+            WHEN qt.query_sql_text LIKE '%OVER(%'          THEN 'ANALYTICS'
+            WHEN qt.query_sql_text LIKE '%DATEADD%'
+                 AND SUM(rs.avg_rowcount * rs.count_executions)
+                     / NULLIF(SUM(rs.count_executions), 0) &gt; 500
+                                                              THEN 'ANALYTICS'
             ELSE 'OLTP'
         END                                                 AS workload_class
-    FROM pg_stat_statements
-    WHERE calls &gt; 5
-      AND query NOT LIKE '%pg_stat_statements%'
+    FROM sys.query_store_query q
+    JOIN sys.query_store_query_text qt ON q.query_text_id = qt.query_text_id
+    JOIN sys.query_store_plan pl       ON pl.query_id = q.query_id
+    JOIN sys.query_store_runtime_stats rs ON rs.plan_id = pl.plan_id
+    WHERE rs.last_execution_time &gt;= DATEADD(HOUR, -1, SYSDATETIME())
+    GROUP BY q.query_id, qt.query_sql_text
+    HAVING SUM(rs.count_executions) &gt; 5
 ),
 totals AS (
     SELECT
         workload_class,
-        SUM(total_exec_time)                               AS class_exec_time,
-        COUNT(*)                                           AS query_count
+        SUM(total_exec_time_ms)                             AS class_exec_time,
+        COUNT(*)                                            AS query_count
     FROM stmt_stats
     GROUP BY workload_class
 )
@@ -506,20 +523,18 @@ def get_db_credentials(secret_arn: str) -&gt; dict:
 
 
 def query_workload_distribution(creds: dict) -&gt; list[dict]:
-    conn = psycopg2.connect(
-        host=creds["host"],
-        port=creds.get("port", 5432),
-        dbname=creds["dbname"],
-        user=creds["username"],
-        password=creds["password"],
-        connect_timeout=10,
-        sslmode="require",
+    conn_str = (
+        "DRIVER={ODBC Driver 18 for SQL Server};"
+        f"SERVER={creds['host']},{creds.get('port', 1433)};"
+        f"DATABASE={creds['dbname']};UID={creds['username']};PWD={creds['password']};"
+        "Encrypt=yes;TrustServerCertificate=no;Connection Timeout=10;"
     )
+    conn = pyodbc.connect(conn_str)
     try:
-        with conn.cursor() as cur:
-            cur.execute(ANALYTICS_CLASSIFICATION_QUERY)
-            cols = [d[0] for d in cur.description]
-            return [dict(zip(cols, row)) for row in cur.fetchall()]
+        cur = conn.cursor()
+        cur.execute(ANALYTICS_CLASSIFICATION_QUERY)
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
     finally:
         conn.close()
 
@@ -540,7 +555,7 @@ def build_alert_message(rows: list[dict], analytics_pct: float) -&gt; str:
         )
     lines += [
         "",
-        "Action: Review pg_stat_statements on the OLTP instance and confirm",
+        "Action: Review Query Store on the OLTP instance and confirm",
         "analytical queries have not been re-routed to the primary.",
         "Runbook: https://wiki.internal/db-finops/workload-separation-runbook",
     ]
@@ -729,20 +744,20 @@ GO</code></pre>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Mixed workloads are a billing multiplier.** Analytics queries running on OLTP infrastructure force you to pay row-store prices for column-store workloads. Measuring the split with `pg_stat_statements` or `sys.dm_exec_query_stats` is the necessary first step before any cost conversation.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Mixed workloads are a billing multiplier.** Analytics queries running on OLTP infrastructure force you to pay row-store prices for column-store workloads. Measuring the split with Query Store or `sys.dm_exec_query_stats` is the necessary first step before any cost conversation.</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The financial case has three compounding layers**: offloading analytics reduces attributed compute cost, lower sustained load allows an instance downsize, and a smaller instance purchases at a lower Reserved Instance tier. Each layer multiplies the previous saving.</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Choose the analytics target by query pattern, not by vendor familiarity.** Near-real-time dashboards belong on a read replica. Batch aggregations over large historical data belong on a columnar MPP engine. Ad-hoc analyst queries against exported snapshots belong on Athena or BigQuery. Routing everything to a single alternative is a common mistake that recreates the original cost problem.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Separation without monitoring drifts back.** Workload classification alerts — whether a Lambda querying `pg_stat_statements` or a SQL Server Agent job writing to a log table — are the operational control that prevents analytics load from silently re-accumulating on the primary over subsequent release cycles.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Separation without monitoring drifts back.** Workload classification alerts — whether a Lambda querying Query Store or a SQL Server Agent job writing to a log table — are the operational control that prevents analytics load from silently re-accumulating on the primary over subsequent release cycles.</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Sequence implementation over 10–12 weeks with explicit rollback paths.** Instance resizes and RI purchases are irreversible commitments. Validate workload behavior at each phase before proceeding to the next, and keep the original routing available as fallback until query results and latency have been confirmed stable on the new target.</li></div>
     <div class="mt-14 bg-amber-950/40 border border-amber-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
-        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+        <p class="text-xs text-gray-400">Query plan visualizer · Index advisor · Slow query dashboard · SQL Server</p>
       </div>
       <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
          class="shrink-0 px-6 py-3 bg-amber-600 hover:bg-amber-500 text-white font-semibold rounded-xl text-sm transition">Download Free</a>
     </div>
-    <div class="mt-8 text-xs"><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a></div>
+    <nav class="mt-8 flex flex-col sm:flex-row items-center justify-between gap-3 text-xs"><span><a href="b7-ch21-caching-economics.html" class="text-gray-400 hover:text-amber-300 transition">← Caching Layer Economics: ElastiCache vs Database Direct</a></span><span><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">All Chapters</a></span><span><a href="b7-ch23-tagging-strategy.html" class="text-gray-400 hover:text-amber-300 transition">Tagging Strategy for Database Cost Allocation →</a></span></nav>
   </article>
   <footer class="border-t border-gray-800/50 px-6 py-8">
     <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · Database FinOps</div>

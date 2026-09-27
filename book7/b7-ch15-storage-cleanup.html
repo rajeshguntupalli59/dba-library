@@ -39,7 +39,7 @@
     </div>
     <div class="space-y-4 text-sm"><h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 15: Automated Storage Cleanup: Snapshots, Temp Tables, and Bloat</h2>
 
-<p class="text-gray-300 leading-relaxed">Storage is the silent budget drain that most engineering teams discover too late. A typical production RDS PostgreSQL instance that has been running for 18 months accumulates between 40% and 70% of its total storage bill in artifacts that provide zero ongoing business value: orphaned snapshots from deprecated environments, bloated tables where dead tuples outnumber live ones three to one, temporary tables that survived a connection restart, and transaction log backups that retention policies never cleaned up. Organizations running mid-scale database fleets on AWS, Azure, or GCP routinely find $8,000 to $25,000 per month in recoverable storage spend once they instrument and automate cleanup properly. This chapter gives you the diagnostic queries, the cleanup logic, and the scheduled automation to capture that money — and keep capturing it every month without manual intervention.</p>
+<p class="text-gray-300 leading-relaxed">Storage is the silent budget drain that most engineering teams discover too late. A typical production RDS for SQL Server instance that has been running for 18 months accumulates between 40% and 70% of its total storage bill in artifacts that provide zero ongoing business value: orphaned snapshots from deprecated environments, fragmented indexes and data files grown far beyond the live data they hold, temporary tables that survived a connection restart, and transaction log backups that retention policies never cleaned up. Organizations running mid-scale database fleets on AWS, Azure, or GCP routinely find $8,000 to $25,000 per month in recoverable storage spend once they instrument and automate cleanup properly. This chapter gives you the diagnostic queries, the cleanup logic, and the scheduled automation to capture that money — and keep capturing it every month without manual intervention.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
@@ -314,264 +314,9 @@ def lambda_handler(event, context):
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">15.3 Identifying and Reclaiming Table Bloat in PostgreSQL</h3>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">15.3 Identifying and Reclaiming Index Fragmentation and File Growth in SQL Server</h3>
 
-<p class="text-gray-300 leading-relaxed">Table bloat is one of the most persistent and expensive PostgreSQL storage problems. Every UPDATE and DELETE operation leaves dead tuples in the heap. PostgreSQL's MVCC architecture requires this for transaction isolation, but autovacuum's job is to reclaim that space over time. When autovacuum is misconfigured, under-resourced, or blocked, dead tuples accumulate faster than they are reclaimed, and table files grow without bound.</p>
-
-<p class="text-gray-300 leading-relaxed">A heavily bloated table might have 3 GB of actual live data inside a 10 GB file. You are paying for 10 GB of provisioned storage — and in some cases 10 GB of backup storage — to hold 3 GB of useful data. On a gp3 volume at $0.092/GB-month, that 7 GB of bloat costs $0.64/month per table. Across a schema with 200 bloated tables, that becomes $128/month in wasted storage, plus the performance cost of sequential scans reading 3x more data than necessary.</p>
-
-<p class="text-gray-300 leading-relaxed">The following query identifies your worst bloat offenders using the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pgstattuple</code> extension, which provides accurate physical measurement of dead tuple space:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: Identify tables with significant bloat
--- Requires: CREATE EXTENSION IF NOT EXISTS pgstattuple;
--- Run as superuser or with pg_stat_scan_tables privilege
--- This performs physical table scans — run during off-peak hours on large tables
-
-CREATE EXTENSION IF NOT EXISTS pgstattuple;
-
-WITH bloat_analysis AS (
-  SELECT
-    schemaname,
-    tablename,
-    pg_size_pretty(pg_total_relation_size(schemaname || '.' || tablename))
-                                                  AS total_size,
-    pg_total_relation_size(schemaname || '.' || tablename)
-                                                  AS total_bytes,
-    (pgstattuple(schemaname || '.' || tablename)).dead_tuple_percent
-                                                  AS dead_pct,
-    (pgstattuple(schemaname || '.' || tablename)).dead_tuple_len
-                                                  AS dead_bytes,
-    (pgstattuple(schemaname || '.' || tablename)).free_space
-                                                  AS free_bytes,
-    (pgstattuple(schemaname || '.' || tablename)).tuple_count
-                                                  AS live_tuples
-  FROM
-    pg_tables
-  WHERE
-    schemaname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
-    -- Filter to tables worth analyzing (&gt; 100 MB)
-    AND pg_total_relation_size(schemaname || '.' || tablename) &gt; 104857600
-),
-cost_estimate AS (
-  SELECT
-    schemaname,
-    tablename,
-    total_size,
-    total_bytes,
-    dead_pct,
-    live_tuples,
-    dead_bytes                                              AS reclaimable_bytes,
-    free_bytes,
-    -- Estimate reclaimable GB and monthly cost at gp3 pricing ($0.092/GB-month)
-    ROUND((dead_bytes + free_bytes) / 1073741824.0, 3)     AS reclaimable_gb,
-    ROUND(
-      ((dead_bytes + free_bytes) / 1073741824.0) * 0.092,
-      4
-    )                                                       AS monthly_waste_usd
-  FROM
-    bloat_analysis
-  WHERE
-    dead_pct &gt; 10  -- Only surface tables with meaningful bloat
-)
-SELECT
-  schemaname,
-  tablename,
-  total_size,
-  ROUND(dead_pct, 1)                                        AS dead_pct,
-  live_tuples,
-  pg_size_pretty(reclaimable_bytes)                         AS reclaimable_data,
-  reclaimable_gb,
-  monthly_waste_usd,
-  CASE
-    WHEN dead_pct &gt; 50 THEN 'VACUUM FULL or pg_repack immediately'
-    WHEN dead_pct &gt; 25 THEN 'Schedule pg_repack within 7 days'
-    WHEN dead_pct &gt; 10 THEN 'Tune autovacuum thresholds'
-    ELSE 'Monitor'
-  END                                                       AS recommended_action
-FROM
-  cost_estimate
-ORDER BY
-  monthly_waste_usd DESC
-LIMIT 30;</code></pre>
-
-<p class="text-gray-300 leading-relaxed">When this query surfaces tables with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dead_pct > 50</code>, your first instinct might be to run <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VACUUM FULL</code>. On a busy production system, avoid it. <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VACUUM FULL</code> acquires an <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">AccessExclusiveLock</code>, blocking all reads and writes for the duration of the operation. On a 50 GB table with heavy fragmentation, that can mean 45 minutes to 2 hours of complete table unavailability.</p>
-
-<p class="text-gray-300 leading-relaxed">Use <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_repack</code> instead. It rebuilds the table online using a trigger-based approach that tracks changes during the rebuild and applies them at the final cutover, which requires only a brief lock at the end. Install it as a PostgreSQL extension and run it from a scheduled cron job on the database host or from a container:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/bin/bash
-# pg_repack_bloated_tables.sh
-# Run as a weekly cron job: 0 1 * * 0 /opt/dba/pg_repack_bloated_tables.sh
-# Prerequisites: pg_repack installed on the PostgreSQL server
-#   Amazon Linux / RHEL: yum install pg_repack_16
-#   Debian/Ubuntu: apt install postgresql-16-repack
-
-set -euo pipefail
-
-PGHOST="${PGHOST:-localhost}"
-PGPORT="${PGPORT:-5432}"
-PGUSER="${PGUSER:-postgres}"
-PGDATABASE="${PGDATABASE:-myapp}"
-LOG_FILE="/var/log/pg_repack_$(date +%Y%m%d).log"
-MIN_BLOAT_PCT=25          # Only repack tables with &gt;= 25% dead tuples
-MIN_TABLE_SIZE_MB=100     # Only repack tables &gt;= 100 MB
-MAX_REPACK_MINUTES=240    # Timeout per table
-
-exec &gt; &gt;(tee -a "$LOG_FILE") 2&gt;&1
-echo "=== pg_repack run started: $(date) ==="
-
-# Get list of bloated tables using pg_stat_user_tables (lightweight, no pgstattuple scan)
-# n_dead_tup / nullif(n_live_tup + n_dead_tup, 0) gives approximate dead ratio
-BLOATED_TABLES=$(psql \
-  -h "$PGHOST" \
-  -p "$PGPORT" \
-  -U "$PGUSER" \
-  -d "$PGDATABASE" \
-  -t -A -F '|' \
-  -c "
-    SELECT
-      schemaname || '.' || relname,
-      ROUND(100.0 * n_dead_tup / NULLIF(n_live_tup + n_dead_tup, 0), 1) AS dead_pct,
-      pg_size_pretty(pg_total_relation_size(schemaname || '.' || relname)) AS size
-    FROM
-      pg_stat_user_tables
-    WHERE
-      n_dead_tup &gt; 0
-      AND (n_live_tup + n_dead_tup) &gt; 0
-      AND ROUND(100.0 * n_dead_tup / NULLIF(n_live_tup + n_dead_tup, 0), 1) &gt;= $MIN_BLOAT_PCT
-      AND pg_total_relation_size(schemaname || '.' || relname) &gt; ($MIN_TABLE_SIZE_MB * 1024 * 1024)
-    ORDER BY
-      n_dead_tup DESC
-    LIMIT 20;
-  ")
-
-if [ -z "$BLOATED_TABLES" ]; then
-  echo "No tables meet bloat threshold. Exiting."
-  exit 0
-fi
-
-echo "Tables scheduled for repack:"
-echo "$BLOATED_TABLES" | column -t -s '|' -N "Table,Dead%,Size"
-
-TOTAL_REPACKED=0
-TOTAL_FAILED=0
-
-while IFS='|' read -r table_name dead_pct table_size; do
-  echo ""
-  echo "--- Repacking: $table_name (dead_pct: $dead_pct%, size: $table_size) ---"
-  START_TIME=$(date +%s)
-
-  if timeout "${MAX_REPACK_MINUTES}m" \
-      pg_repack \
-        --host="$PGHOST" \
-        --port="$PGPORT" \
-        --username="$PGUSER" \
-        --dbname="$PGDATABASE" \
-        --table="$table_name" \
-        --no-superuser-check \
-        2&gt;&1; then
-    END_TIME=$(date +%s)
-    DURATION=$(( END_TIME - START_TIME ))
-    echo "SUCCESS: $table_name repacked in ${DURATION}s"
-    TOTAL_REPACKED=$(( TOTAL_REPACKED + 1 ))
-  else
-    END_TIME=$(date +%s)
-    DURATION=$(( END_TIME - START_TIME ))
-    echo "FAILED: $table_name repack failed after ${DURATION}s"
-    TOTAL_FAILED=$(( TOTAL_FAILED + 1 ))
-  fi
-done &lt;&lt;&lt; "$BLOATED_TABLES"
-
-echo ""
-echo "=== pg_repack run completed: $(date) ==="
-echo "    Tables repacked successfully : $TOTAL_REPACKED"
-echo "    Tables failed                : $TOTAL_FAILED"
-echo "    Log: $LOG_FILE"</code></pre>
-
-<p class="text-gray-300 leading-relaxed">After a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_repack</code> run, the table file physically shrinks. On a gp3 volume, RDS does not automatically reduce provisioned storage when files shrink — you still pay for the provisioned capacity. However, if you are using RDS storage autoscaling, reclaiming physical space prevents the autoscaler from triggering an upward expansion, which is permanent. Preventing a 100 GB autoscale event avoids $9.20/month in perpetual cost.</p>
-
-<p class="text-gray-300 leading-relaxed">If you want to actually reduce provisioned storage on RDS after reclaiming significant bloat, the path is a snapshot restore to a new instance with a lower storage allocation, followed by a DNS cutover. Chapter 16 covers that procedure in full. For now, the bloat cleanup is still worth doing for the performance benefit, the backup size reduction, and the autoscale prevention.</p>
-
-<p class="text-gray-300 leading-relaxed">#### Autovacuum Tuning to Prevent Bloat Recurrence</p>
-
-<p class="text-gray-300 leading-relaxed">Reclaiming bloat through <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_repack</code> is treating the symptom. The cause is usually one of three autovacuum configuration failures:</p>
-
-<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Threshold mismatch</strong>: The default <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">autovacuum_vacuum_scale_factor = 0.2</code> means autovacuum does not trigger until 20% of the table's rows are dead. On a 100-million-row table, that is 20 million dead tuples before any cleanup begins. By then, bloat is severe.</p>
-
-<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Worker starvation</strong>: The default <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">autovacuum_max_workers = 3</code> is insufficient for schemas with hundreds of tables. Workers queue up, high-churn tables fall behind.</p>
-
-<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Cost throttling</strong>: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">autovacuum_vacuum_cost_delay = 2ms</code> with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">autovacuum_vacuum_cost_limit = 200</code> throttles vacuum I/O heavily to avoid impacting production queries. On high-churn tables, this means vacuuming cannot keep pace with the write rate.</p>
-
-<p class="text-gray-300 leading-relaxed">Apply per-table storage parameters to your highest-churn tables rather than modifying the global defaults, which affect all tables:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: Per-table autovacuum tuning for high-churn tables
--- Identify high-churn tables: n_tup_upd + n_tup_del &gt; 100000 per day
-
--- Aggressive autovacuum for a high-update OLTP table
-ALTER TABLE orders SET (
-  autovacuum_vacuum_scale_factor     = 0.01,   -- vacuum when 1% rows are dead (vs 20%)
-  autovacuum_vacuum_threshold        = 1000,   -- vacuum when &gt;= 1000 dead tuples
-  autovacuum_analyze_scale_factor    = 0.005,  -- analyze when 0.5% rows change
-  autovacuum_vacuum_cost_delay       = 0,      -- no throttling for this table
-  autovacuum_vacuum_cost_limit       = 800     -- allow higher I/O rate
-);
-
--- Slightly more conservative for a large append-mostly table
-ALTER TABLE events SET (
-  autovacuum_vacuum_scale_factor     = 0.05,
-  autovacuum_vacuum_threshold        = 5000,
-  autovacuum_analyze_scale_factor    = 0.02,
-  autovacuum_vacuum_cost_delay       = 2,
-  autovacuum_vacuum_cost_limit       = 400
-);
-
--- Verify the per-table settings are applied
-SELECT
-  relname,
-  reloptions
-FROM
-  pg_class
-WHERE
-  reloptions IS NOT NULL
-  AND relkind = 'r'
-ORDER BY
-  relname;</code></pre>
-
-<p class="text-gray-300 leading-relaxed">Monitor the effect of these changes using <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_user_tables</code>. After applying per-table tuning, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">n_dead_tup</code> for the affected tables should plateau well below the threshold that triggers bloat:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: Monitor autovacuum effectiveness after tuning
--- Run daily and track n_dead_tup trend over time
-
-SELECT
-  schemaname,
-  relname                                             AS table_name,
-  n_live_tup,
-  n_dead_tup,
-  ROUND(
-    100.0 * n_dead_tup / NULLIF(n_live_tup + n_dead_tup, 0),
-    1
-  )                                                   AS dead_pct,
-  last_vacuum,
-  last_autovacuum,
-  last_analyze,
-  last_autoanalyze,
-  vacuum_count,
-  autovacuum_count,
-  -- How long since last vacuum? Alert if &gt; 24h on high-churn tables
-  EXTRACT(EPOCH FROM (now() - GREATEST(last_vacuum, last_autovacuum))) / 3600
-                                                      AS hours_since_vacuum
-FROM
-  pg_stat_user_tables
-WHERE
-  n_dead_tup &gt; 10000
-ORDER BY
-  n_dead_tup DESC
-LIMIT 25;</code></pre>
-
-<p class="text-gray-300 leading-relaxed">---</p>
-
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">15.4 Identifying and Reclaiming Table Bloat in SQL Server</h3>
-
-<p class="text-gray-300 leading-relaxed">SQL Server's storage fragmentation problem manifests differently than PostgreSQL bloat. SQL Server does not use MVCC in the same way; instead, fragmentation occurs at the page and extent level inside B-tree index structures. A heavily modified table with a clustered index will develop internal fragmentation (pages that are partially filled) and external fragmentation (pages out of logical order). Both consume storage and degrade query performance.</p>
+<p class="text-gray-300 leading-relaxed">SQL Server's storage fragmentation problem manifests at the page and extent level inside B-tree index structures. Fragmentation occurs at the page and extent level inside B-tree index structures. A heavily modified table with a clustered index will develop internal fragmentation (pages that are partially filled) and external fragmentation (pages out of logical order). Both consume storage and degrade query performance.</p>
 
 <p class="text-gray-300 leading-relaxed">The key measurement is <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">avg_fragmentation_in_percent</code> from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_db_index_physical_stats</code>. An index with 80% fragmentation means that on average, each allocated page is only 20% full — you are paying for 5x more storage than the data actually requires.</p>
 
@@ -784,58 +529,9 @@ EXEC dbo.usp_AdaptiveIndexMaintenance @PrintOnly = 1;
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">15.5 Temporary Table and Temp Space Management</h3>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">15.4 Temporary Table and Temp Space Management</h3>
 
 <p class="text-gray-300 leading-relaxed">Temporary storage is a category that engineering teams almost universally underestimate until it causes either a production incident (temp space exhaustion) or a cost anomaly (unexpected storage tier upgrade). Understanding where temp data lives in each cloud database platform is the prerequisite for managing its cost.</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL on RDS</strong>: Temporary tables and sort operations that cannot fit in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">work_mem</code> spill to temporary files on the data volume. On RDS PostgreSQL, these temporary files live on the same EBS volume as your permanent data. A runaway query that generates 50 GB of temp data consumes 50 GB of provisioned storage while it runs. On a 100 GB provisioned volume, that single query can trigger an autoscale event. Worse, if the query fails midway through, PostgreSQL cleans up the temp files — but the autoscaled volume size does not decrease.</p>
-
-<p class="text-gray-300 leading-relaxed">Query this view to find sessions currently generating temporary files:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: Sessions currently using significant temp file space
-SELECT
-  pid,
-  usename,
-  application_name,
-  state,
-  query_start,
-  EXTRACT(EPOCH FROM (now() - query_start)) / 60   AS running_minutes,
-  temp_files,
-  pg_size_pretty(temp_bytes)                        AS temp_size,
-  LEFT(query, 120)                                  AS query_snippet
-FROM
-  pg_stat_activity
-  JOIN pg_stat_statements USING (queryid)  -- if pg_stat_statements available
-WHERE
-  temp_bytes &gt; 104857600   -- sessions using &gt; 100 MB temp space
-ORDER BY
-  temp_bytes DESC;</code></pre>
-
-<p class="text-gray-300 leading-relaxed">Since <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_activity</code> does not expose <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">temp_bytes</code> directly in all PostgreSQL versions, the more reliable approach is to monitor <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_database</code>:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: Track temp file usage per database over time
--- Schedule this to run every 5 minutes and write to a monitoring table
-
-SELECT
-  datname,
-  temp_files,
-  pg_size_pretty(temp_bytes)         AS temp_size,
-  blks_hit,
-  blks_read,
-  tup_fetched,
-  stats_reset
-FROM
-  pg_stat_database
-WHERE
-  datname NOT IN ('postgres', 'template0', 'template1')
-ORDER BY
-  temp_bytes DESC;</code></pre>
-
-<p class="text-gray-300 leading-relaxed">When <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">temp_bytes</code> is consistently high, the remediation options are:</p>
-
-<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Increase <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">work_mem</code></strong> for the specific queries generating spill: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SET work_mem = '256MB';</code> at session level before known heavy queries.</p>
-<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Identify and optimize the spilling queries</strong>: Use <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">EXPLAIN (ANALYZE, BUFFERS)</code> to find sort and hash operations that exceed <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">work_mem</code>.</p>
-<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Add a dedicated tablespace on a separate EBS volume</strong> for temporary files via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">temp_tablespaces</code>, keeping temp growth off the main data volume.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server on Azure SQL / RDS SQL Server</strong>: SQL Server uses <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">tempdb</code> for temporary tables, table variables, sort spills, row versioning, and online index operations. On RDS SQL Server, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">tempdb</code> lives on a separate NVMe SSD that is not billed as part of your storage allocation — it is sized based on instance class and reset on every restart. On Azure SQL, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">tempdb</code> is managed by Microsoft and does not count toward your database size allocation. This means temporary table cost in SQL Server is primarily an instance-size concern (whether you need a larger instance due to tempdb pressure) rather than a direct storage billing concern.</p>
 
@@ -870,33 +566,9 @@ ORDER BY
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">15.6 Automated Log File and WAL Management</h3>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">15.5 Automated Transaction Log File Management</h3>
 
 <p class="text-gray-300 leading-relaxed">Transaction logs are another category where retention policies frequently drift from intent. The right approach differs significantly across the three platforms.</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL WAL on RDS</strong>: On RDS PostgreSQL, WAL files are managed by AWS. You do not directly control the WAL directory. However, two parameters affect how much WAL accumulates and therefore how much storage it consumes:</p>
-
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `wal_keep_size` (PostgreSQL 13+) or `wal_keep_segments` (earlier versions): determines how many WAL files are retained for streaming replica lag recovery. Setting this too high on a busy system means gigabytes of WAL accumulate on the data volume. Set it to a value that covers your maximum acceptable replica lag, not to an arbitrarily large number.</li>
-
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **RDS automated backup retention**: The transaction logs that RDS retains for point-in-time recovery are separate from WAL files in the PostgreSQL sense. These are managed by RDS and stored in S3. They contribute to your backup storage billing. A 7-day retention window retains fewer transaction logs than a 35-day window. Evaluate whether you actually use point-in-time recovery past a certain day count. Many teams keep 35-day retention because "that's what it was set to" when the instance was created, not because they have ever needed to recover to a specific second from 34 days ago.</li>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: Check WAL generation rate to right-size wal_keep_size
--- Run every hour and track the trend
-SELECT
-  pg_current_wal_lsn()                              AS current_lsn,
-  pg_wal_lsn_diff(
-    pg_current_wal_lsn(),
-    pg_current_wal_flush_lsn()
-  )                                                 AS unflushed_bytes,
-  -- Rate: compare to a snapshot taken 1 hour ago in your monitoring system
-  pg_size_pretty(
-    pg_wal_lsn_diff(
-      pg_current_wal_lsn(),
-      '0/0'::pg_lsn   -- replace with snapshotted LSN for rate calculation
-    )
-  )                                                 AS total_wal_generated,
-  current_setting('wal_keep_size')                  AS wal_keep_size_setting,
-  (SELECT COUNT(*) FROM pg_ls_waldir())             AS wal_files_on_disk;</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server Transaction Logs on RDS / Azure SQL</strong>: SQL Server transaction log bloat is a classic operational problem. The log file grows during a long-running transaction and then cannot be reused (even after a log backup) until the transaction commits or rolls back. On RDS SQL Server, log files live on the EBS data volume and count toward your storage billing. On Azure SQL, log files are included within the max database size allocation.</p>
 
@@ -954,7 +626,7 @@ ORDER BY
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">15.7 Building the Storage Cleanup Automation Pipeline</h3>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">15.6 Building the Storage Cleanup Automation Pipeline</h3>
 
 <p class="text-gray-300 leading-relaxed">The previous sections delivered individual diagnostic queries and cleanup scripts. This section assembles them into a coordinated pipeline that runs on schedule, reports results, and integrates with your FinOps cost tracking.</p>
 
@@ -1079,9 +751,9 @@ Outputs:
   SNSTopicArn:
     Value: !Ref CleanupTopic</code></pre>
 
-<p class="text-gray-300 leading-relaxed">For the weekly bloat analysis job, the recommended deployment pattern on AWS is an ECS Fargate task triggered by an EventBridge Scheduled Rule. The task runs the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_repack_bloated_tables.sh</code> script from Section 15.3 inside a container with PostgreSQL client tools installed. This avoids the need for a persistent bastion host and runs in the VPC with direct database access.</p>
+<p class="text-gray-300 leading-relaxed">For the weekly bloat analysis job, the recommended deployment pattern on AWS is an ECS Fargate task triggered by an EventBridge Scheduled Rule. The task runs the SQL Server index maintenance script from Section 15.3 inside a container with sqlcmd installed. This avoids the need for a persistent bastion host and runs in the VPC with direct database access.</p>
 
-<p class="text-gray-300 leading-relaxed">For Azure environments, the equivalent is an Azure Container Instance (ACI) triggered by Azure Automation or a Logic App on a weekly schedule. The container runs the same bloat analysis queries against Azure Database for PostgreSQL Flexible Server, thencalls the pg_repack utility or — where pg_repack is unavailable — issues <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VACUUM (VERBOSE, ANALYZE)</code> against the identified tables and records the results to a Log Analytics workspace.</p>
+<p class="text-gray-300 leading-relaxed">For Azure environments, the equivalent is an Azure Container Instance (ACI) triggered by Azure Automation or a Logic App on a weekly schedule. The container runs the same fragmentation analysis queries against Azure SQL Database or Managed Instance, then issues <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALTER INDEX ... REBUILD</code> against the identified indexes and records the results to a Log Analytics workspace.</p>
 
 <p class="text-gray-300 leading-relaxed">A practical integration point for all three platforms is to emit the results of each cleanup run as structured JSON to your observability stack. The following is a standardized schema that works across Lambda, ACI, and Cloud Run output formats:</p>
 
@@ -1172,7 +844,7 @@ ORDER BY
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">15.8 Setting Storage Budgets and Anomaly Alerts</h3>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">15.7 Setting Storage Budgets and Anomaly Alerts</h3>
 
 <p class="text-gray-300 leading-relaxed">Automation that cleans up storage is only half the solution. You also need alerting that tells you when storage spend is growing faster than your application's legitimate data growth — which usually signals a new source of waste you have not yet automated away.</p>
 
@@ -1252,7 +924,7 @@ aws ce create-anomaly-subscription \
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">15.9 Right-Sizing Provisioned Storage After Cleanup</h3>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">15.8 Right-Sizing Provisioned Storage After Cleanup</h3>
 
 <p class="text-gray-300 leading-relaxed">After running the cleanup automation for several weeks, you will have recovered storage at the physical layer — table files are smaller, snapshots are gone, log files are trimmed. However, on RDS, the provisioned storage allocation does not decrease automatically. You are still paying for the full provisioned volume size regardless of how much space is now free.</p>
 
@@ -1270,8 +942,8 @@ aws ce create-anomaly-subscription \
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Restore RDS snapshot to a new instance with reduced provisioned storage
 # Assumes the snapshot has been taken and physical used space supports the reduction
 
-SOURCE_SNAPSHOT="rds:prod-postgres-2024-03-01-02-00"
-NEW_INSTANCE_ID="prod-postgres-resized"
+SOURCE_SNAPSHOT="rds:prod-sqlserver-2024-03-01-02-00"
+NEW_INSTANCE_ID="prod-sqlserver-resized"
 NEW_STORAGE_GB=300     # Must be &gt;= actual used space + 30% headroom
 INSTANCE_CLASS="db.r6g.2xlarge"
 SUBNET_GROUP="prod-db-subnet-group"
@@ -1322,22 +994,22 @@ ALTER DATABASE CURRENT MODIFY (MAXSIZE = 500 GB);</code></pre>
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Manual snapshots are the highest-leverage cleanup target**: They accumulate indefinitely, carry per-GB monthly costs, and have no built-in expiration. A tagging convention (`RetentionDays`, `Purpose`) combined with a daily enforcement Lambda recovers storage budget within days of deployment, with no application impact.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **PostgreSQL table bloat requires both immediate remediation and root-cause treatment**: Use `pg_repack` for online, lock-minimal table rebuilding on severely bloated tables, and simultaneously tune per-table `autovacuum_vacuum_scale_factor` and `autovacuum_vacuum_cost_limit` to prevent recurrence. Treating only one side of this problem means running the cleanup operation repeatedly on the same tables.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Index fragmentation requires both immediate remediation and root-cause treatment**: Use `ALTER INDEX ... REBUILD` (online on Enterprise) for severely fragmented indexes, and simultaneously fix the fill-factor and maintenance schedule that let fragmentation recur. Treating only one side of this problem means running the rebuild operation repeatedly on the same indexes.</li>
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **SQL Server fragmentation savings on cloud platforms are context-dependent**: On RDS SQL Server, index rebuilds directly reduce storage billing because log and data files share the provisioned EBS volume. On Azure SQL vCore, the benefit is primarily performance-driven unless you follow the rebuild with an `ALTER DATABASE MODIFY (MAXSIZE = ...)` to reduce the provisioned maximum.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Temporary storage mismanagement triggers permanent cost increases**: On RDS PostgreSQL, temp file spill onto the data EBS volume can trigger autoscale events that are irreversible without a snapshot restore. Monitor `pg_stat_database.temp_bytes` continuously, and increase `work_mem` at the session level for known heavy queries rather than globally, to keep temp growth bounded.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Temporary storage mismanagement triggers permanent cost increases**: On RDS, tempdb spills that push the data volume can trigger autoscale events that are irreversible without a snapshot restore. Monitor tempdb allocation continuously, and fix the queries and statistics that cause spills rather than growing storage to absorb them.</li>
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Automation without measurement is incomplete**: Each cleanup run should emit a structured result record — items deleted, storage reclaimed, estimated monthly savings — to a queryable store such as DynamoDB or BigQuery. This creates a savings ledger that makes the FinOps ROI of cleanup automation visible to finance and engineering leadership, and makes it straightforward to detect when a new source of waste has appeared that the existing automation does not yet address.</li></div>
     <div class="mt-14 bg-amber-950/40 border border-amber-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
-        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+        <p class="text-xs text-gray-400">Query plan visualizer · Index advisor · Slow query dashboard · SQL Server</p>
       </div>
       <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
          class="shrink-0 px-6 py-3 bg-amber-600 hover:bg-amber-500 text-white font-semibold rounded-xl text-sm transition">Download Free</a>
     </div>
-    <div class="mt-8 text-xs"><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a></div>
+    <nav class="mt-8 flex flex-col sm:flex-row items-center justify-between gap-3 text-xs"><span><a href="b7-ch14-provisioned-iops-vs-gp3.html" class="text-gray-400 hover:text-amber-300 transition">← Provisioned IOPS vs gp3: The Break-Even Analysis for I/O-Heavy SQL Server</a></span><span><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">All Chapters</a></span><span><a href="b7-ch16-data-compression.html" class="text-gray-400 hover:text-amber-300 transition">Compressing Data at Rest: Savings and Tradeoffs →</a></span></nav>
   </article>
   <footer class="border-t border-gray-800/50 px-6 py-8">
     <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · Database FinOps</div>

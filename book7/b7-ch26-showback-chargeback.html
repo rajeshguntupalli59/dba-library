@@ -49,7 +49,7 @@
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Showback</strong> is the right starting point for most organizations. It introduces accountability without triggering finance department processes and inter-departmental friction. Teams see their database costs broken out by environment, application, and owner. They don't pay for it directly, but their manager does receive a monthly report. In most organizations, this visibility alone produces meaningful behavior change within 60 days. Teams start asking whether that multi-AZ dev database really needs to be multi-AZ.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Chargeback</strong> allocates actual costs to cost centers, business units, or product teams. The infrastructure team charges the analytics team $4,200/month for their Aurora cluster. That charge appears in the analytics team's budget. Finance is involved. Procurement is involved. When the analytics team's database bill doubles after a poorly designed ETL job runs for a week, the pain is real and the fix comes fast.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Chargeback</strong> allocates actual costs to cost centers, business units, or product teams. The infrastructure team charges the analytics team $4,200/month for their RDS for SQL Server instance. That charge appears in the analytics team's budget. Finance is involved. Procurement is involved. When the analytics team's database bill doubles after a poorly designed ETL job runs for a week, the pain is real and the fix comes fast.</p>
 
 <p class="text-gray-300 leading-relaxed">The decision between the two often comes down to organizational maturity. A startup with three engineering teams can run showback informally through a shared dashboard. An enterprise with 40 business units running separate product lines needs chargeback backed by financial system integration.</p>
 
@@ -57,7 +57,7 @@
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Shared Resource Allocation</strong></p>
 
-<p class="text-gray-300 leading-relaxed">The hardest problem in both models is shared infrastructure. A single Aurora cluster might serve three applications. An RDS Proxy might front-end six services. A multi-tenant PostgreSQL instance might host 40 schemas. You have three allocation strategies to choose from:</p>
+<p class="text-gray-300 leading-relaxed">The hardest problem in both models is shared infrastructure. A single RDS for SQL Server instance might serve three applications. An Azure SQL elastic pool might host six databases. A multi-tenant SQL Server instance might host 40 databases. You have three allocation strategies to choose from:</p>
 
 <p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Equal split</strong>: Divide the cost by the number of consumers. Simple, inaccurate, and often politically acceptable because it's obviously wrong to everyone equally.</p>
 
@@ -71,7 +71,7 @@
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Building a Tag Coverage Foundation</h3>
 
-<p class="text-gray-300 leading-relaxed">Cost allocation lives or dies on tag coverage. Every RDS instance, Aurora cluster, RDS Proxy, storage volume, snapshot, and data transfer charge needs tags before allocation can work. The minimum viable tag set for database FinOps is:</p>
+<p class="text-gray-300 leading-relaxed">Cost allocation lives or dies on tag coverage. Every RDS instance, Azure SQL database, elastic pool, storage volume, snapshot, and data transfer charge needs tags before allocation can work. The minimum viable tag set for database FinOps is:</p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>Environment:    production | staging | development | sandbox
 Team:           data-engineering | analytics | platform | payments
@@ -212,7 +212,7 @@ import os
 # Allocation rules for shared resources
 # Resources listed here are split by the specified method and weights
 SHARED_RESOURCE_RULES = {
-    "aurora-shared-analytics": {
+    "sqlserver-shared-analytics": {
         "method": "weighted",
         "allocations": {
             "analytics": 0.55,
@@ -243,7 +243,6 @@ def get_rds_costs_by_tag(start_date: str, end_date: str) -&gt; dict:
                         'Key': 'SERVICE',
                         'Values': [
                             'Amazon Relational Database Service',
-                            'Amazon Aurora'
                         ]
                     }
                 }
@@ -449,93 +448,9 @@ if __name__ == '__main__':
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Metering Shared Databases for Accurate Allocation</h3>
 
-<p class="text-gray-300 leading-relaxed">Tag-based allocation works for dedicated instances but fails for shared databases where multiple teams share a single RDS instance or Aurora cluster. Accurate allocation at that level requires consumption metering — measuring what each team actually uses.</p>
+<p class="text-gray-300 leading-relaxed">Tag-based allocation works for dedicated instances but fails for shared databases where multiple teams share a single RDS for SQL Server instance or Azure SQL elastic pool. Accurate allocation at that level requires consumption metering — measuring what each team actually uses.</p>
 
-<p class="text-gray-300 leading-relaxed">PostgreSQL exposes per-database and per-user statistics through <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_database</code>. The following query produces a consumption profile that feeds into the allocation model:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: Per-team database consumption metrics for cost allocation
--- Run on shared PostgreSQL/Aurora instances
--- Correlate team with pg_roles by naming convention: team_&lt;teamname&gt;_role
-
--- Enable pg_stat_statements if not already active:
--- CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
--- ALTER SYSTEM SET shared_preload_libraries = 'pg_stat_statements';
-
--- Monthly consumption summary by database user (mapped to teams)
-WITH user_stats AS (
-    SELECT
-        usename AS db_user,
-        -- Extract team from role naming convention: app_&lt;team&gt;_&lt;role&gt;
-        SPLIT_PART(usename, '_', 2) AS team,
-        datname AS database_name,
-        SUM(total_exec_time) AS total_exec_time_ms,
-        SUM(calls) AS total_calls,
-        SUM(rows) AS total_rows_returned,
-        SUM(shared_blks_read) AS total_blocks_read,
-        SUM(shared_blks_hit) AS total_blocks_hit,
-        SUM(temp_blks_written) AS total_temp_blocks,
-        -- Estimate CPU cost: exec_time is a reasonable proxy
-        SUM(total_exec_time) / 1000.0 AS total_exec_time_seconds,
-        -- I/O weight: penalize temp writes (spill to disk)
-        SUM(shared_blks_read) + (SUM(temp_blks_written) * 3) AS weighted_io_score
-    FROM
-        pg_stat_statements pss
-        JOIN pg_roles pr ON pss.userid = pr.oid
-        JOIN pg_database pd ON pss.dbid = pd.oid
-    WHERE
-        -- Exclude system users and monitoring accounts
-        usename NOT IN ('rdsadmin', 'datadog', 'pgbouncer', 'postgres')
-        AND usename NOT LIKE 'pg_%'
-    GROUP BY
-        usename, datname
-),
-totals AS (
-    SELECT
-        SUM(total_exec_time_ms) AS grand_total_exec_time,
-        SUM(weighted_io_score) AS grand_total_io_score
-    FROM user_stats
-),
-allocation_weights AS (
-    SELECT
-        us.team,
-        us.database_name,
-        SUM(us.total_exec_time_ms) AS team_exec_time_ms,
-        SUM(us.weighted_io_score) AS team_io_score,
-        SUM(us.total_calls) AS team_total_calls,
-        SUM(us.total_rows_returned) AS team_total_rows,
-        -- CPU allocation weight (0.0 to 1.0)
-        ROUND(
-            (SUM(us.total_exec_time_ms) / NULLIF(t.grand_total_exec_time, 0))::numeric,
-            4
-        ) AS cpu_allocation_weight,
-        -- I/O allocation weight (0.0 to 1.0)
-        ROUND(
-            (SUM(us.weighted_io_score) / NULLIF(t.grand_total_io_score, 0))::numeric,
-            4
-        ) AS io_allocation_weight
-    FROM user_stats us
-    CROSS JOIN totals t
-    GROUP BY us.team, us.database_name, t.grand_total_exec_time, t.grand_total_io_score
-)
-SELECT
-    team,
-    database_name,
-    team_total_calls AS total_queries,
-    ROUND(team_exec_time_ms / 1000.0 / 60.0, 2) AS exec_time_minutes,
-    team_total_rows AS rows_returned,
-    team_io_score AS weighted_io_score,
-    cpu_allocation_weight,
-    io_allocation_weight,
-    -- Blended allocation weight (60% CPU, 40% I/O)
-    ROUND((cpu_allocation_weight * 0.60 + io_allocation_weight * 0.40)::numeric, 4) AS blended_weight,
-    -- If instance costs $2,400/month: example allocated cost
-    ROUND(
-        (cpu_allocation_weight * 0.60 + io_allocation_weight * 0.40) * 2400.0,
-        2
-    ) AS estimated_monthly_allocation_usd
-FROM allocation_weights
-WHERE team IS NOT NULL AND team != ''
-ORDER BY blended_weight DESC;</code></pre>
+<p class="text-gray-300 leading-relaxed">SQL Server exposes per-query statistics through Query Store and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_query_stats</code>. The following query produces a consumption profile that feeds into the allocation model:</p>
 
 <p class="text-gray-300 leading-relaxed">For Azure SQL Database, the equivalent consumption query uses Dynamic Management Views:</p>
 
@@ -543,38 +458,79 @@ ORDER BY blended_weight DESC;</code></pre>
 -- Run on shared Azure SQL elastic pools or shared instances
 -- Uses app_name from connection string for team identification
 
-WITH app_stats AS (
+-- Part 1: per-query consumption from Query Store, windowed to the billing cycle.
+-- database_name comes from sys.dm_exec_sql_text (dbid), NOT from sql_handle.
+-- Run on shared Azure SQL elastic pools or shared instances.
+WITH query_consumption AS (
     SELECT
-        -- Application name from connection context
-        dest.text AS sample_query,
-        qs.plan_handle,
-        DB_NAME(qs.sql_handle[0]) AS database_name,
-        -- Use application_name from sys.dm_exec_sessions for team mapping
-        es.program_name AS application_name,
-        -- Extract team name: application names should follow convention "Team:AppName"
-        CASE
-            WHEN es.program_name LIKE '%:%'
-            THEN LEFT(es.program_name, CHARINDEX(':', es.program_name) - 1)
-            ELSE 'unknown'
-        END AS team,
-        SUM(qs.total_worker_time) AS total_cpu_microseconds,
-        SUM(qs.total_elapsed_time) AS total_elapsed_microseconds,
-        SUM(qs.total_logical_reads) AS total_logical_reads,
-        SUM(qs.total_physical_reads) AS total_physical_reads,
-        SUM(qs.total_logical_writes) AS total_logical_writes,
-        SUM(qs.total_rows) AS total_rows,
-        SUM(qs.execution_count) AS total_executions
-    FROM
-        sys.dm_exec_query_stats qs
-        CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) dest
-        INNER JOIN sys.dm_exec_sessions es
-            ON qs.plan_handle = es.plan_handle -- approximation; use Query Store for accuracy
-    WHERE
-        es.program_name NOT IN ('Microsoft SQL Server Management Studio',
-                                'SQLServerCEIP', 'DatadogAgent')
-        AND es.is_user_process = 1
-    GROUP BY
-        dest.text, qs.plan_handle, es.program_name
+        DB_NAME(dest.dbid) AS database_name,
+        qt.query_sql_text AS sample_query,
+        SUM(rs.count_executions) AS total_executions,
+        SUM(rs.avg_cpu_time * rs.count_executions) AS total_cpu_microseconds,
+        SUM(rs.avg_logical_io_reads * rs.count_executions) AS total_logical_reads,
+        SUM(rs.avg_physical_io_reads * rs.count_executions) AS total_physical_reads,
+        SUM(rs.avg_logical_io_writes * rs.count_executions) AS total_logical_writes,
+        SUM(rs.avg_rowcount * rs.count_executions) AS total_rows
+    FROM sys.query_store_runtime_stats rs
+    JOIN sys.query_store_plan p
+        ON rs.plan_id = p.plan_id
+    JOIN sys.query_store_query q
+        ON p.query_id = q.query_id
+    JOIN sys.query_store_query_text qt
+        ON q.query_text_id = qt.query_text_id
+    JOIN sys.query_store_runtime_stats_interval i
+        ON rs.runtime_stats_interval_id = i.runtime_stats_interval_id
+    CROSS APPLY sys.dm_exec_sql_text(p.last_compile_batch_sql_handle) dest
+    WHERE i.start_time &gt;= @billing_start
+      AND i.end_time &lt; @billing_end
+      AND qt.query_sql_text NOT LIKE '%query_store%'
+    GROUP BY DB_NAME(dest.dbid), qt.query_sql_text
+),
+-- Part 2: team attribution. Query Store does not record application names, so a
+-- scheduled collector snapshots sys.dm_exec_requests (which joins cleanly to
+-- sys.dm_exec_sessions on session_id) and the pipeline joins samples to Part 1
+-- by query_hash. Collector query (runs every 60 seconds via SQL Agent / cron):
+--   SELECT s.program_name, r.query_hash, r.cpu_time, r.logical_reads
+--   FROM sys.dm_exec_requests r
+--   JOIN sys.dm_exec_sessions s ON r.session_id = s.session_id
+--   WHERE s.is_user_process = 1;
+-- The samples land in dbo.finops_request_samples(program_name, query_hash, ...),
+-- and the mapping below resolves the dominant team per query text.
+query_team AS (
+    SELECT
+        qc.sample_query,
+        COALESCE(m.team, 'unknown') AS team
+    FROM query_consumption qc
+    OUTER APPLY (
+        SELECT TOP 1
+            CASE
+                WHEN s.program_name LIKE '%:%'
+                THEN LEFT(s.program_name, CHARINDEX(':', s.program_name) - 1)
+                ELSE s.program_name
+            END AS team
+        FROM dbo.finops_request_samples s
+        WHERE s.query_text_hash = CHECKSUM(qc.sample_query)
+          AND s.program_name NOT IN ('Microsoft SQL Server Management Studio',
+                                     'SQLServerCEIP', 'DatadogAgent')
+        GROUP BY s.program_name
+        ORDER BY COUNT(*) DESC
+    ) m
+),
+app_stats AS (
+    SELECT
+        qc.sample_query,
+        qc.database_name,
+        qt.team,
+        -- Application names should follow the convention "Team:AppName"
+        SUM(qc.total_cpu_microseconds) AS total_cpu_microseconds,
+        SUM(qc.total_logical_reads) AS total_logical_reads,
+        SUM(qc.total_physical_reads) AS total_physical_reads,
+        SUM(qc.total_logical_writes) AS total_logical_writes,
+        SUM(qc.total_rows) AS total_rows,
+        SUM(qc.total_executions) AS total_executions
+    FROM query_consumption qc
+    JOIN query_team qt ON qt.sample_query = qc.sample_query
+    GROUP BY qc.sample_query, qc.database_name, qt.team
 ),
 team_totals AS (
     SELECT
@@ -608,14 +564,18 @@ FROM team_totals tt
 CROSS JOIN grand_totals gt
 ORDER BY cpu_weight DESC;</code></pre>
 
-<p class="text-gray-300 leading-relaxed">These queries produce the consumption weights that feed into the Python allocation engine. The critical discipline is resetting <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> at the start of each billing cycle:</p>
+<p class="text-gray-300 leading-relaxed">These queries produce the consumption weights that feed into the Python allocation engine. The critical discipline is aligning the Query Store time window with each billing cycle — never clear Query Store data destructively:</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Reset statistics at billing cycle start (run on 1st of each month)
--- Wrap in a stored procedure called by the allocation pipeline
-SELECT pg_stat_statements_reset();
--- Log the reset for audit trail
-INSERT INTO finops_audit_log (event_type, event_time, performed_by, notes)
-VALUES ('pg_stat_statements_reset', NOW(), current_user, 'Monthly billing cycle reset');</code></pre>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: reset Query Store at the billing cycle boundary
+-- Wrap in a stored procedure called by the allocation pipeline.
+-- IMPORTANT: never use ALTER DATABASE ... SET QUERY_STORE CLEAR for billing
+-- windows — it destroys the historical performance baseline. Instead, window
+-- every allocation query to the billing cycle using Query Store runtime stats
+-- intervals: filter sys.query_store_runtime_stats_interval on
+-- start_time &gt;= @billing_start AND end_time &lt; @billing_end.
+-- Log the window boundaries for the audit trail:
+INSERT INTO dbo.finops_audit_log (event_type, event_time, performed_by, notes)
+VALUES ('billing_window_start', SYSDATETIME(), SUSER_SNAME(), 'Monthly billing cycle window recorded');</code></pre>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
@@ -660,8 +620,7 @@ az costmanagement query \
                     "operator": "In",
                     "values": [
                         "Azure SQL Database",
-                        "Azure Database for PostgreSQL",
-                        "Azure Database for MySQL",
+                        "SQL Server on Azure Virtual Machines",
                         "Azure Cosmos DB"
                     ]
                 }
@@ -740,31 +699,34 @@ echo "Azure chargeback automation complete for ${REPORT_MONTH}"</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Build a dispute resolution process into the model from the start. The following query produces the audit trail that resolves 90% of disputes without escalation:</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: Month-over-month allocation change audit
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: month-over-month allocation change audit
 -- Identifies what drove allocation shifts for a specific team
 -- Run on-demand when a team disputes their chargeback
+-- @disputed_team: pass the team slug as a variable
+
+DECLARE @disputed_team NVARCHAR(100) = 'analytics';
 
 WITH monthly_stats AS (
     SELECT
-        DATE_TRUNC('month', query_date) AS billing_month,
+        DATEFROMPARTS(YEAR(query_date), MONTH(query_date), 1) AS billing_month,
         team,
-        SUM(exec_time_ms) AS total_exec_ms,
-        SUM(io_score) AS total_io_score,
-        SUM(query_count) AS total_queries,
-        SUM(rows_returned) AS total_rows
-    FROM finops_consumption_log  -- populated by the monthly metering job
-    WHERE team = :'disputed_team'  -- pass via psql -v disputed_team='analytics'
-      AND query_date &gt;= NOW() - INTERVAL '3 months'
-    GROUP BY DATE_TRUNC('month', query_date), team
+        SUM(exec_time_ms)   AS total_exec_ms,
+        SUM(io_score)       AS total_io_score,
+        SUM(query_count)    AS total_queries,
+        SUM(rows_returned)  AS total_rows
+    FROM dbo.finops_consumption_log  -- populated by the monthly metering job
+    WHERE team = @disputed_team
+      AND query_date &gt;= DATEADD(MONTH, -3, SYSDATETIME())
+    GROUP BY DATEFROMPARTS(YEAR(query_date), MONTH(query_date), 1), team
 ),
 platform_totals AS (
     SELECT
-        DATE_TRUNC('month', query_date) AS billing_month,
+        DATEFROMPARTS(YEAR(query_date), MONTH(query_date), 1) AS billing_month,
         SUM(exec_time_ms) AS platform_total_exec_ms,
-        SUM(io_score) AS platform_total_io_score
-    FROM finops_consumption_log
-    WHERE query_date &gt;= NOW() - INTERVAL '3 months'
-    GROUP BY DATE_TRUNC('month', query_date)
+        SUM(io_score)     AS platform_total_io_score
+    FROM dbo.finops_consumption_log
+    WHERE query_date &gt;= DATEADD(MONTH, -3, SYSDATETIME())
+    GROUP BY DATEFROMPARTS(YEAR(query_date), MONTH(query_date), 1)
 ),
 allocation_history AS (
     SELECT
@@ -775,42 +737,23 @@ allocation_history AS (
         ms.total_queries,
         pt.platform_total_exec_ms,
         pt.platform_total_io_score,
-        ROUND((ms.total_exec_ms::numeric / NULLIF(pt.platform_total_exec_ms, 0)) * 100, 2)
+        ROUND(ms.total_exec_ms * 100.0
+              / NULLIF(pt.platform_total_exec_ms, 0), 2)
             AS cpu_share_pct,
-        ROUND((ms.total_io_score::numeric / NULLIF(pt.platform_total_io_score, 0)) * 100, 2)
+        ROUND(ms.total_io_score * 100.0
+              / NULLIF(pt.platform_total_io_score, 0), 2)
             AS io_share_pct,
         -- Month-over-month query volume change
         ROUND(
-            (ms.total_queries - LAG(ms.total_queries) OVER (ORDER BY ms.billing_month))::numeric
-            / NULLIF(LAG(ms.total_queries) OVER (ORDER BY ms.billing_month), 0) * 100,
-            2
-        ) AS query_volume_change_pct,
-        -- Month-over-month platform total change (explains denominator shifts)
-        ROUND(
-            (pt.platform_total_exec_ms - LAG(pt.platform_total_exec_ms) OVER (ORDER BY ms.billing_month))::numeric
-            / NULLIF(LAG(pt.platform_total_exec_ms) OVER (ORDER BY ms.billing_month), 0) * 100,
-            2
-        ) AS platform_total_change_pct
+            (ms.total_queries - LAG(ms.total_queries)
+                OVER (ORDER BY ms.billing_month)) * 100.0
+            / NULLIF(LAG(ms.total_queries)
+                OVER (ORDER BY ms.billing_month), 0), 1
+        )   AS qoq_query_volume_pct_change
     FROM monthly_stats ms
-    JOIN platform_totals pt USING (billing_month)
+    JOIN platform_totals pt ON pt.billing_month = ms.billing_month
 )
-SELECT
-    billing_month,
-    team,
-    total_queries,
-    query_volume_change_pct AS my_query_change_pct,
-    cpu_share_pct AS my_cpu_share,
-    io_share_pct AS my_io_share,
-    platform_total_change_pct AS platform_volume_change_pct,
-    CASE
-        WHEN query_volume_change_pct &gt; 20 THEN 'Your query volume increased significantly'
-        WHEN platform_total_change_pct &lt; -15 THEN 'Other teams reduced usage — your share increased'
-        WHEN platform_total_change_pct &gt; 20 THEN 'Platform grew — your share decreased'
-        WHEN query_volume_change_pct BETWEEN -5 AND 5
-             AND ABS(platform_total_change_pct) &gt; 15
-            THEN 'Your usage was stable; allocation shift driven by other teams'
-        ELSE 'Review raw consumption logs for this period'
-    END AS dispute_explanation
+SELECT *
 FROM allocation_history
 ORDER BY billing_month;</code></pre>
 
@@ -875,8 +818,7 @@ for TEAM in "${!TEAM_BUDGETS[@]}"; do
             },
             \"CostFilters\": {
                 \"Service\": [
-                    \"Amazon Relational Database Service\",
-                    \"Amazon Aurora\"
+                    \"Amazon Relational Database Service\"
                 ],
                 \"TagKeyValue\": [
                     \"user:Team\$${TEAM}\"
@@ -1007,7 +949,6 @@ def get_daily_costs_by_team(days_back: int = 30) -&gt; List[Dict[str, Any]]:
                 'Key': 'SERVICE',
                 'Values': [
                     'Amazon Relational Database Service',
-                    'Amazon Aurora'
                 ]
             }
         },
@@ -1190,7 +1131,7 @@ if __name__ == '__main__':
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Tag coverage below 90% makes allocation models politically indefensible.** Run the tag coverage audit on a weekly schedule, alert on violations, and enforce tagging policy through preventive controls — AWS Config rules, Azure Policy, GCP Organization Policy — rather than reactive audits.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Shared resource allocation requires consumption metering, not just tag splitting.** Use `pg_stat_statements` on PostgreSQL and `sys.dm_exec_query_stats` on Azure SQL to generate blended CPU and I/O weights that reflect actual usage rather than arbitrary proportions.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Shared resource allocation requires consumption metering, not just tag splitting.** Use Query Store and `sys.dm_exec_query_stats` on SQL Server and Azure SQL to generate blended CPU and I/O weights that reflect actual usage rather than arbitrary proportions.</li>
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Dispute resolution is a first-class requirement, not an afterthought.** Store monthly consumption snapshots in a `finops_consumption_log` table, build the audit trail query before the first dispute arrives, and document the methodology clearly so teams understand what they are being charged for and why.</li>
 
@@ -1198,12 +1139,12 @@ if __name__ == '__main__':
     <div class="mt-14 bg-amber-950/40 border border-amber-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
-        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+        <p class="text-xs text-gray-400">Query plan visualizer · Index advisor · Slow query dashboard · SQL Server</p>
       </div>
       <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
          class="shrink-0 px-6 py-3 bg-amber-600 hover:bg-amber-500 text-white font-semibold rounded-xl text-sm transition">Download Free</a>
     </div>
-    <div class="mt-8 text-xs"><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a></div>
+    <nav class="mt-8 flex flex-col sm:flex-row items-center justify-between gap-3 text-xs"><span><a href="b7-ch25-budget-alerts.html" class="text-gray-400 hover:text-amber-300 transition">← Budget Alerts and Anomaly Detection</a></span><span><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">All Chapters</a></span><span><a href="b7-ch27-finops-culture.html" class="text-gray-400 hover:text-amber-300 transition">FinOps Culture: Getting Engineers to Care About Database Costs →</a></span></nav>
   </article>
   <footer class="border-t border-gray-800/50 px-6 py-8">
     <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · Database FinOps</div>

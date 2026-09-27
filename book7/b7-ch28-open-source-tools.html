@@ -49,12 +49,12 @@
 
 <div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">flowchart TD
     A["Layer 1: Cloud billing ingestion<br/>(Steampipe, Infracost, CloudQuery)"] --> C["Layer 3: Correlation & dashboarding<br/>(Grafana, Prometheus)"]
-    B["Layer 2: Database-internal statistics<br/>(pg_stat_statements, dm_exec_query_stats)"] --> C</pre></div>
+    B["Layer 2: Database-internal statistics<br/>(Query Store, dm_exec_query_stats)"] --> C</pre></div>
 
 <p class="text-gray-300 leading-relaxed">*The three-layer open-source cost visibility stack: billing tells you what you spent, database statistics tell you why, and the correlation layer connects them.*</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Layer 1 — Cloud billing ingestion</strong></p>
-<p class="text-gray-300 leading-relaxed">The most widely adopted open-source tool for this layer is <strong class="text-white">Infracost</strong> (cost estimation from IaC), paired with <strong class="text-white">CloudQuery</strong> or <strong class="text-white">Steampipe</strong> for live account inventory. Steampipe deserves particular attention: it exposes AWS, Azure, and GCP resources as PostgreSQL-compatible tables, meaning you can write standard SQL against your cloud account the same way you write queries against a database.</p>
+<p class="text-gray-300 leading-relaxed">The most widely adopted open-source tool for this layer is <strong class="text-white">Infracost</strong> (cost estimation from IaC), paired with <strong class="text-white">CloudQuery</strong> or <strong class="text-white">Steampipe</strong> for live account inventory. Steampipe deserves particular attention: it exposes AWS, Azure, and GCP resources as SQL-queryable tables, meaning you can write standard SQL against your cloud account the same way you write queries against a database.</p>
 
 <p class="text-gray-300 leading-relaxed">Install Steampipe and the AWS plugin:</p>
 
@@ -106,61 +106,19 @@ FROM
 ORDER BY
     allocated_storage DESC;</code></pre>
 
-<p class="text-gray-300 leading-relaxed">This single query, run against a real AWS account, commonly surfaces stopped instances still accruing storage costs. A stopped <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.r6g.4xlarge</code> with a 2 TB gp2 volume costs <strong class="text-white">$230/month in storage alone</strong> while producing zero useful work.</p>
+<p class="text-gray-300 leading-relaxed">This single query, run against a real AWS account, commonly surfaces stopped instances still accruing storage costs. A stopped <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.r6i.4xlarge</code> with a 2 TB gp2 volume costs <strong class="text-white">$230/month in storage alone</strong> while producing zero useful work.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Layer 2 — Database-internal statistics</strong></p>
-<p class="text-gray-300 leading-relaxed">PostgreSQL's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_user_tables</code>, SQL Server's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_query_stats</code>, and MySQL's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">performance_schema</code> are the authoritative sources for understanding what workload is driving your compute and I/O costs. These are built into the engine — no additional installation required beyond enabling the extension.</p>
+<p class="text-gray-300 leading-relaxed">SQL Server's Query Store, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_query_stats</code>, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_db_index_usage_stats</code> are the authoritative sources for understanding what workload is driving your compute and I/O costs. These are built into the engine — no additional installation required beyond enabling the extension.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Layer 3 — Correlation and dashboarding</strong></p>
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Grafana</strong> with the CloudWatch, Azure Monitor, or Cloud Monitoring data sources connects billing signals to performance signals in a single pane. <strong class="text-white">Prometheus</strong> with the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">postgres_exporter</code> or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">mysqld_exporter</code> provides the time-series foundation for alerting on cost-correlated metrics like <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">blks_read</code> (indicative of IOPS billing) and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">temp_files</code> (indicative of memory pressure that forces scale-up).</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Grafana</strong> with the CloudWatch, Azure Monitor, or Cloud Monitoring data sources connects billing signals to performance signals in a single pane. <strong class="text-white">Prometheus</strong> with the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sql_exporter</code> (or the Windows exporter's MSSQL collector) provides the time-series foundation for alerting on cost-correlated metrics like physical reads (indicative of IOPS billing) and memory grants pending (indicative of memory pressure that forces scale-up).</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Querying Database-Level Cost Signals</h3>
 
 <p class="text-gray-300 leading-relaxed">Cloud bills reflect infrastructure consumption. The root cause of that consumption lives inside the database engine. The following queries give you the operational data needed to map expensive cloud line items back to specific queries, tables, and access patterns.</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL — identifying high-IOPS queries</strong></p>
-
-<p class="text-gray-300 leading-relaxed">IOPS on RDS gp2 storage costs are implicit: you pay for provisioned IOPS on io1/io2, but on gp2 and gp3 you pay for the storage tier itself and suffer performance degradation when you exhaust burst credits. Either way, identifying queries that generate excessive block reads is a direct cost-reduction exercise.</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Enable pg_stat_statements if not already enabled
--- Add to postgresql.conf or RDS parameter group:
--- shared_preload_libraries = 'pg_stat_statements'
--- pg_stat_statements.track = all
-
-CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
-
--- Top 20 queries by total disk block reads (maps to IOPS cost)
-SELECT
-    LEFT(query, 120)                                    AS query_preview,
-    calls,
-    total_exec_time::NUMERIC(18,2)                      AS total_exec_ms,
-    ROUND((total_exec_time / calls)::NUMERIC, 2)        AS avg_exec_ms,
-    shared_blks_read,
-    shared_blks_hit,
-    -- Cache hit ratio: closer to 1.0 = less disk I/O
-    ROUND(
-        shared_blks_hit::NUMERIC /
-        NULLIF(shared_blks_hit + shared_blks_read, 0),
-        4
-    )                                                   AS cache_hit_ratio,
-    -- Queries with cache_hit_ratio &lt; 0.90 are disk-bound
-    -- Each shared_blks_read = 8KB page fetched from storage
-    ROUND(shared_blks_read * 8.0 / 1024, 2)            AS total_mb_read_from_disk,
-    temp_blks_written,
-    -- temp_blks_written signals sorts/hashes spilling to disk
-    -- On RDS, this adds I/O and may indicate undersized work_mem
-    ROUND(temp_blks_written * 8.0 / 1024, 2)           AS temp_writes_mb
-FROM
-    pg_stat_statements
-WHERE
-    calls &gt; 100                          -- filter out one-time queries
-ORDER BY
-    shared_blks_read DESC
-LIMIT 20;</code></pre>
-
-<p class="text-gray-300 leading-relaxed">A query showing <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">total_mb_read_from_disk = 45000</code> across 10,000 calls is reading approximately 4.5 MB of pages per call from storage. If that query runs every 30 seconds around the clock, it is generating roughly 12.9 TB of logical reads per day — a primary driver of IOPS exhaustion and a direct argument for adding the right index or materializing an intermediate result set.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server on Azure SQL / RDS SQL Server — execution stats</strong></p>
 
@@ -199,37 +157,6 @@ ORDER BY
     qs.total_logical_reads DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">On Azure SQL Database, DTU consumption ties directly to logical reads and CPU. A query averaging 50,000 logical reads per execution running 200 times per minute will by itself justify an upgrade from S3 (100 DTUs, ~$150/month) to P1 (125 DTUs, ~$465/month). Finding that query and adding a covering index can eliminate the need for that tier upgrade entirely — a saving of roughly <strong class="text-white">$315/month from one index</strong>.</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">MySQL / Aurora — identifying table scan costs</strong></p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify tables with high full-scan ratios
--- Full scans = unnecessary IOPS = unnecessary storage tier costs
-SELECT
-    object_schema                                       AS db_name,
-    object_name                                         AS table_name,
-    count_read,
-    count_fetch,
-    count_full_scan,                                    -- full scans without index use
-    ROUND(
-        count_full_scan * 100.0 / NULLIF(count_read, 0),
-        2
-    )                                                   AS pct_full_scan,
-    sum_rows_examined,
-    sum_rows_sent,
-    -- rows_examined / rows_sent ratio: higher = more waste per query
-    ROUND(
-        sum_rows_examined * 1.0 / NULLIF(sum_rows_sent, 0),
-        1
-    )                                                   AS examination_ratio
-FROM
-    performance_schema.table_io_waits_summary_with_full_scans
-WHERE
-    count_full_scan &gt; 0
-ORDER BY
-    count_full_scan DESC
-LIMIT 20;</code></pre>
-
-<p class="text-gray-300 leading-relaxed">An <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">examination_ratio</code> above 100 on a high-traffic table means the engine is reading 100 rows to return 1. On Aurora with I/O-Optimized pricing disabled, that translates directly to per-million-request I/O charges. Aurora I/O-Optimized eliminates per-request charges at the cost of a 25% instance price premium — the crossover point is approximately <strong class="text-white">$0.22/million I/O requests × 10M requests/day</strong>, meaning I/O-Optimized pays off at roughly 45 million I/O requests per day. Tables with high <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">examination_ratio</code> on I/O-billed Aurora clusters are the exact targets to fix before that crossover calculation even matters.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
@@ -305,17 +232,17 @@ infracost breakdown \
   --format json \
   --out-file infracost-base.json
 
-# After modifying the Terraform (e.g., changing db.r6g.2xlarge to db.r6g.xlarge):
+# After modifying the Terraform (e.g., changing db.r6i.2xlarge to db.r6i.xlarge):
 infracost diff \
   --path ./terraform/rds-module \
   --compare-to infracost-base.json \
   --format table
 
 # Example output interpretation:
-# db.r6g.2xlarge  (us-east-1, On-Demand):  $0.480/hr  =  $350.40/mo
-# db.r6g.xlarge   (us-east-1, On-Demand):  $0.240/hr  =  $175.20/mo
-# Monthly saving:  -$175.20
-# Annual saving:  -$2,102.40
+# db.r6i.2xlarge  (us-east-1, On-Demand, SQL Server License Included, illustrative):  $2.60/hr  =  $1,898.00/mo
+# db.r6i.xlarge    (us-east-1, On-Demand, SQL Server License Included, illustrative):  $1.30/hr  =  $949.00/mo
+# Monthly saving:  -$949.00
+# Annual saving:  -$11,388.00
 
 # Generate a comment-ready report for a pull request
 infracost comment github \
@@ -366,17 +293,17 @@ LIMIT 30;</code></pre>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Automating Cost Analysis Pipelines</h3>
 
-<p class="text-gray-300 leading-relaxed">One-time queries identify problems. Scheduled pipelines track them over time and alert when costs deviate from baseline. The following Python script implements a weekly cost analysis pipeline that queries pg_stat_statements, correlates findings with CloudWatch IOPS metrics, and writes a summary to a Slack webhook. Schedule it with cron or a managed workflow tool like Apache Airflow.</p>
+<p class="text-gray-300 leading-relaxed">One-time queries identify problems. Scheduled pipelines track them over time and alert when costs deviate from baseline. The following Python script implements a weekly cost analysis pipeline that queries Query Store, correlates findings with CloudWatch IOPS metrics, and writes a summary to a Slack webhook. Schedule it with cron or a managed workflow tool like Apache Airflow.</p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/usr/bin/env python3
 """
 db_cost_analyzer.py
 Weekly database cost analysis pipeline.
-Correlates pg_stat_statements I/O data with CloudWatch RDS metrics
+Correlates Query Store I/O data with CloudWatch RDS metrics
 and posts a cost summary to Slack.
 
 Schedule: cron 0 8 * * 1  (every Monday at 08:00)
-Dependencies: psycopg2-binary, boto3, requests
+Dependencies: pyodbc, boto3, requests
 """
 
 import json
@@ -385,8 +312,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 import boto3
-import psycopg2
-import psycopg2.extras
+import pyodbc
 import requests
 
 logging.basicConfig(
@@ -398,17 +324,16 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Configuration — load from environment variables in production
 # ---------------------------------------------------------------------------
-DB_CONFIG = {
-    "host":     os.environ["RDS_ENDPOINT"],
-    "port":     int(os.environ.get("RDS_PORT", "5432")),
-    "dbname":   os.environ["RDS_DBNAME"],
-    "user":     os.environ["RDS_USER"],
-    "password": os.environ["RDS_PASSWORD"],
-    "sslmode":  "require",
-    "connect_timeout": 10,
-}
+def build_conn_str() -&gt; str:
+    return (
+        "DRIVER={ODBC Driver 18 for SQL Server};"
+        f"SERVER={os.environ['RDS_ENDPOINT']},{os.environ.get('RDS_PORT', '1433')};"
+        f"DATABASE={os.environ['RDS_DBNAME']};"
+        f"UID={os.environ['RDS_USER']};PWD={os.environ['RDS_PASSWORD']};"
+        "Encrypt=yes;TrustServerCertificate=no;Connection Timeout=10;"
+    )
 
-RDS_INSTANCE_ID   = os.environ["RDS_INSTANCE_ID"]    # e.g. "prod-postgres-01"
+RDS_INSTANCE_ID   = os.environ["RDS_INSTANCE_ID"]    # e.g. "prod-sqlserver-01"
 AWS_REGION        = os.environ.get("AWS_REGION", "us-east-1")
 SLACK_WEBHOOK_URL = os.environ["SLACK_WEBHOOK_URL"]
 COST_ALERT_USD    = float(os.environ.get("COST_ALERT_THRESHOLD_USD", "500"))
@@ -421,39 +346,47 @@ IO1_COST_PER_GB_MONTH    = 0.125
 
 
 # ---------------------------------------------------------------------------
-# Step 1: Query pg_stat_statements for top I/O consumers
+# Step 1: Query Query Store for top I/O consumers
 # ---------------------------------------------------------------------------
 def get_top_io_queries(conn, limit: int = 10) -&gt; list[dict]:
-    """Return the top N queries ranked by disk blocks read this week."""
+    """Return the top N queries ranked by logical reads this week (Query Store)."""
     sql = """
-        SELECT
-            queryid,
-            LEFT(query, 200)                                AS query_preview,
-            calls,
-            ROUND(total_exec_time::NUMERIC / 1000, 2)      AS total_exec_sec,
-            ROUND(mean_exec_time::NUMERIC, 2)               AS avg_exec_ms,
-            shared_blks_read,
-            shared_blks_hit,
-            ROUND(
-                shared_blks_hit::NUMERIC /
-                NULLIF(shared_blks_hit + shared_blks_read, 0) * 100,
-                2
-            )                                               AS cache_hit_pct,
-            ROUND(shared_blks_read * 8.0 / 1024 / 1024, 3) AS disk_read_gb,
-            temp_blks_written,
-            ROUND(temp_blks_written * 8.0 / 1024, 2)       AS temp_write_mb
-        FROM pg_stat_statements
-        WHERE calls &gt; 50
-          AND shared_blks_read &gt; 0
-        ORDER BY shared_blks_read DESC
-        LIMIT %s;
+        SELECT TOP (?)
+            q.query_id,
+            LEFT(qt.query_sql_text, 200)                AS query_preview,
+            SUM(rs.count_executions)                    AS calls,
+            ROUND(SUM(rs.avg_duration
+                      * rs.count_executions) / 1000000.0, 2) AS total_exec_sec,
+            ROUND(AVG(rs.avg_duration) / 1000.0, 2)     AS avg_exec_ms,
+            SUM(rs.avg_logical_io_reads
+                * rs.count_executions)                  AS logical_reads,
+            SUM(rs.avg_physical_io_reads
+                * rs.count_executions)                  AS physical_reads,
+            ROUND(CAST(SUM(rs.avg_physical_io_reads
+                           * rs.count_executions) AS FLOAT)
+                  / NULLIF(CAST(SUM((rs.avg_logical_io_reads
+                                     + rs.avg_physical_io_reads)
+                                    * rs.count_executions) AS FLOAT), 0) * 100, 2)
+                                                        AS physical_read_pct,
+            ROUND(SUM(rs.avg_logical_io_reads
+                      * rs.count_executions) * 8.0 / 1024 / 1024, 3)
+                                                        AS logical_read_gb
+        FROM sys.query_store_query q
+        JOIN sys.query_store_query_text qt ON q.query_text_id = qt.query_text_id
+        JOIN sys.query_store_plan pl       ON pl.query_id = q.query_id
+        JOIN sys.query_store_runtime_stats rs ON rs.plan_id = pl.plan_id
+        WHERE rs.last_execution_time &gt;= DATEADD(DAY, -7, SYSDATETIME())
+        GROUP BY q.query_id, qt.query_sql_text
+        HAVING SUM(rs.count_executions) &gt; 50
+           AND SUM(rs.avg_logical_io_reads * rs.count_executions) &gt; 0
+        ORDER BY SUM(rs.avg_logical_io_reads * rs.count_executions) DESC;
     """
-    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute(sql, (limit,))
-        return [dict(row) for row in cur.fetchall()]
+    cur = conn.cursor()
+    cur.execute(sql, (limit,))
+    cols = [d[0] for d in cur.description]
+    return [dict(zip(cols, row)) for row in cur.fetchall()]
 
 
-# ---------------------------------------------------------------------------
 # Step 2: Query CloudWatch for RDS IOPS and storage metrics
 # ---------------------------------------------------------------------------
 def get_rds_cloudwatch_metrics(
@@ -619,18 +552,18 @@ def analyze_cost_opportunities(
             "annual_saving_usd":  0,
         })
 
-    # ---- Connection count check (pgBouncer opportunity) ----
+    # ---- Connection count check (client-side pooling opportunity) ----
     avg_connections = cw_metrics.get("DatabaseConnections_average") or 0
     if avg_connections &gt; 80:
         findings.append({
             "category": "Connection Pooling",
             "issue":    (f"Average {avg_connections:.0f} direct database connections. "
-                         "High connection counts waste memory (each ~5-10 MB on PostgreSQL)"),
-            "action":   "Deploy pgBouncer in transaction pooling mode",
+                         "High connection counts waste memory and worker threads on SQL Server",
+            "action":   "Fix client-side pooling: enable pooling, cap Max Pool Size, fix connection leaks",
             "monthly_saving_usd": 0,   # enables smaller instance class
             "annual_saving_usd":  0,
-            "note":     ("Reducing connections by 60% via pgBouncer commonly allows "
-                         "one instance size downgrade, saving ~$175/mo on r6g.xlarge -&gt; r6g.large"),
+            "note":     ("Reducing connections by 60% via client-side pooling commonly allows "
+                         "one instance size downgrade, saving ~$949/mo on r6i.xlarge -&gt; r6i.large (illustrative LI rate)"),
         })
 
     # ---- CPU headroom check ----
@@ -643,7 +576,7 @@ def analyze_cost_opportunities(
             "action":   "Evaluate one instance class reduction after peak load analysis",
             "monthly_saving_usd": 0,
             "annual_saving_usd":  0,
-            "note":     ("A db.r6g.2xlarge -&gt; db.r6g.xlarge saves $175.20/month. "
+            "note":     ("A db.r6i.2xlarge -&gt; db.r6i.xlarge saves $949/month (illustrative LI rate). "
                          "Validate with 2-week peak window before acting."),
         })
 
@@ -733,18 +666,17 @@ def post_to_slack(analysis: dict, webhook_url: str) -&gt; None:
 def main() -&gt; None:
     logger.info("Starting weekly database cost analysis for %s", RDS_INSTANCE_ID)
 
-    # Connect to PostgreSQL
+    # Connect to SQL Server
     try:
-        conn = psycopg2.connect(**DB_CONFIG)
-        conn.set_session(readonly=True, autocommit=True)
+        conn = pyodbc.connect(build_conn_str(), autocommit=True)
         logger.info("Database connection established.")
-    except psycopg2.OperationalError as exc:
+    except pyodbc.Error as exc:
         logger.error("Failed to connect to database: %s", exc)
         raise
 
     try:
         top_queries   = get_top_io_queries(conn, limit=10)
-        logger.info("Fetched %d top I/O queries from pg_stat_statements.", len(top_queries))
+        logger.info("Fetched %d top I/O queries from Query Store.", len(top_queries))
     finally:
         conn.close()
 
@@ -791,10 +723,10 @@ if __name__ == "__main__":
 <p class="text-gray-300 leading-relaxed">Add this to your crontab on any EC2 instance or container with IAM role access to CloudWatch and RDS describe APIs:</p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Install Python dependencies
-pip install psycopg2-binary boto3 requests
+pip install pyodbc boto3 requests
 
 # Set required environment variables (use AWS Secrets Manager in production)
-export RDS_ENDPOINT="prod-postgres-01.xxxxxxxx.us-east-1.rds.amazonaws.com"
+export RDS_ENDPOINT="prod-sqlserver-01.xxxxxxxx.us-east-1.rds.amazonaws.com"
 export RDS_PORT="5432"
 export RDS_DBNAME="appdb"
 export RDS_USER="monitoring_user"
@@ -802,7 +734,7 @@ export RDS_PASSWORD="$(aws secretsmanager get-secret-value \
   --secret-id prod/rds/monitoring_user \
   --query SecretString \
   --output text | jq -r .password)"
-export RDS_INSTANCE_ID="prod-postgres-01"
+export RDS_INSTANCE_ID="prod-sqlserver-01"
 export AWS_REGION="us-east-1"
 export SLACK_WEBHOOK_URL="https://hooks.slack.com/services/TXXXXXXXX/BXXXXXXXX/xxxxxxxx"
 export COST_ALERT_THRESHOLD_USD="200"
@@ -815,7 +747,7 @@ export COST_ALERT_THRESHOLD_USD="200"
 python3 db_cost_analyzer.py
 
 # Verify the JSON report was written
-ls -lh cost_analysis_prod-postgres-01_*.json</code></pre>
+ls -lh cost_analysis_prod-sqlserver-01_*.json</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The IAM policy required for this script is minimal. Attach the following inline policy to the EC2 instance role or ECS task role:</p>
 
@@ -893,78 +825,81 @@ aws iam get-role-policy \
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Grafana Dashboards for Continuous Cost Visibility</h3>
 
-<p class="text-gray-300 leading-relaxed">A weekly Python report is valuable for trend tracking, but continuous dashboards catch cost anomalies in real time. The most effective open-source dashboard stack for database FinOps combines <strong class="text-white">Grafana</strong> with the <strong class="text-white">CloudWatch data source</strong> and the <strong class="text-white">postgres_exporter</strong> Prometheus exporter. Together they display cloud billing signals and database-internal metrics on a single screen.</p>
+<p class="text-gray-300 leading-relaxed">A weekly Python report is valuable for trend tracking, but continuous dashboards catch cost anomalies in real time. The most effective open-source dashboard stack for database FinOps combines <strong class="text-white">Grafana</strong> with the <strong class="text-white">CloudWatch data source</strong> and the <strong class="text-white">sql_exporter</strong> Prometheus exporter. Together they display cloud billing signals and database-internal metrics on a single screen.</p>
 
-<p class="text-gray-300 leading-relaxed">Install <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">postgres_exporter</code> alongside your application stack:</p>
+<p class="text-gray-300 leading-relaxed">Install <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sql_exporter</code> alongside your application stack:</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Download and install postgres_exporter
-wget https://github.com/prometheus-community/postgres_exporter/releases/download/v0.15.0/postgres_exporter-0.15.0.linux-amd64.tar.gz
-tar xvf postgres_exporter-0.15.0.linux-amd64.tar.gz
-sudo mv postgres_exporter-0.15.0.linux-amd64/postgres_exporter /usr/local/bin/
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Download and install sql_exporter
+wget https://github.com/burningalchemist/sql_exporter/releases/download/0.19.1/sql_exporter-0.19.1.linux-amd64.tar.gz
+tar xvf sql_exporter-0.19.1.linux-amd64.tar.gz
+sudo mv sql_exporter-0.19.1.linux-amd64/sql_exporter /usr/local/bin/
 
-# Create a dedicated monitoring user in PostgreSQL
-# Run this against your RDS instance
-psql -h "$RDS_ENDPOINT" -U master_user -d postgres &lt;&lt; 'SQL'
-CREATE USER postgres_exporter WITH PASSWORD 'strong_password_here';
-GRANT pg_monitor TO postgres_exporter;
-GRANT SELECT ON pg_stat_statements TO postgres_exporter;
--- Grant connect on all databases you want to monitor
-GRANT CONNECT ON DATABASE appdb TO postgres_exporter;
+# Create a dedicated monitoring login in SQL Server
+# Run this against your RDS for SQL Server instance
+sqlcmd -S "$RDS_ENDPOINT" -U admin_user -P "$DB_PASSWORD" &lt;&lt; 'SQL'
+CREATE LOGIN sql_exporter WITH PASSWORD = 'strong_password_here';
+GRANT VIEW SERVER STATE TO sql_exporter;
+-- Query Store views live in each user database and require VIEW DATABASE STATE,
+-- not GRANT SELECT on the catalog views. Run once per monitored database:
+--   USE [YourDatabase];
+--   CREATE USER sql_exporter FOR LOGIN sql_exporter;
+--   GRANT VIEW DATABASE STATE TO sql_exporter;
 SQL
 
 # Create the exporter configuration file
-cat &gt; /etc/postgres_exporter/queries.yaml &lt;&lt; 'EOF'
-pg_stat_statements_io:
+cat &gt; /etc/sql_exporter/queries.yaml &lt;&lt; 'EOF'
+query_store_io:
   query: |
     SELECT
-      queryid::text,
-      LEFT(query, 80) AS query_preview,
-      calls,
-      shared_blks_read,
-      shared_blks_hit,
-      temp_blks_written,
-      ROUND(shared_blks_hit * 100.0 / NULLIF(shared_blks_hit + shared_blks_read, 0), 2) AS cache_hit_pct
-    FROM pg_stat_statements
-    WHERE calls &gt; 10
-    ORDER BY shared_blks_read DESC
-    LIMIT 20
+      q.query_id AS queryid,
+      LEFT(qt.query_sql_text, 80) AS query_preview,
+      SUM(rs.count_executions) AS calls,
+      SUM(rs.avg_logical_io_reads * rs.count_executions) AS logical_reads,
+      SUM(rs.avg_physical_io_reads * rs.count_executions) AS physical_reads,
+      ROUND(CAST(SUM(rs.avg_physical_io_reads * rs.count_executions) AS FLOAT)
+            / NULLIF(CAST(SUM((rs.avg_logical_io_reads + rs.avg_physical_io_reads)
+                              * rs.count_executions) AS FLOAT), 0) * 100, 2) AS physical_read_pct
+    FROM sys.query_store_query q
+    JOIN sys.query_store_query_text qt ON q.query_text_id = qt.query_text_id
+    JOIN sys.query_store_plan pl ON pl.query_id = q.query_id
+    JOIN sys.query_store_runtime_stats rs ON rs.plan_id = pl.plan_id
+    WHERE rs.last_execution_time &gt;= DATEADD(DAY, -7, SYSDATETIME())
+    GROUP BY q.query_id, qt.query_sql_text
+    HAVING SUM(rs.count_executions) &gt; 10
   metrics:
     - queryid:
         usage: "LABEL"
-        description: "Query ID"
+        description: "Query Store query ID"
     - query_preview:
         usage: "LABEL"
         description: "Query text preview"
     - calls:
         usage: "COUNTER"
         description: "Total executions"
-    - shared_blks_read:
+    - logical_reads:
         usage: "COUNTER"
-        description: "Disk blocks read"
-    - shared_blks_hit:
+        description: "Logical pages read"
+    - physical_reads:
         usage: "COUNTER"
-        description: "Buffer cache hits"
-    - temp_blks_written:
-        usage: "COUNTER"
-        description: "Temp blocks written to disk"
-    - cache_hit_pct:
+        description: "Physical pages read"
+    - physical_read_pct:
         usage: "GAUGE"
-        description: "Buffer cache hit percentage"
+        description: "Physical read percentage"
 EOF
 
-# Create systemd service for postgres_exporter
-cat &gt; /etc/systemd/system/postgres_exporter.service &lt;&lt; 'EOF'
+# Create systemd service for sql_exporter
+cat &gt; /etc/systemd/system/sql_exporter.service &lt;&lt; 'EOF'
 [Unit]
-Description=Prometheus PostgreSQL Exporter
+Description=Prometheus SQL Exporter
 After=network.target
 
 [Service]
 Type=simple
 User=prometheus
-Environment="DATA_SOURCE_NAME=postgresql://postgres_exporter:strong_password_here@prod-postgres-01.xxxxxxxx.us-east-1.rds.amazonaws.com:5432/appdb?sslmode=require"
-ExecStart=/usr/local/bin/postgres_exporter \
-  --extend.query-path=/etc/postgres_exporter/queries.yaml \
-  --web.listen-address=":9187" \
+Environment="DATA_SOURCE_NAME=sqlserver://sql_exporter:strong_password_here@prod-sqlserver-01.xxxxxxxx.us-east-1.rds.amazonaws.com:1433?encrypt=true"
+ExecStart=/usr/local/bin/sql_exporter \
+  --config.file=/etc/sql_exporter/sql_exporter.yml \
+  --web.listen-address=":9399" \
   --log.level=info
 Restart=always
 RestartSec=10s
@@ -974,18 +909,18 @@ WantedBy=multi-user.target
 EOF
 
 sudo systemctl daemon-reload
-sudo systemctl enable postgres_exporter
-sudo systemctl start postgres_exporter
+sudo systemctl enable sql_exporter
+sudo systemctl start sql_exporter
 
 # Verify metrics are being exported
-curl -s http://localhost:9187/metrics | grep pg_stat_statements_io</code></pre>
+curl -s http://localhost:9399/metrics | grep query_store_io</code></pre>
 
-<p class="text-gray-300 leading-relaxed">With <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">postgres_exporter</code> running and Prometheus scraping it, create Grafana panels that surface cost-correlated signals:</p>
+<p class="text-gray-300 leading-relaxed">With <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sql_exporter</code> running and Prometheus scraping it, create Grafana panels that surface cost-correlated signals:</p>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Panel 1 — Cache hit ratio over time**: A drop below 90% signals increased disk I/O and potential IOPS cost escalation. Alert at 85%.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Panel 2 — Temp blocks written per minute**: Spikes indicate `work_mem` is too low for sort/hash operations, forcing disk spills. Memory tuning eliminates these before they force an instance resize.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Panel 3 — Active connections vs. pgBouncer pool size**: Visualize the gap between total client connections and actual server-side connections to quantify pgBouncer's memory savings.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Panel 4 — CloudWatch ReadIOPS + WriteIOPS**: Overlay with pg_stat_statements disk reads to confirm the correlation and identify the specific queries driving IOPS peaks.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Panel 1 — Buffer cache hit ratio over time**: A drop below 90% signals increased disk I/O and potential IOPS cost escalation. Alert at 85%.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Panel 2 — Memory grants pending per minute**: Spikes indicate queries are waiting on memory grants, forcing disk spills. Memory tuning eliminates these before they force an instance resize.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Panel 3 — Active connections vs. client pool saturation**: Visualize the gap between total application connections and SQL Server sessions to quantify client-side pooling savings.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Panel 4 — CloudWatch ReadIOPS + WriteIOPS**: Overlay with Query Store physical reads to confirm the correlation and identify the specific queries driving IOPS peaks.</li>
 
 <p class="text-gray-300 leading-relaxed">The Grafana dashboard JSON for these four panels can be provisioned automatically:</p>
 
@@ -1024,10 +959,10 @@ echo "Dashboard provisioned: $GRAFANA_URL/d/$DASHBOARD_UID"</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">ec2instances.info</strong> (open-source, hosted at instances.vantage.sh) provides machine-readable pricing for RDS instance types. Combine it with your CloudWatch utilization data to build a custom RI recommendation:</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Fetch current RDS pricing for PostgreSQL in us-east-1
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Fetch current RDS pricing for SQL Server in us-east-1
 # The instances.vantage.sh API returns structured JSON
 curl -s "https://ec2instances.info/rds/json" \
-  | jq '[.[] | select(.region == "us-east-1" and .database_engine == "PostgreSQL") |
+  | jq '[.[] | select(.region == "us-east-1" and .database_engine == "SQL Server") |
     {
       instance_type: .instance_type,
       vcpu: .vcpu,
@@ -1041,8 +976,8 @@ curl -s "https://ec2instances.info/rds/json" \
   &gt; rds-pricing-us-east-1.json
 
 # Calculate break-even and savings for a specific instance type
-# Example: db.r6g.2xlarge
-INSTANCE="db.r6g.2xlarge"
+# Example: db.r6i.2xlarge
+INSTANCE="db.r6i.2xlarge"
 
 jq --arg inst "$INSTANCE" '
   .[] | select(.instance_type == $inst) |
@@ -1065,7 +1000,7 @@ jq --arg inst "$INSTANCE" '
   }
 ' rds-pricing-us-east-1.json</code></pre>
 
-<p class="text-gray-300 leading-relaxed">For a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.r6g.2xlarge</code> running PostgreSQL in us-east-1, the math works out as follows: On-Demand runs at approximately <strong class="text-white">$0.480/hour ($350.40/month)</strong>. A 1-year No-Upfront Reserved Instance drops that to approximately <strong class="text-white">$0.288/hour ($210.24/month)</strong> — a saving of <strong class="text-white">$1,682/year</strong> per instance. A 3-year No-Upfront RI pushes the saving to approximately <strong class="text-white">$2,520/year</strong>. For a fleet of ten such instances, that single commitment decision is worth <strong class="text-white">$16,820–$25,200 per year</strong>.</p>
+<p class="text-gray-300 leading-relaxed">For a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.r6i.2xlarge</code> running SQL Server (License Included) in us-east-1, the math works out as follows — all rates illustrative, verify current license-included pricing in the AWS pricing calculator: On-Demand runs at approximately <strong class="text-white">$2.60/hour ($1,898/month)</strong>. A 1-year No-Upfront Reserved Instance drops that to approximately <strong class="text-white">$1.64/hour ($1,197/month)</strong> — a 37% discount, saving <strong class="text-white">$8,410/year</strong> per instance. A 3-year All-Upfront RI drops the effective rate to approximately <strong class="text-white">$1.04/hour</strong> — a 60% discount, saving <strong class="text-white">$13,666/year</strong> per instance. For a fleet of ten such instances, that single commitment decision is worth <strong class="text-white">$84,100–$136,660 per year</strong>.</p>
 
 <p class="text-gray-300 leading-relaxed">The key constraint is utilization confidence. Use the following query to identify instances that have run continuously for the past 90 days — these are your safest RI candidates:</p>
 
@@ -1107,22 +1042,22 @@ aws rds describe-db-instances \
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Steampipe transforms cloud inventory into SQL**: Writing standard `SELECT` queries against your AWS, Azure, or GCP account surfaces stopped instances, oversized storage, and untagged resources in minutes — waste that vendor consoles obscure behind navigation layers and monthly aggregates.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **pg_stat_statements and sys.dm_exec_query_stats are the root-cause layer**: Every expensive cloud bill line item traces back to a specific query, table scan, or access pattern inside the database engine. Running the I/O correlation queries in this chapter weekly identifies the top three to five queries that justify your IOPS tier — and often reveals that removing one full-table scan eliminates the need for a storage tier upgrade entirely.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Query Store and sys.dm_exec_query_stats are the root-cause layer**: Every expensive cloud bill line item traces back to a specific query, table scan, or access pattern inside the database engine. Running the I/O correlation queries in this chapter weekly identifies the top three to five queries that justify your IOPS tier — and often reveals that removing one full-table scan eliminates the need for a storage tier upgrade entirely.</li>
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Infracost in the CI/CD pipeline stops cost regressions before they reach production**: Attaching a cost diff comment to every Terraform pull request that touches an RDS resource creates a financial review gate with zero additional process overhead. Teams that implement this report catching expensive misconfigurations — accidentally enabled Multi-AZ, oversized instance class selections, io1 where gp3 suffices — before they run for a full billing cycle.</li>
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The automated weekly pipeline pays for itself in the first finding**: The Python script in this chapter runs in under two minutes, requires no additional paid tooling, and consistently identifies at least one actionable finding per instance per month. A single gp2-to-gp3 migration flagged by the script on a 2 TB volume saves **$70/month indefinitely** — the script's entire annual value exceeds most paid FinOps SaaS subscriptions.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Reserved Instance decisions require utilization confidence, not just age**: The `jq` pipeline that identifies instances with 90-plus days of continuous operation gives you the evidence base for RI commitment conversations with finance. The math is straightforward — a `db.r6g.2xlarge` fleet of ten instances saves between $16,820 and $25,200 per year on 1-year versus 3-year RIs — but only when the instances have demonstrated stable, sustained utilization that makes the commitment credible.</li></div>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Reserved Instance decisions require utilization confidence, not just age**: The `jq` pipeline that identifies instances with 90-plus days of continuous operation gives you the evidence base for RI commitment conversations with finance. The math is straightforward — a `db.r6i.2xlarge` fleet of ten instances saves between $84,100 and $136,660 per year on 1-year versus 3-year RIs (illustrative license-included rates) — but only when the instances have demonstrated stable, sustained utilization that makes the commitment credible.</li></div>
     <div class="mt-14 bg-amber-950/40 border border-amber-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
-        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+        <p class="text-xs text-gray-400">Query plan visualizer · Index advisor · Slow query dashboard · SQL Server</p>
       </div>
       <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
          class="shrink-0 px-6 py-3 bg-amber-600 hover:bg-amber-500 text-white font-semibold rounded-xl text-sm transition">Download Free</a>
     </div>
-    <div class="mt-8 text-xs"><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a></div>
+    <nav class="mt-8 flex flex-col sm:flex-row items-center justify-between gap-3 text-xs"><span><a href="b7-ch27-finops-culture.html" class="text-gray-400 hover:text-amber-300 transition">← FinOps Culture: Getting Engineers to Care About Database Costs</a></span><span><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">All Chapters</a></span><span><a href="b7-ch29-custom-cost-analyzer.html" class="text-gray-400 hover:text-amber-300 transition">Building a Custom Database Cost Analyzer →</a></span></nav>
   </article>
   <footer class="border-t border-gray-800/50 px-6 py-8">
     <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · Database FinOps</div>

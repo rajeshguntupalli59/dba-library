@@ -157,62 +157,13 @@ aws cloudwatch get-metric-statistics \
   --statistics Average Maximum \
   --output table</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Querying workload behavior from inside PostgreSQL</strong></p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Querying workload behavior from inside SQL Server</strong></p>
 
-<p class="text-gray-300 leading-relaxed">CloudWatch tells you about resource consumption. <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> tells you *why*. These two views must be read together. A database showing 15% CPU might have one query consuming 14% of it — downsize the instance and that query becomes a latency problem.</p>
+<p class="text-gray-300 leading-relaxed">CloudWatch tells you about resource consumption. <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_query_stats</code> tells you *why*. These two sources must be read together. A database showing 15% CPU might have one query consuming 14% of it — downsize the instance and that query becomes a latency problem.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: identify top resource consumers over the past 24 hours
--- Run this on the replica to avoid overhead on the primary
--- Requires pg_stat_statements extension (enabled by default on RDS, Aurora, Cloud SQL)
 
-SELECT
-    round(total_exec_time::numeric / 1000, 2)          AS total_exec_sec,
-    calls,
-    round(mean_exec_time::numeric, 2)                   AS mean_ms,
-    round(stddev_exec_time::numeric, 2)                 AS stddev_ms,
-    round((100 * total_exec_time /
-           sum(total_exec_time) OVER ())::numeric, 2)   AS pct_of_total,
-    rows,
-    round(rows::numeric / nullif(calls, 0), 1)          AS rows_per_call,
-    left(query, 120)                                    AS query_snippet
-FROM
-    pg_stat_statements
-WHERE
-    total_exec_time &gt; 1000          -- at least 1 second cumulative
-    AND calls &gt; 10                  -- not a one-off
-ORDER BY
-    total_exec_time DESC
-LIMIT 20;
 
--- Buffer cache hit ratio — if this drops below 95%, do NOT downsize memory
-SELECT
-    sum(heap_blks_hit)  AS heap_hits,
-    sum(heap_blks_read) AS heap_reads,
-    round(
-        100.0 * sum(heap_blks_hit)
-        / nullif(sum(heap_blks_hit) + sum(heap_blks_read), 0),
-        2
-    ) AS buffer_hit_ratio_pct
-FROM
-    pg_statio_user_tables;
-
--- Active connection distribution by state and wait event
--- A high count of "ClientRead" is a connection pooling problem, not a compute problem
-SELECT
-    state,
-    wait_event_type,
-    wait_event,
-    count(*) AS connection_count
-FROM
-    pg_stat_activity
-WHERE
-    backend_type = 'client backend'
-GROUP BY
-    state, wait_event_type, wait_event
-ORDER BY
-    connection_count DESC;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Equivalent query for SQL Server on RDS or Azure SQL</strong></p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Top queries and memory pressure on RDS for SQL Server or Azure SQL</strong></p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: top queries by CPU consumption (last execution plan cache)
 -- Run on RDS SQL Server or Azure SQL Database
@@ -278,20 +229,20 @@ WHERE
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>Required vCPUs = ceil(P95_CPU_utilization_pct / 0.70 × current_vCPUs)
 Required RAM   = ceil(working_set_GB / 0.75)</code></pre>
 
-<p class="text-gray-300 leading-relaxed">Where <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">working_set_GB</code> is estimated as: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">total_database_size_GB × active_data_ratio</code>. The active data ratio is typically 0.15–0.30 for OLTP workloads (only a fraction of tables are hot at any given time). If your buffer cache hit ratio is above 99%, your working set already fits in RAM. If it is between 95% and 99%, you are cache-constrained and should not reduce memory even if the instance appears to have freeable memory — freeable memory in RDS often reflects OS-level cache that PostgreSQL or MySQL will use immediately under load.</p>
+<p class="text-gray-300 leading-relaxed">Where <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">working_set_GB</code> is estimated as: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">total_database_size_GB × active_data_ratio</code>. The active data ratio is typically 0.15–0.30 for OLTP workloads (only a fraction of tables are hot at any given time). If your buffer cache hit ratio is above 99%, your working set already fits in RAM. If it is between 95% and 99%, you are cache-constrained and should not reduce memory even if the instance appears to have freeable memory — freeable memory in RDS often reflects OS-level cache that SQL Server will use immediately under load.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Instance family selection</strong></p>
 
-<p class="text-gray-300 leading-relaxed">AWS RDS offers multiple instance families, and the price difference between them is substantial:</p>
+<p class="text-gray-300 leading-relaxed">AWS RDS for SQL Server offers multiple instance families (note: SQL Server cannot run on Graviton/ARM classes, so the eligible families are Intel/AMD-based), and the price difference between them is substantial. Relative costs below are illustrative license-included ratios — verify current prices in the AWS pricing calculator:</p>
 
 <p class="text-gray-300 leading-relaxed">| Family | vCPU:RAM Ratio | Best For | Example (4 vCPU) | On-Demand/mo |</p>
 <p class="text-gray-300 leading-relaxed">|---|---|---|---|---|</p>
-<p class="text-gray-300 leading-relaxed">| db.t4g | 1:2 (burstable) | Dev/test, low-traffic | db.t4g.xlarge | $119 |</p>
-<p class="text-gray-300 leading-relaxed">| db.m7g | 1:4 (general) | Balanced OLTP | db.m7g.xlarge | $291 |</p>
-<p class="text-gray-300 leading-relaxed">| db.r7g | 1:8 (memory) | Large buffer pools | db.r7g.xlarge | $450 |</p>
-<p class="text-gray-300 leading-relaxed">| db.x2g | 1:16 (memory) | In-memory analytics | db.x2g.xlarge | $1,125 |</p>
+<p class="text-gray-300 leading-relaxed">| db.t3 | 1:2 (burstable) | Dev/test, low-traffic | db.t3.xlarge | lowest |</p>
+<p class="text-gray-300 leading-relaxed">| db.m6i | 1:4 (general) | Balanced OLTP | db.m6i.xlarge | ~2.4x t3 |</p>
+<p class="text-gray-300 leading-relaxed">| db.r6i | 1:8 (memory) | Large buffer pools | db.r6i.xlarge | ~3.6x t3 |</p>
+<p class="text-gray-300 leading-relaxed">| db.x2iedn | 1:16 (memory) | In-memory analytics | db.x2iedn.xlarge | ~8x t3 |</p>
 
-<p class="text-gray-300 leading-relaxed">Moving a workload from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.r7g.2xlarge</code> ($900/mo) to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.m7g.2xlarge</code> ($582/mo) saves $318/month if the workload is CPU-bound rather than memory-bound. Over a three-year reserved term, that is $11,448 saved on a single instance.</p>
+<p class="text-gray-300 leading-relaxed">Moving a workload from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.r6i.2xlarge</code> to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.m6i.2xlarge</code> saves roughly a third of the instance cost if the workload is CPU-bound rather than memory-bound — and that saving compounds over a one- or three-year reserved term.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
@@ -324,32 +275,35 @@ import boto3
 import pandas as pd
 
 # ---------------------------------------------------------------------------
-# Instance pricing map (on-demand, us-east-1, Linux, single-AZ, USD/hour)
-# Update quarterly from https://aws.amazon.com/rds/mysql/pricing/
+# Instance pricing map: RDS for SQL Server, Standard edition, license-included,
+# on-demand, us-east-1, single-AZ, USD/hour.
+# NOTE: SQL Server cannot run on Graviton (t4g/m7g/r7g) classes — only Intel/AMD.
+# Rates below are ILLUSTRATIVE. Replace with current rates from the
+# AWS RDS for SQL Server pricing page before relying on the output.
 # ---------------------------------------------------------------------------
 RDS_PRICING = {
-    "db.t4g.micro":    0.016,  "db.t4g.small":    0.034,
-    "db.t4g.medium":   0.068,  "db.t4g.large":    0.136,
-    "db.t4g.xlarge":   0.272,  "db.t4g.2xlarge":  0.544,
-    "db.m7g.large":    0.192,  "db.m7g.xlarge":   0.384,
-    "db.m7g.2xlarge":  0.768,  "db.m7g.4xlarge":  1.536,
-    "db.m7g.8xlarge":  3.072,  "db.m7g.12xlarge": 4.608,
-    "db.r7g.large":    0.300,  "db.r7g.xlarge":   0.600,
-    "db.r7g.2xlarge":  1.200,  "db.r7g.4xlarge":  2.400,
-    "db.r7g.8xlarge":  4.800,  "db.r7g.12xlarge": 7.200,
+    "db.t3.micro":     0.12,   "db.t3.small":     0.24,
+    "db.t3.medium":    0.48,   "db.t3.large":     0.96,
+    "db.t3.xlarge":    1.92,   "db.t3.2xlarge":   3.84,
+    "db.m6i.large":    1.15,   "db.m6i.xlarge":   2.30,
+    "db.m6i.2xlarge":  4.60,   "db.m6i.4xlarge":  9.20,
+    "db.m6i.8xlarge":  18.40,  "db.m6i.12xlarge": 27.60,
+    "db.r6i.large":    1.60,   "db.r6i.xlarge":   3.20,
+    "db.r6i.2xlarge":  6.40,   "db.r6i.4xlarge":  12.80,
+    "db.r6i.8xlarge":  25.60,  "db.r6i.12xlarge": 38.40,
 }
 
 # Instance specs: vCPUs and RAM (GB)
 INSTANCE_SPECS = {
-    "db.t4g.micro":    (2,  1),   "db.t4g.small":    (2,  2),
-    "db.t4g.medium":   (2,  4),   "db.t4g.large":    (2,  8),
-    "db.t4g.xlarge":   (4,  16),  "db.t4g.2xlarge":  (8,  32),
-    "db.m7g.large":    (2,  8),   "db.m7g.xlarge":   (4,  16),
-    "db.m7g.2xlarge":  (8,  32),  "db.m7g.4xlarge":  (16, 64),
-    "db.m7g.8xlarge":  (32, 128), "db.m7g.12xlarge": (48, 192),
-    "db.r7g.large":    (2,  16),  "db.r7g.xlarge":   (4,  32),
-    "db.r7g.2xlarge":  (8,  64),  "db.r7g.4xlarge":  (16, 128),
-    "db.r7g.8xlarge":  (32, 256), "db.r7g.12xlarge": (48, 384),
+    "db.t3.micro":     (2,  1),   "db.t3.small":     (2,  2),
+    "db.t3.medium":    (2,  4),   "db.t3.large":     (2,  8),
+    "db.t3.xlarge":    (4,  16),  "db.t3.2xlarge":   (8,  32),
+    "db.m6i.large":    (2,  8),   "db.m6i.xlarge":   (4,  16),
+    "db.m6i.2xlarge":  (8,  32),  "db.m6i.4xlarge":  (16, 64),
+    "db.m6i.8xlarge":  (32, 128), "db.m6i.12xlarge": (48, 192),
+    "db.r6i.large":    (2,  16),  "db.r6i.xlarge":   (4,  32),
+    "db.r6i.2xlarge":  (8,  64),  "db.r6i.4xlarge":  (16, 128),
+    "db.r6i.8xlarge":  (32, 256), "db.r6i.12xlarge": (48, 384),
 }
 
 HOURS_PER_MONTH = 730
@@ -600,18 +554,7 @@ def get_azure_sql_metrics(
 <p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Check for scheduled jobs that run at non-business hours.</strong> Nightly ETL, weekly statistics updates, and monthly purges can all create CPU or I/O spikes that appear in P99 but are invisible in daily averages. Query the job scheduler directly.</p>
 
 <p class="text-gray-300 leading-relaxed">   ```sql</p>
-<p class="text-gray-300 leading-relaxed">   -- PostgreSQL: check pg_cron scheduled jobs (if pg_cron extension is installed)</p>
-<p class="text-gray-300 leading-relaxed">   SELECT</p>
-<p class="text-gray-300 leading-relaxed">       jobid,</p>
-<p class="text-gray-300 leading-relaxed">       schedule,</p>
-<p class="text-gray-300 leading-relaxed">       command,</p>
-<p class="text-gray-300 leading-relaxed">       nodename,</p>
-<p class="text-gray-300 leading-relaxed">       active</p>
-<p class="text-gray-300 leading-relaxed">   FROM</p>
-<p class="text-gray-300 leading-relaxed">       cron.job</p>
-<p class="text-gray-300 leading-relaxed">   ORDER BY</p>
-<p class="text-gray-300 leading-relaxed">       jobid;</p>
-<p class="text-gray-300 leading-relaxed">   ```</p>
+
 
 <p class="text-gray-300 leading-relaxed">   ```sql</p>
 <p class="text-gray-300 leading-relaxed">   -- SQL Server: list SQL Agent jobs and their last run duration</p>
@@ -644,7 +587,7 @@ def get_azure_sql_metrics(
 # unless --apply-immediately is specified)
 aws rds modify-db-instance \
   --db-instance-identifier mydb-prod \
-  --db-instance-class db.r7g.xlarge \
+  --db-instance-class db.r6i.xlarge \
   --apply-immediately \
   --region us-east-1
 
@@ -665,38 +608,7 @@ aws rds describe-db-instances \
 
 <p class="text-gray-300 leading-relaxed">Run these in the first 15 minutes after the resize and again at the 24-hour mark.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: confirm buffer cache is recovering after restart
--- Expected: hit ratio climbs back above 95% within 30 minutes as cache warms
-SELECT
-    now()                                           AS check_time,
-    round(
-        100.0 * sum(heap_blks_hit)
-        / nullif(sum(heap_blks_hit) + sum(heap_blks_read), 0),
-        2
-    )                                               AS buffer_hit_ratio_pct,
-    sum(heap_blks_read)                             AS total_disk_reads
-FROM
-    pg_statio_user_tables;
 
--- Compare query latency percentiles to pre-resize baseline
--- Run this before the resize and save the output, then re-run after
-SELECT
-    left(query, 80)                                 AS query_snippet,
-    calls,
-    round(mean_exec_time::numeric, 2)               AS mean_ms,
-    round(stddev_exec_time::numeric, 2)             AS stddev_ms,
-    round(
-        percentile_cont(0.95) WITHIN GROUP
-        (ORDER BY total_exec_time / calls),
-        2
-    )                                               AS p95_ms_estimate
-FROM
-    pg_stat_statements
-WHERE
-    calls &gt; 50
-ORDER BY
-    mean_exec_time DESC
-LIMIT 20;</code></pre>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: post-resize health check
 -- Confirm PLE has recovered and there is no memory pressure
@@ -747,53 +659,38 @@ ORDER BY
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">The bursty dev/test instance that looks like prod</strong></p>
 
-<p class="text-gray-300 leading-relaxed">Development and test databases often have low average utilization but periodic spikes caused by CI/CD pipelines running integration tests. These spikes are real but they are not customer-facing. The right response is to move the instance to a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.t4g</code> burstable family and let it accumulate CPU credits during idle periods to spend during test runs. For a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.m7g.xlarge</code> running CI workloads, switching to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.t4g.xlarge</code> reduces cost by approximately 29% with no performance degradation in practice.</p>
+<p class="text-gray-300 leading-relaxed">Development and test databases often have low average utilization but periodic spikes caused by CI/CD pipelines running integration tests. These spikes are real but they are not customer-facing. The right response is to move the instance to a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.t3</code> burstable family and let it accumulate CPU credits during idle periods to spend during test runs. For a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.m6i.xlarge</code> running CI workloads, switching to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.t3.xlarge</code> reduces cost by roughly a quarter with no performance degradation in practice.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">The connection-saturated instance with low CPU</strong></p>
 
-<p class="text-gray-300 leading-relaxed">An instance at 8% CPU and 95% connection utilization is not oversized — it is under-pooled. Before recommending a downsize, check whether the application is using a connection pooler. On PostgreSQL, the standard recommendation is PgBouncer in transaction-pooling mode. Deploying PgBouncer can reduce the effective connection count by 10× without changing the instance class, and it unblocks the downsize decision by removing the false constraint.</p>
+<p class="text-gray-300 leading-relaxed">An instance at 8% CPU and 95% connection utilization is not oversized — it is under-pooled. Before recommending a downsize, check whether the application is using a connection pooler. On SQL Server, the standard answer is client-side connection pooling (ADO.NET / ODBC pooling, enabled by default in most drivers) plus right-sizing <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Max Pool Size</code> per application tier. Fixing the pool configuration can reduce the effective connection count by 10x without changing the instance class, and it unblocks the downsize decision by removing the false constraint.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: diagnose connection waste
--- "idle" connections holding slots but doing no work
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: diagnose connection waste
+-- "sleeping" sessions holding connections but doing no work
 SELECT
-    count(*)                                        AS idle_connections,
-    min(now() - state_change)                       AS shortest_idle,
-    max(now() - state_change)                       AS longest_idle,
-    avg(now() - state_change)                       AS avg_idle_time
+    COUNT(*)                                            AS sleeping_sessions,
+    MIN(DATEDIFF(SECOND, s.last_request_end_time, SYSDATETIME()))
+                                                        AS shortest_idle_sec,
+    MAX(DATEDIFF(SECOND, s.last_request_end_time, SYSDATETIME()))
+                                                        AS longest_idle_sec,
+    AVG(CAST(DATEDIFF(SECOND, s.last_request_end_time, SYSDATETIME()) AS FLOAT))
+                                                        AS avg_idle_sec,
+    s.program_name
 FROM
-    pg_stat_activity
+    sys.dm_exec_sessions s
 WHERE
-    state = 'idle'
-    AND backend_type = 'client backend';</code></pre>
+    s.is_user_process = 1
+    AND s.status = 'sleeping'
+GROUP BY
+    s.program_name
+ORDER BY
+    sleeping_sessions DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">The instance with high I/O and low CPU</strong></p>
 
 <p class="text-gray-300 leading-relaxed">This pattern indicates either a missing index causing full table scans, or a workload that is genuinely I/O-bound (large analytical queries, bulk exports). Before concluding the instance needs more I/O-optimized storage, check whether adding an index eliminates the scans.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: tables with high sequential scans relative to index scans
--- A high seq_scan/idx_scan ratio on large tables is the fingerprint
--- of a missing index opportunity
-SELECT
-    schemaname,
-    tablename,
-    seq_scan,
-    idx_scan,
-    n_live_tup                                      AS live_rows,
-    round(
-        100.0 * seq_scan / nullif(seq_scan + idx_scan, 0),
-        1
-    )                                               AS seq_scan_pct,
-    pg_size_pretty(pg_total_relation_size(
-        quote_ident(schemaname) || '.' || quote_ident(tablename)
-    ))                                              AS total_size
-FROM
-    pg_stat_user_tables
-WHERE
-    seq_scan &gt; 100
-    AND n_live_tup &gt; 10000
-ORDER BY
-    seq_scan DESC
-LIMIT 20;</code></pre>
+
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: missing index recommendations from the DMV
 SELECT TOP 20
@@ -833,7 +730,7 @@ ORDER BY
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Change freeze windows.</strong> Define a calendar of blackout periods when right-sizing operations cannot be executed — typically the last two weeks of a fiscal quarter, major product release dates, and the period around public holidays. The recommendation engine should flag instances as "eligible" or "frozen" based on this calendar.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Linking to Reserved Instance purchases.</strong> Right-sizing must precede RI commitments. An organization that buys a three-year RI for <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.r7g.4xlarge</code> and then discovers six months later that the workload fits on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.r7g.xlarge</code> has locked in the savings of neither. The workflow should be:</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Linking to Reserved Instance purchases.</strong> Right-sizing must precede RI commitments. An organization that buys a three-year RI for <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.r6i.4xlarge</code> and then discovers six months later that the workload fits on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.r6i.xlarge</code> has locked in the savings of neither. The workflow should be:</p>
 
 <p class="text-gray-300 leading-relaxed">1. Right-size the instance on-demand.</p>
 <p class="text-gray-300 leading-relaxed">2. Observe for 30 days.</p>
@@ -859,12 +756,12 @@ ORDER BY
     <div class="mt-14 bg-amber-950/40 border border-amber-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
-        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+        <p class="text-xs text-gray-400">Query plan visualizer · Index advisor · Slow query dashboard · SQL Server</p>
       </div>
       <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
          class="shrink-0 px-6 py-3 bg-amber-600 hover:bg-amber-500 text-white font-semibold rounded-xl text-sm transition">Download Free</a>
     </div>
-    <div class="mt-8 text-xs"><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a></div>
+    <nav class="mt-8 flex flex-col sm:flex-row items-center justify-between gap-3 text-xs"><span><a href="b7-ch06-cost-dashboard.html" class="text-gray-400 hover:text-amber-300 transition">← Building Your First Database Cost Dashboard</a></span><span><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">All Chapters</a></span><span><a href="b7-ch08-reserved-vs-on-demand.html" class="text-gray-400 hover:text-amber-300 transition">Reserved Instances vs Savings Plans vs On-Demand: The Math →</a></span></nav>
   </article>
   <footer class="border-t border-gray-800/50 px-6 py-8">
     <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · Database FinOps</div>

@@ -49,7 +49,7 @@
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">The Storage Cost Breakdown</strong></p>
 
-<p class="text-gray-300 leading-relaxed">On AWS RDS with gp3 storage, you pay $0.115 per GB-month for the primary volume. Multi-AZ doubles that to $0.230 per GB-month because RDS replicates the entire EBS volume to the standby. Automated backups stored in S3 add another $0.095 per GB-month for retention beyond the free tier. On a 3 TB Multi-AZ PostgreSQL instance with 14-day backup retention, the all-in storage cost looks like this:</p>
+<p class="text-gray-300 leading-relaxed">On AWS RDS with gp3 storage, you pay $0.115 per GB-month for the primary volume. Multi-AZ doubles that to $0.230 per GB-month because RDS replicates the entire EBS volume to the standby. Automated backups stored in S3 add another $0.095 per GB-month for retention beyond the free tier. On a 3 TB Multi-AZ SQL Server instance with 14-day backup retention, the all-in storage cost looks like this:</p>
 
 <p class="text-gray-300 leading-relaxed">| Component | Size | Rate | Monthly Cost |</p>
 <p class="text-gray-300 leading-relaxed">|---|---|---|---|</p>
@@ -60,64 +60,7 @@
 
 <p class="text-gray-300 leading-relaxed">If compression reduces the primary volume to 1,200 GB — a 60% reduction common with mixed OLTP data — the same table drops to $367.20/month. That is $550.80 in monthly savings on storage alone, not counting backup savings, before you touch instance sizing.</p>
 
-<p class="text-gray-300 leading-relaxed">Azure SQL Managed Instance on Business Critical tier charges $0.115 per GB-month (General Purpose is $0.115 as well, but Business Critical adds locally redundant replicas automatically). Google Cloud SQL for PostgreSQL charges $0.170 per GB-month on SSD storage with HA, making storage compression proportionally more valuable on GCP than on AWS.</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Finding Compressible Data in PostgreSQL</strong></p>
-
-<p class="text-gray-300 leading-relaxed">Start by identifying table-level bloat, data type distribution, and actual compression readiness:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify the largest tables and their estimated compression potential
--- Run this on AWS RDS PostgreSQL, Aurora PostgreSQL, or Cloud SQL for PostgreSQL
-
-WITH table_sizes AS (
-    SELECT
-        schemaname,
-        tablename,
-        pg_total_relation_size(schemaname || '.' || tablename) AS total_bytes,
-        pg_relation_size(schemaname || '.' || tablename) AS table_bytes,
-        pg_total_relation_size(schemaname || '.' || tablename)
-            - pg_relation_size(schemaname || '.' || tablename) AS index_bytes
-    FROM pg_tables
-    WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
-),
-column_type_analysis AS (
-    SELECT
-        c.table_schema,
-        c.table_name,
-        COUNT(*) FILTER (WHERE data_type IN ('text', 'character varying', 'json', 'jsonb', 'xml')) AS text_columns,
-        COUNT(*) FILTER (WHERE data_type IN ('bytea', 'bit varying')) AS binary_columns,
-        COUNT(*) AS total_columns
-    FROM information_schema.columns c
-    WHERE c.table_schema NOT IN ('pg_catalog', 'information_schema')
-    GROUP BY c.table_schema, c.table_name
-)
-SELECT
-    ts.schemaname,
-    ts.tablename,
-    pg_size_pretty(ts.total_bytes) AS total_size,
-    pg_size_pretty(ts.table_bytes) AS table_data_size,
-    pg_size_pretty(ts.index_bytes) AS index_size,
-    ct.text_columns,
-    ct.binary_columns,
-    ct.total_columns,
-    ROUND(ct.text_columns::numeric / NULLIF(ct.total_columns, 0) * 100, 1) AS pct_text_columns,
-    -- Tables with &gt;40% text columns and &gt;100MB are compression candidates
-    CASE
-        WHEN ct.text_columns::numeric / NULLIF(ct.total_columns, 0) &gt; 0.4
-             AND ts.table_bytes &gt; 104857600
-        THEN 'HIGH PRIORITY'
-        WHEN ct.text_columns::numeric / NULLIF(ct.total_columns, 0) &gt; 0.2
-             AND ts.table_bytes &gt; 52428800
-        THEN 'MEDIUM PRIORITY'
-        ELSE 'LOW PRIORITY'
-    END AS compression_priority
-FROM table_sizes ts
-JOIN column_type_analysis ct
-    ON ts.schemaname = ct.table_schema
-    AND ts.tablename = ct.table_name
-WHERE ts.total_bytes &gt; 10485760  -- Only tables &gt; 10 MB
-ORDER BY ts.total_bytes DESC
-LIMIT 50;</code></pre>
+<p class="text-gray-300 leading-relaxed">Azure SQL Managed Instance charges per GB-month for allocated storage depending on tier and redundancy; Google Cloud SQL for SQL Server SSD storage has its own per-GB-month rate. Because rates differ by platform, tier, and region, compute the per-GB-month cost for your exact configuration and multiply by the GB you expect compression to reclaim — that number is the monthly value of this chapter.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Finding Compressible Data in SQL Server (Azure SQL / RDS SQL Server)</strong></p>
 
@@ -159,59 +102,7 @@ ORDER BY a.total_pages DESC;
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">16.2 Compression Options by Database Engine and Cloud Platform</h3>
 
-<p class="text-gray-300 leading-relaxed">Each database engine offers different compression mechanisms, and each cloud platform has its own constraints on which ones are available. Using the right compression at the right layer is the difference between a 60% reduction and a 5% reduction.</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL: TOAST, pg_compress, and tablespace-level approaches</strong></p>
-
-<p class="text-gray-300 leading-relaxed">PostgreSQL uses TOAST (The Oversized-Attribute Storage Technique) automatically for column values exceeding approximately 2 KB. TOAST compresses the value using LZ4 (PostgreSQL 14+) or PGLZ (earlier versions) before writing it to the TOAST table. The key insight is that this is transparent — no schema changes required — but you control which algorithm it uses.</p>
-
-<p class="text-gray-300 leading-relaxed">PostgreSQL 14 and later (available on RDS PostgreSQL 14+, Aurora PostgreSQL 14+, and Cloud SQL for PostgreSQL 14+) allows setting the compression method per column:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Check current TOAST compression settings for a table
-SELECT
-    attname AS column_name,
-    attstorage AS storage_mode,
-    attcompression AS compression_method,
-    -- attstorage values: 'p'=plain, 'e'=external, 'x'=extended (TOAST+compress), 'm'=main
-    CASE attstorage
-        WHEN 'p' THEN 'No TOAST - always inline'
-        WHEN 'e' THEN 'External TOAST - no compression'
-        WHEN 'x' THEN 'Extended - TOAST with compression (best)'
-        WHEN 'm' THEN 'Main - compress first, TOAST if needed'
-    END AS storage_description,
-    CASE attcompression
-        WHEN '' THEN 'Default (pglz on PG13-, lz4 on PG14+)'
-        WHEN 'p' THEN 'pglz'
-        WHEN 'l' THEN 'lz4'
-    END AS compression_algorithm
-FROM pg_attribute
-WHERE attrelid = 'your_schema.your_table'::regclass
-  AND attnum &gt; 0
-  AND NOT attisdropped
-ORDER BY attnum;
-
--- Switch a text column from pglz to lz4 (PostgreSQL 14+, RDS PG14+, Aurora PG14+)
--- lz4 is 3-5x faster to compress/decompress than pglz with similar compression ratios
-ALTER TABLE your_schema.your_table
-    ALTER COLUMN description SET COMPRESSION lz4;
-
-ALTER TABLE your_schema.your_table
-    ALTER COLUMN payload SET COMPRESSION lz4;
-
--- Force recompression of existing rows by rewriting the table
--- Schedule during a maintenance window - this takes an ACCESS EXCLUSIVE lock
--- For large tables, use pg_repack instead (no lock):
--- pg_repack --table your_schema.your_table -d your_database
-VACUUM FULL your_schema.your_table;
-
--- Verify compression took effect on existing TOAST data
-SELECT
-    pg_size_pretty(pg_total_relation_size('your_schema.your_table')) AS total_with_toast,
-    pg_size_pretty(pg_relation_size('your_schema.your_table')) AS main_table,
-    pg_size_pretty(
-        pg_total_relation_size('your_schema.your_table')
-        - pg_relation_size('your_schema.your_table')
-    ) AS toast_and_indexes;</code></pre>
+<p class="text-gray-300 leading-relaxed">Each cloud platform has its own constraints on which compression options are available. Using the right compression at the right layer is the difference between a 60% reduction and a 5% reduction.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server on Azure SQL and RDS: Row and Page Compression</strong></p>
 
@@ -260,57 +151,11 @@ INNER JOIN sys.allocation_units a ON p.partition_id = a.container_id
 GROUP BY s.name, t.name, i.name, i.type_desc, p.data_compression_desc
 ORDER BY SUM(a.total_pages) DESC;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">MySQL / Aurora MySQL: InnoDB Compression and Page Size</strong></p>
 
-<p class="text-gray-300 leading-relaxed">InnoDB row format compression (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ROW_FORMAT=COMPRESSED</code>) has been available since MySQL 5.5 but carries a significant caveat: it halves the effective buffer pool utilization because InnoDB keeps both compressed and uncompressed versions of each page in the buffer pool. This makes InnoDB row compression a poor choice for frequently accessed hot tables.</p>
-
-<p class="text-gray-300 leading-relaxed">The better option for Aurora MySQL and RDS MySQL 8.0+ is Barracuda file format with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">KEY_BLOCK_SIZE</code> tuning. For cold or archive tables, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ROW_FORMAT=COMPRESSED KEY_BLOCK_SIZE=8</code> achieves 40–60% compression with acceptable performance since those pages rarely appear in the buffer pool.</p>
-
-<p class="text-gray-300 leading-relaxed">The right approach for Aurora MySQL specifically is to use the Aurora storage engine's built-in compression, which operates at the storage layer and does not penalize the buffer pool — it is always on and transparent. Measuring Aurora storage savings therefore requires comparing Aurora's reported volume size against what the same data would occupy on a standard MySQL installation.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">16.3 Measuring the Real Performance Tradeoff</h3>
 
 <p class="text-gray-300 leading-relaxed">Enabling compression without measuring its CPU and latency impact is how organizations discover problems in production at 2 AM. The measurement methodology below runs before and after compression to capture an honest before/after comparison.</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL: Measuring Query Performance Against Compressed TOAST Data</strong></p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Capture baseline query performance before compression changes
--- Run this before altering any compression settings
-
--- Enable pg_stat_statements if not already enabled
--- (On RDS, add pg_stat_statements to shared_preload_libraries via parameter group)
-CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
-
--- Capture baseline for queries touching the tables you plan to compress
-SELECT
-    left(query, 100) AS query_snippet,
-    calls,
-    ROUND(total_exec_time::numeric, 2) AS total_ms,
-    ROUND(mean_exec_time::numeric, 4) AS mean_ms,
-    ROUND(stddev_exec_time::numeric, 4) AS stddev_ms,
-    rows,
-    shared_blks_read,
-    shared_blks_hit,
-    ROUND(
-        shared_blks_hit::numeric /
-        NULLIF(shared_blks_hit + shared_blks_read, 0) * 100, 2
-    ) AS buffer_hit_pct
-FROM pg_stat_statements
-WHERE query ILIKE '%your_table_name%'
-  AND calls &gt; 100
-ORDER BY mean_exec_time DESC;
-
--- Reset stats, apply compression, run workload for 1 hour, then compare
-SELECT pg_stat_statements_reset();
-
--- After compression and workload replay, run again and compare mean_ms values
--- Also check shared_blks_read: if TOAST decompression causes more block reads,
--- you will see this number increase even if mean query time stays flat
-
--- Check CloudWatch metrics alongside this for CPU correlation
--- Use RDS Performance Insights to correlate CPU spikes with compression events</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Monitoring Compression CPU Impact with CloudWatch and Python</strong></p>
 
@@ -582,37 +427,6 @@ ORDER BY avg_cpu_microseconds DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">For manual snapshots exported to S3 via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">aws rds start-export-task</code>, the exported data is stored as Parquet files in S3, which applies Snappy compression by default. You do not control this, but you benefit from it automatically. A 3 TB Parquet export of typical relational OLTP data commonly stores in 600–900 GB of S3 space due to Snappy compression plus Parquet's columnar encoding. That S3 storage at $0.023/GB-month is substantially cheaper than RDS snapshot storage at $0.095/GB-month for long-term archival.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL WAL Compression for Logical Replication</strong></p>
-
-<p class="text-gray-300 leading-relaxed">For Aurora PostgreSQL or RDS PostgreSQL instances using logical replication to feed downstream consumers (analytics databases, Kafka, CDC pipelines), enabling WAL-level compression reduces replication bandwidth costs:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Check current WAL settings relevant to compression
--- On RDS, these are set via parameter groups, not directly in psql
-SHOW wal_compression;
-SHOW wal_level;
-
--- If wal_compression is 'off', request a parameter group change:
--- wal_compression = lz4   (PostgreSQL 14+ supports lz4 and zstd)
--- This reduces WAL segment sizes by 30-60% for text-heavy workloads
--- and directly reduces cross-AZ replication traffic costs
-
--- Measure current WAL generation rate to estimate savings
-SELECT
-    pg_current_wal_lsn() AS current_lsn,
-    pg_walfile_name(pg_current_wal_lsn()) AS current_wal_file,
-    -- Run this query twice, 60 seconds apart, and subtract LSN values
-    -- to get bytes of WAL generated per minute
-    pg_wal_lsn_diff(
-        pg_current_wal_lsn(),
-        '0/0'::pg_lsn
-    ) AS total_wal_bytes_generated
-;
-
--- Cross-AZ data transfer pricing on AWS: $0.02/GB
--- If WAL compression reduces replication traffic by 40% on a database
--- generating 50 GB/day of WAL, that is 20 GB/day saved = $0.40/day = $12/month
--- For a write-intensive database generating 500 GB/day, savings reach $120/month</code></pre>
-
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Azure SQL: Built-in Backup Compression</strong></p>
 
 <p class="text-gray-300 leading-relaxed">Azure SQL Database and Azure SQL Managed Instance compress backups automatically using a built-in compression algorithm. You cannot disable it, and you do not tune it. The practical implication is that applying page or row compression to your tables reduces the pre-compression data volume fed into Azure's backup pipeline, which in turn reduces the compressed backup size and the backup storage billed. The effect is multiplicative rather than additive: if page compression reduces your table data by 50% and Azure's backup compression reduces that by an additional 30%, your backup storage is roughly 65% smaller than the uncompressed baseline.</p>
@@ -646,75 +460,6 @@ ORDER BY backup_start_date DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">One-off compression projects decay. Engineers create new tables without compression settings, schema changes introduce uncompressed columns, and within six months the storage savings erode as new data accumulates uncompressed. Automation that enforces compression standards at table creation and identifies drift on a schedule is what converts a project into compounding savings.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL: Event Trigger to Enforce TOAST Compression on New Tables</strong></p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Deploy this to each PostgreSQL database in your fleet
--- It fires on CREATE TABLE and ALTER TABLE ADD COLUMN,
--- automatically setting lz4 compression on all text/json/jsonb columns
-
-CREATE OR REPLACE FUNCTION enforce_lz4_compression()
-RETURNS event_trigger
-LANGUAGE plpgsql
-SECURITY DEFINER
-AS $$
-DECLARE
-    obj record;
-    col record;
-    schema_name text;
-    table_name text;
-BEGIN
-    FOR obj IN
-        SELECT * FROM pg_event_trigger_ddl_commands()
-        WHERE command_tag IN ('CREATE TABLE', 'ALTER TABLE')
-          AND object_type = 'table'
-    LOOP
-        -- Parse schema and table from object_identity
-        schema_name := split_part(obj.object_identity, '.', 1);
-        table_name  := split_part(obj.object_identity, '.', 2);
-
-        -- Skip system schemas
-        IF schema_name IN ('pg_catalog', 'information_schema', 'pg_toast') THEN
-            CONTINUE;
-        END IF;
-
-        -- Set lz4 compression on all compressible columns
-        FOR col IN
-            SELECT attname, attstorage
-            FROM pg_attribute
-            WHERE attrelid = obj.objid
-              AND attnum &gt; 0
-              AND NOT attisdropped
-              AND atttypid IN (
-                  'text'::regtype,
-                  'varchar'::regtype,
-                  'json'::regtype,
-                  'jsonb'::regtype,
-                  'xml'::regtype,
-                  'bytea'::regtype
-              )
-              AND attcompression != 'l'  -- not already lz4
-        LOOP
-            EXECUTE format(
-                'ALTER TABLE %I.%I ALTER COLUMN %I SET COMPRESSION lz4',
-                schema_name, table_name, col.attname
-            );
-        END LOOP;
-    END LOOP;
-END;
-$$;
-
--- Create the event trigger (runs in all databases where deployed)
-DROP EVENT TRIGGER IF EXISTS enforce_compression_on_ddl;
-CREATE EVENT TRIGGER enforce_compression_on_ddl
-    ON ddl_command_end
-    WHEN TAG IN ('CREATE TABLE', 'ALTER TABLE')
-    EXECUTE FUNCTION enforce_lz4_compression();
-
--- Verify the trigger is active
-SELECT evtname, evtevent, evtenabled, evtfoid::regproc AS function
-FROM pg_event_trigger
-WHERE evtname = 'enforce_compression_on_ddl';</code></pre>
-
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Fleet-Wide Compression Drift Detection Script</strong></p>
 
 <p class="text-gray-300 leading-relaxed">The event trigger handles new objects, but it does not retroactively fix existing tables or catch tables created before the trigger was deployed. A scheduled drift detection job handles the remediation side:</p>
@@ -723,21 +468,20 @@ WHERE evtname = 'enforce_compression_on_ddl';</code></pre>
 """
 compression_drift_detector.py
 
-Scans a fleet of PostgreSQL databases for tables with compressible columns
-that are not using lz4 compression. Outputs a remediation script and
+Scans a fleet of SQL Server databases for tables that are not using
+row or page compression. Outputs a remediation script and
 optionally posts findings to an SNS topic for alerting.
 
 Designed to run as an AWS Lambda function on a weekly schedule via
 EventBridge, or as a cron job on a bastion host.
 
-Requirements: psycopg2-binary, boto3
+Requirements: pyodbc, boto3
 """
 
 import json
 import os
 import boto3
-import psycopg2
-import psycopg2.extras
+import pyodbc
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 
@@ -748,7 +492,6 @@ class CompressionDrift:
     database: str
     schema_name: str
     table_name: str
-    column_name: str
     current_compression: str
     table_size_mb: float
     remediation_sql: str
@@ -770,7 +513,7 @@ def get_database_endpoints(tag_key: str = 'compression-managed',
             tags = {t['Key']: t['Value'] for t in instance.get('TagList', [])}
             if tags.get(tag_key) != tag_value:
                 continue
-            if instance['Engine'] not in ('postgres', 'aurora-postgresql'):
+            if instance['Engine'] not in ('sqlserver-ee', 'sqlserver-se', 'sqlserver-ex', 'sqlserver-web'):
                 continue
             if instance['DBInstanceStatus'] != 'available':
                 continue
@@ -780,7 +523,7 @@ def get_database_endpoints(tag_key: str = 'compression-managed',
                 'port': instance['Endpoint']['Port'],
                 'instance_id': instance['DBInstanceIdentifier'],
                 'engine': instance['Engine'],
-                'databases': tags.get('monitored-databases', 'postgres').split(',')
+                'databases': tags.get('monitored-databases', 'master').split(',')
             })
 
     return endpoints
@@ -797,78 +540,60 @@ def scan_database_for_drift(host: str, port: int, database: str,
                              credentials: dict,
                              min_table_size_mb: float = 10.0) -&gt; list[CompressionDrift]:
     """
-    Connect to a PostgreSQL database and find compressible columns
-    not using lz4 compression.
+    Connect to a SQL Server database and find tables
+    not using row or page compression.
     """
     drifts = []
 
+    conn_str = (
+        "DRIVER={ODBC Driver 18 for SQL Server};"
+        f"SERVER={host},{port};DATABASE={database};"
+        f"UID={credentials['username']};PWD={credentials['password']};"
+        "Encrypt=yes;TrustServerCertificate=yes;"
+        "Connection Timeout=10;"
+    )
     try:
-        conn = psycopg2.connect(
-            host=host,
-            port=port,
-            dbname=database,
-            user=credentials['username'],
-            password=credentials['password'],
-            connect_timeout=10,
-            sslmode='require'
-        )
-        conn.set_session(readonly=True, autocommit=True)
-        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        conn = pyodbc.connect(conn_str, autocommit=True)
+        cursor = conn.cursor()
 
         cursor.execute("""
             SELECT
-                n.nspname AS schema_name,
-                c.relname AS table_name,
-                a.attname AS column_name,
-                CASE a.attcompression
-                    WHEN '' THEN 'default'
-                    WHEN 'p' THEN 'pglz'
-                    WHEN 'l' THEN 'lz4'
-                    ELSE a.attcompression
-                END AS current_compression,
-                ROUND(pg_total_relation_size(c.oid) / 1024.0 / 1024.0, 2)
+                s.name AS schema_name,
+                t.name AS table_name,
+                p.data_compression_desc AS current_compression,
+                CAST(SUM(a.total_pages) * 8.0 / 1024 AS DECIMAL(12,2))
                     AS table_size_mb
-            FROM pg_attribute a
-            JOIN pg_class c ON a.attrelid = c.oid
-            JOIN pg_namespace n ON c.relnamespace = n.oid
-            WHERE a.attnum &gt; 0
-              AND NOT a.attisdropped
-              AND c.relkind = 'r'
-              AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
-              AND a.atttypid IN (
-                  'text'::regtype,
-                  'varchar'::regtype,
-                  'json'::regtype,
-                  'jsonb'::regtype,
-                  'xml'::regtype,
-                  'bytea'::regtype
-              )
-              AND a.attstorage IN ('x', 'm', 'e')
-              AND a.attcompression != 'l'  -- not already lz4
-              AND pg_total_relation_size(c.oid) &gt; %s * 1024 * 1024
-            ORDER BY pg_total_relation_size(c.oid) DESC
-        """, (min_table_size_mb,))
+            FROM sys.tables t
+            JOIN sys.schemas s ON s.schema_id = t.schema_id
+            JOIN sys.partitions p ON p.object_id = t.object_id
+            JOIN sys.allocation_units a ON a.container_id = p.partition_id
+            WHERE p.index_id IN (0, 1)
+            GROUP BY s.name, t.name, p.data_compression_desc
+            HAVING p.data_compression_desc = 'NONE'
+               AND SUM(a.total_pages) * 8.0 / 1024 &gt; ?
+            ORDER BY table_size_mb DESC
+        """, min_table_size_mb)
 
         for row in cursor.fetchall():
+            schema_name, table_name, current_compression, table_size_mb = row
             remediation = (
-                f"ALTER TABLE {row['schema_name']}.{row['table_name']} "
-                f"ALTER COLUMN {row['column_name']} SET COMPRESSION lz4;"
+                f"ALTER TABLE [{schema_name}].[{table_name}] "
+                f"REBUILD PARTITION = ALL WITH (DATA_COMPRESSION = PAGE);"
             )
             drifts.append(CompressionDrift(
                 host=host,
                 database=database,
-                schema_name=row['schema_name'],
-                table_name=row['table_name'],
-                column_name=row['column_name'],
-                current_compression=row['current_compression'],
-                table_size_mb=float(row['table_size_mb']),
+                schema_name=schema_name,
+                table_name=table_name,
+                current_compression=current_compression,
+                table_size_mb=float(table_size_mb),
                 remediation_sql=remediation
             ))
 
         cursor.close()
         conn.close()
 
-    except psycopg2.OperationalError as e:
+    except pyodbc.Error as e:
         print(f"  Connection failed to {host}/{database}: {e}")
 
     return drifts
@@ -886,7 +611,7 @@ def publish_drift_report(drifts: list[CompressionDrift],
     total_size_mb = sum(d.table_size_mb for d in drifts)
 
     print(f"\n=== COMPRESSION DRIFT REPORT ===")
-    print(f"Affected columns: {len(drifts)}")
+    print(f"Affected tables: {len(drifts)}")
     print(f"Affected tables:  {total_affected_tables}")
     print(f"Total table size: {total_size_mb / 1024:.1f} GB")
     print(f"\n-- REMEDIATION SQL --")
@@ -932,7 +657,7 @@ def lambda_handler(event: dict, context) -&gt; dict:
                 min_table_size_mb=min_size_mb
             )
             all_drifts.extend(drifts)
-            print(f"  Found {len(drifts)} uncompressed compressible columns")
+            print(f"  Found {len(drifts)} uncompressed tables")
 
     publish_drift_report(all_drifts, sns_topic_arn)
 
@@ -1138,13 +863,7 @@ WHERE OBJECT_NAME(i.object_id) = 'AuditLog'
 GROUP BY i.name, i.type_desc, p.data_compression_desc
 ORDER BY SUM(a.total_pages) DESC;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL: Partitioning + pg_partman + Columnar Extension (Citus / Hydra)</strong></p>
 
-<p class="text-gray-300 leading-relaxed">Standard PostgreSQL does not include a native columnar storage engine for on-disk row format compression at the columnar level, but the Hydra columnar extension (available on Aurora PostgreSQL via custom parameter groups in some configurations) and Citus columnar (available on Azure Database for PostgreSQL – Flexible Server) both provide columnar access methods. For workloads running on those platforms, columnar tables achieve similar compression ratios to SQL Server columnstore indexes.</p>
-
-<p class="text-gray-300 leading-relaxed">For RDS PostgreSQL without columnar extensions, the practical equivalent is aggressive partitioning by time combined with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CLUSTER</code> on the most selective column and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VACUUM FULL</code> on older partitions. This does not achieve columnar compression ratios, but it does concentrate similar data on each page, making PGLZ and LZ4 TOAST compression more effective, and it enables detaching and archiving cold partitions to cheaper storage tiers.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">16.7 Building a Compression Savings Dashboard</h3>
 
@@ -1185,22 +904,22 @@ STORAGE_PRICING = {
         'gp3_single_az': 0.115,
         'gp3_multi_az': 0.230,    # primary + standby volumes
         'backup_s3': 0.095,
-        'aurora_single': 0.10,
-        'aurora_multi': 0.10,     # Aurora charges per-GB regardless of AZ config
+        'rds_sqlserver_single': 0.10,   # placeholder: use gp3 rate
+        'rds_sqlserver_multi': 0.20,    # primary + standby volumes
     },
     'eu-west-1': {
         'gp3_single_az': 0.131,
         'gp3_multi_az': 0.262,
         'backup_s3': 0.095,
-        'aurora_single': 0.114,
-        'aurora_multi': 0.114,
+        'rds_sqlserver_single': 0.114,
+        'rds_sqlserver_multi': 0.114,
     },
     'ap-southeast-1': {
         'gp3_single_az': 0.138,
         'gp3_multi_az': 0.276,
         'backup_s3': 0.095,
-        'aurora_single': 0.122,
-        'aurora_multi': 0.122,
+        'rds_sqlserver_single': 0.122,
+        'rds_sqlserver_multi': 0.122,
     }
 }
 
@@ -1296,8 +1015,8 @@ def calculate_monthly_savings(instance_id: str, region: str,
     engine = current['engine']
 
     # Determine per-GB rate based on engine and AZ configuration
-    if 'aurora' in engine:
-        rate_per_gb = pricing['aurora_multi']  # Aurora always effectively multi-AZ
+    if 'sqlserver' in engine:
+        rate_per_gb = pricing['rds_sqlserver_multi'] if multi_az else pricing['rds_sqlserver_single']
     elif multi_az:
         rate_per_gb = pricing['gp3_multi_az']
     else:
@@ -1446,26 +1165,25 @@ if __name__ == '__main__':
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Tables used for in-flight streaming</strong>: Tables that serve as intermediate buffers for real-time event processing — where rows are written, read once, and deleted within seconds — spend no time on disk in a meaningful sense. The buffer pool absorbs nearly all I/O, so physical storage compression has no effect on costs.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">High-cardinality columns with random data</strong>: Page compression's prefix and dictionary compression steps achieve nothing on columns with UUID values, hash outputs, random tokens, or base64-encoded nonces. Row compression still eliminates padding from fixed-length types, so it remains viable, but page compression adds CPU overhead with negligible storage benefit. Run <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sp_estimate_data_compression_savings</code> or a TOAST size comparison before applying page compression to any table with UUIDs as primary or foreign keys.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">High-cardinality columns with random data</strong>: Page compression's prefix and dictionary compression steps achieve nothing on columns with UUID values, hash outputs, random tokens, or base64-encoded nonces. Row compression still eliminates padding from fixed-length types, so it remains viable, but page compression adds CPU overhead with negligible storage benefit. Run <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sp_estimate_data_compression_savings</code> before applying page compression to any table with UUIDs as primary or foreign keys.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Storage savings multiply across layers**: Compressing primary data reduces not just the primary EBS or managed disk volume but also the standby replica volume (in Multi-AZ deployments), automated backup snapshots, and WAL or log replication traffic. The actual cost reduction is often two to three times the primary storage saving in isolation.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **LZ4 is the correct default for PostgreSQL 14+ TOAST columns**: LZ4 compresses and decompresses three to five times faster than the older PGLZ algorithm with comparable or better compression ratios for the text and JSON workloads that dominate most OLTP schemas. Switching existing databases requires an explicit ALTER COLUMN plus VACUUM FULL or pg_repack to rewrite existing TOAST entries.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Storage savings multiply across layers**: Compressing primary data reduces not just the primary EBS or managed disk volume but also the standby replica volume (in Multi-AZ deployments), automated backup snapshots, and transaction log replication traffic. The actual cost reduction is often two to three times the primary storage saving in isolation.</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **SQL Server row versus page compression is a CPU budget decision**: Row compression saves 10–25% with minimal CPU overhead and is safe for nearly all tables. Page compression saves 30–60% but can add 15–25% CPU overhead on write-heavy tables. On vCore-based Azure SQL tiers, calculate whether the CPU cost of page compression exceeds the storage savings at current pricing before applying it.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Automation prevents savings erosion**: A compression project without drift detection and enforcement via event triggers (PostgreSQL) or a scheduled audit job (SQL Server) will see its gains diluted within months as new uncompressed tables accumulate. The event trigger in section 16.5 costs nothing to run and applies lz4 to every new compressible column automatically.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Automation prevents savings erosion**: A compression project without drift detection and enforcement via a scheduled audit job (SQL Server) will see its gains diluted within months as new uncompressed tables accumulate. The scheduled job in section 16.5 costs nothing to run and flags every new uncompressed table automatically.</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Know when to stop**: Already-compressed binary formats, extremely high write-throughput tables, sub-10 MB tables, and columns with high-cardinality random values are not compression candidates. Applying compression to these patterns wastes CPU, increases write latency, and produces no meaningful storage savings, converting a cost optimization project into a performance incident.</li></div>
     <div class="mt-14 bg-amber-950/40 border border-amber-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
-        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+        <p class="text-xs text-gray-400">Query plan visualizer · Index advisor · Slow query dashboard · SQL Server</p>
       </div>
       <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
          class="shrink-0 px-6 py-3 bg-amber-600 hover:bg-amber-500 text-white font-semibold rounded-xl text-sm transition">Download Free</a>
     </div>
-    <div class="mt-8 text-xs"><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a></div>
+    <nav class="mt-8 flex flex-col sm:flex-row items-center justify-between gap-3 text-xs"><span><a href="b7-ch15-storage-cleanup.html" class="text-gray-400 hover:text-amber-300 transition">← Automated Storage Cleanup: Snapshots, Temp Tables, and Bloat</a></span><span><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">All Chapters</a></span><span><a href="b7-ch17-tiered-storage.html" class="text-gray-400 hover:text-amber-300 transition">Tiered Storage: Moving Cold Data Cheaply →</a></span></nav>
   </article>
   <footer class="border-t border-gray-800/50 px-6 py-8">
     <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · Database FinOps</div>

@@ -57,57 +57,13 @@
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Memory pressure from working set size</strong> occurs when the database's active data genuinely cannot fit in buffer pool or shared buffers, forcing repeated physical disk reads. This is a legitimate case for vertical scaling — but only after confirming that the buffer pool is tuned to use available memory and that no single runaway query is monopolizing the cache by scanning enormous tables repeatedly.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Memory pressure from connection count</strong> is entirely different. Each database connection on PostgreSQL consumes between 5 MB and 10 MB of process memory. One thousand connections consume 5 GB to 10 GB of RAM before a single query executes. This is a pgBouncer problem, not an instance size problem.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Memory pressure from connection count</strong> is entirely different. Each database connection on SQL Server consumes worker threads and session workspace memory. One thousand mostly-idle sessions still force the engine to manage a thousand session contexts and their memory grants queue. This is a connection-pooling problem, not an instance size problem.</p>
 
 <p class="text-gray-300 leading-relaxed">The following query identifies which category your current bottleneck falls into by correlating wait event data with query execution patterns.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: Identify top wait events and correlate with specific queries
--- Run this against your RDS PostgreSQL or Aurora PostgreSQL instance
--- Requires pg_stat_activity and pg_stat_statements
 
-WITH active_waits AS (
-    SELECT
-        wait_event_type,
-        wait_event,
-        COUNT(*)                            AS sessions_waiting,
-        ROUND(COUNT(*) * 100.0 /
-            NULLIF(SUM(COUNT(*)) OVER (), 0), 2) AS pct_of_sessions
-    FROM pg_stat_activity
-    WHERE state = 'active'
-      AND wait_event IS NOT NULL
-      AND pid &lt;&gt; pg_backend_pid()
-    GROUP BY wait_event_type, wait_event
-    ORDER BY sessions_waiting DESC
-),
-expensive_queries AS (
-    SELECT
-        LEFT(query, 100)                    AS query_preview,
-        calls,
-        ROUND((total_exec_time / calls)::numeric, 2) AS avg_ms,
-        ROUND(total_exec_time::numeric, 2)  AS total_ms,
-        rows,
-        ROUND((rows::numeric / NULLIF(calls, 0)), 0) AS avg_rows,
-        shared_blks_hit,
-        shared_blks_read,
-        ROUND(
-            shared_blks_read * 100.0 /
-            NULLIF(shared_blks_hit + shared_blks_read, 0),
-        2)                                  AS cache_miss_pct
-    FROM pg_stat_statements
-    WHERE calls &gt; 50
-    ORDER BY total_exec_time DESC
-    LIMIT 15
-)
-SELECT 'WAIT EVENTS' AS section, * FROM active_waits
-UNION ALL
-SELECT 'TOP QUERIES', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
-UNION ALL
-SELECT 'QUERY', query_preview, calls::text, avg_ms::text,
-       total_ms::text, avg_rows::text, NULL, shared_blks_hit::text,
-       shared_blks_read::text, cache_miss_pct::text, NULL
-FROM expensive_queries;</code></pre>
 
-<p class="text-gray-300 leading-relaxed">Interpret the results as follows. If the dominant wait event type is <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">IO</code> (specifically <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DataFileRead</code>), your bottleneck is storage, not compute. If it is <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Lock</code> or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">LWLock</code>, you have contention issues. If it is <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CPU</code> with no wait events at all, compute pressure may be legitimate. If your top queries show cache miss percentages above 15%, your working set exceeds shared buffers, and you should consider memory before vCPUs.</p>
+
 
 <p class="text-gray-300 leading-relaxed">For SQL Server on Azure SQL or RDS SQL Server, the equivalent diagnostic uses wait statistics:</p>
 
@@ -157,26 +113,26 @@ ORDER BY wait_time_ms DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Vertical scaling decisions are budget decisions. Before any discussion of remediation, the DBA and the engineering leadership need to understand the actual cost delta of scaling decisions. These numbers are not theoretical — they appear on your bill every month.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">AWS RDS PostgreSQL pricing (us-east-1, Multi-AZ, On-Demand, 2024 rates):</strong></p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">AWS RDS for SQL Server pricing (us-east-1, Multi-AZ, license-included, illustrative rates):</strong></p>
 
 <p class="text-gray-300 leading-relaxed">| Instance Class | vCPUs | RAM | $/hr | $/month | $/year |</p>
 <p class="text-gray-300 leading-relaxed">|---|---|---|---|---|---|</p>
-<p class="text-gray-300 leading-relaxed">| db.t4g.medium | 2 | 4 GB | $0.068 | $50 | $595 |</p>
-<p class="text-gray-300 leading-relaxed">| db.r6g.large | 2 | 16 GB | $0.240 | $175 | $2,102 |</p>
-<p class="text-gray-300 leading-relaxed">| db.r6g.xlarge | 4 | 32 GB | $0.480 | $350 | $4,205 |</p>
-<p class="text-gray-300 leading-relaxed">| db.r6g.2xlarge | 8 | 64 GB | $0.960 | $701 | $8,409 |</p>
-<p class="text-gray-300 leading-relaxed">| db.r6g.4xlarge | 16 | 128 GB | $1.920 | $1,402 | $16,819 |</p>
-<p class="text-gray-300 leading-relaxed">| db.r6g.8xlarge | 32 | 256 GB | $3.840 | $2,803 | $33,638 |</p>
+<p class="text-gray-300 leading-relaxed">| db.t3.medium | 2 | 4 GB | $0.96 | $701 | $8,410 |</p>
+<p class="text-gray-300 leading-relaxed">| db.r6i.large | 2 | 16 GB | $3.20 | $2,336 | $28,032 |</p>
+<p class="text-gray-300 leading-relaxed">| db.r6i.xlarge | 4 | 32 GB | $6.40 | $4,672 | $56,064 |</p>
+<p class="text-gray-300 leading-relaxed">| db.r6i.2xlarge | 8 | 64 GB | $12.80 | $9,344 | $112,128 |</p>
+<p class="text-gray-300 leading-relaxed">| db.r6i.4xlarge | 16 | 128 GB | $25.60 | $18,688 | $224,256 |</p>
+<p class="text-gray-300 leading-relaxed">| db.r6i.8xlarge | 32 | 256 GB | $51.20 | $37,376 | $448,512 |</p>
 
-<p class="text-gray-300 leading-relaxed">Every step up the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">r6g</code> ladder exactly doubles your compute cost. The question this chapter answers is: which of those steps actually buys you performance, and which ones are just buying comfort?</p>
+<p class="text-gray-300 leading-relaxed">Every step up the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">r6i</code> ladder exactly doubles your compute cost (illustrative license-included rates — SQL Server cannot use Graviton classes). The question this chapter answers is: which of those steps actually buys you performance, and which ones are just buying comfort?</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Azure SQL Database (General Purpose, 8 vCores vs 16 vCores, East US):</strong></p>
 
 <p class="text-gray-300 leading-relaxed">Moving from 8 vCores ($1.1424/hr) to 16 vCores ($2.2848/hr) costs $9,989 more per year. Azure Hyperscale at 16 vCores runs $14,965/year just in compute, before storage.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Google Cloud SQL PostgreSQL (us-central1):</strong></p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Google Cloud SQL for SQL Server (us-central1, illustrative):</strong></p>
 
-<p class="text-gray-300 leading-relaxed">Moving from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db-custom-8-32768</code> ($0.5290/hr, 8 vCPUs, 32 GB) to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db-custom-16-65536</code> ($1.0580/hr) costs $4,638 more per year. Cloud SQL for PostgreSQL Enterprise Plus at 16 vCPUs approaches $1.40/hr, or $12,264/year.</p>
+<p class="text-gray-300 leading-relaxed">Moving from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db-custom-8-32768</code> (8 vCPUs, 32 GB) to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db-custom-16-65536</code> roughly doubles the hourly rate — and for SQL Server the per-core license charge doubles with it, since licensing is billed per vCPU per hour on top of compute. Cloud SQL for SQL Server Enterprise at 16 vCPUs therefore carries both a higher compute rate and a higher license charge; verify both on the Cloud SQL pricing page before sizing up.</p>
 
 <p class="text-gray-300 leading-relaxed">These are the numbers that make query optimization worth the effort. A developer spending two weeks optimizing a slow query at $200,000 annual fully-loaded salary costs roughly $7,700. If that optimization prevents a vertical scaling event that would have cost $9,000 per year, it pays for itself in under 13 months — and the savings compound every subsequent year.</p>
 
@@ -279,85 +235,77 @@ echo "Analysis complete. Review DOWNSIZE CANDIDATES above before any instance ch
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Step 1: Identify the highest-cost queries by CPU contribution</strong></p>
 
-<p class="text-gray-300 leading-relaxed">PostgreSQL's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> extension (enabled by default on RDS PostgreSQL) provides cumulative execution statistics. The critical metric for CPU-driven cost is <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">total_exec_time</code> — this is wall-clock time the database spent on each query across all calls.</p>
+<p class="text-gray-300 leading-relaxed">SQL Server's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Query Store</code> (enable it per database) provides cumulative execution statistics. The critical metric for CPU-driven cost is <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">avg_cpu_time</code> — the CPU time the engine spent on each query across all executions.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: CPU cost ranking with optimization opportunity scoring
--- Reset stats periodically: SELECT pg_stat_statements_reset();
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: CPU cost ranking with optimization opportunity scoring
+-- Uses Query Store (enable it first: ALTER DATABASE ... SET QUERY_STORE = ON)
 -- Run after collecting at least 1 hour of production traffic
 
-SELECT
-    pss.queryid,
-    LEFT(pss.query, 120)                        AS query_preview,
-    pss.calls,
-    ROUND(pss.total_exec_time::numeric / 1000, 2)
-                                                AS total_exec_sec,
-    ROUND((pss.total_exec_time / pss.calls)::numeric, 2)
-                                                AS avg_exec_ms,
-    ROUND(pss.rows::numeric / NULLIF(pss.calls, 0), 0)
-                                                AS avg_rows_returned,
+SELECT TOP 25
+    q.query_id,
+    LEFT(qt.query_sql_text, 120)                AS query_preview,
+    SUM(rs.count_executions)                    AS calls,
+    ROUND(SUM(rs.avg_cpu_time * rs.count_executions) / 1000000.0, 2)
+                                                AS total_cpu_sec,
+    ROUND(AVG(rs.avg_cpu_time) / 1000.0, 2)     AS avg_cpu_ms,
 
-    -- Estimated CPU cost contribution as % of all query time
-    ROUND(pss.total_exec_time * 100.0 /
-        SUM(pss.total_exec_time) OVER (), 2)    AS pct_total_cpu,
+    -- Estimated CPU cost contribution as % of all query CPU
+    ROUND(SUM(rs.avg_cpu_time * rs.count_executions) * 100.0 /
+        NULLIF(SUM(SUM(rs.avg_cpu_time * rs.count_executions)) OVER (), 0), 2)
+                                                AS pct_total_cpu,
 
-    -- Buffer efficiency: high read ratio = missing index or large scan
-    pss.shared_blks_hit + pss.shared_blks_read  AS total_blks_accessed,
-    ROUND(pss.shared_blks_read * 100.0 /
-        NULLIF(pss.shared_blks_hit + pss.shared_blks_read, 0), 2)
-                                                AS physical_read_pct,
+    -- Logical reads: high reads per execution = missing index or large scan
+    SUM(rs.avg_logical_io_reads * rs.count_executions)
+                                                AS total_logical_reads,
 
-    -- Rows vs blocks: low rows per block access = inefficient access pattern
     CASE
-        WHEN pss.shared_blks_read &gt; 10000
-         AND pss.rows &lt; pss.shared_blks_read * 5
+        WHEN SUM(rs.avg_logical_io_reads * rs.count_executions) &gt; 100000
+         AND SUM(rs.count_executions) &lt; 1000
             THEN 'MISSING INDEX LIKELY'
-        WHEN pss.total_exec_time / NULLIF(pss.calls, 0) &gt; 5000
-         AND pss.rows &lt; 1000
+        WHEN AVG(rs.avg_duration) / 1000.0 &gt; 5000
+         AND SUM(rs.count_executions) &lt; 1000
             THEN 'SINGLE QUERY VERY SLOW'
-        WHEN pss.calls &gt; 10000
-         AND pss.total_exec_time / NULLIF(pss.calls, 0) &gt; 100
+        WHEN SUM(rs.count_executions) &gt; 10000
+         AND AVG(rs.avg_duration) / 1000.0 &gt; 100
             THEN 'HIGH FREQUENCY + SLOW'
-        WHEN pss.total_exec_time * 100.0 /
-             NULLIF(SUM(pss.total_exec_time) OVER (), 0) &gt; 10
+        WHEN SUM(rs.avg_cpu_time * rs.count_executions) * 100.0 /
+             NULLIF(SUM(SUM(rs.avg_cpu_time * rs.count_executions)) OVER (), 0) &gt; 10
             THEN 'HIGH TOTAL CPU SHARE'
         ELSE 'REVIEW IF IN TOP 10'
-    END                                         AS optimization_signal,
-
-    -- Temp file usage indicates sort/hash spill to disk
-    pss.temp_blks_written,
-    CASE WHEN pss.temp_blks_written &gt; 1000
-         THEN 'SORT SPILL - TUNE work_mem'
-         ELSE '' END                            AS memory_signal
-
-FROM pg_stat_statements pss
-JOIN pg_database pd ON pd.oid = pss.dbid
-WHERE pd.datname = current_database()
-  AND pss.calls &gt;= 10
-  AND pss.total_exec_time &gt; 1000  -- At least 1 second total execution time
-ORDER BY pss.total_exec_time DESC
-LIMIT 25;</code></pre>
+    END                                         AS optimization_signal
+FROM
+    sys.query_store_query q
+    JOIN sys.query_store_query_text qt ON q.query_text_id = qt.query_text_id
+    JOIN sys.query_store_plan pl ON pl.query_id = q.query_id
+    JOIN sys.query_store_runtime_stats rs ON rs.plan_id = pl.plan_id
+WHERE
+    rs.last_execution_time &gt;= DATEADD(HOUR, -24, SYSDATETIME())
+GROUP BY
+    q.query_id, qt.query_sql_text
+ORDER BY
+    total_cpu_sec DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Step 2: Analyze execution plans for the top offenders</strong></p>
 
-<p class="text-gray-300 leading-relaxed">Once the top queries are identified, execution plan analysis reveals what is actually happening. The key markers in PostgreSQL <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">EXPLAIN (ANALYZE, BUFFERS)</code> output that signal optimization headroom rather than compute need:</p>
+<p class="text-gray-300 leading-relaxed">Once the top queries are identified, execution plan analysis reveals what is actually happening. The key markers in an actual execution plan (SSMS: include Actual Execution Plan, or Query Store) that signal optimization headroom rather than compute need:</p>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `Seq Scan` on a large table where a selective `WHERE` clause exists → missing index</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `Sort` operations with large `Memory Usage` values exceeding `work_mem` → increasing `work_mem` for that session or globally can eliminate disk spills</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `Hash Join` with very large `Batches: N` values → hash spill to disk, increase `work_mem`</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `Clustered Index Scan` / `Table Scan` on a large table with a selective predicate → missing index</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `Sort` operators with `Warnings: spill to tempdb` → stale statistics or an undersized memory grant; update statistics first</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `Hash Match` with tempdb spill warnings → cardinality misestimate; check statistics and consider a query hint only as a last resort</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Nested loop joins over large sets → join order or index issues</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> High `rows=X` estimates that are wildly inaccurate compared to `actual rows=Y` → stale statistics, run `ANALYZE`</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Estimated rows wildly different from actual rows → stale statistics; run <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">UPDATE STATISTICS</code></li>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Step 3: Apply targeted fixes in order of effort-to-impact</strong></p>
 
 <p class="text-gray-300 leading-relaxed">The following sequence resolves the majority of CPU pressure issues without instance resizing, ordered from fastest to most time-intensive:</p>
 
-<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Update statistics</strong> — <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ANALYZE tablename</code> or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ANALYZE VERBOSE</code>. Free, takes seconds, can immediately improve plan quality. On RDS, autovacuum handles this but may lag behind rapid data changes.</p>
+<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Update statistics</strong> — <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">UPDATE STATISTICS dbo.tablename WITH FULLSCAN</code>. Free, takes seconds to minutes, can immediately improve plan quality. Auto-update statistics handles this but may lag behind rapid data changes.</p>
 
-<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Add missing indexes</strong> — Use the query from Step 1 to find high <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">physical_read_pct</code> queries, then <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">EXPLAIN ANALYZE</code> to confirm sequential scans on selective predicates. Creating a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CONCURRENTLY</code> index has zero downtime impact on PostgreSQL.</p>
+<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Add missing indexes</strong> — Use the query from Step 1 to find high-logical-read queries, then check the actual plan to confirm scans on selective predicates. Creating the index <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WITH (ONLINE = ON)</code> avoids long table locks on Enterprise edition.</p>
 
-<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Tune <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">work_mem</code></strong> — Queries with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">temp_blks_written > 0</code> are spilling sorts or hash joins to disk. <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SET work_mem = '64MB'</code> at the session level for specific heavy queries, or set it globally if most connections run large analytical queries. Caution: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">work_mem</code> is per-sort-operation per connection, so multiplying by connection count before setting globally is necessary to avoid OOM.</p>
+<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Fix memory grants</strong> — Queries whose plans show tempdb spill warnings are granted too little workspace memory, usually because of stale statistics rather than a wrong setting. Update statistics first. If spills persist for specific heavy queries, a targeted <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">MIN_GRANT_PERCENT</code> query hint raises that query’s grant without changing anything globally.</p>
 
-<p class="text-gray-300 leading-relaxed">4. <strong class="text-white">Connection pooling via pgBouncer</strong> — If memory pressure is connection-driven (see 12.1), deploying pgBouncer in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">transaction</code> mode in front of your RDS instance can reduce active backend connections from 800 to 50 while handling identical throughput. This frequently recovers 4–8 GB of RAM, which may entirely eliminate the need for a memory upgrade.</p>
+<p class="text-gray-300 leading-relaxed">4. <strong class="text-white">Connection pooling discipline</strong> — If memory pressure is connection-driven (see 12.1), tightening client-side pooling (ADO.NET <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Max Pool Size</code>, closing connections promptly) can reduce active sessions from 800 to 50 while handling identical throughput. This frequently recovers gigabytes of RAM, which may entirely eliminate the need for a memory upgrade.</p>
 
 <p class="text-gray-300 leading-relaxed">5. <strong class="text-white">Rewrite pathological queries</strong> — Queries returning 500,000 rows to an application that filters them in code should be rewritten to push that filter into the database. This is a development task but has the highest ceiling for improvement.</p>
 
@@ -410,46 +358,34 @@ ORDER BY qs.total_worker_time DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Step 4: Index creation without downtime</strong></p>
 
-<p class="text-gray-300 leading-relaxed">On PostgreSQL, creating an index concurrently prevents table locks but takes longer and consumes more CPU during the build. On production RDS PostgreSQL instances, always use <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CONCURRENTLY</code>:</p>
+<p class="text-gray-300 leading-relaxed">On SQL Server Enterprise edition, building an index <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WITH (ONLINE = ON)</code> lets reads and writes continue during the build (a brief lock is still taken at the start and end). On Standard edition, online index operations are not available for most index types, so schedule builds in a maintenance window:</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: Safe concurrent index creation for production RDS instances
--- Does NOT acquire a full table lock
--- Takes longer but allows reads and writes to continue during build
--- Monitor progress in pg_stat_progress_create_index
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: online index creation for production
+-- Enterprise edition: ONLINE = ON keeps the table readable/writable during build
 
 -- First, confirm the index is needed by checking existing indexes
 SELECT
-    t.relname                               AS table_name,
-    i.relname                               AS index_name,
-    ix.indisunique,
-    ix.indisprimary,
-    array_agg(a.attname ORDER BY x.n)       AS indexed_columns
-FROM pg_class t
-JOIN pg_index ix ON t.oid = ix.indrelid
-JOIN pg_class i  ON i.oid = ix.indexrelid
-JOIN pg_attribute a ON a.attrelid = t.oid
-    AND a.attnum = ANY(ix.indkey)
-CROSS JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS x(attnum, n)
-WHERE t.relname = 'your_table_name'
-  AND a.attnum = x.attnum
-GROUP BY t.relname, i.relname, ix.indisunique, ix.indisprimary
-ORDER BY i.relname;
+    t.name                                     AS table_name,
+    i.name                                     AS index_name,
+    i.is_unique,
+    i.is_primary_key,
+    STRING_AGG(c.name, ', ') WITHIN GROUP (ORDER BY ic.key_ordinal)
+                                               AS indexed_columns
+FROM sys.tables t
+JOIN sys.indexes i        ON i.object_id = t.object_id
+JOIN sys.index_columns ic ON ic.object_id = i.object_id
+                         AND ic.index_id = i.index_id
+JOIN sys.columns c        ON c.object_id = ic.object_id
+                         AND c.column_id = ic.column_id
+WHERE t.name = 'orders'
+GROUP BY t.name, i.name, i.is_unique, i.is_primary_key
+ORDER BY i.name;
 
--- Check progress of any running index builds
-SELECT
-    phase,
-    blocks_done,
-    blocks_total,
-    ROUND(blocks_done * 100.0 / NULLIF(blocks_total, 0), 1) AS pct_complete,
-    tuples_done,
-    tuples_total
-FROM pg_stat_progress_create_index;
-
--- Create the index concurrently (run outside a transaction block)
-CREATE INDEX CONCURRENTLY IF NOT EXISTS
-    idx_orders_customer_created
-ON orders (customer_id, created_at)
-WHERE status != 'cancelled';  -- Partial index reduces size if applicable</code></pre>
+-- Build the index online (Enterprise) so production keeps running
+CREATE NONCLUSTERED INDEX IX_orders_customer_created
+ON dbo.orders (customer_id, created_at)
+WHERE status &lt;&gt; 'cancelled'   -- Filtered index reduces size if applicable
+WITH (ONLINE = ON, MAXDOP = 4);</code></pre>
 
 <p class="text-gray-300 leading-relaxed">On SQL Server and Azure SQL, the equivalent online index creation uses <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WITH (ONLINE = ON)</code>:</p>
 
@@ -493,60 +429,23 @@ WHERE state = 1;  -- In progress</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Several database parameters directly affect CPU and memory utilization in ways that can eliminate false scaling pressure. These changes are lower risk than query rewrites and often faster than index creation. They should be evaluated before any vertical scaling decision is finalized.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL parameters with the highest cost impact on RDS:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: memory grant diagnostics
+-- Queries waiting on RESOURCE_SEMAPHORE are queued for workspace memory
 
-<p class="text-gray-300 leading-relaxed"><code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">shared_buffers</code> is the most impactful parameter for memory-related CPU pressure. The default on RDS PostgreSQL is set to 25% of instance memory, which is appropriate for most workloads. However, on dedicated database instances where the RDS host runs only PostgreSQL (as is standard), this can safely be increased to 40% of RAM. For a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.r6g.2xlarge</code> with 64 GB RAM, moving from the default 16 GB to 25 GB of shared buffers increases the amount of hot data held in memory, reducing physical reads and the associated CPU spent on buffer management.</p>
-
-<p class="text-gray-300 leading-relaxed">On RDS, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">shared_buffers</code> cannot be set directly in bytes — it is controlled via the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">rds.instance.memory</code> dynamic formula in parameter groups. The correct approach is to modify the parameter group:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- After applying the RDS parameter group change, verify the active setting:
-SHOW shared_buffers;
-
--- Also check effective_cache_size (used by the planner, not actual allocation)
--- This should reflect total available memory including OS cache
--- Set to 75% of instance RAM in your parameter group
-SHOW effective_cache_size;
-
--- Verify work_mem (per sort operation, per connection -- set conservatively)
-SHOW work_mem;
-
--- View all non-default settings currently active
 SELECT
-    name,
-    setting,
-    unit,
-    source,
-    short_desc
-FROM pg_settings
-WHERE source NOT IN ('default', 'override')
-ORDER BY name;</code></pre>
+    r.session_id,
+    r.granted_query_memory * 8            AS granted_kb,
+    r.requested_memory_kb,
+    r.wait_time,
+    r.wait_type,
+    SUBSTRING(qt.text, 1, 120)            AS query_preview
+FROM sys.dm_exec_requests r
+CROSS APPLY sys.dm_exec_sql_text(r.sql_handle) qt
+WHERE r.wait_type = 'RESOURCE_SEMAPHORE'
+   OR r.granted_query_memory &gt; 0
+ORDER BY r.granted_query_memory DESC;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">work_mem</code> deserves special attention because it interacts directly with sort and hash join operations that contribute to CPU spikes. The formula for safe global <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">work_mem</code> is:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>safe_work_mem = (available_RAM × 0.25) / (max_connections × max_parallel_workers_per_gather)</code></pre>
-
-<p class="text-gray-300 leading-relaxed">For a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.r6g.xlarge</code> with 32 GB RAM, 200 max connections, and 2 parallel workers per query:</p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>safe_work_mem = (32,000 MB × 0.25) / (200 × 2) = 8,000 MB / 400 = 20 MB</code></pre>
-
-<p class="text-gray-300 leading-relaxed">Setting <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">work_mem = 20MB</code> globally ensures that sort spills to disk are minimized without risking out-of-memory conditions. For specific analytical queries that need more, set it at the session level:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: Session-level work_mem override for analytical queries
--- This does NOT affect other sessions and resets on disconnect
-
-SET work_mem = '256MB';
-
--- Your analytical query here
-SELECT
-    region,
-    product_category,
-    SUM(revenue)    AS total_revenue,
-    COUNT(DISTINCT customer_id) AS unique_customers
-FROM sales_facts
-GROUP BY region, product_category
-ORDER BY total_revenue DESC;
-
--- Reset if continuing with OLTP queries in same session
-RESET work_mem;</code></pre>
+<p class="text-gray-300 leading-relaxed">Memory grants deserve special attention because they interact directly with sort and hash operations that contribute to CPU spikes. The fix order is: update statistics first (most spills are cardinality misestimates), then consider a targeted <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">MIN_GRANT_PERCENT</code> hint for the specific query — never raise the server-wide grant behavior, because over-granting starves concurrent queries and creates <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">RESOURCE_SEMAPHORE</code> waits.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server parameters with the highest cost impact on Azure SQL and RDS SQL Server:</strong></p>
 
@@ -618,78 +517,37 @@ ORDER BY wait_time_ms DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Connection management is responsible for a disproportionate share of false vertical scaling decisions. The pattern is consistent: application connections grow, memory utilization climbs, someone observes the memory metric and escalates to a larger instance. The larger instance has more RAM, the memory metric looks healthy for several weeks, connections grow again, and the cycle repeats. The actual fix — connection pooling — would have cost nothing.</p>
 
-<p class="text-gray-300 leading-relaxed">Each PostgreSQL backend process consumes memory not just for the connection itself but for:</p>
+<p class="text-gray-300 leading-relaxed">Each SQL Server session consumes memory not just for the connection itself but for:</p>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Shared catalog cache per backend (several hundred KB)</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Per-backend memory context overhead</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Stack space for the backend process</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `work_mem` allocation when queries execute sorts or hash joins</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> memory grant sizing when queries execute sorts or hash joins</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Lock table entries proportional to objects accessed</li>
 
 <p class="text-gray-300 leading-relaxed">The aggregate overhead per idle connection is typically 5–10 MB. The overhead per active connection running a complex query can reach 50–100 MB temporarily. On a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.r6g.xlarge</code> with 32 GB of RAM configured with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_connections = 500</code>, the theoretical maximum memory consumed by connections alone approaches 25 GB before any data is cached in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">shared_buffers</code>. This is the definition of a misconfiguration, not a hardware limitation.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">RDS PostgreSQL connection pooling with pgBouncer on EC2:</strong></p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">RDS for SQL Server connection pooling guidance:</strong></p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># pgbouncer.ini
-# Deploy pgBouncer on a small EC2 instance (t4g.small is sufficient for most workloads)
-# and point application connection strings here instead of directly at RDS
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: find who is holding all the sessions
+-- Run before deciding to upsize for "memory pressure"
 
-[databases]
-# Replace &lt;RDS_ENDPOINT&gt; with your actual RDS hostname
-# Replace &lt;DB_NAME&gt; with your database name
-myapp_db = host=&lt;RDS_ENDPOINT&gt; port=5432 dbname=&lt;DB_NAME&gt;
+SELECT
+    DB_NAME(s.database_id)                    AS database_name,
+    s.host_name,
+    s.program_name,
+    s.login_name,
+    COUNT(*)                                  AS session_count,
+    SUM(CASE WHEN r.session_id IS NOT NULL THEN 1 ELSE 0 END)
+                                              AS active_count
+FROM sys.dm_exec_sessions s
+LEFT JOIN sys.dm_exec_requests r ON r.session_id = s.session_id
+WHERE s.is_user_process = 1
+GROUP BY DB_NAME(s.database_id), s.host_name, s.program_name, s.login_name
+ORDER BY session_count DESC;</code></pre>
 
-[pgbouncer]
-listen_port             = 5432
-listen_addr             = 0.0.0.0
+<p class="text-gray-300 leading-relaxed">SQL Server has no pgBouncer equivalent and RDS Proxy does not support the SQL Server engine, so pooling is enforced at the client: keep ADO.NET / ODBC / JDBC pooling enabled (it is on by default), set a sensible <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Max Pool Size</code> per application tier, and make sure connections are closed promptly. If the query above shows hundreds of sleeping sessions from one application host, fix the application&apos;s connection lifetime — that recovers memory no instance upgrade can buy.</p>
 
-# Transaction mode: connection to RDS held only during transaction
-# This is the most aggressive pooling mode and most resource-efficient
-# Use session mode only if your app uses session-level features (SET, temp tables)
-pool_mode               = transaction
-
-# Maximum connections pgBouncer will maintain TO the RDS instance
-# Set this to the maximum your RDS instance can handle efficiently
-# Rule: max_connections on RDS = 2–4× vCPUs for OLTP
-server_pool_size        = 40
-
-# Maximum client connections (applications → pgBouncer)
-# This can be very large — pgBouncer handles these cheaply
-max_client_conn         = 1000
-
-# Authentication: use md5 or scram-sha-256 matching your RDS pg_hba.conf
-auth_type               = scram-sha-256
-auth_file               = /etc/pgbouncer/userlist.txt
-
-# Connection lifetime management
-server_idle_timeout     = 600    # Close idle RDS connections after 10 min
-server_lifetime         = 3600   # Recycle RDS connections hourly
-client_idle_timeout     = 300    # Disconnect idle clients after 5 min
-
-# Monitoring
-stats_period            = 60
-logfile                 = /var/log/pgbouncer/pgbouncer.log
-pidfile                 = /var/run/pgbouncer/pgbouncer.pid</code></pre>
-
-<p class="text-gray-300 leading-relaxed">With this configuration, 800 application connections flow through pgBouncer, which maintains only 40 connections to RDS. The RDS instance's memory pressure from connection overhead drops from roughly 4–8 GB to under 400 MB. In many cases this alone recovers enough memory that a scheduled instance upsize becomes unnecessary.</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Monitoring pgBouncer effectiveness from within the pool:</strong></p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Connect to pgBouncer admin database to inspect pool stats
--- psql -h &lt;pgbouncer_host&gt; -p 5432 -U pgbouncer pgbouncer
-
--- Pool status: confirm server connections are well below client connections
-SHOW POOLS;
-
--- Per-database statistics: requests/sec, avg query time, wait time
-SHOW STATS;
-
--- Identify if clients are waiting for server connections (indicates pool too small)
-SHOW CLIENTS;
-
--- If avg_wait_time in SHOW STATS is consistently above 5ms, increase server_pool_size
--- If all server connections are always active, the pool may be undersized</code></pre>
-
-<p class="text-gray-300 leading-relaxed">For Azure SQL, the equivalent connection pooling is handled at the application layer through ADO.NET connection pooling (built in to the .NET stack), HikariCP for Java workloads, or PgBouncer-equivalent tools like <strong class="text-white">PgPool-II</strong> or <strong class="text-white">RDS Proxy</strong> on AWS. Azure SQL itself manages connections more efficiently than PostgreSQL at the engine level, but the same principle applies: each application tier instance maintaining its own pool of 20 connections multiplied by 50 application instances creates 1,000 backend threads that Azure SQL must manage, and consolidating through a proxy layer reduces this to a controlled pool.</p>
+<p class="text-gray-300 leading-relaxed">For Azure SQL and RDS for SQL Server, connection pooling is handled at the application layer through ADO.NET connection pooling (built in to the .NET stack) or HikariCP for Java workloads. Note that RDS Proxy does not support the SQL Server engine, so there is no managed proxy layer to consolidate through on AWS — pooling discipline in the application is the only lever. The same principle applies on every platform: each application tier instance maintaining its own pool of 20 connections multiplied by 50 application instances creates 1,000 sessions the engine must manage, and capping <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Max Pool Size</code> per tier reduces this to a controlled pool.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
@@ -703,9 +561,9 @@ SHOW CLIENTS;
     A[Performance complaint:\nslow queries, timeouts, high CPU/memory] --> B{Dominant wait\nevent type?}
     B -->|IO| C[STOP: storage problem\nreview IOPS / storage class]
     B -->|Lock/LWLock| D[STOP: contention problem\nreview transactions, indexing]
-    B -->|Connection exhaustion| E[STOP: pooling problem\ndeploy/tune pgBouncer]
+    B -->|Connection exhaustion| E[STOP: pooling problem\nfix client pooling settings]
     B -->|CPU, signal_wait > 25%| F{Query cost analysis:\nmissing index or sort spill?}
-    F -->|Yes| G[Fix indexes/work_mem\nmeasure 24h]
+    F -->|Yes| G[Fix indexes/statistics\nmeasure 24h]
     F -->|No| H{Parameter baseline\noff target?}
     H -->|Yes| I[Tune shared_buffers /\ncost_threshold_for_parallelism]
     H -->|No| J{CPU > 80% for 7 days AND\ncache hit < 95%?}
@@ -728,7 +586,7 @@ SHOW CLIENTS;
 │   │
 │   ├─► Dominant wait: Connection exhaustion / THREADPOOL
 │   │   └─► STOP — this is a pooling problem, not a compute problem
-│   │       Action: Deploy or tune pgBouncer / RDS Proxy (Section 12.5)
+│   │       Action: Fix client-side pooling settings (Section 12.5)
 │   │
 │   └─► Dominant wait: CPU / SOS_SCHEDULER (signal_wait_pct &gt; 25%)
 │       └─► Continue to Step 2
@@ -740,7 +598,7 @@ SHOW CLIENTS;
 │   │       Measure CPU after 24 hours. If resolved, DONE. If not, continue.
 │   │
 │   ├─► Found queries with SORT SPILL (temp_blks_written &gt; 0)?
-│   │   └─► Action: Tune work_mem (Section 12.4)
+│   │   └─► Action: Fix statistics/memory grants (Section 12.4)
 │   │       Measure CPU after 24 hours. If resolved, DONE. If not, continue.
 │   │
 │   └─► All queries look efficient; CPU pressure persists
@@ -748,7 +606,7 @@ SHOW CLIENTS;
 │
 ├─► Step 3: Verify parameter baseline (Section 12.4)
 │   │
-│   ├─► shared_buffers &lt; 30% of RAM? → Increase to 35-40% (PostgreSQL)
+│   ├─► max server memory left at default? → Cap it (leave 4 GB or 10% for the OS)
 │   ├─► CXPACKET dominant? → Raise cost_threshold_for_parallelism to 50 (SQL Server)
 │   └─► Changes made? Measure for 24 hours. If resolved, DONE. If not, continue.
 │
@@ -810,7 +668,7 @@ and re-evaluate whether the previous tier can be restored with further optimizat
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">12.7 Automating the Decision with CloudWatch and Cost Anomaly Detection</h3>
 
-<p class="text-gray-300 leading-relaxed">Manual diagnosis is reliable but slow. A performance incident at 2 AM cannot wait for a developer to run <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> queries at 9 AM. The following automation layer provides early detection of conditions that indicate either optimization opportunities or legitimate scaling needs, and routes the right alert to the right action.</p>
+<p class="text-gray-300 leading-relaxed">Manual diagnosis is reliable but slow. A performance incident at 2 AM cannot wait for a developer to run <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Query Store</code> queries at 9 AM. The following automation layer provides early detection of conditions that indicate either optimization opportunities or legitimate scaling needs, and routes the right alert to the right action.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">CloudWatch composite alarms for RDS scaling decisions:</strong></p>
 
@@ -908,7 +766,7 @@ def create_scaling_alarm_stack(instance_id: str, sns_topic_arn: str,
         AlarmName=f'rds-{instance_id}-connection-storm',
         AlarmDescription=(
             'CPU high AND connections high — likely connection storm. '
-            'Deploy pgBouncer before considering vertical scale.'
+            'Fix client-side pooling settings before considering vertical scale.'
         ),
         AlarmRule=(
             f'ALARM("rds-{instance_id}-cpu-high") AND '
@@ -988,7 +846,7 @@ import json
 import os
 import urllib.request
 import boto3
-import psycopg2
+import pyodbc
 
 def get_db_password(secret_arn: str) -&gt; str:
     sm = boto3.client('secretsmanager')
@@ -998,55 +856,56 @@ def get_db_password(secret_arn: str) -&gt; str:
 
 
 def get_top_wait_events(conn) -&gt; list:
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT
-                wait_event_type,
-                wait_event,
-                COUNT(*) AS sessions
-            FROM pg_stat_activity
-            WHERE state = 'active'
-              AND wait_event IS NOT NULL
-              AND pid &lt;&gt; pg_backend_pid()
-            GROUP BY wait_event_type, wait_event
-            ORDER BY sessions DESC
-            LIMIT 5
-        """)
-        return cur.fetchall()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT TOP 5
+            r.wait_type,
+            COUNT(*) AS sessions
+        FROM sys.dm_exec_requests r
+        WHERE r.session_id &gt; 50
+          AND r.wait_type IS NOT NULL
+        GROUP BY r.wait_type
+        ORDER BY sessions DESC
+    """)
+    return cur.fetchall()
 
 
 def get_connection_count(conn) -&gt; dict:
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT
-                COUNT(*)                        AS total,
-                SUM(CASE WHEN state = 'active' THEN 1 ELSE 0 END)  AS active,
-                SUM(CASE WHEN state = 'idle'   THEN 1 ELSE 0 END)  AS idle,
-                SUM(CASE WHEN wait_event_type = 'Lock'
-                         THEN 1 ELSE 0 END)     AS waiting_on_lock
-            FROM pg_stat_activity
-            WHERE pid &lt;&gt; pg_backend_pid()
-        """)
-        row = cur.fetchone()
-        return {
-            'total': row[0], 'active': row[1],
-            'idle': row[2], 'waiting_on_lock': row[3]
-        }
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT
+            COUNT(*) AS total,
+            SUM(CASE WHEN r.session_id IS NOT NULL THEN 1 ELSE 0 END) AS active,
+            SUM(CASE WHEN r.session_id IS NULL THEN 1 ELSE 0 END)      AS idle,
+            SUM(CASE WHEN r.wait_type LIKE 'LCK%' THEN 1 ELSE 0 END)   AS waiting_on_lock
+        FROM sys.dm_exec_sessions s
+        LEFT JOIN sys.dm_exec_requests r ON r.session_id = s.session_id
+        WHERE s.is_user_process = 1
+    """)
+    row = cur.fetchone()
+    return {
+        'total': row[0], 'active': row[1],
+        'idle': row[2], 'waiting_on_lock': row[3]
+    }
 
 
 def get_top_slow_queries(conn) -&gt; list:
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT
-                LEFT(query, 80) AS q,
-                calls,
-                ROUND((total_exec_time / calls)::numeric, 1) AS avg_ms
-            FROM pg_stat_statements
-            WHERE calls &gt; 10
-            ORDER BY total_exec_time DESC
-            LIMIT 3
-        """)
-        return cur.fetchall()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT TOP 3
+            LEFT(qt.query_sql_text, 80) AS q,
+            SUM(rs.count_executions) AS calls,
+            ROUND(SUM(rs.avg_duration * rs.count_executions)
+                  / NULLIF(SUM(rs.count_executions), 0) / 1000.0, 1) AS avg_ms
+        FROM sys.query_store_query qq
+        JOIN sys.query_store_query_text qt ON qq.query_text_id = qt.query_text_id
+        JOIN sys.query_store_plan qp ON qp.query_id = qq.query_id
+        JOIN sys.query_store_runtime_stats rs ON rs.plan_id = qp.plan_id
+        GROUP BY qt.query_sql_text
+        HAVING SUM(rs.count_executions) &gt; 10
+        ORDER BY SUM(rs.avg_duration * rs.count_executions) DESC
+    """)
+    return cur.fetchall()
 
 
 def post_to_slack(webhook_url: str, message: dict) -&gt; None:
@@ -1068,16 +927,17 @@ def lambda_handler(event, context):
     if alarm_state != 'ALARM':
         return {'statusCode': 200, 'body': 'Not in ALARM state, skipping.'}
 
-    # Connect to RDS
-    password = get_db_password(os.environ['DB_PASSWORD_SECRET_ARN'])
-    conn = psycopg2.connect(
-        host=os.environ['DB_HOST'],
-        dbname=os.environ['DB_NAME'],
-        user=os.environ['DB_USER'],
-        password=password,
-        connect_timeout=5
+    # Connect to RDS for SQL Server (read-only intent, autocommit for DMV reads)
+    conn = pyodbc.connect(
+        "DRIVER={ODBC Driver 18 for SQL Server};"
+        f"SERVER={os.environ['DB_HOST']},1433;"
+        f"DATABASE={os.environ['DB_NAME']};"
+        f"UID={os.environ['DB_USER']};"
+        f"PWD={get_db_password(os.environ['DB_PASSWORD_SECRET_ARN'])};"
+        "Encrypt=yes;TrustServerCertificate=no;"
+        "ApplicationIntent=ReadOnly;",
+        timeout=5, autocommit=True
     )
-    conn.set_session(readonly=True, autocommit=True)
 
     try:
         wait_events  = get_top_wait_events(conn)
@@ -1096,13 +956,13 @@ def lambda_handler(event, context):
     query_lines = '\n'.join(
         f"  [{r[1]} calls, {r[2]}ms avg] {r[0]}..."
         for r in slow_queries
-    ) or '  (pg_stat_statements not available)'
+    ) or '  (Query Store not available)'
 
     # Determine recommended action from alarm name
     if 'connection-storm' in alarm_name:
         recommendation = (
             ':rotating_light: *Recommended action:* Connection storm pattern detected. '
-            'Check pgBouncer pool utilization before considering vertical scale. '
+            'Check client-side pool utilization before considering vertical scale. '
             'See Chapter 12 runbook: connection-pooling-response.'
         )
     elif 'scaling-candidate' in alarm_name:
@@ -1157,50 +1017,48 @@ def lambda_handler(event, context):
 
 <p class="text-gray-300 leading-relaxed">Within 48 hours of a vertical scaling event, capture the current state of all metrics that justified the scaling. These become the baseline against which the 30-day review is measured.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: Capture post-scale performance snapshot
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: Capture post-scale performance snapshot
 -- Run immediately after scaling and save the output
 -- Compare against this snapshot at the 30-day review
 
 SELECT
-    current_database()                          AS database_name,
-    NOW()                                       AS snapshot_time,
+    DB_NAME()                                   AS database_name,
+    SYSDATETIME()                               AS snapshot_time,
 
     -- Connection utilization
-    (SELECT COUNT(*) FROM pg_stat_activity
-     WHERE pid &lt;&gt; pg_backend_pid())             AS current_connections,
-    current_setting('max_connections')::int     AS max_connections,
+    (SELECT COUNT(*) FROM sys.dm_exec_sessions
+     WHERE is_user_process = 1)                 AS current_connections,
 
     -- Buffer cache hit rate (should be &gt; 95% on a healthy instance)
-    ROUND(
-        SUM(heap_blks_hit) * 100.0 /
-        NULLIF(SUM(heap_blks_hit) + SUM(heap_blks_read), 0),
-    2)                                          AS table_cache_hit_pct,
+    (SELECT CAST(COUNT(*) * 1.0 / NULLIF(SUM(COUNT(*)) OVER (), 0) * 100 AS DECIMAL(5,2))
+     FROM sys.dm_os_performance_counters
+     WHERE counter_name = 'Buffer cache hit ratio') AS buffer_cache_note,
 
-    -- Index cache hit rate
-    ROUND(
-        SUM(idx_blks_hit) * 100.0 /
-        NULLIF(SUM(idx_blks_hit) + SUM(idx_blks_read), 0),
-    2)                                          AS index_cache_hit_pct
+    -- Top wait type right now
+    (SELECT TOP 1 wait_type FROM sys.dm_os_wait_stats
+     WHERE wait_type NOT IN (
+        'SLEEP_TASK','LAZYWRITER_SLEEP','SQLTRACE_BUFFER_FLUSH','WAITFOR',
+        'XE_DISPATCHER_WAIT','BROKER_TASK_STOP')
+     ORDER BY wait_time_ms DESC)                 AS top_wait_type;</code></pre>
 
-FROM pg_statio_user_tables;</code></pre>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Also capture the top 10 queries by CPU
+-- Save this as your optimization baseline (requires Query Store)
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Also capture the top 10 queries by CPU at the 48-hour mark
--- Save this as your optimization baseline
-
-SELECT
-    queryid,
-    LEFT(query, 100)                            AS query_preview,
-    calls,
-    ROUND(total_exec_time::numeric / 1000, 2)   AS total_exec_sec,
-    ROUND((total_exec_time / calls)::numeric, 2) AS avg_exec_ms,
-    ROUND(
-        total_exec_time * 100.0 /
-        NULLIF(SUM(total_exec_time) OVER (), 0),
-    2)                                          AS pct_total_cpu
-FROM pg_stat_statements
-WHERE calls &gt;= 10
-ORDER BY total_exec_time DESC
-LIMIT 10;</code></pre>
+SELECT TOP 10
+    q.query_id,
+    LEFT(qt.query_sql_text, 100)                 AS query_preview,
+    SUM(rs.count_executions)                    AS calls,
+    ROUND(SUM(rs.avg_cpu_time * rs.count_executions) / 1000000.0, 2)
+                                                AS total_cpu_sec,
+    ROUND(SUM(rs.avg_cpu_time * rs.count_executions) * 100.0 /
+        NULLIF(SUM(SUM(rs.avg_cpu_time * rs.count_executions)) OVER (), 0), 2)
+                                                AS pct_total_cpu
+FROM sys.query_store_query q
+JOIN sys.query_store_query_text qt ON q.query_text_id = qt.query_text_id
+JOIN sys.query_store_plan pl ON pl.query_id = q.query_id
+JOIN sys.query_store_runtime_stats rs ON rs.plan_id = pl.plan_id
+GROUP BY q.query_id, qt.query_sql_text
+ORDER BY total_cpu_sec DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Step 2: Schedule the 30-day review as a calendar event immediately</strong></p>
 
@@ -1208,38 +1066,31 @@ LIMIT 10;</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Step 3: At 30 days, compare metrics and evaluate downgrade viability</strong></p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: 30-day review — compare current state to post-scale baseline
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: 30-day review — compare current state to post-scale baseline
 -- Pair this with the CloudWatch CPU average for the last 30 days
 
 SELECT
-    current_database()                          AS database_name,
-    NOW()                                       AS review_time,
+    DB_NAME()                                   AS database_name,
+    SYSDATETIME()                               AS review_time,
 
     -- Current average CPU (pull from CloudWatch separately)
     -- Flag if CPU is below 40% — strong downgrade signal
 
     -- Connection utilization
-    (SELECT COUNT(*) FROM pg_stat_activity
-     WHERE pid &lt;&gt; pg_backend_pid())             AS current_connections,
-    current_setting('max_connections')::int     AS max_connections,
-    ROUND(
-        (SELECT COUNT(*) FROM pg_stat_activity
-         WHERE pid &lt;&gt; pg_backend_pid()) * 100.0 /
-        current_setting('max_connections')::numeric,
-    1)                                          AS connection_utilization_pct,
+    (SELECT COUNT(*) FROM sys.dm_exec_sessions
+     WHERE is_user_process = 1)                 AS current_connections,
 
-    -- Buffer cache health
-    ROUND(
-        SUM(heap_blks_hit) * 100.0 /
-        NULLIF(SUM(heap_blks_hit) + SUM(heap_blks_read), 0),
-    2)                                          AS table_cache_hit_pct,
+    -- Buffer pool health: page life expectancy (higher = healthier)
+    (SELECT cntr_value FROM sys.dm_os_performance_counters
+     WHERE counter_name = 'Page life expectancy'
+       AND object_name LIKE '%Buffer Manager%') AS page_life_expectancy_sec,
 
-    ROUND(
-        SUM(idx_blks_hit) * 100.0 /
-        NULLIF(SUM(idx_blks_hit) + SUM(idx_blks_read), 0),
-    2)                                          AS index_cache_hit_pct
-
-FROM pg_statio_user_tables;</code></pre>
+    -- Top wait type now vs baseline
+    (SELECT TOP 1 wait_type FROM sys.dm_os_wait_stats
+     WHERE wait_type NOT IN (
+        'SLEEP_TASK','LAZYWRITER_SLEEP','SQLTRACE_BUFFER_FLUSH','WAITFOR',
+        'XE_DISPATCHER_WAIT','BROKER_TASK_STOP')
+     ORDER BY wait_time_ms DESC)                 AS top_wait_type;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The downgrade decision criteria at 30 days are:</p>
 
@@ -1312,20 +1163,20 @@ gcloud sql operations list \
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Quantify the cost delta before any scaling conversation begins.** Moving up a single instance tier on AWS RDS, Azure SQL, or Google Cloud SQL typically doubles the annual compute cost for that instance. That number — stated explicitly in dollars per year — anchors the optimization-versus-scaling decision in financial reality and makes the business case for query optimization work self-evident.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Connection pooling resolves a disproportionate share of false scaling signals.** PostgreSQL's per-process memory model means that connection count is a direct driver of memory pressure. Deploying pgBouncer in transaction mode in front of an RDS instance can reduce active backend connections by an order of magnitude, frequently recovering enough memory to eliminate a pending upsize entirely.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Connection pooling resolves a disproportionate share of false scaling signals.** On SQL Server, session count is a direct driver of memory pressure and worker-thread consumption. Tightening client-side pooling (Max Pool Size, prompt connection close) can reduce active sessions by an order of magnitude, frequently recovering enough memory to eliminate a pending upsize entirely.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Parameter tuning — particularly `work_mem`, `shared_buffers`, and `cost threshold for parallelism` — delivers measurable CPU reduction with zero infrastructure cost.** These changes should be evaluated and applied before any scaling decision is finalized. Sort spills, hash join spills, and unnecessary parallelism are common sources of CPU overhead that disappear with correct parameter configuration.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Parameter tuning — particularly `max server memory`, `cost threshold for parallelism`, and `max degree of parallelism` — delivers measurable CPU reduction with zero infrastructure cost.** These changes should be evaluated and applied before any scaling decision is finalized. Sort spills, hash join spills, and unnecessary parallelism are common sources of CPU overhead that disappear with correct parameter configuration.</li>
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Every vertical scaling event requires a scheduled 30-day review.** Instances scaled up under incident pressure are rarely scaled back down without an explicit review process. Capturing a post-scale baseline within 48 hours and scheduling the review before the incident closes converts a one-way cost increase into a reversible decision, and systematically reclaims overprovisioned spend across the database fleet.</li></div>
     <div class="mt-14 bg-amber-950/40 border border-amber-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
-        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+        <p class="text-xs text-gray-400">Query plan visualizer · Index advisor · Slow query dashboard · SQL Server</p>
       </div>
       <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
          class="shrink-0 px-6 py-3 bg-amber-600 hover:bg-amber-500 text-white font-semibold rounded-xl text-sm transition">Download Free</a>
     </div>
-    <div class="mt-8 text-xs"><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a></div>
+    <nav class="mt-8 flex flex-col sm:flex-row items-center justify-between gap-3 text-xs"><span><a href="b7-ch11-dev-test-cost.html" class="text-gray-400 hover:text-amber-300 transition">← Dev and Test Cost Reduction: Schedules and Smaller Instances</a></span><span><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">All Chapters</a></span><span><a href="b7-ch13-storage-types.html" class="text-gray-400 hover:text-amber-300 transition">gp2 vs gp3 vs io1 vs io2: Choosing the Right Storage Type →</a></span></nav>
   </article>
   <footer class="border-t border-gray-800/50 px-6 py-8">
     <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · Database FinOps</div>

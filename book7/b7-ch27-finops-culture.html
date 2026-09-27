@@ -101,74 +101,7 @@ gcloud sql instances patch payments-prod-pg15 \
 
 <p class="text-gray-300 leading-relaxed">Showing a team their monthly RDS bill is useful. Showing them which specific queries are generating that bill is transformative. When an engineer can see that a particular unindexed join is responsible for $400 of compute cost per month, they fix it in the next sprint — not because someone told them to, but because the number is attached to code they wrote.</p>
 
-<p class="text-gray-300 leading-relaxed">The following query runs against <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> on PostgreSQL (available on RDS PostgreSQL and Aurora PostgreSQL with the extension enabled) and produces a cost-weighted ranking of queries based on their compute consumption. It assumes a cost rate of $0.063 per vCPU-hour, which you should calibrate to your actual instance pricing.</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Cost-weighted query analysis using pg_stat_statements
--- Run this on RDS PostgreSQL or Aurora PostgreSQL
--- Requires: CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
--- Adjust vcpu_cost_per_hour to match your instance pricing
-
-WITH instance_params AS (
-  SELECT
-    0.063 AS vcpu_cost_per_hour,   -- db.r6g.4xlarge: $1.008/hr / 16 vCPUs ≈ $0.063
-    16    AS vcpu_count,
-    720   AS hours_in_month
-),
-query_stats AS (
-  SELECT
-    queryid,
-    LEFT(query, 120)                          AS query_preview,
-    calls,
-    total_exec_time / 1000.0                  AS total_exec_seconds,
-    mean_exec_time / 1000.0                   AS mean_exec_seconds,
-    rows,
-    shared_blks_hit,
-    shared_blks_read,
-    (shared_blks_read * 8192.0) / (1024^3)   AS data_read_gb,
-    stddev_exec_time / 1000.0                 AS stddev_exec_seconds
-  FROM pg_stat_statements
-  WHERE calls &gt; 50        -- filter noise; adjust threshold to your call volume
-    AND query NOT LIKE '%pg_stat%'
-),
-cost_calc AS (
-  SELECT
-    qs.*,
-    ip.vcpu_cost_per_hour,
-    ip.vcpu_count,
-    -- Estimated monthly cost: scale total execution time to a month,
-    -- then proportion of vCPU time consumed
-    ROUND(
-      (
-        (qs.total_exec_seconds / NULLIF(ip.hours_in_month * 3600.0, 0))
-        * ip.vcpu_count
-        * ip.vcpu_cost_per_hour
-        * ip.hours_in_month
-      )::numeric, 4
-    )                                          AS estimated_monthly_cost_usd,
-    ROUND((
-      100.0 * qs.shared_blks_read
-      / NULLIF(SUM(qs.shared_blks_read) OVER (), 0)
-    )::numeric, 2)                             AS pct_of_total_reads
-  FROM query_stats qs
-  CROSS JOIN instance_params ip
-)
-SELECT
-  queryid,
-  query_preview,
-  calls,
-  ROUND(mean_exec_seconds::numeric, 4)         AS mean_exec_sec,
-  ROUND(total_exec_seconds::numeric, 2)        AS total_exec_sec,
-  estimated_monthly_cost_usd,
-  pct_of_total_reads,
-  ROUND(data_read_gb::numeric, 4)              AS data_read_gb,
-  CASE
-    WHEN mean_exec_seconds &gt; 1.0  THEN 'HIGH — optimize immediately'
-    WHEN mean_exec_seconds &gt; 0.1  THEN 'MEDIUM — review this sprint'
-    ELSE                               'LOW — monitor'
-  END                                          AS priority
-FROM cost_calc
-ORDER BY estimated_monthly_cost_usd DESC
-LIMIT 25;</code></pre>
+<p class="text-gray-300 leading-relaxed">The following query runs against Query Store on SQL Server (available on RDS for SQL Server, Azure SQL, and Cloud SQL for SQL Server) and produces a cost-weighted ranking of queries based on their compute consumption. It assumes a cost rate of $0.063 per vCPU-hour, which you should calibrate to your actual instance pricing.</p>
 
 <p class="text-gray-300 leading-relaxed">On SQL Server (Azure SQL Database or RDS SQL Server), the equivalent uses <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_query_stats</code>:</p>
 
@@ -285,7 +218,6 @@ def get_rds_costs_by_team(lookback_days: int) -&gt; list[dict]:
                 "Key":    "SERVICE",
                 "Values": [
                     "Amazon Relational Database Service",
-                    "Amazon Aurora",
                 ],
             }
         },
@@ -399,7 +331,7 @@ az rest \
         \"dimensions\": {
           \"name\": \"ServiceName\",
           \"operator\": \"In\",
-          \"values\": [\"SQL Database\", \"SQL Managed Instance\", \"Azure Database for PostgreSQL\"]
+          \"values\": [\"SQL Database\", \"SQL Managed Instance\"]
         }
       }
     },
@@ -435,7 +367,7 @@ aws budgets create-budget \
     "TimeUnit": "MONTHLY",
     "CostFilters": {
       "TagKeyValue": ["user:team$payments"],
-      "Service": ["Amazon Relational Database Service", "Amazon Aurora"]
+      "Service": ["Amazon Relational Database Service"]
     },
     "CostTypes": {
       "IncludeCredit": false,
@@ -593,7 +525,6 @@ def get_recent_anomalies(lookback_days: int = 14) -&gt; list[dict]:
             "Services": {
                 "Values": [
                     "Amazon Relational Database Service",
-                    "Amazon Aurora",
                 ]
             }
         },
@@ -628,7 +559,6 @@ def get_week_over_week_costs() -&gt; dict:
                     "Key":    "SERVICE",
                     "Values": [
                         "Amazon Relational Database Service",
-                        "Amazon Aurora",
                     ],
                 }
             },
@@ -743,7 +673,7 @@ def format_slack_message(
                 "type": "mrkdwn",
                 "text": (
                     "Data source: AWS Cost Explorer · "
-                    "Filtered to RDS + Aurora · "
+                    "Filtered to RDS for SQL Server · "
                     f"Generated: {datetime.date.today().isoformat()} · "
                     "&lt;https://console.aws.amazon.com/cost-management/home|"
                     "Open Cost Explorer&gt;"
@@ -840,7 +770,7 @@ aws lambda get-function \
 
 <p class="text-gray-300 leading-relaxed">The finance team sends a monthly cloud bill. Engineering leadership expresses concern. No one knows which team or service is responsible for which cost. There are no tags on RDS instances. Cost optimization efforts are one-off and manual.</p>
 
-<p class="text-gray-300 leading-relaxed">Priority interventions at this stage: enforce tagging through Terraform modules and Service Control Policies (SCPs), activate cost allocation tags in the billing console, establish per-team budget alerts at the account or tag level, and run the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> cost query manually for the top three most expensive instances.</p>
+<p class="text-gray-300 leading-relaxed">Priority interventions at this stage: enforce tagging through Terraform modules and Service Control Policies (SCPs), activate cost allocation tags in the billing console, establish per-team budget alerts at the account or tag level, and run the Query Store cost query manually for the top three most expensive instances.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Stage 2 — Aware (3–6 months)</strong></p>
 
@@ -854,7 +784,7 @@ aws lambda get-function \
 
 <p class="text-gray-300 leading-relaxed">Cost is a standard agenda item in sprint planning. Engineers ask "what will this cost?" before provisioning, not after. Infracost comments on infrastructure PRs are read and acted on. Non-production shutdown schedules run automatically. Reserved Instance coverage for production is above 70%. The DBA team runs a monthly cost review meeting with engineering managers.</p>
 
-<p class="text-gray-300 leading-relaxed">Priority interventions: implement query-level cost attribution from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> and publish results to team dashboards, evaluate Aurora Serverless v2 for variable workloads, implement pgBouncer for connection pooling to reduce the need for oversized instances driven by connection count, and begin Savings Plans analysis for consistent Aurora compute spend.</p>
+<p class="text-gray-300 leading-relaxed">Priority interventions: implement query-level cost attribution from Query Store and publish results to team dashboards, evaluate Azure SQL serverless for variable workloads, fix client-side connection pooling to reduce the need for oversized instances driven by connection count, and begin Reserved Instance analysis for consistent SQL Server compute spend.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Stage 4 — Optimized (12+ months)</strong></p>
 
@@ -870,7 +800,7 @@ aws lambda get-function \
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Monthly cost review meetings that are 30 minutes, not 90</strong></p>
 
-<p class="text-gray-300 leading-relaxed">Keep the monthly cost review short by doing the analysis before the meeting, not during it. The agenda: five minutes reviewing the week-over-week Slack digest trends, ten minutes on any anomalies that triggered alerts, ten minutes on one optimization opportunity identified from the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> cost report, five minutes on action items with owners and due dates. The meeting ends. No one spends 45 minutes staring at AWS Cost Explorer together.</p>
+<p class="text-gray-300 leading-relaxed">Keep the monthly cost review short by doing the analysis before the meeting, not during it. The agenda: five minutes reviewing the week-over-week Slack digest trends, ten minutes on any anomalies that triggered alerts, ten minutes on one optimization opportunity identified from the Query Store cost report, five minutes on action items with owners and due dates. The meeting ends. No one spends 45 minutes staring at AWS Cost Explorer together.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Recognize cost savings the same way you recognize feature delivery</strong></p>
 
@@ -878,7 +808,7 @@ aws lambda get-function \
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Make the cost of technical debt legible</strong></p>
 
-<p class="text-gray-300 leading-relaxed">One of the most effective culture shifts happens when teams can see the ongoing cost of deferred optimization work. A query that has been on the backlog for six months because it "works well enough" looks different when the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> report shows it is costing $340/month. At six months of deferral, the team has paid $2,040 for a fix that would have taken four hours of developer time. Framing technical debt in dollar terms creates urgency that "performance improvement" framing does not.</p>
+<p class="text-gray-300 leading-relaxed">One of the most effective culture shifts happens when teams can see the ongoing cost of deferred optimization work. A query that has been on the backlog for six months because it "works well enough" looks different when the Query Store report shows it is costing $340/month. At six months of deferral, the team has paid $2,040 for a fix that would have taken four hours of developer time. Framing technical debt in dollar terms creates urgency that "performance improvement" framing does not.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Run a quarterly FinOps retrospective across teams</strong></p>
 
@@ -892,7 +822,7 @@ aws lambda get-function \
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Tagging is the foundation.** No tag strategy means no team-level attribution, which means no accountability. Enforce a minimum viable tag set — `team`, `environment`, `service`, `owner` — through Terraform modules and AWS Service Control Policies before deploying any other FinOps tooling. Everything else depends on it.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Query-level cost attribution is the highest-leverage intervention for DBAs.** The `pg_stat_statements` cost query and its SQL Server equivalent in `sys.dm_exec_query_stats` translate compute consumption into dollar figures attached to specific queries. When engineers see a $600/month query with their name on it, they fix it in the next sprint. Publish this report weekly to team channels.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Query-level cost attribution is the highest-leverage intervention for DBAs.** The Query Store cost query and its `sys.dm_exec_query_stats` equivalent translate compute consumption into dollar figures attached to specific queries. When engineers see a $600/month query with their name on it, they fix it in the next sprint. Publish this report weekly to team channels.</li>
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Automated signals beat manual reviews.** A weekly Slack digest with week-over-week cost trends, a Prometheus metric pushed to Grafana, an Infracost comment on infrastructure PRs, and a Lambda function that shuts down staging databases at 8 PM — these run without human intervention and create continuous feedback. Monthly manual cost reviews cannot move fast enough to change daily engineering decisions.</li>
 
@@ -900,12 +830,12 @@ aws lambda get-function \
     <div class="mt-14 bg-amber-950/40 border border-amber-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
-        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+        <p class="text-xs text-gray-400">Query plan visualizer · Index advisor · Slow query dashboard · SQL Server</p>
       </div>
       <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
          class="shrink-0 px-6 py-3 bg-amber-600 hover:bg-amber-500 text-white font-semibold rounded-xl text-sm transition">Download Free</a>
     </div>
-    <div class="mt-8 text-xs"><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a></div>
+    <nav class="mt-8 flex flex-col sm:flex-row items-center justify-between gap-3 text-xs"><span><a href="b7-ch26-showback-chargeback.html" class="text-gray-400 hover:text-amber-300 transition">← Showback vs Chargeback Models for Database Costs</a></span><span><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">All Chapters</a></span><span><a href="b7-ch28-open-source-tools.html" class="text-gray-400 hover:text-amber-300 transition">Open-Source Tools for Cloud Database Cost Analysis →</a></span></nav>
   </article>
   <footer class="border-t border-gray-800/50 px-6 py-8">
     <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · Database FinOps</div>

@@ -45,7 +45,7 @@
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">10.1 Defining "Idle": Metrics That Actually Matter</h3>
 
-<p class="text-gray-300 leading-relaxed">The instinct to define an idle database as one with zero connections is wrong in practice. Connection poolers like pgBouncer and RDS Proxy maintain persistent connections to the database engine even when no application queries are running. A single health-check query from a monitoring agent counts as a "connection" and will mask genuine idleness if you rely on connection count alone.</p>
+<p class="text-gray-300 leading-relaxed">The instinct to define an idle database as one with zero connections is wrong in practice. Client-side connection pools (ADO.NET / ODBC / JDBC) maintain persistent connections to the database engine even when no application queries are running. A single health-check query from a monitoring agent counts as a "connection" and will mask genuine idleness if you rely on connection count alone.</p>
 
 <p class="text-gray-300 leading-relaxed">A production-grade idle definition combines four signals measured over a rolling 7-day window:</p>
 
@@ -98,21 +98,24 @@ class InstanceIdleScore:
     tags: dict = field(default_factory=dict)
     recommendation: str = ""
 
-# On-demand pricing for common RDS instance classes (us-east-1, MySQL/PostgreSQL)
-# Update this map quarterly or fetch from AWS Price List API
+# On-demand pricing for common RDS for SQL Server instance classes
+# (us-east-1, Standard edition, license-included, single-AZ, USD/hour).
+# NOTE: SQL Server cannot run on Graviton (t4g/m6g/r6g) classes — Intel/AMD only.
+# Rates below are ILLUSTRATIVE. Update quarterly from the AWS RDS for SQL Server
+# pricing page or fetch from the AWS Price List API.
 RDS_HOURLY_PRICING = {
-    "db.t3.micro":    0.017,
-    "db.t3.small":    0.034,
-    "db.t3.medium":   0.068,
-    "db.t3.large":    0.136,
-    "db.r6g.large":   0.260,
-    "db.r6g.xlarge":  0.520,
-    "db.r6g.2xlarge": 1.040,
-    "db.r5.large":    0.240,
-    "db.r5.xlarge":   0.480,
-    "db.r5.2xlarge":  0.960,
-    "db.m6g.large":   0.183,
-    "db.m6g.xlarge":  0.365,
+    "db.t3.micro":    0.12,
+    "db.t3.small":    0.24,
+    "db.t3.medium":   0.48,
+    "db.t3.large":    0.96,
+    "db.r6i.large":   1.60,
+    "db.r6i.xlarge":  3.20,
+    "db.r6i.2xlarge": 6.40,
+    "db.r5.large":    1.45,
+    "db.r5.xlarge":   2.90,
+    "db.r5.2xlarge":  5.80,
+    "db.m6i.large":   1.15,
+    "db.m6i.xlarge":  2.30,
 }
 
 def get_metric_average(cw_client, instance_id, metric_name, namespace,
@@ -1093,66 +1096,48 @@ def handle_schedule(request):
 
 <p class="text-gray-300 leading-relaxed">The following query, run against the CloudWatch metrics stored in your detection pipeline's output or a central inventory table, provides a weekly digest for finance and engineering leadership:</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Run against a PostgreSQL table populated by idle_detector_aws.py
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Run against a SQL Server table populated by idle_detector_aws.py
 -- Create the table once:
 --
--- CREATE TABLE rds_idle_scan_results (
+-- CREATE TABLE dbo.rds_idle_scan_results (
 --   scan_date        DATE NOT NULL,
---   instance_id      TEXT NOT NULL,
---   region           TEXT,
---   instance_class   TEXT,
---   engine           TEXT,
---   idle_score       INTEGER,
---   avg_connections  NUMERIC(8,4),
---   avg_cpu          NUMERIC(8,4),
---   avg_read_iops    NUMERIC(8,4),
---   avg_write_iops   NUMERIC(8,4),
---   monthly_cost_usd NUMERIC(10,2),
---   recommendation   TEXT,
---   action_taken     TEXT,
+--   instance_id      NVARCHAR(255) NOT NULL,
+--   region           NVARCHAR(50),
+--   instance_class   NVARCHAR(100),
+--   engine           NVARCHAR(50),
+--   idle_score       INT,
+--   avg_connections  DECIMAL(8,4),
+--   avg_cpu          DECIMAL(8,4),
+--   avg_read_iops    DECIMAL(8,4),
+--   avg_write_iops   DECIMAL(8,4),
+--   monthly_cost_usd DECIMAL(10,2),
+--   recommendation   NVARCHAR(MAX),
+--   action_taken     NVARCHAR(50),
 --   PRIMARY KEY (scan_date, instance_id)
 -- );
 
 -- Weekly trend: how many idle instances were detected and acted on?
 SELECT
-    DATE_TRUNC('week', scan_date)          AS week_start,
-    COUNT(*)                               AS total_scanned,
-    COUNT(*) FILTER (WHERE idle_score &gt;= 3) AS idle_candidates,
-    COUNT(*) FILTER (WHERE idle_score = 4)  AS high_confidence_idle,
-    SUM(monthly_cost_usd)
-        FILTER (WHERE idle_score &gt;= 3)      AS idle_monthly_cost_usd,
-    COUNT(*) FILTER (WHERE action_taken IN ('STOPPED', 'TERMINATED'))
-                                           AS actions_taken,
-    SUM(monthly_cost_usd)
-        FILTER (WHERE action_taken IN ('STOPPED', 'TERMINATED'))
-                                           AS savings_actioned_usd
+    DATEADD(week, DATEDIFF(week, 0, scan_date), 0) AS week_start,
+    COUNT(*)                                        AS total_scanned,
+    SUM(CASE WHEN idle_score &gt;= 3 THEN 1 ELSE 0 END) AS idle_candidates,
+    SUM(CASE WHEN idle_score = 4 THEN 1 ELSE 0 END)  AS high_confidence_idle,
+    SUM(CASE WHEN idle_score &gt;= 3
+             THEN monthly_cost_usd ELSE 0 END)       AS idle_monthly_cost_usd,
+    SUM(CASE WHEN action_taken IN ('STOPPED','TERMINATED')
+             THEN 1 ELSE 0 END)                      AS actions_taken,
+    SUM(CASE WHEN action_taken IN ('STOPPED','TERMINATED')
+             THEN monthly_cost_usd ELSE 0 END)       AS savings_actioned_usd
 FROM rds_idle_scan_results
-WHERE scan_date &gt;= CURRENT_DATE - INTERVAL '90 days'
-GROUP BY 1
-ORDER BY 1 DESC;
-
--- SQL Server equivalent:
--- SELECT
---     DATEADD(week, DATEDIFF(week, 0, scan_date), 0) AS week_start,
---     COUNT(*)                                        AS total_scanned,
---     SUM(CASE WHEN idle_score &gt;= 3 THEN 1 ELSE 0 END) AS idle_candidates,
---     SUM(CASE WHEN idle_score = 4 THEN 1 ELSE 0 END)  AS high_confidence_idle,
---     SUM(CASE WHEN idle_score &gt;= 3
---              THEN monthly_cost_usd ELSE 0 END)      AS idle_monthly_cost_usd,
---     SUM(CASE WHEN action_taken IN ('STOPPED','TERMINATED')
---              THEN 1 ELSE 0 END)                     AS actions_taken,
---     SUM(CASE WHEN action_taken IN ('STOPPED','TERMINATED')
---              THEN monthly_cost_usd ELSE 0 END)      AS savings_actioned_usd
--- FROM rds_idle_scan_results
--- WHERE scan_date &gt;= DATEADD(day, -90, CAST(GETDATE() AS DATE))
--- GROUP BY DATEADD(week, DATEDIFF(week, 0, scan_date), 0)
--- ORDER BY week_start DESC;</code></pre>
+WHERE scan_date &gt;= DATEADD(day, -90, CAST(GETDATE() AS DATE))
+GROUP BY DATEADD(week, DATEDIFF(week, 0, scan_date), 0)
+ORDER BY week_start DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Drift Detection: Instances That Reappeared After Shutdown</strong></p>
 
 <p class="text-gray-300 leading-relaxed">A stopped instance that restarts automatically (AWS's 7-day auto-restart, or a developer manually starting a stopped instance) will reappear in your next scan. The following query surfaces "drift" — instances that were actioned and came back:</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: find instances that were stopped/terminated and then
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- T-SQL: find instances that were stopped/terminated and then
 -- reappeared as available in a subsequent scan
 
 WITH actioned AS (
@@ -1174,37 +1159,11 @@ SELECT
     instance_id,
     first_actioned_date,
     reappear_date,
-    (reappear_date - first_actioned_date)  AS days_until_reappear,
-    idle_score                              AS current_idle_score,
+    DATEDIFF(day, first_actioned_date, reappear_date) AS days_until_reappear,
+    idle_score                                         AS current_idle_score,
     monthly_cost_usd
 FROM reappeared
-ORDER BY days_until_reappear ASC;
-
--- SQL Server equivalent:
--- WITH actioned AS (
---     SELECT DISTINCT instance_id, MIN(scan_date) AS first_actioned_date
---     FROM rds_idle_scan_results
---     WHERE action_taken IN ('STOPPED', 'TERMINATED')
---     GROUP BY instance_id
--- ),
--- reappeared AS (
---     SELECT r.instance_id, r.scan_date AS reappear_date,
---            r.idle_score, r.monthly_cost_usd
---     FROM rds_idle_scan_results r
---     JOIN actioned a ON r.instance_id = a.instance_id
---     WHERE r.scan_date &gt; a.first_actioned_date
---       AND r.action_taken NOT IN ('STOPPED', 'TERMINATED')
---       AND r.idle_score &lt; 3
--- )
--- SELECT
---     instance_id,
---     first_actioned_date,
---     reappear_date,
---     DATEDIFF(day, first_actioned_date, reappear_date) AS days_until_reappear,
---     idle_score                                         AS current_idle_score,
---     monthly_cost_usd
--- FROM reappeared
--- ORDER BY days_until_reappear ASC;</code></pre>
+ORDER BY days_until_reappear ASC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Instances that consistently reappear as active within a day or two of being stopped are likely hitting AWS's 7-day auto-restart (someone is keeping them alive by starting them periodically). These are escalation candidates: the automation correctly identifies them as idle, but a human keeps restarting them, suggesting the instance has a legitimate owner who simply hasn't responded to notifications. The appropriate response is a direct conversation with the tagged owner, not repeated automated shutdowns.</p>
 
@@ -1367,32 +1326,38 @@ def handler(event, context):
 
 <p class="text-gray-300 leading-relaxed">When the orchestrator encounters a read replica with idle score 4, it should flag the primary for review rather than attempting to stop the replica alone. If both the primary and all its replicas score 4/4, the correct sequence is: stop replicas first (if the primary is also being stopped — though RDS does not allow stopping replicas independently), or more practically, stop the primary, at which point replicas automatically stop receiving replication and will show as stopped as well.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Failure Mode 2: Aurora Clusters Require Cluster-Level Actions</strong></p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Failure Mode 2: Stopping Saves Compute and License, Not Storage</strong></p>
 
-<p class="text-gray-300 leading-relaxed">Aurora instances are part of a cluster; you cannot stop an individual Aurora instance. The stop action must target the DB cluster identifier, not the DB instance identifier:</p>
+<p class="text-gray-300 leading-relaxed">On RDS for SQL Server with license-included pricing, stopping an instance halts the compute <em>plus</em> the bundled license charge — the biggest line item. But storage, backup retention, and snapshot costs keep accruing. Teams that celebrate the stop action without accounting for residual storage costs overstate their savings:</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>def stop_aurora_cluster(rds_client, cluster_id: str):
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>def estimate_stop_savings(rds_client, instance_id: str,
+                          hourly_rate: float) -&gt; dict:
+    """Stopping halts compute+license (bundled in LI) but storage keeps billing."""
+    resp = rds_client.describe_db_instances(DBInstanceIdentifier=instance_id)
+    db = resp["DBInstances"][0]
+    allocated_gb = db["AllocatedStorage"]
+    # gp3 storage ~$0.115/GB-month; backup retention billed beyond the free window
+    storage_monthly = allocated_gb * 0.115
+    compute_monthly = hourly_rate * 730
+    return {
+        "instance_id": instance_id,
+        "monthly_compute_license_savings": round(compute_monthly, 2),
+        "residual_storage_cost": round(storage_monthly, 2),
+        "note": "Terminate (not stop) if the instance will never return; "
+                "otherwise the storage tail compounds monthly.",
+    }
+
+def stop_sqlserver_instance(rds_client, instance_id: str):
     if DRY_RUN:
-        log.info(f"[DRY-RUN] Would stop Aurora cluster: {cluster_id}")
+        log.info(f"[DRY-RUN] Would stop RDS SQL Server instance: {instance_id}")
         return
     try:
-        rds_client.stop_db_cluster(DBClusterIdentifier=cluster_id)
-        log.info(f"Aurora cluster stop issued: {cluster_id}")
+        rds_client.stop_db_instance(DBInstanceIdentifier=instance_id)
+        log.info(f"RDS SQL Server instance stop issued: {instance_id}")
     except Exception as e:
-        log.error(f"Failed to stop Aurora cluster {cluster_id}: {e}")
+        log.error(f"Failed to stop {instance_id}: {e}")</code></pre>
 
-def get_cluster_id(rds_client, instance_id: str) -&gt; str:
-    """Returns the cluster identifier for an Aurora instance, or '' for non-Aurora."""
-    try:
-        response = rds_client.describe_db_instances(
-            DBInstanceIdentifier=instance_id
-        )
-        db = response["DBInstances"][0]
-        return db.get("DBClusterIdentifier", "")
-    except Exception:
-        return ""</code></pre>
-
-<p class="text-gray-300 leading-relaxed">The scan_region function in Section 10.2 should be extended to record cluster membership so that the shutdown orchestrator can deduplicate: if three Aurora instances all belong to the same cluster and all score 4/4, the action is one <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">stop_db_cluster</code> call, not three <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">stop_db_instance</code> calls.</p>
+<p class="text-gray-300 leading-relaxed">The scan_region function in Section 10.2 should record each instance’s <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ReadReplicaSourceDBInstanceIdentifier</code> so the orchestrator treats read replicas as independent stop targets: every RDS for SQL Server instance — primary or replica — takes its own <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">stop_db_instance</code> call. Never stop a primary while its replicas are still running without a plan; stop replicas first, then the primary.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Failure Mode 3: Multi-AZ Failover During Shutdown</strong></p>
 
@@ -1465,12 +1430,12 @@ def notify_and_wait(sns_client, topic_arn: str, instance_id: str,
     <div class="mt-14 bg-amber-950/40 border border-amber-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
-        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+        <p class="text-xs text-gray-400">Query plan visualizer · Index advisor · Slow query dashboard · SQL Server</p>
       </div>
       <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
          class="shrink-0 px-6 py-3 bg-amber-600 hover:bg-amber-500 text-white font-semibold rounded-xl text-sm transition">Download Free</a>
     </div>
-    <div class="mt-8 text-xs"><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a></div>
+    <nav class="mt-8 flex flex-col sm:flex-row items-center justify-between gap-3 text-xs"><span><a href="b7-ch09-azure-sql-serverless-economics.html" class="text-gray-400 hover:text-amber-300 transition">← Azure SQL Serverless: When It Saves vs When It Costs More</a></span><span><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">All Chapters</a></span><span><a href="b7-ch11-dev-test-cost.html" class="text-gray-400 hover:text-amber-300 transition">Dev and Test Cost Reduction: Schedules and Smaller Instances →</a></span></nav>
   </article>
   <footer class="border-t border-gray-800/50 px-6 py-8">
     <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · Database FinOps</div>

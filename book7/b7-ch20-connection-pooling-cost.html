@@ -37,962 +37,245 @@
       <span class="px-2.5 py-1 bg-amber-900/40 border border-amber-800/40 text-amber-300 text-xs rounded-full font-medium">Chapter 20 of 30</span>
       <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">Database FinOps</span>
     </div>
-    <div class="space-y-4 text-sm"><h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 20: Connection Pooling to Reduce Compute Overhead</h2>
+    <div class="space-y-4 text-sm"><h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 20: Connection Pooling Costs: Why SQL Server Pools Differently</h2>
 
-<p class="text-gray-300 leading-relaxed">Organizations running PostgreSQL on AWS RDS, Azure Database for PostgreSQL, or Cloud SQL routinely overpay for compute by 30–50% simply because each application thread holds a dedicated database connection whether it is actively executing a query or sitting idle. A db.r6g.2xlarge RDS instance running at $0.48/hour — $346/month — often spends the majority of its CPU cycles managing connection overhead rather than executing SQL. By deploying PgBouncer in transaction pooling mode in front of that instance, teams consistently reduce their active connection count from several hundred to fewer than fifty, which in turn allows them to right-size to a db.r6g.xlarge at $173/month — saving $173/month on a single instance without changing a line of application code. Across a fleet of ten such instances the annual saving reaches $20,760. This chapter covers how to diagnose connection waste, size a connection pool correctly, deploy and automate PgBouncer on each major cloud platform, and wire the entire operation into a scheduled cost-audit pipeline so savings are permanent rather than one-time.</p>
+<p class="text-gray-300 leading-relaxed">Organizations running SQL Server on AWS RDS, Azure SQL Database, or Cloud SQL for SQL Server routinely overpay for compute by 30–50% because of connection waste — but the fix is not a proxy like PgBouncer. SQL Server drivers (ADO.NET SqlClient, ODBC, JDBC) implement connection pooling <em>in the client</em>: the pool lives in each application process, not in a separate tier. That means there is nothing to deploy — but also nothing to tune centrally, which is why connection waste on SQL Server goes undiagnosed for years. A db.r5.2xlarge RDS for SQL Server instance running at roughly $1.40/hour — over $1,000/month — often spends a meaningful share of its memory and worker threads servicing hundreds of idle connections rather than executing queries. Fixing connection strings, pool sizes, and connection leaks across the application fleet frequently allows a right-size to a db.r5.xlarge, cutting the bill nearly in half without changing a line of SQL. This chapter covers how to diagnose connection waste on SQL Server, size client-side pools correctly, eliminate the connection-string anti-patterns that defeat pooling, and wire the whole thing into a scheduled cost-audit pipeline so the savings stick.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">Diagnosing Connection Overhead Before You Optimize</h3>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">20.1 How SQL Server Connection Pooling Actually Works</h3>
 
-<p class="text-gray-300 leading-relaxed">No optimization survives a budget review without a before-state baseline. Connection overhead manifests in three measurable ways: high <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_connections</code> utilization, elevated CPU on the database instance while query throughput is low, and spikes in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_activity</code> showing processes in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">idle</code> or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">idle in transaction</code> state.</p>
+<p class="text-gray-300 leading-relaxed">Before optimizing, understand the mechanism. When a .NET application opens a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SqlConnection</code>, ADO.NET does not open a network connection to SQL Server — it checks a per-process, per-connection-string pool for a reusable physical connection. Only when the pool is empty (or every pooled connection is busy) does a real login occur. Closing the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SqlConnection</code> returns the physical connection to the pool; it is not torn down. Pooling is <strong class="text-white">on by default</strong> and keyed on the exact connection string: two connection strings that differ by a single character (even whitespace) create two separate pools.</p>
 
-<p class="text-gray-300 leading-relaxed">The following query exposes the exact distribution of connection states on a live PostgreSQL instance. Run it against every RDS or Cloud SQL instance in your fleet and export the results to a spreadsheet:</p>
+<p class="text-gray-300 leading-relaxed">The cost implications follow directly:</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Connection state audit: run on each PostgreSQL instance
--- Identifies idle connections that are burning compute capacity
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">1. Each pooled connection consumes server memory.</strong> A SQL Server session carries worker thread reservation, session state, and network buffers — roughly tens of kilobytes per connection plus whatever the session has allocated. A thousand idle connections can pin hundreds of megabytes of buffer pool and exhaust <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max worker threads</code> on smaller instance classes, forcing you onto a larger (more expensive) instance for no query benefit.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">2. Logins are expensive; pooled reuse is cheap.</strong> A fresh login requires authentication, session setup, and database context initialization — measurable in milliseconds. Applications that disable pooling (or leak connections so the pool never fills) pay this cost on every operation and drive up CPU.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">3. Azure SQL throttles by session count.</strong> Each Azure SQL Database service tier has a hard session limit (and elastic pools add per-database limits). Connection storms — deployments, cache stampedes, retry floods — hit error 10928/10929 (resource limits) and the standard "fix" teams reach for is a bigger tier. The real fix is pooling discipline.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">4. Connection-string sprawl multiplies pools.</strong> Ten microservices with slightly different connection strings (different <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Application Name</code>, different parameter order) create ten independent pools against the same database, each holding its own idle connections. Standardizing the connection string is free and often halves total connections overnight.</p>
+
+<p class="text-gray-300 leading-relaxed">No optimization survives a budget review without a before-state baseline. Connection waste on SQL Server manifests in three measurable ways: high session counts relative to active requests, large numbers of sessions with old <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">last_request_end_time</code> (idle but holding resources), and worker-thread pressure on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_os_schedulers</code>.</p>
+
+<p class="text-gray-300 leading-relaxed">The following query exposes the exact distribution of connection states on a live SQL Server instance. Run it against every RDS, Azure SQL, and Cloud SQL instance in your fleet and export the results:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: connection state audit — run on each instance
 SELECT
-    datname                          AS database_name,
-    usename                          AS username,
-    state,
-    wait_event_type,
-    wait_event,
-    COUNT(*)                         AS connection_count,
-    ROUND(COUNT(*) * 100.0
-          / SUM(COUNT(*)) OVER (), 2) AS pct_of_total,
-    MAX(EXTRACT(EPOCH FROM (NOW() - state_change))::INT)
-                                     AS max_idle_seconds,
-    AVG(EXTRACT(EPOCH FROM (NOW() - state_change))::INT)
-                                     AS avg_idle_seconds
-FROM pg_stat_activity
-WHERE pid &lt;&gt; pg_backend_pid()        -- exclude this monitoring session
-GROUP BY datname, usename, state, wait_event_type, wait_event
-ORDER BY connection_count DESC;</code></pre>
-
-<p class="text-gray-300 leading-relaxed">Interpret the output with these thresholds:</p>
-
-<p class="text-gray-300 leading-relaxed">| Condition | Meaning | Action |</p>
-<p class="text-gray-300 leading-relaxed">|---|---|---|</p>
-<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">idle</code> > 40% of total | Application not releasing connections | Pool immediately |</p>
-<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">idle in transaction</code> > 5% | Long transactions or ORM misuse | Fix ORM + Pool |</p>
-<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_idle_seconds</code> > 300 | Connections parked for 5+ minutes | Reduce pool timeout |</p>
-<p class="text-gray-300 leading-relaxed">| Total connections > 80% of <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_connections</code> | Near exhaustion | Pool + raise limit |</p>
-
-<p class="text-gray-300 leading-relaxed">Pull the current <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_connections</code> ceiling and see how close you are to it:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Current connection ceiling vs. actual usage
-SELECT
-    'max_connections'                          AS name,
-    setting::INT                               AS configured_value,
-    (SELECT COUNT(*) FROM pg_stat_activity)    AS current_connections,
-    ROUND(
-        (SELECT COUNT(*) FROM pg_stat_activity)::NUMERIC
-        / setting::INT * 100, 1
-    )                                          AS utilization_pct
-FROM pg_settings
-WHERE name = 'max_connections';</code></pre>
-
-<p class="text-gray-300 leading-relaxed">On AWS RDS, cross-reference this data with CloudWatch. The metric <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DatabaseConnections</code> sampled over 24 hours tells you peak and average. Pull it with the CLI so you can baseline before and after pooling:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/bin/bash
-# baseline_connections.sh
-# Pulls 7-day connection metrics from CloudWatch for a named RDS instance
-# Usage: ./baseline_connections.sh mydb-instance-1 us-east-1
-
-INSTANCE_ID="${1:?Usage: $0 &lt;db-instance-id&gt; &lt;region&gt;}"
-REGION="${2:-us-east-1}"
-START_TIME=$(date -u -d '7 days ago' '+%Y-%m-%dT%H:%M:%SZ' 2&gt;/dev/null \
-             || date -u -v-7d '+%Y-%m-%dT%H:%M:%SZ')  # macOS fallback
-END_TIME=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
-
-echo "=== Connection baseline for: $INSTANCE_ID ==="
-
-aws cloudwatch get-metric-statistics \
-    --region        "$REGION" \
-    --namespace     AWS/RDS \
-    --metric-name   DatabaseConnections \
-    --dimensions    Name=DBInstanceIdentifier,Value="$INSTANCE_ID" \
-    --start-time    "$START_TIME" \
-    --end-time      "$END_TIME" \
-    --period        3600 \
-    --statistics    Maximum Average \
-    --output        json \
-| python3 - &lt;&lt; 'PYEOF'
-import sys, json
-data = json.load(sys.stdin)
-points = sorted(data["Datapoints"], key=lambda p: p["Timestamp"])
-print(f"{'Timestamp':&lt;30} {'Max':&gt;8} {'Avg':&gt;8}")
-print("-" * 50)
-for p in points:
-    print(f"{p['Timestamp']:&lt;30} {p['Maximum']:&gt;8.0f} {p['Average']:&gt;8.1f}")
-
-if points:
-    maxes = [p["Maximum"] for p in points]
-    avgs  = [p["Average"]  for p in points]
-    print(f"\nPeak 7-day maximum : {max(maxes):.0f}")
-    print(f"Mean of hourly avg : {sum(avgs)/len(avgs):.1f}")
-PYEOF
-
-echo ""
-echo "=== CPUUtilization during same window ==="
-aws cloudwatch get-metric-statistics \
-    --region      "$REGION" \
-    --namespace   AWS/RDS \
-    --metric-name CPUUtilization \
-    --dimensions  Name=DBInstanceIdentifier,Value="$INSTANCE_ID" \
-    --start-time  "$START_TIME" \
-    --end-time    "$END_TIME" \
-    --period      3600 \
-    --statistics  Maximum Average \
-    --output      json \
-| python3 -c "
-import sys, json
-data = json.load(sys.stdin)
-points = sorted(data['Datapoints'], key=lambda p: p['Timestamp'])
-if points:
-    maxes = [p['Maximum'] for p in points]
-    avgs  = [p['Average']  for p in points]
-    print(f'Peak CPU  : {max(maxes):.1f}%')
-    print(f'Mean CPU  : {sum(avgs)/len(avgs):.1f}%')
-    print()
-    print('Rule of thumb: if mean CPU &lt; 20% and connections are high,')
-    print('you are paying for connection overhead, not real workload.')
-"</code></pre>
-
-<p class="text-gray-300 leading-relaxed">When peak connections are high and mean CPU is below 20%, the instance is sized for connection overhead rather than query work. That gap is your cost recovery opportunity.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
-
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">Sizing the Pool: The Math Behind Right-Sizing</h3>
-
-<p class="text-gray-300 leading-relaxed">The common mistake is deploying PgBouncer with default settings and calling it done. The pool size determines whether you can actually downsize the instance, and the instance determines the monthly bill. Get the math right first.</p>
-
-<p class="text-gray-300 leading-relaxed">PostgreSQL performs best when the number of *active* (non-idle) connections does not exceed <strong class="text-white">2 × vCPU count</strong>. For a db.r6g.2xlarge (8 vCPUs), the optimal active connection count is 16. Every connection above that figure competes for the same CPU cores and increases context-switching overhead — you pay for a larger instance to manage connections, not to execute queries.</p>
-
-<p class="text-gray-300 leading-relaxed">The PgBouncer pool target formula:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>server_pool_size = 2 × vCPU_count_of_target_instance
-max_client_conn  = peak_application_threads × safety_factor (1.25)</code></pre>
-
-<p class="text-gray-300 leading-relaxed">Example calculation for a migration from db.r6g.2xlarge to db.r6g.xlarge:</p>
-
-<p class="text-gray-300 leading-relaxed">| Parameter | Before | After |</p>
-<p class="text-gray-300 leading-relaxed">|---|---|---|</p>
-<p class="text-gray-300 leading-relaxed">| Instance | db.r6g.2xlarge (8 vCPU) | db.r6g.xlarge (4 vCPU) |</p>
-<p class="text-gray-300 leading-relaxed">| On-Demand price | $0.480/hr | $0.240/hr |</p>
-<p class="text-gray-300 leading-relaxed">| Monthly cost | $346.56 | $172.80 |</p>
-<p class="text-gray-300 leading-relaxed">| Monthly saving | — | $173.76 |</p>
-<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_connections</code> on RDS | 5,000* | 2,500* |</p>
-<p class="text-gray-300 leading-relaxed">| Application threads | 400 | 400 |</p>
-<p class="text-gray-300 leading-relaxed">| PgBouncer <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">default_pool_size</code> | — | 8 |</p>
-<p class="text-gray-300 leading-relaxed">| PgBouncer <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_client_conn</code> | — | 500 |</p>
-
-<p class="text-gray-300 leading-relaxed">*RDS sets <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_connections</code> automatically based on instance RAM; values shown are illustrative.</p>
-
-<p class="text-gray-300 leading-relaxed">The key insight: 400 application threads share 8 server-side connections. Each thread waits at most a few milliseconds for a connection in transaction pooling mode because transactions complete in tens of milliseconds on OLTP workloads. Average wait is negligible compared to the compute saving.</p>
-
-<p class="text-gray-300 leading-relaxed">For Azure Database for PostgreSQL Flexible Server, the equivalent instance comparison is:</p>
-
-<p class="text-gray-300 leading-relaxed">| Tier | vCPU | RAM | Price (East US) | Monthly |</p>
-<p class="text-gray-300 leading-relaxed">|---|---|---|---|---|</p>
-<p class="text-gray-300 leading-relaxed">| Standard_D4ds_v4 | 4 | 16 GB | $0.334/hr | $241 |</p>
-<p class="text-gray-300 leading-relaxed">| Standard_D2ds_v4 | 2 | 8 GB | $0.167/hr | $120 |</p>
-<p class="text-gray-300 leading-relaxed">| Saving per instance | | | | $121/mo |</p>
-
-<p class="text-gray-300 leading-relaxed">On Google Cloud SQL for PostgreSQL, the equivalent:</p>
-
-<p class="text-gray-300 leading-relaxed">| Machine type | vCPU | RAM | Price (us-central1) | Monthly |</p>
-<p class="text-gray-300 leading-relaxed">|---|---|---|---|---|</p>
-<p class="text-gray-300 leading-relaxed">| db-custom-4-15360 | 4 | 15 GB | $0.3567/hr | $257 |</p>
-<p class="text-gray-300 leading-relaxed">| db-custom-2-7680 | 2 | 7.5 GB | $0.1784/hr | $129 |</p>
-<p class="text-gray-300 leading-relaxed">| Saving per instance | | | | $128/mo |</p>
-
-<p class="text-gray-300 leading-relaxed">Before committing to a smaller instance, validate the pool size calculation against <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code>. The following query identifies the 95th-percentile query duration, which determines how long a server connection is held per transaction:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Estimate transaction duration from pg_stat_statements
--- This determines whether transaction pooling is safe and effective
-SELECT
-    LEFT(query, 80)                                           AS query_sample,
-    calls,
-    ROUND((total_exec_time / calls)::NUMERIC, 2)             AS avg_exec_ms,
-    ROUND(
-        PERCENTILE_CONT(0.95) WITHIN GROUP
-        (ORDER BY total_exec_time / calls)
-        OVER ()::NUMERIC, 2)                                  AS p95_exec_ms,
-    ROUND((mean_exec_time)::NUMERIC, 2)                       AS mean_exec_ms,
-    rows / calls                                              AS avg_rows_returned
-FROM pg_stat_statements
-WHERE calls &gt; 100
-  AND query NOT LIKE '%pg_stat%'   -- exclude monitoring queries
-ORDER BY total_exec_time DESC
-LIMIT 20;</code></pre>
-
-<p class="text-gray-300 leading-relaxed">If p95 query duration is under 100ms (typical for OLTP), transaction pooling is safe. If you see queries above 5,000ms regularly, those long-running queries will hold server connections and reduce the effectiveness of the pool — address query performance before right-sizing compute.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
-
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">Deploying PgBouncer on Each Cloud Platform</h3>
-
-<p class="text-gray-300 leading-relaxed">PgBouncer sits between the application and the RDS/Cloud SQL instance. It multiplexes hundreds of client connections onto a small number of server connections. The deployment pattern differs slightly by cloud platform.</p>
-
-<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">flowchart LR
-    subgraph App["Application tier"]
-        T1[Thread 1]
-        T2[Thread 2]
-        T3["... 400 threads"]
-    end
-    T1 & T2 & T3 --> PB["PgBouncer<br/>(transaction pooling)"]
-    PB --> S1[Server conn 1]
-    PB --> S2[Server conn 2]
-    PB --> S3["... 8 conns"]
-    S1 & S2 & S3 --> DB[(RDS / Cloud SQL)]</pre></div>
-
-<p class="text-gray-300 leading-relaxed">*PgBouncer multiplexes hundreds of application threads onto a handful of server-side connections — this is what makes right-sizing the database instance itself possible.*</p>
-
-<p class="text-gray-300 leading-relaxed">#### AWS: PgBouncer on EC2 or ECS</p>
-
-<p class="text-gray-300 leading-relaxed">The lowest-latency placement for PgBouncer on AWS is an EC2 instance in the same Availability Zone as the primary RDS instance, or a Fargate task in ECS if you want managed infrastructure. A t3.small ($0.0208/hr, $15/month) handles tens of thousands of application connections with negligible CPU usage — it is purely I/O and memory bounded.</p>
-
-<p class="text-gray-300 leading-relaxed">The following Bash script provisions PgBouncer on an Amazon Linux 2023 EC2 instance, configures it for transaction pooling, and registers it as a systemd service:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/bin/bash
-# deploy_pgbouncer_aws.sh
-# Installs and configures PgBouncer on Amazon Linux 2023
-# Run as ec2-user with sudo privileges
-# Requires: RDS endpoint, DB name, credentials in AWS Secrets Manager
-
-set -euo pipefail
-
-RDS_ENDPOINT="${RDS_ENDPOINT:?Set RDS_ENDPOINT environment variable}"
-RDS_PORT="${RDS_PORT:-5432}"
-DB_NAME="${DB_NAME:?Set DB_NAME environment variable}"
-SECRET_ARN="${SECRET_ARN:?Set SECRET_ARN for Secrets Manager}"
-PGBOUNCER_PORT=6432
-POOL_SIZE="${POOL_SIZE:-16}"         # 2 × vCPU of target instance
-MAX_CLIENT_CONN="${MAX_CLIENT_CONN:-500}"
-
-echo "[1/6] Installing PgBouncer..."
-sudo dnf install -y pgbouncer
-
-echo "[2/6] Fetching credentials from Secrets Manager..."
-SECRET=$(aws secretsmanager get-secret-value \
-    --secret-id "$SECRET_ARN" \
-    --query SecretString \
-    --output text)
-DB_USER=$(echo "$SECRET" | python3 -c "import sys,json; print(json.load(sys.stdin)['username'])")
-DB_PASS=$(echo "$SECRET" | python3 -c "import sys,json; print(json.load(sys.stdin)['password'])")
-
-echo "[3/6] Writing pgbouncer.ini..."
-sudo tee /etc/pgbouncer/pgbouncer.ini &gt; /dev/null &lt;&lt; INIEOF
-[databases]
-${DB_NAME} = host=${RDS_ENDPOINT} port=${RDS_PORT} dbname=${DB_NAME}
-
-[pgbouncer]
-listen_addr          = 0.0.0.0
-listen_port          = ${PGBOUNCER_PORT}
-auth_type            = scram-sha-256
-auth_file            = /etc/pgbouncer/userlist.txt
-
-; TRANSACTION mode: connection returned to pool after each transaction
-; This is the mode that enables compute right-sizing
-pool_mode            = transaction
-
-default_pool_size    = ${POOL_SIZE}
-min_pool_size        = 2
-reserve_pool_size    = 5
-reserve_pool_timeout = 3
-max_client_conn      = ${MAX_CLIENT_CONN}
-
-; Connection hygiene — recycle idle server connections
-server_idle_timeout  = 60
-client_idle_timeout  = 300
-server_lifetime      = 3600
-
-; Logging for cost audit trail
-log_connections      = 1
-log_disconnections   = 1
-stats_period         = 60
-
-; TLS toward RDS
-server_tls_sslmode   = require
-
-; Admin interface — restrict to localhost
-admin_users          = pgbouncer_admin
-stats_users          = pgbouncer_stats
-INIEOF
-
-echo "[4/6] Writing userlist.txt..."
-# PgBouncer needs MD5 or SCRAM hashes; use pg_shadow query for production
-# For initial setup, write plaintext and migrate to scram-sha-256 hashes
-sudo tee /etc/pgbouncer/userlist.txt &gt; /dev/null &lt;&lt; USEREOF
-"${DB_USER}" "${DB_PASS}"
-"pgbouncer_admin" "changeme_admin_pw"
-"pgbouncer_stats" "changeme_stats_pw"
-USEREOF
-sudo chmod 600 /etc/pgbouncer/userlist.txt
-sudo chown pgbouncer:pgbouncer /etc/pgbouncer/userlist.txt
-
-echo "[5/6] Enabling and starting systemd service..."
-sudo systemctl enable pgbouncer
-sudo systemctl restart pgbouncer
-sudo systemctl status pgbouncer --no-pager
-
-echo "[6/6] Verification..."
-echo "Connecting to PgBouncer admin interface..."
-PGPASSWORD="changeme_admin_pw" psql \
-    -h 127.0.0.1 -p $PGBOUNCER_PORT \
-    -U pgbouncer_admin pgbouncer \
-    -c "SHOW POOLS;" \
-    -c "SHOW STATS;" \
-    -c "SHOW CONFIG;" 2&gt;&1 | head -60
-
-echo ""
-echo "=== Deployment complete ==="
-echo "Application connection string:"
-echo "  host=&lt;this-ec2-ip&gt; port=${PGBOUNCER_PORT} dbname=${DB_NAME} user=${DB_USER}"
-echo ""
-echo "Next step: update application connection strings, then right-size RDS instance."</code></pre>
-
-<p class="text-gray-300 leading-relaxed">#### Azure: PgBouncer Built-In vs. Sidecar</p>
-
-<p class="text-gray-300 leading-relaxed">Azure Database for PostgreSQL Flexible Server includes PgBouncer as a built-in feature — enable it with a single CLI command at no additional cost:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/bin/bash
-# enable_pgbouncer_azure.sh
-# Enables built-in PgBouncer on Azure Database for PostgreSQL Flexible Server
-# Requires: az CLI logged in, Contributor role on the server resource
-
-RESOURCE_GROUP="${RESOURCE_GROUP:?Set RESOURCE_GROUP}"
-SERVER_NAME="${SERVER_NAME:?Set SERVER_NAME}"
-SUBSCRIPTION="${SUBSCRIPTION:-$(az account show --query id -o tsv)}"
-
-echo "=== Enabling PgBouncer on Azure PostgreSQL Flexible Server ==="
-echo "Server      : $SERVER_NAME"
-echo "Resource Grp: $RESOURCE_GROUP"
-
-# Enable the pgbouncer extension and set pool parameters
-az postgres flexible-server parameter set \
-    --resource-group "$RESOURCE_GROUP" \
-    --server-name    "$SERVER_NAME" \
-    --name           "pgbouncer.enabled" \
-    --value          "true"
-
-az postgres flexible-server parameter set \
-    --resource-group "$RESOURCE_GROUP" \
-    --server-name    "$SERVER_NAME" \
-    --name           "pgbouncer.default_pool_size" \
-    --value          "16"
-
-az postgres flexible-server parameter set \
-    --resource-group "$RESOURCE_GROUP" \
-    --server-name    "$SERVER_NAME" \
-    --name           "pgbouncer.max_client_conn" \
-    --value          "500"
-
-az postgres flexible-server parameter set \
-    --resource-group "$RESOURCE_GROUP" \
-    --server-name    "$SERVER_NAME" \
-    --name           "pgbouncer.pool_mode" \
-    --value          "transaction"
-
-az postgres flexible-server parameter set \
-    --resource-group "$RESOURCE_GROUP" \
-    --server-name    "$SERVER_NAME" \
-    --name           "pgbouncer.server_idle_timeout" \
-    --value          "60"
-
-echo ""
-echo "=== Verifying PgBouncer status ==="
-az postgres flexible-server parameter list \
-    --resource-group "$RESOURCE_GROUP" \
-    --server-name    "$SERVER_NAME" \
-    --query          "[?starts_with(name, 'pgbouncer')]" \
-    --output         table
-
-echo ""
-echo "=== PgBouncer connection endpoint ==="
-SERVER_FQDN=$(az postgres flexible-server show \
-    --resource-group "$RESOURCE_GROUP" \
-    --name           "$SERVER_NAME" \
-    --query          "fullyQualifiedDomainName" \
-    --output         tsv)
-
-echo "Standard port (direct) : ${SERVER_FQDN}:5432"
-echo "PgBouncer port         : ${SERVER_FQDN}:6432"
-echo ""
-echo "Update application connection strings to port 6432."
-echo "Monitor via Azure Monitor metric: active_connections"</code></pre>
-
-<p class="text-gray-300 leading-relaxed">For Google Cloud SQL, the native proxy (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">cloud-sql-proxy</code>) handles authentication but does not pool connections. Deploy PgBouncer as a Cloud Run sidecar or on a single e2-micro ($0.0084/hr, $6/month) in the same region.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
-
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">Measuring the Cost Impact and Automating Continuous Monitoring</h3>
-
-<p class="text-gray-300 leading-relaxed">Deploying PgBouncer is a one-time action. The ongoing value comes from continuously verifying that pooling efficiency is maintained as the application evolves — new features often add new connection patterns that erode pool efficiency over time. The following Python script runs on a cron schedule, compares current connection behavior against a stored baseline, and posts an alert to Slack when efficiency drops below threshold. It also queries the AWS Cost Explorer API to correlate connection count changes with actual spend.</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/usr/bin/env python3
-"""
-pgbouncer_cost_monitor.py
-
-Scheduled cost-efficiency monitor for PgBouncer deployments.
-Queries PgBouncer admin interface + AWS Cost Explorer and reports
-on connection efficiency and compute cost trends.
-
-Schedule: run every 6 hours via cron or EventBridge Scheduler
-  0 */6 * * * /usr/bin/python3 /opt/dba-tools/pgbouncer_cost_monitor.py
-
-Dependencies: psycopg2, boto3, requests
-  pip install psycopg2-binary boto3 requests
-"""
-
-import os
-import json
-import datetime
-import psycopg2
-import boto3
-import requests
-from dataclasses import dataclass, asdict
-from typing import Optional
-
-# ── Configuration ────────────────────────────────────────────────────────────
-PGBOUNCER_HOST  = os.environ.get("PGBOUNCER_HOST", "127.0.0.1")
-PGBOUNCER_PORT  = int(os.environ.get("PGBOUNCER_PORT", 6432))
-PGBOUNCER_ADMIN = os.environ.get("PGBOUNCER_ADMIN_USER", "pgbouncer_admin")
-PGBOUNCER_PASS  = os.environ.get("PGBOUNCER_ADMIN_PASS")
-
-AWS_REGION      = os.environ.get("AWS_REGION", "us-east-1")
-RDS_INSTANCE_ID = os.environ.get("RDS_INSTANCE_ID")       # for Cost Explorer filter
-SLACK_WEBHOOK   = os.environ.get("SLACK_WEBHOOK_URL")      # optional
-
-EFFICIENCY_THRESHOLD = 0.30   # alert if server_conn / cl_active drops below 30%
-IDLE_RATIO_THRESHOLD = 0.50   # alert if idle client ratio exceeds 50%
-
-# ── Data classes ─────────────────────────────────────────────────────────────
-@dataclass
-class PoolStats:
-    database:       str
-    cl_active:      int    # active client connections
-    cl_waiting:     int    # clients waiting for a server connection
-    sv_active:      int    # active server connections
-    sv_idle:        int    # idle server connections
-    sv_used:        int    # server connections used and returned to pool
-    maxwait:        int    # longest wait time (seconds)
-    pool_mode:      str
-
-@dataclass
-class CostReport:
-    period_start:       str
-    period_end:         str
-    rds_compute_cost:   float
-    currency:           str
-    instance_id:        str
-
-# ── PgBouncer queries ────────────────────────────────────────────────────────
-def get_pool_stats(host: str, port: int, user: str, password: str) -&gt; list[PoolStats]:
-    """Query PgBouncer admin interface for current pool statistics."""
-    conn = psycopg2.connect(
-        host=host, port=port,
-        user=user, password=password,
-        dbname="pgbouncer",
-        connect_timeout=5
-    )
-    conn.autocommit = True
-    cur = conn.cursor()
-    cur.execute("SHOW POOLS;")
-    cols = [desc[0] for desc in cur.description]
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
-
-    stats = []
-    for row in rows:
-        row_dict = dict(zip(cols, row))
-        stats.append(PoolStats(
-            database   = row_dict.get("database", ""),
-            cl_active  = int(row_dict.get("cl_active",  0)),
-            cl_waiting = int(row_dict.get("cl_waiting", 0)),
-            sv_active  = int(row_dict.get("sv_active",  0)),
-            sv_idle    = int(row_dict.get("sv_idle",    0)),
-            sv_used    = int(row_dict.get("sv_used",    0)),
-            maxwait    = int(row_dict.get("maxwait",    0)),
-            pool_mode  = row_dict.get("pool_mode", ""),
-        ))
-    return stats
-
-
-def get_global_stats(host: str, port: int, user: str, password: str) -&gt; dict:
-    """Query SHOW STATS for aggregate throughput and timing metrics."""
-    conn = psycopg2.connect(
-        host=host, port=port,
-        user=user, password=password,
-        dbname="pgbouncer",
-        connect_timeout=5
-    )
-    conn.autocommit = True
-    cur = conn.cursor()
-    cur.execute("SHOW STATS;")
-    cols = [desc[0] for desc in cur.description]
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
-    return [dict(zip(cols, row)) for row in rows]
-
-
-# ── AWS Cost Explorer ─────────────────────────────────────────────────────────
-def get_rds_cost_last_30_days(instance_id: Optional[str]) -&gt; Optional[CostReport]:
-    """Fetch RDS compute spend for the last 30 days from Cost Explorer."""
-    if not instance_id:
-        return None
-
-    ce = boto3.client("ce", region_name="us-east-1")   # CE is global; always us-east-1
-    end   = datetime.date.today()
-    start = end - datetime.timedelta(days=30)
-
-    try:
-        response = ce.get_cost_and_usage(
-            TimePeriod={"Start": start.isoformat(), "End": end.isoformat()},
-            Granularity="MONTHLY",
-            Filter={
-                "And": [
-                    {"Dimensions": {"Key": "SERVICE",
-                                    "Values": ["Amazon Relational Database Service"]}},
-                    {"Dimensions": {"Key": "RESOURCE_ID",
-                                    "Values": [instance_id]}},
-                ]
-            },
-            Metrics=["UnblendedCost"],
-        )
-        total = sum(
-            float(p["Total"]["UnblendedCost"]["Amount"])
-            for p in response["ResultsByTime"]
-        )
-        currency = response["ResultsByTime"][0]["Total"]["UnblendedCost"]["Unit"] \
-            if response["ResultsByTime"] else "USD"
-        return CostReport(
-            period_start     = start.isoformat(),
-            period_end       = end.isoformat(),
-            rds_compute_cost = round(total, 2),
-            currency         = currency,
-            instance_id      = instance_id,
-        )
-    except Exception as exc:
-        print(f"[WARN] Cost Explorer query failed: {exc}")
-        return None
-
-
-# ── Analysis ──────────────────────────────────────────────────────────────────
-def analyze_pools(stats: list[PoolStats]) -&gt; dict:
-    """
-    Compute efficiency ratios and flag pools that need attention.
-    Returns a dict with aggregate metrics and a list of alerts.
-    """
-    alerts = []
-    total_cl_active  = sum(s.cl_active  for s in stats)
-    total_sv_active  = sum(s.sv_active  for s in stats)
-    total_sv_idle    = sum(s.sv_idle    for s in stats)
-    total_cl_waiting = sum(s.cl_waiting for s in stats)
-
-    # Multiplexing ratio: how many client connections share one server connection
-    if total_sv_active &gt; 0:
-        mux_ratio = round(total_cl_active / total_sv_active, 1)
-    else:
-        mux_ratio = 0.0
-
-    # Server utilization: fraction of server connections that are active vs. idle
-    total_sv = total_sv_active + total_sv_idle
-    sv_utilization = round(total_sv_active / total_sv, 2) if total_sv &gt; 0 else 0.0
-
-    for s in stats:
-        sv_total = s.sv_active + s.sv_idle
-        if sv_total == 0:
-            continue
-        efficiency = s.sv_active / sv_total
-        if efficiency &lt; EFFICIENCY_THRESHOLD:
-            alerts.append({
-                "level":   "WARNING",
-                "database": s.database,
-                "message": (
-                    f"Pool efficiency {efficiency:.0%} is below threshold "
-                    f"{EFFICIENCY_THRESHOLD:.0%}. "
-                    f"sv_idle={s.sv_idle}, sv_active={s.sv_active}. "
-                    "Consider reducing default_pool_size."
-                ),
-            })
-        if s.maxwait &gt; 5:
-            alerts.append({
-                "level":    "CRITICAL",
-                "database": s.database,
-                "message": (
-                    f"Clients waiting {s.maxwait}s for a server connection. "
-                    "Pool is undersized — increase default_pool_size or "
-                    "right-size the target instance upward."
-                ),
-            })
-        if s.cl_waiting &gt; 0:
-            alerts.append({
-                "level":    "WARNING",
-                "database": s.database,
-                "message": (
-                    f"{s.cl_waiting} client(s) currently queued for a server "
-                    "connection. Investigate query duration or increase pool size."
-                ),
-            })
-
-    return {
-        "timestamp":        datetime.datetime.utcnow().isoformat() + "Z",
-        "total_cl_active":  total_cl_active,
-        "total_sv_active":  total_sv_active,
-        "total_sv_idle":    total_sv_idle,
-        "total_cl_waiting": total_cl_waiting,
-        "mux_ratio":        mux_ratio,
-        "sv_utilization":   sv_utilization,
-        "alerts":           alerts,
-        "pool_detail":      [asdict(s) for s in stats],
-    }
-
-
-# ── Slack notification ────────────────────────────────────────────────────────
-def post_slack(webhook_url: str, report: dict, cost: Optional[CostReport]) -&gt; None:
-    """Format and post a summary to a Slack webhook."""
-    alert_lines = "\n".join(
-        f"• [{a['level']}] {a['database']}: {a['message']}"
-        for a in report["alerts"]
-    ) or "• No alerts — pool operating within thresholds."
-
-    cost_line = (
-        f"RDS compute cost last 30 days: "
-        f"{cost.currency} {cost.rds_compute_cost:,.2f} "
-        f"(instance: {cost.instance_id})"
-        if cost else "Cost Explorer data unavailable."
-    )
-
-    text = (
-        f"*PgBouncer Cost Monitor — {report['timestamp']}*\n"
-        f"Multiplexing ratio  : {report['mux_ratio']}:1 "
-        f"(client connections per server connection)\n"
-        f"Server utilization  : {report['sv_utilization']:.0%}\n"
-        f"Clients waiting now : {report['total_cl_waiting']}\n"
-        f"{cost_line}\n\n"
-        f"*Alerts*\n{alert_lines}"
-    )
-    payload = {"text": text}
-    try:
-        resp = requests.post(webhook_url, json=payload, timeout=10)
-        resp.raise_for_status()
-    except Exception as exc:
-        print(f"[WARN] Slack notification failed: {exc}")
-
-
-# ── Main ──────────────────────────────────────────────────────────────────────
-def main():
-    print(f"[{datetime.datetime.utcnow().isoformat()}Z] PgBouncer cost monitor starting...")
-
-    # 1. Pull pool stats
-    pool_stats = get_pool_stats(
-        PGBOUNCER_HOST, PGBOUNCER_PORT,
-        PGBOUNCER_ADMIN, PGBOUNCER_PASS
-    )
-    global_stats = get_global_stats(
-        PGBOUNCER_HOST, PGBOUNCER_PORT,
-        PGBOUNCER_ADMIN, PGBOUNCER_PASS
-    )
-
-    # 2. Analyse
-    report = analyze_pools(pool_stats)
-
-    # 3. Pull cost data
-    cost_report = get_rds_cost_last_30_days(RDS_INSTANCE_ID)
-
-    # 4. Print structured JSON to stdout (captured by CloudWatch Logs or similar)
-    output = {
-        "pool_report":  report,
-        "cost_report":  asdict(cost_report) if cost_report else None,
-        "global_stats": global_stats,
-    }
-    print(json.dumps(output, indent=2, default=str))
-
-    # 5. Alert via Slack if configured
-    if SLACK_WEBHOOK:
-        post_slack(SLACK_WEBHOOK, report, cost_report)
-
-    # 6. Exit non-zero if critical alerts exist so cron can trigger further alerting
-    critical = [a for a in report["alerts"] if a["level"] == "CRITICAL"]
-    if critical:
-        print(f"[ERROR] {len(critical)} CRITICAL alert(s) detected. Exiting 1.")
-        raise SystemExit(1)
-
-    print("Monitor run complete — no critical issues.")
-
-
-if __name__ == "__main__":
-    main()</code></pre>
-
-<p class="text-gray-300 leading-relaxed">Save this script to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">/opt/dba-tools/pgbouncer_cost_monitor.py</code>, make it executable, and schedule it with cron or AWS EventBridge Scheduler:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># crontab -e  (on the PgBouncer EC2 host)
-# Run every 6 hours; pipe output to logger for CloudWatch Logs integration
-0 */6 * * * PGBOUNCER_ADMIN_PASS="$(aws secretsmanager get-secret-value \
-    --secret-id pgbouncer/admin --query SecretString --output text \
-    | python3 -c 'import sys,json; print(json.load(sys.stdin)["password"])')" \
-    RDS_INSTANCE_ID="mydb-prod-1" \
-    SLACK_WEBHOOK_URL="https://hooks.slack.com/services/..." \
-    /usr/bin/python3 /opt/dba-tools/pgbouncer_cost_monitor.py \
-    2&gt;&1 | /usr/bin/logger -t pgbouncer-cost-monitor</code></pre>
-
-<p class="text-gray-300 leading-relaxed">---</p>
-
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">Validating the Right-Sizing Decision Before Executing It</h3>
-
-<p class="text-gray-300 leading-relaxed">Committing to a smaller instance class carries risk. The following checklist, implemented as a Bash validation script, guards against the most common failure modes before you modify the instance in production.</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/bin/bash
-# validate_rightsize.sh
-# Pre-flight checks before right-sizing an RDS instance behind PgBouncer
-# Run this script and review all outputs before modifying the instance class.
-
-set -euo pipefail
-
-INSTANCE_ID="${1:?Usage: $0 &lt;db-instance-id&gt; &lt;region&gt; &lt;target-class&gt;}"
-REGION="${2:-us-east-1}"
-TARGET_CLASS="${3:?Provide target instance class, e.g. db.r6g.xlarge}"
-
-PGB_HOST="${PGBOUNCER_HOST:-127.0.0.1}"
-PGB_PORT="${PGBOUNCER_PORT:-6432}"
-PGB_ADMIN="${PGBOUNCER_ADMIN_USER:-pgbouncer_admin}"
-PGB_PASS="${PGBOUNCER_ADMIN_PASS:?Set PGBOUNCER_ADMIN_PASS}"
-
-PASS=0
-FAIL=0
-WARN=0
-
-check() {
-    local label="$1" result="$2" expected="$3" severity="${4:-FAIL}"
-    if [ "$result" = "$expected" ]; then
-        echo "  [PASS] $label"
-        PASS=$((PASS+1))
-    else
-        echo "  [$severity] $label (got: $result, expected: $expected)"
-        [ "$severity" = "FAIL" ] && FAIL=$((FAIL+1)) || WARN=$((WARN+1))
-    fi
-}
-
-echo "============================================================"
-echo " Pre-flight validation: $INSTANCE_ID → $TARGET_CLASS"
-echo " Region: $REGION"
-echo " $(date -u)"
-echo "============================================================"
-
-# ── Check 1: PgBouncer is running and reachable ───────────────────────────────
-echo ""
-echo "--- Check 1: PgBouncer availability ---"
-PGB_UP=$(PGPASSWORD="$PGB_PASS" psql \
-    -h "$PGB_HOST" -p "$PGB_PORT" -U "$PGB_ADMIN" pgbouncer \
-    -c "SHOW VERSION;" -tA 2&gt;/dev/null | head -1 | grep -c "PgBouncer" || echo "0")
-check "PgBouncer reachable" "$PGB_UP" "1"
-
-# ── Check 2: Pool mode is transaction ────────────────────────────────────────
-echo ""
-echo "--- Check 2: Pool mode ---"
-POOL_MODE=$(PGPASSWORD="$PGB_PASS" psql \
-    -h "$PGB_HOST" -p "$PGB_PORT" -U "$PGB_ADMIN" pgbouncer \
-    -c "SHOW CONFIG;" -tA 2&gt;/dev/null \
-    | grep "^pool_mode" | awk -F'|' '{print $2}' | tr -d ' ')
-check "pool_mode=transaction" "$POOL_MODE" "transaction"
-
-# ── Check 3: No clients currently waiting ────────────────────────────────────
-echo ""
-echo "--- Check 3: Client wait queue ---"
-CL_WAITING=$(PGPASSWORD="$PGB_PASS" psql \
-    -h "$PGB_HOST" -p "$PGB_PORT" -U "$PGB_ADMIN" pgbouncer \
-    -c "SHOW POOLS;" -tA 2&gt;/dev/null \
-    | awk -F'|' '{sum += $5} END {print sum+0}')
-check "No clients waiting (cl_waiting=0)" "$CL_WAITING" "0" "WARN"
-
-# ── Check 4: Server connection count fits target instance ────────────────────
-echo ""
-echo "--- Check 4: Server connection headroom ---"
-SV_ACTIVE=$(PGPASSWORD="$PGB_PASS" psql \
-    -h "$PGB_HOST" -p "$PGB_PORT" -U "$PGB_ADMIN" pgbouncer \
-    -c "SHOW POOLS;" -tA 2&gt;/dev/null \
-    | awk -F'|' '{sum += $3} END {print sum+0}')
-# Extract vCPU count from target instance class name (r6g.xlarge = 4, r6g.2xlarge = 8)
-TARGET_VCPU=$(aws ec2 describe-instance-types \
-    --instance-types "${TARGET_CLASS/db./}" \
-    --query "InstanceTypes[0].VCpuInfo.DefaultVCpus" \
-    --output text --region "$REGION" 2&gt;/dev/null || echo "4")
-RECOMMENDED_POOL=$((TARGET_VCPU * 2))
-HEADROOM=$(( RECOMMENDED_POOL - SV_ACTIVE ))
-if [ "$HEADROOM" -ge 0 ]; then
-    echo "  [PASS] sv_active=$SV_ACTIVE ≤ recommended pool size=$RECOMMENDED_POOL for $TARGET_CLASS (${TARGET_VCPU} vCPU)"
-    PASS=$((PASS+1))
-else
-    echo "  [FAIL] sv_active=$SV_ACTIVE exceeds recommended pool size=$RECOMMENDED_POOL — reduce default_pool_size first"
-    FAIL=$((FAIL+1))
-fi
-
-# ── Check 5: RDS CPU not saturated at current workload ────────────────────────
-echo ""
-echo "--- Check 5: Current RDS CPU utilization (last 30 minutes) ---"
-PEAK_CPU=$(aws cloudwatch get-metric-statistics \
-    --region "$REGION" \
-    --namespace AWS/RDS \
-    --metric-name CPUUtilization \
-    --dimensions Name=DBInstanceIdentifier,Value="$INSTANCE_ID" \
-    --start-time "$(date -u -d '30 minutes ago' '+%Y-%m-%dT%H:%M:%SZ' 2&gt;/dev/null \
-                  || date -u -v-30M '+%Y-%m-%dT%H:%M:%SZ')" \
-    --end-time "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
-    --period 300 \
-    --statistics Maximum \
-    --output json \
-    | python3 -c "
-import sys, json
-d = json.load(sys.stdin)
-pts = d.get('Datapoints', [])
-print(f'{max((p[\"Maximum\"] for p in pts), default=0):.1f}')
-")
-# Safe to right-size if peak CPU on current (larger) instance is below 40%
-# because the smaller instance will have proportionally fewer vCPUs
-CPU_OK=$(python3 -c "print('yes' if float('${PEAK_CPU}') &lt; 40.0 else 'no')")
-check "Peak CPU &lt; 40% (current workload safe for smaller instance)" "$CPU_OK" "yes"
-echo "  Peak CPU last 30 min: ${PEAK_CPU}%"
-
-# ── Check 6: No long-running transactions ────────────────────────────────────
-echo ""
-echo "--- Check 6: Long-running transactions on RDS ---"
-# Connect directly to RDS for this check (bypasses PgBouncer)
-RDS_ENDPOINT=$(aws rds describe-db-instances \
-    --db-instance-identifier "$INSTANCE_ID" \
-    --region "$REGION" \
-    --query "DBInstances[0].Endpoint.Address" \
-    --output text 2&gt;/dev/null || echo "")
-
-if [ -n "$RDS_ENDPOINT" ] && [ -n "${PGPASSWORD:-}" ]; then
-    LONG_TXN=$(psql "host=$RDS_ENDPOINT port=5432 sslmode=require" \
-        -c "SELECT COUNT(*) FROM pg_stat_activity
-            WHERE state = 'idle in transaction'
-              AND EXTRACT(EPOCH FROM (NOW() - xact_start)) &gt; 60;" \
-        -tA 2&gt;/dev/null || echo "0")
-    check "No long idle-in-transaction (&gt;60s)" "$LONG_TXN" "0" "WARN"
-else
-    echo "  [SKIP] RDS direct connection not available for long-txn check"
-    WARN=$((WARN+1))
-fi
-
-# ── Summary ──────────────────────────────────────────────────────────────────
-echo ""
-echo "============================================================"
-echo " Validation summary"
-echo "   PASS : $PASS"
-echo "   WARN : $WARN"
-echo "   FAIL : $FAIL"
-echo "============================================================"
-
-if [ "$FAIL" -gt 0 ]; then
-    echo ""
-    echo "ACTION REQUIRED: $FAIL check(s) failed."
-    echo "Resolve failures before modifying the instance class."
-    exit 1
-elif [ "$WARN" -gt 0 ]; then
-    echo ""
-    echo "WARNINGS present: $WARN check(s). Review before proceeding."
-    echo "Right-sizing is likely safe but review each warning above."
-    exit 0
-else
-    echo ""
-    echo "All checks passed. Safe to proceed with right-sizing:"
-    echo ""
-    echo "  aws rds modify-db-instance \\"
-    echo "      --db-instance-identifier $INSTANCE_ID \\"
-    echo "      --db-instance-class $TARGET_CLASS \\"
-    echo "      --apply-immediately \\"
-    echo "      --region $REGION"
-    echo ""
-    echo "Estimated monthly saving:"
-    aws rds describe-db-instances \
-        --db-instance-identifier "$INSTANCE_ID" \
-        --region "$REGION" \
-        --query "DBInstances[0].DBInstanceClass" \
-        --output text 2&gt;/dev/null \
-        | xargs -I{} echo "  Current class: {} → Target: $TARGET_CLASS"
-    exit 0
-fi</code></pre>
-
-<p class="text-gray-300 leading-relaxed">Run the validation script at least one full business day before executing the instance modification. If it exits 0 and all checks pass, issue the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">aws rds modify-db-instance</code> command during a maintenance window or low-traffic period.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
-
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">Extending the Pattern to Azure SQL and SQL Server</h3>
-
-<p class="text-gray-300 leading-relaxed">Azure SQL Database and SQL Server on RDS manage connections differently from PostgreSQL. They use a thread-based architecture where each connection consumes roughly 7–8 MB of memory and a small CPU overhead. The equivalent optimization is <strong class="text-white">connection pool management at the application layer</strong> via ADO.NET, JDBC, or SQLAlchemy connection pool settings, not an external proxy.</p>
-
-<p class="text-gray-300 leading-relaxed">The diagnostic query for SQL Server shows idle connection distribution in the same way the PostgreSQL query does:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: connection state audit
--- Identifies idle sessions and their resource consumption
--- Run on Azure SQL Database or SQL Server on RDS
-SELECT
-    s.session_id,
     s.status,
+    COUNT(*)                                            AS session_count,
+    SUM(CASE WHEN r.session_id IS NOT NULL THEN 1 ELSE 0 END)
+                                                        AS active_requests,
+    AVG(DATEDIFF(SECOND, s.last_request_end_time, SYSDATETIME()))
+                                                        AS avg_idle_seconds,
+    SUM(s.memory_usage * 8)                             AS total_memory_kb,
+    SUM(s.cpu_time)                                     AS total_cpu_ms
+FROM sys.dm_exec_sessions s
+LEFT JOIN sys.dm_exec_requests r ON r.session_id = s.session_id
+WHERE s.is_user_process = 1
+  AND s.session_id &lt;&gt; @@SPID
+GROUP BY s.status
+ORDER BY session_count DESC;
+
+-- Worker thread pressure: how close are we to max worker threads?
+SELECT
+    max_workers_count,
+    active_workers_count,
+    CAST(100.0 * active_workers_count / max_workers_count AS DECIMAL(5,2))
+                                                        AS pct_workers_used
+FROM sys.dm_os_sys_info;
+
+-- Top idle sessions holding resources the longest
+SELECT TOP 20
+    s.session_id,
     s.login_name,
     s.host_name,
     s.program_name,
     DB_NAME(s.database_id)                              AS database_name,
-    s.cpu_time                                          AS cpu_time_ms,
+    DATEDIFF(MINUTE, s.last_request_end_time, SYSDATETIME())
+                                                        AS idle_minutes,
     s.memory_usage * 8                                  AS memory_kb,
-    s.reads,
-    s.writes,
-    DATEDIFF(SECOND, s.last_request_end_time, GETUTCDATE())
-                                                        AS idle_seconds,
-    r.command                                           AS active_command,
-    r.wait_type,
-    r.blocking_session_id
-FROM sys.dm_exec_sessions  s
-LEFT JOIN sys.dm_exec_requests r ON r.session_id = s.session_id
+    c.num_reads,
+    c.num_writes
+FROM sys.dm_exec_sessions s
+JOIN sys.dm_exec_connections c ON c.session_id = s.session_id
 WHERE s.is_user_process = 1
   AND s.session_id &lt;&gt; @@SPID
-ORDER BY idle_seconds DESC;</code></pre>
+  AND s.status = 'sleeping'
+ORDER BY idle_minutes DESC;</code></pre>
 
-<p class="text-gray-300 leading-relaxed">The SQL Server equivalent of pooling analysis focuses on idle seconds and memory consumption per session. Sessions idle for more than 300 seconds while consuming memory are candidates for pool timeout reduction in the application tier. The corresponding PostgreSQL diagnostic was shown earlier in this chapter; the two queries paired serve as your cross-platform connection audit toolkit.</p>
-
-<p class="text-gray-300 leading-relaxed">For Azure SQL specifically, pull the DTU or vCore consumption alongside connection counts using the built-in DMV:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Azure SQL: vCore / DTU consumption correlated with active connections
--- Run on Azure SQL Database (not on-premise SQL Server)
-SELECT
-    end_time,
-    avg_cpu_percent,
-    avg_data_io_percent,
-    avg_log_write_percent,
-    max_session_percent,
-    max_worker_percent,
-    avg_memory_usage_percent,
-    -- Derived: sessions as a fraction of the tier limit
-    max_session_percent / 100.0 * 30000   AS estimated_sessions  -- 30000 = General Purpose limit
-FROM sys.dm_db_resource_stats
-ORDER BY end_time DESC
-OFFSET 0 ROWS FETCH NEXT 96 ROWS ONLY;  -- last 24 hours at 15-minute intervals</code></pre>
-
-<p class="text-gray-300 leading-relaxed">When <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_session_percent</code> is consistently below 20% and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">avg_cpu_percent</code> is below 20%, the Azure SQL tier is oversized relative to actual workload and connection count. The right-sizing action on Azure SQL is to reduce the vCore count or move from General Purpose to a lower service tier — the connection pool on the application side limits the effective session demand, enabling the downsize just as PgBouncer does for PostgreSQL.</p>
+<p class="text-gray-300 leading-relaxed">If sleeping sessions outnumber active requests by 10:1 or more, the application tier is holding connections it does not need — the classic signature of oversized <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Max Pool Size</code> defaults multiplied across many application instances.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">20.2 Sizing Client-Side Pools: The Math</h3>
+
+<p class="text-gray-300 leading-relaxed">ADO.NET defaults to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Max Pool Size=100</code> per process per connection string. An application fleet of 20 web servers, each running 4 worker processes, each with 2 distinct connection strings, can theoretically hold <strong class="text-white">16,000 pooled connections</strong> against one database — even though the database never sees more than a few dozen concurrent requests. Each of those pooled connections is a live session on the server.</p>
+
+<p class="text-gray-300 leading-relaxed">Size the pool from measured concurrency, not defaults:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">1. Measure peak concurrent requests</strong> per application process using <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_requests</code> sampled over a week, or application-side telemetry of in-flight database calls.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">2. Set Max Pool Size to peak concurrency plus headroom.</strong> If a process peaks at 12 concurrent database calls, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Max Pool Size=25</code> gives 2x headroom. The default of 100 is a ceiling for pathological cases, not a target.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">3. Set Min Pool Size to zero</strong> unless warm-start latency is measured and matters. <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Min Pool Size</code> keeps connections open permanently — useful for latency-sensitive paths, wasteful everywhere else.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">4. Use Connection Lifetime / Load Balance Timeout</strong> to recycle connections periodically (e.g. 300 seconds) so that load spreads evenly when new application instances start.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Canonical cost-efficient SQL Server connection string (.NET)
+-- Pooling=true is the default; the cost wins come from the size bounds
+"Server=tcp:prod-sqlserver-01.database.windows.net,1433;
+ Database=Orders;
+ User ID=app_svc; Password=...;
+ Encrypt=True; TrustServerCertificate=False;
+ Pooling=True;
+ Min Pool Size=0;
+ Max Pool Size=25;
+ Connection Lifetime=300;
+ Connect Timeout=30;"
+
+-- Anti-patterns that silently defeat pooling — audit for these:
+--   Pooling=False .................... opens a physical connection per operation
+--   Enlist=false with MSDTC .......... rarely needed; adds overhead
+--   Different connection strings ..... per-service/per-environment string sprawl
+--   Connection string built per-call . with timestamps or GUIDs embedded (unique string = unique pool!)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">That last anti-pattern — embedding a changing value in the connection string — is the most expensive single bug in this chapter: every distinct string creates a brand-new pool, so the application effectively runs with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Pooling=False</code> while believing it is pooled. Audit connection-string construction in code review the way you audit SQL injection.</p>
+
+<p class="text-gray-300 leading-relaxed">The instance right-sizing math: if connection-driven memory and worker-thread pressure is what forces a db.r5.2xlarge (8 vCPU, 64 GB), and pooling discipline drops steady-state sessions from 1,200 to 150, the same workload frequently fits on a db.r5.xlarge (4 vCPU, 32 GB). At illustrative License-Included rates, that is roughly a <strong class="text-white">40–50% compute saving</strong> — verify current pricing for your region and edition before committing.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">20.3 Finding and Fixing Connection Leaks</h3>
+
+<p class="text-gray-300 leading-relaxed">A connection leak — opening a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SqlConnection</code> and not closing/disposing it — removes the connection from the pool permanently (until pool timeout reclaims it). Leaks show up as steadily climbing session counts that never fall after load subsides, eventually producing timeout exceptions ("Timeout expired. The timeout period elapsed prior to obtaining a connection from the pool.").</p>
+
+<p class="text-gray-300 leading-relaxed">Diagnose leaks by correlating session growth with application deploys, and by finding sessions whose <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">last_request_start_time</code> is far in the past while the client process still holds them open. The strongest fixes are in code, not on the server:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- C#: the pattern that prevents leaks — using blocks return connections to the pool
+using (var conn = new SqlConnection(connectionString))
+{
+    await conn.OpenAsync();
+    using (var cmd = new SqlCommand("SELECT ...", conn))
+    using (var reader = await cmd.ExecuteReaderAsync())
+    {
+        while (await reader.ReadAsync()) { /* ... */ }
+    }
+} // connection returned to the pool here, even on exception
+
+-- Server-side safety net: find sessions idle for over an hour from app logins
+-- (alert on these; killing is a last resort — fix the app instead)
+SELECT
+    s.session_id, s.login_name, s.host_name, s.program_name,
+    DATEDIFF(MINUTE, s.last_request_end_time, SYSDATETIME()) AS idle_minutes
+FROM sys.dm_exec_sessions s
+WHERE s.is_user_process = 1
+  AND s.status = 'sleeping'
+  AND s.last_request_end_time &lt; DATEADD(HOUR, -1, SYSDATETIME())
+ORDER BY idle_minutes DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Also check for the subtler leak: <strong class="text-white">unclosed data readers with</strong> <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CommandBehavior.CloseConnection</code> <strong class="text-white">missing</strong>, and ORMs (Entity Framework) with long-lived <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DbContext</code> instances held across web requests. Both hold pooled connections far longer than the query duration.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">20.4 Azure SQL and RDS for SQL Server: Platform-Specific Guidance</h3>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Azure SQL Database.</strong> Session limits are per-tier and hard: exceeding them returns errors, not queueing. Pull session pressure alongside resource stats to see whether a tier upgrade is genuinely needed or whether pooling discipline avoids it:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Azure SQL: session pressure vs tier limits (last 24 hours, 15-minute intervals)
+SELECT
+    end_time,
+    avg_cpu_percent,
+    max_session_percent,
+    max_worker_percent,
+    avg_memory_usage_percent
+FROM sys.dm_db_resource_stats
+ORDER BY end_time DESC
+OFFSET 0 ROWS FETCH NEXT 96 ROWS ONLY;
+
+-- Current session count vs the tier limit
+SELECT
+    COUNT(*)                                        AS current_sessions,
+    @@MAX_CONNECTIONS                               AS tier_session_limit
+FROM sys.dm_exec_sessions
+WHERE is_user_process = 1;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">If <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_session_percent</code> is high while <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">avg_cpu_percent</code> is low, the tier is being consumed by connections, not queries — the textbook case for fixing pooling instead of scaling up. Add transient-fault retry logic (exponential backoff) so that throttling events and failovers do not turn into retry storms that multiply connections.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">RDS for SQL Server.</strong> There is no proxy tier to deploy; the lever is instance sizing against worker-thread and memory headroom. Monitor <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DatabaseConnections</code> in CloudWatch alongside <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CPUUtilization</code>: connections climbing while CPU stays flat is the pooling-waste signature. Because RDS for SQL Server is License Included, every connection-driven upsize also upsizes the license bill — doubling the cost of the waste.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Cloud SQL for SQL Server.</strong> Same client-side pooling story; the Cloud SQL Auth Proxy (if used) multiplexes but does not pool server sessions — it still opens one backend connection per client connection. Size application pools as above regardless of the proxy.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">20.5 Automating Connection-Waste Audits</h3>
+
+<p class="text-gray-300 leading-relaxed">Connection discipline decays as new services ship with default connection strings. A weekly automated audit keeps it honest. The script below connects to each SQL Server in the fleet, captures session and worker-thread metrics, and flags instances where idle sessions dominate:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/usr/bin/env python3
+"""Weekly SQL Server connection-waste audit. Requires: pyodbc."""
+import pyodbc, csv, datetime
+
+SERVERS = [
+    ("prod-sqlserver-01", "DRIVER={ODBC Driver 18 for SQL Server};"
+     "SERVER=prod-sqlserver-01;DATABASE=master;UID=audit_svc;PWD=...;Encrypt=yes;"),
+]
+
+AUDIT_SQL = """
+SELECT
+    @@SERVERNAME                                     AS server_name,
+    (SELECT COUNT(*) FROM sys.dm_exec_sessions
+      WHERE is_user_process = 1)                     AS user_sessions,
+    (SELECT COUNT(*) FROM sys.dm_exec_requests
+      WHERE session_id &gt; 50)                          AS active_requests,
+    (SELECT COUNT(*) FROM sys.dm_exec_sessions
+      WHERE is_user_process = 1 AND status = 'sleeping'
+        AND last_request_end_time &lt; DATEADD(MINUTE, -30, SYSDATETIME()))
+                                                     AS idle_over_30min,
+    (SELECT max_workers_count FROM sys.dm_os_sys_info) AS max_workers,
+    (SELECT active_workers_count FROM sys.dm_os_sys_info) AS active_workers
+"""
+
+out = f"connection_audit_{datetime.date.today():%Y%m%d}.csv"
+with open(out, "w", newline="") as f:
+    w = csv.writer(f)
+    w.writerow(["server", "user_sessions", "active_requests", "idle_over_30min",
+                "max_workers", "active_workers", "flag"])
+    for name, cs in SERVERS:
+        conn = pyodbc.connect(cs, timeout=15)
+        row = conn.execute(AUDIT_SQL).fetchone()
+        conn.close()
+        idle_ratio = row.idle_over_30min / max(row.user_sessions, 1)
+        flag = "INVESTIGATE" if idle_ratio &gt; 0.7 and row.user_sessions &gt; 50 else "OK"
+        w.writerow([name, row.user_sessions, row.active_requests,
+                    row.idle_over_30min, row.max_workers,
+                    row.active_workers, flag])
+        print(f"{name}: {row.user_sessions} sessions, "
+              f"{row.active_requests} active, flag={flag}")
+print(f"Audit written to {out}")</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Route <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">INVESTIGATE</code> rows to the owning team with the session-breakdown query from section 20.1 attached. The remediation order is always the same: standardize connection strings, bound <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Max Pool Size</code> from measured concurrency, fix leaks in code, and only then consider a larger instance.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+</div>
+
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Diagnose before deploying**: use `pg_stat_activity` (PostgreSQL) or `sys.dm_exec_sessions` (SQL Server / Azure SQL) to quantify idle connections and establish a before-state baseline; optimization without measurement is guesswork that cannot survive a budget review.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Size the pool with math, not defaults**: set `default_pool_size` to 2 × vCPU of the *target* (smaller) instance, and set `max_client_conn` to 1.25 × peak application thread count; this arithmetic directly determines which instance class becomes feasible and therefore which monthly bill becomes achievable.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Transaction pooling mode unlocks the largest savings**: session pooling returns a connection to the pool only when the client disconnects, which provides minimal multiplexing; transaction pooling returns the server connection after every commit, multiplexing hundreds of client threads onto a handful of server connections and enabling the compute right-sizing that drives cost reduction.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Automate continuous verification**: pool efficiency degrades silently as applications evolve — new ORMs, new services, and new query patterns all introduce connection behavior that can erode multiplexing ratios; the scheduled monitor script in this chapter detects degradation and correlates it with actual AWS Cost Explorer spend before the next billing cycle closes.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The pattern generalizes across clouds**: PgBouncer on EC2 or ECS for AWS RDS, the built-in PgBouncer feature on Azure Database for PostgreSQL Flexible Server, and a Cloud Run or Compute Engine sidecar for Google Cloud SQL all implement the same multiplexing principle; for SQL Server and Azure SQL the equivalent lever is application-tier connection pool tuning surfaced through `sys.dm_exec_sessions` and `sys.dm_db_resource_stats` rather than an external proxy.</li></div>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **SQL Server pools in the client, not in a proxy**: ADO.NET/Odbc pooling is on by default and keyed on the exact connection string — standardize connection strings and there is nothing to deploy, but also nothing to tune centrally, so waste hides in application defaults.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Size Max Pool Size from measured concurrency**: the default of 100 per process per connection string multiplied across a fleet creates thousands of idle server sessions; set it to peak concurrent requests plus headroom and set Min Pool Size to 0 unless warm-start latency is measured.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Idle sessions block right-sizing**: hundreds of sleeping sessions pin memory and worker threads, forcing a larger instance; because RDS for SQL Server is License Included, connection-driven upsizing doubles the waste through the license bill.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **On Azure SQL, sessions are a tier limit**: high max_session_percent with low CPU means the tier is consumed by connections, not queries — fix pooling before scaling up, and add retry with backoff to survive throttling.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Automate the audit**: a weekly connection-waste scan with an idle-ratio flag keeps new services honest; remediate in order — standardize strings, bound pool sizes, fix leaks, then (and only then) resize the instance.</li>
     <div class="mt-14 bg-amber-950/40 border border-amber-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
-        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+        <p class="text-xs text-gray-400">Query plan visualizer · Index advisor · Slow query dashboard · SQL Server</p>
       </div>
       <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
          class="shrink-0 px-6 py-3 bg-amber-600 hover:bg-amber-500 text-white font-semibold rounded-xl text-sm transition">Download Free</a>
     </div>
-    <div class="mt-8 text-xs"><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a></div>
+    <nav class="mt-8 flex flex-col sm:flex-row items-center justify-between gap-3 text-xs"><span><a href="b7-ch19-read-replica-economics.html" class="text-gray-400 hover:text-amber-300 transition">← Read Replica Economics: When They Pay Off vs Waste Money</a></span><span><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">All Chapters</a></span><span><a href="b7-ch21-caching-economics.html" class="text-gray-400 hover:text-amber-300 transition">Caching Layer Economics: ElastiCache vs Database Direct →</a></span></nav>
   </article>
   <footer class="border-t border-gray-800/50 px-6 py-8">
     <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · Database FinOps</div>

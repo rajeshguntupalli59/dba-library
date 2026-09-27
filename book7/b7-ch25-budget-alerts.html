@@ -83,7 +83,7 @@ Automated remediation (Lambda / Automation Runbooks / Cloud Functions)</code></p
 
 <p class="text-gray-300 leading-relaxed">#### AWS Budget Alerts</p>
 
-<p class="text-gray-300 leading-relaxed">AWS Budgets support four budget types: Cost, Usage, Savings Plans coverage, and Reserved Instance utilization. For database FinOps, all four are relevant. A team running RDS PostgreSQL on Reserved Instances needs both a cost budget and an RI utilization alert — the first catches overspend, the second catches underutilized reservations that represent sunk cost without benefit.</p>
+<p class="text-gray-300 leading-relaxed">AWS Budgets support four budget types: Cost, Usage, Savings Plans coverage, and Reserved Instance utilization. For database FinOps, all four are relevant. A team running RDS for SQL Server on Reserved Instances needs both a cost budget and an RI utilization alert — the first catches overspend, the second catches underutilized reservations that represent sunk cost without benefit.</p>
 
 <p class="text-gray-300 leading-relaxed">The following script creates a complete budget configuration for an RDS workload using the AWS CLI. It establishes three alert thresholds: 70% (early warning), 90% (action required), and 100% (breach). The forecasted-spend alert at 80% gives finance teams roughly a week of lead time before the billing period closes.</p>
 
@@ -450,14 +450,14 @@ aws ce get-anomalies \
 
 <p class="text-gray-300 leading-relaxed">The built-in anomaly detection on all three clouds works well for billing-level anomalies but misses the pattern where a cost spike is caused by a specific query, connection pool explosion, or unexpected autoscaling event. Building a custom detection layer that correlates database-level metrics with cost data closes this gap. When an alert fires, you want to know not just *that* costs spiked but *why*.</p>
 
-<p class="text-gray-300 leading-relaxed">The following Python script runs on a schedule (recommended: every 6 hours via AWS Lambda, Azure Functions, or Cloud Run) and performs three checks: it queries pg_stat_statements for query-level cost drivers, it pulls CloudWatch RDS metrics to detect resource anomalies, and it compares the current day's Cost Explorer spend against the 30-day rolling average. If any of the three checks exceed their thresholds, it posts a structured alert to a Slack webhook with enough context to act immediately.</p>
+<p class="text-gray-300 leading-relaxed">The following Python script runs on a schedule (recommended: every 6 hours via AWS Lambda, Azure Functions, or Cloud Run) and performs three checks: it queries Query Store for query-level cost drivers, it pulls CloudWatch RDS metrics to detect resource anomalies, and it compares the current day's Cost Explorer spend against the 30-day rolling average. If any of the three checks exceed their thresholds, it posts a structured alert to a Slack webhook with enough context to act immediately.</p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/usr/bin/env python3
 """
 db_cost_anomaly_detector.py
 Correlates database metrics with cost data to identify anomaly root causes.
 Runs on a 6-hour schedule via Lambda/Cloud Run/Azure Functions.
-Requires: psycopg2, boto3, requests
+Requires: pyodbc, boto3, requests
 Environment variables: DB_HOST, DB_NAME, DB_USER, DB_PASSWORD,
                        SLACK_WEBHOOK_URL, AWS_DEFAULT_REGION
 """
@@ -469,21 +469,22 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import boto3
-import psycopg2
+import pyodbc
 import requests
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-DB_CONFIG = {
-    "host": os.environ["DB_HOST"],
-    "dbname": os.environ["DB_NAME"],
-    "user": os.environ["DB_USER"],
-    "password": os.environ["DB_PASSWORD"],
-    "connect_timeout": 10,
-}
+def build_conn_str() -&gt; str:
+    return (
+        "DRIVER={ODBC Driver 18 for SQL Server};"
+        f"SERVER={os.environ['DB_HOST']},{os.environ.get('DB_PORT', '1433')};"
+        f"DATABASE={os.environ['DB_NAME']};"
+        f"UID={os.environ['DB_USER']};PWD={os.environ['DB_PASSWORD']};"
+        "Encrypt=yes;TrustServerCertificate=no;Connection Timeout=10;"
+    )
 
 SLACK_WEBHOOK = os.environ.get("SLACK_WEBHOOK_URL")
 REGION = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
-RDS_INSTANCE_ID = os.environ.get("RDS_INSTANCE_ID", "prod-postgres-01")
+RDS_INSTANCE_ID = os.environ.get("RDS_INSTANCE_ID", "prod-sqlserver-01")
 
 # Anomaly thresholds
 COST_SPIKE_THRESHOLD_PCT = 25.0      # Alert if today's spend &gt; 30-day avg by this %
@@ -631,35 +632,35 @@ def get_cloudwatch_anomalies(cw_client, instance_id: str) -&gt; list:
 
 def get_expensive_queries(conn) -&gt; list:
     """
-    Queries pg_stat_statements for queries with mean execution time
+    Queries Query Store for queries with mean execution time
     above the configured threshold, which directly maps to I/O cost.
-    Resets stats are not performed here — only read.
+    Read-only — no state is reset here.
     """
     query = """
-        SELECT
-            LEFT(query, 120)                          AS query_snippet,
-            calls,
-            ROUND(mean_exec_time::numeric, 2)         AS mean_ms,
-            ROUND(total_exec_time::numeric, 2)        AS total_ms,
-            ROUND(rows::numeric / NULLIF(calls, 0), 1) AS rows_per_call,
-            ROUND(
-                (shared_blks_read + shared_blks_hit)::numeric
-                / NULLIF(calls, 0), 0
-            )                                          AS blks_per_call
-        FROM
-            pg_stat_statements
-        WHERE
-            mean_exec_time &gt; %(threshold_ms)s
-            AND calls &gt; 50
-            AND query NOT LIKE '%%pg_stat%%'
-        ORDER BY
-            total_exec_time DESC
-        LIMIT 10;
+        SELECT TOP 10
+            LEFT(qt.query_sql_text, 120)              AS query_snippet,
+            SUM(rs.count_executions)                  AS calls,
+            ROUND(AVG(rs.avg_duration) / 1000.0, 2)   AS mean_ms,
+            ROUND(SUM(rs.avg_duration
+                      * rs.count_executions) / 1000000.0, 2) AS total_sec,
+            ROUND(CAST(SUM(rs.avg_rowcount * rs.count_executions) AS FLOAT)
+                  / NULLIF(SUM(rs.count_executions), 0), 1) AS rows_per_call,
+            ROUND(CAST(SUM(rs.avg_logical_io_reads * rs.count_executions) AS FLOAT)
+                  / NULLIF(SUM(rs.count_executions), 0), 0) AS logical_reads_per_call
+        FROM sys.query_store_query q
+        JOIN sys.query_store_query_text qt ON q.query_text_id = qt.query_text_id
+        JOIN sys.query_store_plan pl       ON pl.query_id = q.query_id
+        JOIN sys.query_store_runtime_stats rs ON rs.plan_id = pl.plan_id
+        WHERE rs.last_execution_time &gt;= DATEADD(DAY, -1, SYSDATETIME())
+        GROUP BY qt.query_sql_text
+        HAVING AVG(rs.avg_duration) / 1000.0 &gt; ?
+           AND SUM(rs.count_executions) &gt; 50
+        ORDER BY SUM(rs.avg_duration * rs.count_executions) DESC;
     """
-    with conn.cursor() as cur:
-        cur.execute(query, {"threshold_ms": QUERY_COST_THRESHOLD_MS})
-        columns = [desc[0] for desc in cur.description]
-        return [dict(zip(columns, row)) for row in cur.fetchall()]
+    cur = conn.cursor()
+    cur.execute(query, (QUERY_COST_THRESHOLD_MS,))
+    cols = [d[0] for d in cur.description]
+    return [dict(zip(cols, row)) for row in cur.fetchall()]
 
 
 def format_slack_alert(cost_data: dict, cw_anomalies: list, query_data: list) -&gt; dict:
@@ -791,17 +792,16 @@ def lambda_handler(event=None, context=None) -&gt; dict:
         for a in cw_anomalies:
             print(f"CW anomaly: {a['metric']} +{a['deviation_pct']}% above baseline")
 
-    # ── Check 3: Expensive queries in pg_stat_statements ──────────────────────
+    # ── Check 3: Expensive queries in Query Store ──────────────────────
     expensive_queries = []
     try:
-        conn = psycopg2.connect(**DB_CONFIG)
-        conn.autocommit = True
+        conn = pyodbc.connect(build_conn_str(), autocommit=True)
         expensive_queries = get_expensive_queries(conn)
         conn.close()
         if expensive_queries:
             findings.append("slow_queries")
             print(f"Found {len(expensive_queries)} queries exceeding {QUERY_COST_THRESHOLD_MS}ms mean time")
-    except psycopg2.Error as exc:
+    except pyodbc.Error as exc:
         print(f"DB connection failed — skipping query analysis: {exc}")
 
     # ── Alert if any finding exists ────────────────────────────────────────────
@@ -836,7 +836,7 @@ ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/lambda-db-cost-detector-role"
 
 # Package dependencies
-pip install psycopg2-binary boto3 requests -t ./package/
+pip install pyodbc boto3 requests -t ./package/
 cp db_cost_anomaly_detector.py ./package/
 cd package && zip -r ../anomaly_detector.zip . && cd ..
 
@@ -894,96 +894,11 @@ aws lambda get-function \
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">25.5 Query-Level Cost Attribution Using pg_stat_statements and sys.dm_exec_query_stats</h3>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">25.5 Query-Level Cost Attribution Using Query Store and sys.dm_exec_query_stats</h3>
 
 <p class="text-gray-300 leading-relaxed">Budget alerts tell you that money is leaving the account. Query-level attribution tells you exactly which SQL statement is responsible. This is where FinOps crosses back into DBA territory, and it is where database professionals have a decisive advantage over generic cloud cost teams.</p>
 
-<p class="text-gray-300 leading-relaxed">On PostgreSQL (RDS, Aurora, Cloud SQL, Azure Database for PostgreSQL), <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> is the primary instrument. The following query correlates execution statistics with an estimated I/O cost model. It does not produce exact dollar figures — those live in the billing feed — but it ranks queries by their share of total I/O load, which maps directly to IOPS spend on gp2/gp3/io1 volumes.</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- ============================================================
--- Query Cost Attribution Report
--- Identifies top queries by I/O load and estimated cost share
--- Run against RDS PostgreSQL with pg_stat_statements enabled
--- ============================================================
-
-WITH total_stats AS (
-    SELECT
-        SUM(shared_blks_read + shared_blks_written
-            + local_blks_read + local_blks_written)   AS total_blks,
-        SUM(total_exec_time)                           AS total_exec_ms,
-        SUM(calls)                                     AS total_calls
-    FROM pg_stat_statements
-    WHERE query NOT LIKE '%pg_stat%'
-),
-query_stats AS (
-    SELECT
-        pss.userid::regrole::text                      AS db_role,
-        pss.dbid::regdatabase::text                    AS database,
-        LEFT(pss.query, 200)                           AS query_snippet,
-        pss.calls,
-        ROUND(pss.mean_exec_time::numeric, 2)          AS mean_exec_ms,
-        ROUND(pss.total_exec_time::numeric / 1000 / 60, 2) AS total_exec_min,
-        pss.shared_blks_read,
-        pss.shared_blks_hit,
-        pss.shared_blks_written,
-        pss.shared_blks_dirtied,
-        (pss.shared_blks_read + pss.shared_blks_written)   AS io_blks,
-        ROUND(
-            (pss.shared_blks_read + pss.shared_blks_written)::numeric * 8 / 1024,
-            2
-        )                                              AS io_mb,
-        -- Cache hit ratio for this specific query
-        ROUND(
-            pss.shared_blks_hit::numeric /
-            NULLIF(pss.shared_blks_hit + pss.shared_blks_read, 0) * 100,
-            1
-        )                                              AS cache_hit_pct,
-        ts.total_blks
-    FROM pg_stat_statements pss
-    CROSS JOIN total_stats ts
-    WHERE pss.calls &gt; 10
-      AND query NOT LIKE '%pg_stat%'
-      AND query NOT LIKE '%autovacuum%'
-),
-ranked AS (
-    SELECT
-        db_role,
-        database,
-        query_snippet,
-        calls,
-        mean_exec_ms,
-        total_exec_min,
-        io_mb,
-        cache_hit_pct,
-        shared_blks_read,
-        shared_blks_written,
-        -- Share of total instance I/O this query consumes
-        ROUND(io_blks::numeric / NULLIF(total_blks, 0) * 100, 2) AS io_share_pct,
-        -- Estimated monthly I/O cost assuming gp3 at $0.000065 per 1M IOPS
-        -- Adjust multiplier for io1 ($0.000065 * 3x) if on io1 volumes
-        ROUND(
-            (shared_blks_read + shared_blks_written)::numeric
-            * calls / 1e6 * 0.000065 * 30 * 24 * 60,
-            4
-        )                                              AS est_monthly_io_cost_usd
-    FROM query_stats
-)
-SELECT
-    database,
-    db_role,
-    query_snippet,
-    calls,
-    ROUND(mean_exec_ms, 2)    AS mean_exec_ms,
-    total_exec_min,
-    ROUND(io_mb, 2)           AS io_mb_total,
-    cache_hit_pct             AS "cache_hit_%",
-    io_share_pct              AS "io_share_%",
-    est_monthly_io_cost_usd   AS "est_monthly_io_$"
-FROM ranked
-ORDER BY io_share_pct DESC
-LIMIT 25;</code></pre>
-
-<p class="text-gray-300 leading-relaxed">For <strong class="text-white">Azure SQL Database and SQL Managed Instance</strong>, the equivalent instrument is <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_query_stats</code> combined with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_sql_text</code>. The following query surfaces the top 20 queries by logical reads, which is the primary cost driver on Azure SQL's DTU and vCore models:</p>
+<p class="text-gray-300 leading-relaxed">On SQL Server (RDS, Azure SQL, Cloud SQL), Query Store is the primary instrument. The following query correlates execution statistics with an estimated I/O cost model. It does not produce exact dollar figures — those live in the billing feed — but it ranks queries by their share of total I/O load, which maps directly to IOPS spend on gp2/gp3/io1 volumes.</p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- ============================================================
 -- Azure SQL: Query Cost Attribution by Logical Reads
@@ -1029,45 +944,32 @@ WHERE
 ORDER BY
     qs.total_logical_reads DESC;</code></pre>
 
-<p class="text-gray-300 leading-relaxed">For <strong class="text-white">GCP Cloud SQL for PostgreSQL</strong>, the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> query above works directly. For <strong class="text-white">BigQuery</strong> workloads, the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">INFORMATION_SCHEMA.JOBS</code> view provides the equivalent attribution:</p>
+<p class="text-gray-300 leading-relaxed">For <strong class="text-white">GCP Cloud SQL for SQL Server</strong>, the Query Store query above works directly against the Cloud SQL instance. For analytical spillover, attribute cost by bytes scanned in your analytics platform's job history instead:</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- ============================================================
--- BigQuery: Job-level cost attribution by bytes processed
--- GCP charges $6.25 per TB processed (on-demand pricing as of 2024)
--- Run in BigQuery console or via bq CLI
--- ============================================================
-
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- BigQuery: Cloud SQL for SQL Server cost attribution from the billing export
+-- Replace 'your-project.billing_export.gcp_billing_export_v1_XXXXXX'
+-- with your actual billing export table name
 SELECT
-    project_id,
-    user_email,
-    job_type,
-    statement_type,
-    COUNT(*)                                          AS job_count,
-    SUM(total_bytes_processed) / POW(1024, 4)        AS total_tb_processed,
-    ROUND(
-        SUM(total_bytes_processed) / POW(1024, 4) * 6.25,
-        2
-    )                                                 AS estimated_cost_usd,
-    AVG(TIMESTAMP_DIFF(end_time, start_time, SECOND)) AS avg_duration_sec,
-    -- Identify the single most expensive query pattern
-    APPROX_TOP_COUNT(
-        LEFT(REGEXP_REPLACE(query, r'\s+', ' '), 200), 1
-    )[OFFSET(0)].value                                AS top_query_pattern
+    project.name                                     AS project_name,
+    labels.value                                     AS team_label,
+    sku.description                                  AS sku_description,
+    COUNT(DISTINCT DATE(usage_start_time))            AS active_days,
+    SUM(cost)                                        AS total_cost_usd,
+    SUM(cost) / NULLIF(COUNT(DISTINCT DATE(usage_start_time)), 0)
+                                                     AS avg_daily_cost_usd
 FROM
-    `region-us`.INFORMATION_SCHEMA.JOBS
+    `your-project.billing_export.gcp_billing_export_v1_XXXXXX`,
+    UNNEST(labels) AS labels
 WHERE
-    creation_time BETWEEN TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)
-                      AND CURRENT_TIMESTAMP()
-    AND state = 'DONE'
-    AND error_result IS NULL
-    AND total_bytes_processed &gt; 0
+    service.description = 'Cloud SQL'
+    AND labels.key = 'team'
+    AND usage_start_time &gt;= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)
 GROUP BY
-    project_id,
-    user_email,
-    job_type,
-    statement_type
+    project_name,
+    team_label,
+    sku_description
 ORDER BY
-    estimated_cost_usd DESC
+    total_cost_usd DESC
 LIMIT 30;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">These three queries together cover the full multi-cloud estate. The pattern is consistent: find the queries consuming the most I/O or bytes processed, calculate their share of total load, and prioritize optimization work accordingly. A single query responsible for 35% of instance I/O that can be rewritten to use an index represents not just a performance win but a direct reduction in IOPS charges — particularly significant on io1 volumes at $0.065/GB-month compared to gp3 at $0.02/GB-month.</p>
@@ -1103,15 +1005,15 @@ PLAYBOOKS = {
     "storage_spike": {
         "title": "Unexpected Storage Growth",
         "likely_causes": [
-            "Uncontrolled binary log / WAL accumulation",
+            "Uncontrolled transaction log growth / backup accumulation",
             "Forgotten large table without TTL or partition pruning",
             "Snapshot retention policy changed or missing",
         ],
         "immediate_actions": [
             "Check RDS storage metrics in CloudWatch (FreeStorageSpace)",
-            "Query pg_database_size() / information_schema.tables for growth",
+            "Query sys.master_files and file sizes for growth",
             "Review automated backup retention period (target: 7 days for prod)",
-            "Identify tables added in last 7 days: SELECT relname, pg_size_pretty(pg_total_relation_size(oid)) FROM pg_class ORDER BY pg_total_relation_size(oid) DESC LIMIT 20;",
+            "Identify largest tables: SELECT TOP 20 OBJECT_SCHEMA_NAME(object_id), OBJECT_NAME(object_id) FROM sys.tables ORDER BY (SELECT SUM(reserved_page_count) FROM sys.dm_db_partition_stats WHERE object_id = t.object_id) DESC;",
         ],
         "automation_available": True,
         "runbook_url": "https://wiki.internal/runbooks/rds-storage-spike",
@@ -1120,14 +1022,14 @@ PLAYBOOKS = {
         "title": "IOPS Spike Detected",
         "likely_causes": [
             "New or changed query missing an index",
-            "Autovacuum running on large table",
+            "Index rebuild / reorg running on large table",
             "Bulk insert / ETL job without rate limiting",
             "gp2 IOPS burst bucket depleted",
         ],
         "immediate_actions": [
-            "Pull pg_stat_statements sorted by shared_blks_read",
-            "Check pg_stat_activity for long-running queries",
-            "Verify autovacuum_vacuum_cost_delay setting for large tables",
+            "Pull Query Store top resource consumers sorted by logical reads",
+            "Check sys.dm_exec_requests for long-running queries",
+            "Verify maintenance window scheduling for large tables",
             "If on gp2: evaluate migration to gp3 (3,000 baseline IOPS free)",
         ],
         "automation_available": True,
@@ -1137,15 +1039,15 @@ PLAYBOOKS = {
         "title": "Connection Count Anomaly",
         "likely_causes": [
             "Application connection pool misconfigured after deploy",
-            "pgBouncer or RDS Proxy not routing traffic correctly",
+            "Client-side pooling misconfigured (Max Pool Size / connection string sprawl)",
             "Connection leak in application code",
             "Sudden traffic spike without connection pool scaling",
         ],
         "immediate_actions": [
-            "SELECT count(*), state, wait_event_type FROM pg_stat_activity GROUP BY state, wait_event_type;",
-            "Check pgBouncer SHOW POOLS; SHOW STATS;",
-            "Verify max_connections parameter against instance class limits",
-            "Consider enabling RDS Proxy if not already active (reduces connection overhead by 60-80%)",
+            "SELECT status, wait_type, COUNT(*) FROM sys.dm_exec_requests GROUP BY status, wait_type;",
+            "Check sys.dm_exec_sessions for idle session counts per host/program;",
+            "Verify user connections against max worker threads (sys.dm_os_sys_info)",
+            "Consider client-side pooling fixes before upsizing (see Chapter 20)",
         ],
         "automation_available": False,
         "runbook_url": "https://wiki.internal/runbooks/rds-connection-spike",
@@ -1332,7 +1234,7 @@ def lambda_handler(event, context):
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Tune anomaly detection thresholds after 30 days of data.** The default AWS Cost Anomaly Detection thresholds and the custom Python script's percentage values are starting points. Review the anomaly history, count false positives and missed events, and recalibrate. A threshold set too low creates alert fatigue that causes engineers to ignore real incidents.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Query-level attribution is where billing data meets database expertise.** `pg_stat_statements`, `sys.dm_exec_query_stats`, and BigQuery `INFORMATION_SCHEMA.JOBS` translate abstract cost spikes into specific SQL statements. The DBA who can deliver a root-cause query within 30 minutes of an alert firing is providing $10,000-equivalent value compared to a team that spends two days correlating metrics manually.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Query-level attribution is where billing data meets database expertise.** Query Store and `sys.dm_exec_query_stats` translate abstract cost spikes into specific SQL statements. The DBA who can deliver a root-cause query within 30 minutes of an alert firing is providing $10,000-equivalent value compared to a team that spends two days correlating metrics manually.</li>
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Automate the triage brief, not the remediation.** Automated remediation of cost anomalies risks making systems worse — killing a query that was intentional, scaling down an instance during a legitimate traffic spike. The safe automation boundary is data collection, classification, and briefing. Let humans make the remediation call but give them everything they need to make it in under 10 minutes.</li>
 
@@ -1340,12 +1242,12 @@ def lambda_handler(event, context):
     <div class="mt-14 bg-amber-950/40 border border-amber-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
-        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+        <p class="text-xs text-gray-400">Query plan visualizer · Index advisor · Slow query dashboard · SQL Server</p>
       </div>
       <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
          class="shrink-0 px-6 py-3 bg-amber-600 hover:bg-amber-500 text-white font-semibold rounded-xl text-sm transition">Download Free</a>
     </div>
-    <div class="mt-8 text-xs"><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a></div>
+    <nav class="mt-8 flex flex-col sm:flex-row items-center justify-between gap-3 text-xs"><span><a href="b7-ch24-cost-reporting.html" class="text-gray-400 hover:text-amber-300 transition">← Per-Team, Per-App, Per-Feature Cost Reporting</a></span><span><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">All Chapters</a></span><span><a href="b7-ch26-showback-chargeback.html" class="text-gray-400 hover:text-amber-300 transition">Showback vs Chargeback Models for Database Costs →</a></span></nav>
   </article>
   <footer class="border-t border-gray-800/50 px-6 py-8">
     <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · Database FinOps</div>

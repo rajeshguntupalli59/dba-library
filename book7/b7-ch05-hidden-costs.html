@@ -158,47 +158,36 @@ bq query --use_legacy_sql=false \
 -- Run this in the CloudWatch console under Logs Insights against your VPC Flow Log group
 -- Paste this directly into the query editor:
 -- fields @timestamp, srcAddr, dstAddr, dstPort, bytes, azId
--- | filter dstPort in [5432, 3306, 1433, 5439, 27017]
+-- | filter dstPort in [1433]
 -- | filter srcAddr not like /^10\.0\.1\./   -- replace with your primary AZ subnet
 -- | stats sum(bytes) as total_bytes by srcAddr, dstAddr, dstPort
 -- | sort total_bytes desc
 -- | limit 20
 
--- For PostgreSQL: query pg_stat_activity to see connection origins
--- Run this on your RDS PostgreSQL instance to identify which client IPs are connecting
-SELECT 
-    client_addr,
+-- For SQL Server: query sys.dm_exec_connections to see connection origins
+-- Run this on your RDS for SQL Server instance to identify which client IPs are connecting
+SELECT
+    c.client_net_address AS client_ip,
     COUNT(*) AS connection_count,
-    MAX(state) AS state,
-    application_name,
-    usename
-FROM pg_stat_activity
-WHERE client_addr IS NOT NULL
-  AND state != 'idle'
-GROUP BY client_addr, application_name, usename
+    s.program_name AS application_name,
+    s.login_name
+FROM sys.dm_exec_connections c
+JOIN sys.dm_exec_sessions s ON c.session_id = s.session_id
+WHERE c.client_net_address IS NOT NULL
+GROUP BY c.client_net_address, s.program_name, s.login_name
 ORDER BY connection_count DESC;
 
--- For MySQL: equivalent connection origin query
--- Run this on RDS MySQL to identify connection sources
--- SELECT 
---     HOST,
---     DB,
---     COUNT(*) as connection_count,
---     SUM(DATA_READ)/1024/1024 as data_read_mb,
---     SUM(DATA_WRITTEN)/1024/1024 as data_written_mb
--- FROM information_schema.PROCESSLIST
--- GROUP BY HOST, DB
--- ORDER BY connection_count DESC;</code></pre>
+</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Cross-reference the client_addr values against your AWS subnet map. Any connection coming from a subnet in a different AZ than your RDS primary is generating cross-AZ charges.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Fixing Cross-AZ Traffic: Three Approaches</strong></p>
 
 <p class="text-gray-300 leading-relaxed">*Option 1: Subnet-Aware Connection Routing*</p>
-<p class="text-gray-300 leading-relaxed">Configure your application's database connection pool to prefer the endpoint nearest to its own AZ. For applications using a service mesh or a proxy layer like ProxySQL or pgBouncer, configure topology-aware routing. This is the lowest-risk change.</p>
+<p class="text-gray-300 leading-relaxed">Configure your application's database connection pool to prefer the endpoint nearest to its own AZ. For applications using a service mesh or a proxy layer like SQL Server Always On routing or a proxy layer, configure topology-aware routing. This is the lowest-risk change.</p>
 
 <p class="text-gray-300 leading-relaxed">*Option 2: Read Replica Placement*</p>
-<p class="text-gray-300 leading-relaxed">If your workload is read-heavy, place one read replica in each AZ where application servers run. Configure read traffic to route to the local replica. For a three-AZ setup processing 5TB of reads per month per AZ, this eliminates cross-AZ read traffic entirely. The cost of an additional read replica (for example, an <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.r6g.large</code> at approximately $146/month) is offset immediately if cross-AZ read traffic exceeds 7,300GB/month per AZ.</p>
+<p class="text-gray-300 leading-relaxed">If your workload is read-heavy, place one read replica in each AZ where application servers run. Configure read traffic to route to the local replica. For a three-AZ setup processing 5TB of reads per month per AZ, this eliminates cross-AZ read traffic entirely. The cost of an additional read replica (for example, an <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.r6i.large</code> at approximately $146/month) is offset immediately if cross-AZ read traffic exceeds 7,300GB/month per AZ.</p>
 
 <p class="text-gray-300 leading-relaxed">*Option 3: Private Endpoint Enforcement*</p>
 <p class="text-gray-300 leading-relaxed">Audit all connection strings and ensure every application is connecting to the private DNS endpoint, not the public endpoint. This single change eliminates the class of cross-AZ charges that arise from public-IP routing.</p>
@@ -354,23 +343,7 @@ if __name__ == '__main__':
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Finding Your Current Snapshot Footprint</strong></p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: Query pg_stat_user_tables for table size trends
--- This helps estimate how fast your database is growing (and thus snapshot sizes)
-SELECT
-    schemaname,
-    tablename,
-    pg_size_pretty(pg_total_relation_size(schemaname||'.'||tablename)) AS total_size,
-    pg_size_pretty(pg_relation_size(schemaname||'.'||tablename)) AS table_size,
-    pg_size_pretty(pg_total_relation_size(schemaname||'.'||tablename) 
-                   - pg_relation_size(schemaname||'.'||tablename)) AS index_size,
-    n_live_tup AS live_rows,
-    n_dead_tup AS dead_rows,
-    ROUND(100.0 * n_dead_tup / NULLIF(n_live_tup + n_dead_tup, 0), 2) AS dead_pct
-FROM pg_stat_user_tables
-WHERE pg_total_relation_size(schemaname||'.'||tablename) &gt; 1073741824  -- &gt; 1GB
-ORDER BY pg_total_relation_size(schemaname||'.'||tablename) DESC;
-
--- SQL Server (Azure SQL): Estimate backup size from database file sizes
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server (Azure SQL): Estimate backup size from database file sizes
 SELECT
     DB_NAME(database_id) AS database_name,
     type_desc,
@@ -631,7 +604,7 @@ if __name__ == '__main__':
 
 <p class="text-gray-300 leading-relaxed">The storage cost in the destination region is often missed entirely. Teams account for the transfer charge during architecture review but forget that the replicated snapshot occupies equal storage in the destination region at the same per-GB rate. This doubles the effective snapshot storage cost for any database using cross-region replication for DR.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">The alternative</strong>: For databases where the DR requirement is "restore within hours, not minutes," evaluate whether cross-region snapshot replication is necessary, or whether recreating the database from application-level backups (pg_dump, mysqldump, or SQL Server BACPAC exports stored in S3/Blob Storage) achieves the same RTO at a fraction of the cost. Application-level exports stored as compressed files in object storage typically reduce DR storage costs by 70–90% versus binary snapshot replication.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">The alternative</strong>: For databases where the DR requirement is "restore within hours, not minutes," evaluate whether cross-region snapshot replication is necessary, or whether recreating the database from application-level backups (SQL Server BACPAC exports or native backup files stored in S3/Blob Storage) achieves the same RTO at a fraction of the cost. Application-level exports stored as compressed files in object storage typically reduce DR storage costs by 70–90% versus binary snapshot replication.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
@@ -641,7 +614,7 @@ if __name__ == '__main__':
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">CloudWatch Logs: The Silent Cost Multiplier</strong></p>
 
-<p class="text-gray-300 leading-relaxed">AWS RDS can export multiple log types to CloudWatch Logs: general query logs, slow query logs, error logs, audit logs, and PostgreSQL upgrade logs. Each log type enabled multiplies CloudWatch Logs ingestion costs ($0.50/GB ingested) and storage costs ($0.03/GB-month) against the volume of logs generated.</p>
+<p class="text-gray-300 leading-relaxed">AWS RDS for SQL Server can export log types to CloudWatch Logs — primarily the SQL Server error log and the SQL Agent log. Each log type enabled multiplies CloudWatch Logs ingestion costs ($0.50/GB ingested) and storage costs ($0.03/GB-month) against the volume of logs generated. Each log type enabled multiplies CloudWatch Logs ingestion costs ($0.50/GB ingested) and storage costs ($0.03/GB-month) against the volume of logs generated.</p>
 
 <p class="text-gray-300 leading-relaxed">The most expensive single configuration is enabling <strong class="text-white">general query logging on a high-throughput OLTP database</strong>. A database handling 5,000 queries per second generates approximately 1–3GB of query log data per hour. At $0.50/GB ingestion:</p>
 
@@ -711,35 +684,11 @@ gcloud logging sinks list --format="table(name,destination,filter)"
 <p class="text-gray-300 leading-relaxed">| Slow query (>100ms) | On | Optional | Off | Optional |</p>
 <p class="text-gray-300 leading-relaxed">| General query log | On | Off | <strong class="text-white">Off</strong> | Off |</p>
 <p class="text-gray-300 leading-relaxed">| Audit log | Off | Off | Compliance-driven | Compliance-driven |</p>
-<p class="text-gray-300 leading-relaxed">| PostgreSQL pg_stat_statements | On | On | On | On |</p>
+<p class="text-gray-300 leading-relaxed">| Query Store / dm_exec_query_stats | On | On | On | On |</p>
 
-<p class="text-gray-300 leading-relaxed"><code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> deserves special attention. It is the single highest-value logging mechanism for production PostgreSQL because it aggregates query performance data in-memory inside the database engine itself, with no per-query log write overhead and no CloudWatch cost. Everything general query logging tells you (which queries ran, how long, how often) is available from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> at a fraction of the infrastructure cost.</p>
+<p class="text-gray-300 leading-relaxed">SQL Server <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Query Store</code> deserves special attention. It is the single highest-value observability mechanism for production SQL Server because it aggregates query performance data inside the database engine itself, with no per-query log write overhead and no CloudWatch cost. Everything verbose logging tells you (which queries ran, how long, how often) is available from Query Store and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_query_stats</code> at a fraction of the infrastructure cost.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: Enable pg_stat_statements (add to parameter group, then reconnect)
--- In RDS parameter group: set shared_preload_libraries = 'pg_stat_statements'
--- After reconnect, create the extension:
-CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
-
--- Query the top 20 most expensive queries by total execution time
-SELECT
-    LEFT(query, 120) AS query_preview,
-    calls,
-    ROUND(total_exec_time::numeric, 2) AS total_ms,
-    ROUND(mean_exec_time::numeric, 2) AS mean_ms,
-    ROUND((total_exec_time / SUM(total_exec_time) OVER ()) * 100, 2) AS pct_total_time,
-    rows,
-    shared_blks_hit,
-    shared_blks_read,
-    ROUND(
-        100.0 * shared_blks_hit / NULLIF(shared_blks_hit + shared_blks_read, 0),
-        2
-    ) AS cache_hit_pct
-FROM pg_stat_statements
-WHERE calls &gt; 10
-ORDER BY total_exec_time DESC
-LIMIT 20;
-
--- SQL Server equivalent: sys.dm_exec_query_stats for top queries
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server equivalent: sys.dm_exec_query_stats for top queries
 SELECT TOP 20
     SUBSTRING(qt.text, (qs.statement_start_offset/2)+1,
         ((CASE qs.statement_end_offset
@@ -780,7 +729,7 @@ RETENTION_POLICY: Dict[str, int] = {
     'error':           90,   # Error logs: 90 days for incident investigation
     'general':         7,    # General query logs: if enabled, keep minimal window
     'audit':           365,  # Audit logs: 1 year (common compliance baseline)
-    'postgresql':      90,   # PostgreSQL logs (combined error/slow)
+    'agent':           30,   # SQL Agent logs: short retention
     'upgrade':         30,   # Upgrade logs: short retention
     'default':         30,   # Fallback for unrecognized log types
 }
@@ -891,7 +840,7 @@ az monitor diagnostic-settings update \
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">AWS RDS Cross-Region Read Replicas</strong></p>
 
-<p class="text-gray-300 leading-relaxed">An RDS read replica in a different region receives a continuous stream of binlog or WAL data from the primary. The replication traffic volume equals the database's write throughput. For a database writing 500MB/hour:</p>
+<p class="text-gray-300 leading-relaxed">An RDS cross-region read replica receives a continuous stream of transaction log records from the primary. The replication traffic volume equals the database's write throughput. For a database writing 500MB/hour:</p>
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Replication data per month: 500MB × 24 × 30 = 360GB/month</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Cross-region transfer at $0.02/GB (us-east-1 to us-west-2): **$7.20/month** on replication alone</li>
@@ -899,30 +848,32 @@ az monitor diagnostic-settings update \
 
 <p class="text-gray-300 leading-relaxed">These numbers are manageable. The expensive scenario is when application servers in the secondary region also read from the replica — adding application read traffic to the replication traffic in the same region, and requiring careful accounting of whether reads are served locally or pulled cross-region.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Aurora Global Database Pricing</strong></p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Cross-Region Replication Pricing for SQL Server</strong></p>
 
-<p class="text-gray-300 leading-relaxed">Aurora Global Database adds a distinct cost tier that surprises teams coming from standard RDS replication. In addition to instance costs in the secondary region, Aurora Global Database charges <strong class="text-white">$0.20 per million I/O operations</strong> for replication I/O at the storage layer. For a write-heavy Aurora cluster:</p>
+<p class="text-gray-300 leading-relaxed">Cross-region replication for SQL Server adds a distinct cost tier that surprises teams coming from single-region deployments. In addition to full instance costs in the secondary region, every gigabyte of replication traffic crossing regions is billed at inter-region transfer rates (approximately <strong class="text-white">$0.02/GB</strong> on AWS). For a write-heavy SQL Server workload with a cross-region read replica:</p>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> 1 billion write I/Os per month (a moderate workload)</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Replication I/O charge: 1,000 × $0.20 = **$200/month in replication I/O**</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Plus standard cross-region transfer for the replication stream</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> 500 GB/day of transaction log replication traffic (a moderate OLTP workload)</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Replication transfer: 15,000 GB/month × $0.02 = **$300/month in transfer**</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Plus the full secondary-region instance cost — a replica is billed at the same hourly rate as the primary, including the SQL Server license portion</li>
 
-<p class="text-gray-300 leading-relaxed">This replication I/O charge does not appear on most cost models for Aurora Global Database because it is a separate line item from the instance cost, storage cost, and transfer cost — and the documentation places it deep in the Aurora pricing page. Run the following query to estimate your Aurora Global Database replication I/O volume:</p>
+<p class="text-gray-300 leading-relaxed">This replication transfer charge does not appear on most single-region cost models because it is a separate line item from the instance cost, storage cost, and snapshot cost. Run the following commands to estimate your cross-region replication transfer volume from CloudWatch network metrics:</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># CloudWatch: Get Aurora write I/O operations for the last 30 days
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># CloudWatch: estimate cross-region replication transfer for the last 30 days
+# NetworkTransmitThroughput is bytes/sec leaving the primary instance
 aws cloudwatch get-metric-statistics \
   --namespace AWS/RDS \
-  --metric-name VolumeWriteIOPs \
-  --dimensions Name=DBClusterIdentifier,Value=YOUR_CLUSTER_ID \
+  --metric-name NetworkTransmitThroughput \
+  --dimensions Name=DBInstanceIdentifier,Value=YOUR_PRIMARY_ID \
   --start-time $(date -u -d '30 days ago' '+%Y-%m-%dT%H:%M:%SZ') \
   --end-time $(date -u '+%Y-%m-%dT%H:%M:%SZ') \
   --period 86400 \
-  --statistics Sum \
-  --query 'sort_by(Datapoints, &Timestamp)[*].[Timestamp, Sum]' \
+  --statistics Average \
+  --query 'sort_by(Datapoints, &Timestamp)[*].[Timestamp, Average]' \
   --output table
 
-# Sum the output and multiply by $0.20 per million for replication I/O cost estimate
-# Note: divide total IOPs by 1,000,000, then multiply by $0.20</code></pre>
+# Monthly GB transferred ~= Average bytes/sec x 2,592,000 sec / 1e9
+# Multiply by $0.02/GB for the cross-region transfer estimate
+# Then add the full secondary-region instance cost (same rate as primary, license included)</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Google Cloud SQL Cross-Region Replicas</strong></p>
 
@@ -956,7 +907,6 @@ class RegionConfig:
 class ReplicationConfig:
     write_throughput_gb_per_hour: float
     transfer_cost_per_gb: float          # cross-region rate
-    aurora_replication_io_millions: float = 0.0   # Aurora Global DB only
 
 def calculate_total_cost(
     regions: List[RegionConfig],
@@ -990,11 +940,6 @@ def calculate_total_cost(
     breakdown['replication_transfer_usd'] = round(replication_transfer_total, 2)
     total += replication_transfer_total
 
-    # Aurora Global Database replication I/O (if applicable)
-    aurora_io_cost = replication.aurora_replication_io_millions * 0.20
-    breakdown['aurora_replication_io_usd'] = round(aurora_io_cost, 2)
-    total += aurora_io_cost
-
     # Snapshot costs: primary region
     primary_snapshot_cost = snapshot_gb * 0.095
     breakdown['snapshot_primary_region_usd'] = round(primary_snapshot_cost, 2)
@@ -1014,11 +959,11 @@ def calculate_total_cost(
 
 
 if __name__ == '__main__':
-    # Example: Two-region Aurora Global Database setup
+    # Example: two-region SQL Server setup with a cross-region read replica
     regions = [
         RegionConfig(
             name='us-east-1 (primary)',
-            instance_type='db.r6g.2xlarge',
+            instance_type='db.r6i.2xlarge',
             instance_monthly_usd=730,
             storage_gb=1000,
             is_primary=True,
@@ -1037,7 +982,8 @@ if __name__ == '__main__':
     replication = ReplicationConfig(
         write_throughput_gb_per_hour=2.0,       # 2 GB/hour write throughput
         transfer_cost_per_gb=0.02,               # us-east-1 to eu-west-1
-        aurora_replication_io_millions=800.0     # 800 million replication I/Os/month
+        write_throughput_gb_per_hour=20.8,   # ~500 GB/day of log replication
+        transfer_cost_per_gb=0.02,
     )
 
     result = calculate_total_cost(
@@ -1112,33 +1058,35 @@ aws rds describe-db-instances \
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Week 3: Log Export and Diagnostic Setting Changes</strong></p>
 
-<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Disable general query logging on production databases.</strong> This is the single highest-impact log change. On RDS PostgreSQL, set <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">log_statement = 'none'</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">log_min_duration_statement = 1000</code> (slow queries over 1 second) in the parameter group. On RDS MySQL, set <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">general_log = 0</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">slow_query_log = 1</code> with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">long_query_time = 1</code>.</p>
+<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Disable verbose statement-level logging on production databases.</strong> This is the single highest-impact log change. On RDS for SQL Server, a SQL Server Audit specification capturing every statement — plus error/agent log exports to CloudWatch — is the equivalent cost driver. Audit what is actually exported: keep only failed-logon and error-severity events in the audit specification, and export the SQL Server error log to CloudWatch only for production instances where you actively alert on it. Statement-level auditing belongs on the instances where compliance requires it, not on every database in the fleet.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># RDS PostgreSQL: Create or modify parameter group to disable general logging
-# First, check current parameter group settings
-aws rds describe-db-parameters \
-  --db-parameter-group-name your-parameter-group \
-  --query 'Parameters[?ParameterName==`log_statement` || ParameterName==`log_min_duration_statement`].[ParameterName, ParameterValue, IsModifiable]' \
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># RDS for SQL Server: audit which logs are exported to CloudWatch
+aws rds describe-db-instances \
+  --db-instance-identifier your-instance \
+  --query 'DBInstances[0].EnabledCloudwatchLogsExports' \
   --output table
 
-# Apply the change
-aws rds modify-db-parameter-group \
-  --db-parameter-group-name your-parameter-group \
-  --parameters \
-    'ParameterName=log_statement,ParameterValue=none,ApplyMethod=pending-reboot' \
-    'ParameterName=log_min_duration_statement,ParameterValue=1000,ApplyMethod=pending-reboot'
+# Disable log exports that are not actively used (error/agent logs
+# generate the most volume on busy instances)
+aws rds modify-db-instance \
+  --db-instance-identifier your-instance \
+  --cloudwatch-logs-export-configuration '{"DisableLogTypes":["agent","error"]}' \
+  --apply-immediately
 
-# RDS MySQL: Disable general log, keep slow query log
-aws rds modify-db-parameter-group \
-  --db-parameter-group-name your-mysql-parameter-group \
-  --parameters \
-    'ParameterName=general_log,ParameterValue=0,ApplyMethod=immediate' \
-    'ParameterName=slow_query_log,ParameterValue=1,ApplyMethod=immediate' \
-    'ParameterName=long_query_time,ParameterValue=1,ApplyMethod=immediate'</code></pre>
+-- SQL Server: check for statement-level audit specifications
+-- generating high log volume, and scope them down
+SELECT s.name AS audit_spec,
+       d.audit_action_name,
+       d.class_desc
+FROM sys.server_audit_specifications s
+JOIN sys.server_audit_specification_details d
+  ON s.server_specification_id = d.server_specification_id
+WHERE d.audit_action_name LIKE '%STATEMENT%'
+  AND s.is_state_enabled = 1;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Disable high-volume Azure SQL diagnostic categories.</strong> Run the Azure CLI diagnostic settings commands from §5.4 to disable SQLInsights and AutomaticTuning on databases not under active investigation.</p>
 
-<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Enable pg_stat_statements on PostgreSQL instances where it is absent.</strong> This provides query performance visibility through the database engine rather than log files, removing the operational justification for keeping general query logging enabled.</p>
+<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Enable Query Store on SQL Server databases where it is absent.</strong> This provides query performance visibility through the database engine rather than log files, removing the operational justification for keeping verbose statement-level logging enabled:<br><code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALTER DATABASE [YourDB] SET QUERY_STORE = ON (OPERATION_MODE = READ_WRITE);</code></p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Week 4: Traffic Routing Changes</strong></p>
 
@@ -1164,9 +1112,9 @@ grep -rn "\.rds\.amazonaws\.com" /etc/app/ /opt/app/ ~/.env 2&gt;/dev/null | \
   grep -v "private" | \
   head -50</code></pre>
 
-<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Implement AZ-aware connection routing for the top two databases by cross-AZ cost.</strong> Do not attempt to change connection routing for all databases simultaneously. Start with the two highest-cost instances identified in Week 1. Configure your connection pool (pgBouncer, ProxySQL, HikariCP) to prefer connections within the same AZ. Validate that connection counts and query latency remain stable for 48 hours before expanding to additional databases.</p>
+<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Implement AZ-aware connection routing for the top two databases by cross-AZ cost.</strong> Do not attempt to change connection routing for all databases simultaneously. Start with the two highest-cost instances identified in Week 1. Configure your connection pool to prefer connections within the same AZ. Validate that connection counts and query latency remain stable for 48 hours before expanding to additional databases.</p>
 
-<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Review cross-region replica necessity.</strong> For each cross-region read replica or Aurora Global Database secondary, answer three questions: What is the current RTO/RPO requirement? When was this replica last used for actual reads? Is the DR requirement met by cross-region snapshots at lower cost? If the replica is serving zero application reads and exists purely for DR, evaluate replacing it with automated cross-region snapshot replication — which typically satisfies RTO requirements measured in hours at a fraction of the active-replica cost.</p>
+<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Review cross-region replica necessity.</strong> For each cross-region read replica or secondary, answer three questions: What is the current RTO/RPO requirement? When was this replica last used for actual reads? Is the DR requirement met by cross-region snapshots at lower cost? If the replica is serving zero application reads and exists purely for DR, evaluate replacing it with automated cross-region snapshot replication — which typically satisfies RTO requirements measured in hours at a fraction of the active-replica cost.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Tracking and Reporting Progress</strong></p>
 
@@ -1377,7 +1325,7 @@ locals {
     slowquery = 30
     general   = 7
     audit     = 365
-    postgresql = 90
+    sqlagent   = 30
   }
 }</code></pre>
 
@@ -1506,18 +1454,18 @@ def cleanup_expired_snapshots(event, context):
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Snapshot costs scale linearly with retention period and are frequently doubled by cross-region replication storage that teams forget to account for.** A tiered retention policy — 35 days for regulated production, 7 days for standard production, 1–3 days for non-production — combined with automated TTL tagging for manual snapshots eliminates 40–70% of snapshot spend without reducing actual restore capability for any environment.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **General query logging on high-throughput OLTP databases is the single most expensive logging misconfiguration, and it is almost always unnecessary.** Slow query logging with a threshold of 1,000ms and `pg_stat_statements` (PostgreSQL) or `sys.dm_exec_query_stats` (SQL Server) provide complete query performance visibility at less than 1% of the CloudWatch ingestion cost of general query logging. Disabling general query logging in production is a zero-risk, high-return remediation.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **General query logging on high-throughput OLTP databases is the single most expensive logging misconfiguration, and it is almost always unnecessary.** Query Store and `sys.dm_exec_query_stats` provide complete query performance visibility at less than 1% of the CloudWatch ingestion cost of verbose statement-level logging. Keeping statement-level audit logging scoped to compliance requirements — not left capturing every batch — is a zero-risk, high-return remediation.</li>
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Prevention through infrastructure guardrails is more reliable than periodic remediation.** Terraform variable validations that reject non-compliant retention and logging configurations at plan time, AWS Config custom rules that flag drift, and EventBridge-triggered TTL tagging for manual snapshots together ensure that the costs eliminated during the remediation phase do not silently return as new databases and log groups are provisioned.</li></div>
     <div class="mt-14 bg-amber-950/40 border border-amber-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
-        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+        <p class="text-xs text-gray-400">Query plan visualizer · Index advisor · Slow query dashboard · SQL Server</p>
       </div>
       <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
          class="shrink-0 px-6 py-3 bg-amber-600 hover:bg-amber-500 text-white font-semibold rounded-xl text-sm transition">Download Free</a>
     </div>
-    <div class="mt-8 text-xs"><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a></div>
+    <nav class="mt-8 flex flex-col sm:flex-row items-center justify-between gap-3 text-xs"><span><a href="b7-ch04-gcp-pricing.html" class="text-gray-400 hover:text-amber-300 transition">← Cloud SQL for SQL Server Pricing Deep Dive</a></span><span><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">All Chapters</a></span><span><a href="b7-ch06-cost-dashboard.html" class="text-gray-400 hover:text-amber-300 transition">Building Your First Database Cost Dashboard →</a></span></nav>
   </article>
   <footer class="border-t border-gray-800/50 px-6 py-8">
     <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · Database FinOps</div>

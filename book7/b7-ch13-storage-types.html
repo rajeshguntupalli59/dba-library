@@ -95,7 +95,7 @@
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Pull 30-day average and peak IOPS for an RDS instance
 # Replace DB_INSTANCE_IDENTIFIER with your actual instance ID
 
-DB_ID="prod-postgres-01"
+DB_ID="prod-sqlserver-01"
 START_TIME=$(date -u -d '30 days ago' +%Y-%m-%dT%H:%M:%SZ)
 END_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
@@ -165,60 +165,63 @@ aws cloudwatch get-metric-statistics \
 
 <p class="text-gray-300 leading-relaxed">3. <strong class="text-white">DiskQueueDepth regularly exceeds 1.0</strong> — storage is a bottleneck. This is not a candidate for cost reduction yet; it needs either more IOPS or a storage type upgrade evaluated for performance, not cost.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Querying PostgreSQL for I/O Patterns at the Table Level</strong></p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Querying SQL Server for I/O Patterns at the File Level</strong></p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify which tables and indexes drive the most I/O
--- Run on PostgreSQL RDS / Aurora PostgreSQL
--- Requires pg_stat_user_tables to have accumulated data (reset on restart)
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: find database files with the highest physical I/O pressure
+-- Run against the target database on RDS SQL Server
+-- sys.dm_io_virtual_file_stats accumulates since the last SQL Server restart
 
 SELECT
-    schemaname,
-    relname AS table_name,
-    heap_blks_read,
-    heap_blks_hit,
-    ROUND(
-        100.0 * heap_blks_hit / NULLIF(heap_blks_hit + heap_blks_read, 0),
-        2
-    ) AS cache_hit_ratio_pct,
-    idx_blks_read,
-    idx_blks_hit,
-    ROUND(
-        100.0 * idx_blks_hit / NULLIF(idx_blks_hit + idx_blks_read, 0),
-        2
-    ) AS index_cache_hit_pct,
-    -- Estimated physical I/O operations (blocks not served from shared_buffers)
-    (heap_blks_read + idx_blks_read) AS total_physical_reads
+    DB_NAME(vfs.database_id)                    AS database_name,
+    mf.name                                     AS logical_file_name,
+    mf.physical_name,
+    vfs.io_stall_read_ms,
+    vfs.io_stall_write_ms,
+    vfs.io_stall_read_ms + vfs.io_stall_write_ms AS io_stall_total_ms,
+    vfs.num_of_reads,
+    vfs.num_of_writes,
+    vfs.num_of_bytes_read    / 1048576.0        AS mb_read,
+    vfs.num_of_bytes_written / 1048576.0        AS mb_written,
+    -- Average read latency in ms (high values indicate storage pressure)
+    CASE WHEN vfs.num_of_reads = 0 THEN 0
+         ELSE vfs.io_stall_read_ms * 1.0 / vfs.num_of_reads
+    END                                         AS avg_read_latency_ms,
+    CASE WHEN vfs.num_of_writes = 0 THEN 0
+         ELSE vfs.io_stall_write_ms * 1.0 / vfs.num_of_writes
+    END                                         AS avg_write_latency_ms
 FROM
-    pg_stat_user_tables
-WHERE
-    (heap_blks_read + idx_blks_read) &gt; 1000
+    sys.dm_io_virtual_file_stats(NULL, NULL) AS vfs
+    JOIN sys.master_files AS mf
+        ON vfs.database_id = mf.database_id
+        AND vfs.file_id    = mf.file_id
 ORDER BY
-    total_physical_reads DESC
-LIMIT 25;
+    io_stall_total_ms DESC;
 
--- Companion query: find the most I/O-intensive queries
--- Requires pg_stat_statements extension (enabled by default on RDS)
-SELECT
-    LEFT(query, 100) AS query_preview,
-    calls,
-    total_exec_time::BIGINT AS total_ms,
-    ROUND((total_exec_time / calls)::NUMERIC, 2) AS avg_ms,
-    shared_blks_read,
-    shared_blks_hit,
-    ROUND(
-        100.0 * shared_blks_hit / NULLIF(shared_blks_hit + shared_blks_read, 0),
-        2
-    ) AS hit_ratio_pct,
-    -- Blocks read from disk (not cache) — direct storage pressure
-    shared_blks_read AS disk_blocks_read,
-    local_blks_read + temp_blks_read AS temp_disk_reads
+-- SQL Server: identify the most I/O-intensive queries currently in the plan cache
+SELECT TOP 20
+    qs.total_logical_reads                          AS total_logical_reads,
+    qs.total_physical_reads                         AS total_physical_reads,
+    qs.total_logical_writes                         AS total_logical_writes,
+    qs.execution_count,
+    qs.total_physical_reads / NULLIF(qs.execution_count, 0)
+                                                    AS avg_physical_reads,
+    SUBSTRING(qt.text, (qs.statement_start_offset/2) + 1,
+        ((CASE qs.statement_end_offset
+            WHEN -1 THEN DATALENGTH(qt.text)
+            ELSE qs.statement_end_offset
+          END - qs.statement_start_offset) / 2) + 1)
+                                                    AS statement_text,
+    qp.query_plan
 FROM
-    pg_stat_statements
+    sys.dm_exec_query_stats      AS qs
+    CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle)   AS qt
+    CROSS APPLY sys.dm_exec_query_plan(qs.plan_handle) AS qp
 WHERE
-    shared_blks_read &gt; 10000
+    qs.total_physical_reads &gt; 5000
 ORDER BY
-    shared_blks_read DESC
-LIMIT 20;</code></pre>
+    qs.total_physical_reads DESC;</code></pre>
+
+
 
 <p class="text-gray-300 leading-relaxed">A cache hit ratio consistently above 99% across most tables signals that your workload is largely memory-bound — physical IOPS are a secondary concern, and gp3's baseline allocation is almost certainly sufficient.</p>
 
@@ -258,7 +261,7 @@ Pulls live data from CloudWatch and RDS API, then computes cost differentials.
 
 Usage:
     python3 rds_storage_advisor.py --region us-east-1 --profile prod
-    python3 rds_storage_advisor.py --instance-id prod-postgres-01
+    python3 rds_storage_advisor.py --instance-id prod-sqlserver-01
 """
 
 import argparse
@@ -509,13 +512,13 @@ if __name__ == "__main__":
 
 <p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Storage autoscaling</strong> — if RDS storage autoscaling is enabled, verify the maximum autoscale threshold won't trigger immediately after the migration in a way that inflates gp3 costs unexpectedly.</p>
 
-<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Parameter group IOPS settings</strong> — some PostgreSQL parameter group settings reference effective storage performance. If you have tuned <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">effective_io_concurrency</code> or checkpoint settings based on io1 performance characteristics, revisit those after migration to gp3.</p>
+<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">I/O-related settings</strong> — if you tuned any I/O-related SQL Server settings (for example <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">recovery interval</code> or checkpoint behavior) based on io1 performance characteristics, revisit those after migration to gp3.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">The Migration Command</strong></p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Step 1: Capture current configuration before any change
 aws rds describe-db-instances \
-  --db-instance-identifier prod-postgres-01 \
+  --db-instance-identifier prod-sqlserver-01 \
   --query 'DBInstances[0].{Type:StorageType,GB:AllocatedStorage,IOPS:Iops,Engine:Engine}' \
   --output table
 
@@ -523,7 +526,7 @@ aws rds describe-db-instances \
 # --apply-immediately causes the modification to start now rather than
 # waiting for the next maintenance window. Use this during off-peak hours.
 aws rds modify-db-instance \
-  --db-instance-identifier prod-postgres-01 \
+  --db-instance-identifier prod-sqlserver-01 \
   --storage-type gp3 \
   --iops 3000 \
   --storage-throughput 125 \
@@ -531,7 +534,7 @@ aws rds modify-db-instance \
 
 # If your workload needs more than 3,000 IOPS (from CloudWatch analysis):
 aws rds modify-db-instance \
-  --db-instance-identifier prod-postgres-01 \
+  --db-instance-identifier prod-sqlserver-01 \
   --storage-type gp3 \
   --iops 6000 \
   --storage-throughput 250 \
@@ -540,13 +543,13 @@ aws rds modify-db-instance \
 # Step 3: Monitor the modification status
 # Status will transition: available -&gt; modifying -&gt; available
 aws rds describe-db-instances \
-  --db-instance-identifier prod-postgres-01 \
+  --db-instance-identifier prod-sqlserver-01 \
   --query 'DBInstances[0].{Status:DBInstanceStatus,PendingModifications:PendingModifiedValues}' \
   --output table
 
 # Poll until modification completes (typically 15–60 minutes for volumes under 500GB)
 watch -n 60 "aws rds describe-db-instances \
-  --db-instance-identifier prod-postgres-01 \
+  --db-instance-identifier prod-sqlserver-01 \
   --query 'DBInstances[0].DBInstanceStatus' \
   --output text"</code></pre>
 
@@ -554,7 +557,7 @@ watch -n 60 "aws rds describe-db-instances \
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Confirm the new storage type is in effect
 aws rds describe-db-instances \
-  --db-instance-identifier prod-postgres-01 \
+  --db-instance-identifier prod-sqlserver-01 \
   --query 'DBInstances[0].{Type:StorageType,IOPS:Iops,Throughput:StorageThroughput,GB:AllocatedStorage}' \
   --output table
 
@@ -562,7 +565,7 @@ aws rds describe-db-instances \
 aws cloudwatch get-metric-statistics \
   --namespace AWS/RDS \
   --metric-name DiskQueueDepth \
-  --dimensions Name=DBInstanceIdentifier,Value=prod-postgres-01 \
+  --dimensions Name=DBInstanceIdentifier,Value=prod-sqlserver-01 \
   --start-time $(date -u -d '4 hours ago' +%Y-%m-%dT%H:%M:%SZ) \
   --end-time $(date -u +%Y-%m-%dT%H:%M:%SZ) \
   --period 300 \
@@ -575,7 +578,7 @@ for METRIC in ReadLatency WriteLatency; do
   aws cloudwatch get-metric-statistics \
     --namespace AWS/RDS \
     --metric-name $METRIC \
-    --dimensions Name=DBInstanceIdentifier,Value=prod-postgres-01 \
+    --dimensions Name=DBInstanceIdentifier,Value=prod-sqlserver-01 \
     --start-time $(date -u -d '4 hours ago' +%Y-%m-%dT%H:%M:%SZ) \
     --end-time $(date -u +%Y-%m-%dT%H:%M:%SZ) \
     --period 300 \
@@ -589,61 +592,9 @@ done</code></pre>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">SQL Server Equivalent: Diagnosing I/O on RDS SQL Server</h3>
 
-<p class="text-gray-300 leading-relaxed">The PostgreSQL queries above have direct equivalents for SQL Server running on RDS. The diagnostic approach is the same: identify which objects are generating physical I/O, then compare that to provisioned storage capacity.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: find tables and indexes with the highest physical I/O pressure
--- Run against the target database on RDS SQL Server
--- sys.dm_io_virtual_file_stats accumulates since the last SQL Server restart
 
-SELECT
-    DB_NAME(vfs.database_id)                    AS database_name,
-    mf.name                                     AS logical_file_name,
-    mf.physical_name,
-    vfs.io_stall_read_ms,
-    vfs.io_stall_write_ms,
-    vfs.io_stall_read_ms + vfs.io_stall_write_ms AS io_stall_total_ms,
-    vfs.num_of_reads,
-    vfs.num_of_writes,
-    vfs.num_of_bytes_read    / 1048576.0        AS mb_read,
-    vfs.num_of_bytes_written / 1048576.0        AS mb_written,
-    -- Average read latency in ms (high values indicate storage pressure)
-    CASE WHEN vfs.num_of_reads = 0 THEN 0
-         ELSE vfs.io_stall_read_ms * 1.0 / vfs.num_of_reads
-    END                                         AS avg_read_latency_ms,
-    CASE WHEN vfs.num_of_writes = 0 THEN 0
-         ELSE vfs.io_stall_write_ms * 1.0 / vfs.num_of_writes
-    END                                         AS avg_write_latency_ms
-FROM
-    sys.dm_io_virtual_file_stats(NULL, NULL) AS vfs
-    JOIN sys.master_files AS mf
-        ON vfs.database_id = mf.database_id
-        AND vfs.file_id    = mf.file_id
-ORDER BY
-    io_stall_total_ms DESC;
 
--- SQL Server: identify the most I/O-intensive queries currently in the plan cache
-SELECT TOP 20
-    qs.total_logical_reads                          AS total_logical_reads,
-    qs.total_physical_reads                         AS total_physical_reads,
-    qs.total_logical_writes                         AS total_logical_writes,
-    qs.execution_count,
-    qs.total_physical_reads / NULLIF(qs.execution_count, 0)
-                                                    AS avg_physical_reads,
-    SUBSTRING(qt.text, (qs.statement_start_offset/2) + 1,
-        ((CASE qs.statement_end_offset
-            WHEN -1 THEN DATALENGTH(qt.text)
-            ELSE qs.statement_end_offset
-          END - qs.statement_start_offset) / 2) + 1)
-                                                    AS statement_text,
-    qp.query_plan
-FROM
-    sys.dm_exec_query_stats      AS qs
-    CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle)   AS qt
-    CROSS APPLY sys.dm_exec_query_plan(qs.plan_handle) AS qp
-WHERE
-    qs.total_physical_reads &gt; 5000
-ORDER BY
-    qs.total_physical_reads DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Reading the Results</strong></p>
 
@@ -1070,12 +1021,12 @@ if __name__ == "__main__":
     <div class="mt-14 bg-amber-950/40 border border-amber-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
-        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+        <p class="text-xs text-gray-400">Query plan visualizer · Index advisor · Slow query dashboard · SQL Server</p>
       </div>
       <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
          class="shrink-0 px-6 py-3 bg-amber-600 hover:bg-amber-500 text-white font-semibold rounded-xl text-sm transition">Download Free</a>
     </div>
-    <div class="mt-8 text-xs"><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a></div>
+    <nav class="mt-8 flex flex-col sm:flex-row items-center justify-between gap-3 text-xs"><span><a href="b7-ch12-vertical-scaling.html" class="text-gray-400 hover:text-amber-300 transition">← Vertical Scaling Decisions: When to Go Up vs Optimize Queries</a></span><span><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">All Chapters</a></span><span><a href="b7-ch14-provisioned-iops-vs-gp3.html" class="text-gray-400 hover:text-amber-300 transition">Provisioned IOPS vs gp3: The Break-Even Analysis for I/O-Heavy SQL Server →</a></span></nav>
   </article>
   <footer class="border-t border-gray-800/50 px-6 py-8">
     <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · Database FinOps</div>

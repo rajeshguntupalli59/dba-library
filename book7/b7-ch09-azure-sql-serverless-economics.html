@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 9: Azure SQL Serverless: When It Saves vs When It Costs More — Database FinOps</title>
+  <meta name="description" content="Database FinOps Chapter 9: Azure SQL Serverless: When It Saves vs When It Costs More. SQL Server cloud cost optimization — by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-amber-500 to-amber-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-amber-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 7 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-amber-600 hover:bg-amber-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6"><a href="index.html" class="text-xs text-amber-400 hover:text-amber-300 transition">← All Chapters</a></div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-amber-900/40 border border-amber-800/40 text-amber-300 text-xs rounded-full font-medium">Chapter 9 of 30</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">Database FinOps</span>
+    </div>
+    <div class="space-y-4 text-sm"><h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 9: Azure SQL Serverless: When It Saves vs When It Costs More</h2>
+
+<p class="text-gray-300 leading-relaxed">Azure SQL Database serverless promises the perfect deal: pay only for the compute you use, and pay nothing at all when the database is idle. In practice, teams that migrate provisioned databases to serverless without understanding the billing model often see their monthly bills <em>increase</em> — sometimes dramatically. The culprits are almost always the same: a minimum vCore floor set too high, an auto-pause delay that never triggers because something keeps the database awake, and workloads with steady usage that were cheaper on provisioned all along. This chapter builds the precise mental model of serverless billing you need, shows you how to identify the workloads where it wins, and gives you the monitoring and automation to keep it winning.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">9.1 How Azure SQL Serverless Actually Bills You</h3>
+
+<p class="text-gray-300 leading-relaxed">Azure SQL serverless is available in the General Purpose tier only, scaling between a configured minimum (0.5 vCore) and maximum (up to 40 vCores). Billing has three components:</p>
+
+<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Compute, billed per vCore-second</strong> while the database is active. The meter runs at the <em>currently allocated</em> vCore count — not the average utilization. A database configured with a 2-vCore minimum that idles for an hour before auto-pause kicks in is billed for 2 vCores for that entire hour, even though it did no work. Published General Purpose serverless compute rates run roughly $0.52–$0.62 per vCore-hour depending on region and hardware generation (check current pricing for your region).</p>
+<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Storage, billed per GB-month</strong> continuously — including while paused. Serverless does not make storage free; it makes <em>compute</em> free during pauses.</p>
+<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Zero compute while paused.</strong> After the auto-pause delay elapses with no activity, the database pauses and compute billing drops to literally $0. The first new connection resumes it automatically, typically within 30–60 seconds.</p>
+
+<p class="text-gray-300 leading-relaxed">The auto-pause delay is configurable from 1 hour to 7 days, with 60 minutes as the default. This delay is the single most misunderstood parameter in serverless economics: every wake-up costs you at minimum the delay window at your minimum vCore count. A database with a 0.5-vCore minimum and a 1-hour delay costs at least 1,800 vCore-seconds per active session — the session itself plus the trailing idle hour. Fifty distinct sessions a month is roughly 25 vCore-hours of minimum billing before any actual query work is counted.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="text-xs text-gray-300 leading-relaxed">Worked example: dev database, GP serverless, 0.5–4 vCores, 100 GB storage
+  Active 6h/day at avg 1 vCore :  6 × 30 × 1 × $0.55   ≈  $99/month
+  Trailing idle (auto-pause 1h):  1 × 30 × 0.5 × $0.55 ≈   $8/month
+  Storage: 100 GB × $0.115/GB-month                    ≈  $12/month
+                                                         ──────────
+  Serverless total:                                      ≈ $119/month
+
+  Same database provisioned GP Gen5 2 vCore: ~$370/month compute + $12 storage
+  → Serverless saves ~68% for this pattern.</pre></div>
+
+<p class="text-gray-300 leading-relaxed">Now run the same math for a database active 20 hours a day at an average of 3 vCores: 20 × 30 × 3 × $0.55 ≈ $990/month in compute alone — nearly triple the provisioned 4-vCore price. Serverless pricing carries a premium per vCore-hour over provisioned; it only wins when the idle windows are real and long.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">9.2 Identifying Workloads Where Serverless Wins</h3>
+
+<p class="text-gray-300 leading-relaxed">Serverless wins on exactly one workload shape: <strong class="text-white">intermittent usage with multi-hour idle gaps</strong>. The canonical winners:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Development and QA databases</strong> used during working hours and idle overnight. A dev database active 9 hours a day, 5 days a week, with auto-pause covering nights and weekends, typically bills 60–75% less than its provisioned equivalent.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Demo and trial environments</strong> spun up for sales cycles. These may sit untouched for days between evaluations — pure paused time at $0 compute.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Batch and scheduled workloads</strong> — the nightly ETL target, the weekly report mart. If the database genuinely does nothing between runs and the runs are separated by more than the auto-pause delay, serverless is nearly ideal.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Feature-branch databases</strong> in CI/CD pipelines. Created for a pull request, exercised by integration tests for an hour, then idle until the next push. Auto-pause absorbs the idle time; just make sure the branch database is <em>deleted</em> when the PR merges, or the storage meter runs forever.</p>
+
+<p class="text-gray-300 leading-relaxed">The diagnostic query before migrating: pull 30 days of CPU utilization from Azure Monitor at 5-minute granularity and compute the fraction of time below 5% utilization. If the database is under 5% CPU for less than 40% of the month, serverless will likely cost more than provisioned. If it is idle more than 70% of the time, serverless is usually a clear win. Between 40% and 70%, run the worked-example math from Section 9.1 with your actual numbers.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">9.3 The vCore Floor Problem and How to Fix It</h3>
+
+<p class="text-gray-300 leading-relaxed">When databases are migrated to serverless through the portal, the minimum vCores frequently get set to match the old provisioned size "to be safe" — a 4-vCore provisioned database becomes a 4–16 vCore serverless database. This single choice can make serverless <em>more</em> expensive than what it replaced: the database now bills a minimum of 4 vCores for every active second plus every trailing idle hour, at the serverless premium rate.</p>
+
+<p class="text-gray-300 leading-relaxed">The fix is mechanical: <strong class="text-white">set the minimum to 0.5 vCores unless you have measured evidence it needs more.</strong> The minimum is a billing floor, not a performance setting — the database still auto-scales up to the maximum when load arrives. The only workloads that justify a higher floor are those with latency-sensitive first queries after idle periods, where starting from 0.5 vCores adds perceptible scale-up time. For everything else, 0.5 is correct.</p>
+
+<p class="text-gray-300 leading-relaxed">Audit the fleet monthly with Azure Resource Graph:</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="text-xs text-gray-300 leading-relaxed"><code>-- Serverless databases with a minimum above 0.5 vCores: the floor audit
+resources
+| where type == "microsoft.sql/servers/databases"
+| where sku.tier == "GeneralPurpose" and sku.family has "Serverless"
+| project name, resourceGroup,
+          minCapacity = todecimal(sku.capacity),
+          maxCapacity = todecimal(properties.maxSizeBytes)
+| where minCapacity &gt; 0.5
+| order by minCapacity desc</code></pre></div>
+
+<p class="text-gray-300 leading-relaxed">Every row this returns is a candidate for an immediate, zero-risk cost reduction. Lowering the minimum requires no downtime and takes effect within minutes.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">9.4 Monitoring vCore Consumption in Real Time</h3>
+
+<p class="text-gray-300 leading-relaxed">Serverless billing follows <em>allocated</em> vCores, and the metric that tracks it is <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">app_cpu_billed</code> (billed CPU) in Azure Monitor, alongside <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sqlserver_process_cpu</code> for actual utilization. The gap between the two is your waste signal: a database consistently billed for 2 vCores while using 0.3 has a floor problem (Section 9.3) or a keep-awake problem (Section 9.6).</p>
+
+<p class="text-gray-300 leading-relaxed">Build the serverless efficiency view as an Azure Monitor workbook or a Log Analytics query over the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">AzureMetrics</code> table:</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="text-xs text-gray-300 leading-relaxed"><code>// Billed vs used vCores per database, last 7 days
+AzureMetrics
+| where ResourceProvider == "MICROSOFT.SQL"
+| where MetricName in ("app_cpu_billed", "sqlserver_process_cpu")
+| extend vCores = Average / 100.0
+| summarize billed_vcore_h = sumif(vCores * 5/60.0, MetricName=="app_cpu_billed"),
+            used_vcore_h   = sumif(vCores * 5/60.0, MetricName=="sqlserver_process_cpu")
+            by Resource
+| extend efficiency = 100.0 * used_vcore_h / billed_vcore_h
+| order by billed_vcore_h desc</code></pre></div>
+
+<p class="text-gray-300 leading-relaxed">An efficiency under 30% sustained over a week means the database is paying for capacity it never uses — lower the minimum, shorten the auto-pause delay, or hunt the keep-awake source. Also track pause/resume events: a database that resumes dozens of times per day is being kept artificially warm, and each resume restarts the auto-pause delay clock.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">9.5 Capacity Planning: Setting max vCores Without Fear</h3>
+
+<p class="text-gray-300 leading-relaxed">Teams routinely set the maximum vCores far above any realistic need — 40 vCores "just in case" — because the maximum feels like a safety setting rather than a billing setting. It is both. The maximum caps the scale-up ceiling, but a runaway query or an unexpected load spike can now bill at 40 vCores until it finishes. For a workload that normally needs 4, that is a 10x cost multiplier on the spike.</p>
+
+<p class="text-gray-300 leading-relaxed">Set the maximum from measured data: take the 99th percentile of allocated vCores over the last 30 days and add one scaling step of headroom (e.g., P99 of 3.2 → max 4). Revisit quarterly. The failure mode of a too-low maximum is throttled queries during a genuine spike — visible, alertable, and fixable in minutes. The failure mode of a too-high maximum is a silent 10x bill. Prefer the visible failure.</p>
+
+<p class="text-gray-300 leading-relaxed">Pair the maximum with an alert: if allocated vCores sit at the maximum for more than 15 minutes, page the owning team. Sustained max-allocation is either a legitimate growth signal (time to raise the ceiling deliberately) or a runaway process (time to kill it before the invoice arrives).</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">9.6 The Connection and Keep-Alive Multiplier Effect</h3>
+
+<p class="text-gray-300 leading-relaxed">The most common reason auto-pause "doesn't work" is that something prevents the database from ever going idle. The usual suspects, in order of frequency:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Uptime monitors and synthetic probes.</strong> A ping every 5 minutes is activity. The database never reaches the 60-minute idle threshold, so it bills the minimum vCores 24/7. Exclude serverless databases from synthetic monitoring, or accept that the monitor is the workload.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Application connection pools holding connections open.</strong> An idle-but-open connection with no active query does not by itself block auto-pause — but connection validation queries, keep-alive pings from ORMs, and background health checks do. Configure the pool's idle timeout below the auto-pause delay and disable aggressive validation queries on serverless targets.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Scheduled jobs and agents.</strong> SQL Agent jobs, Elastic Jobs, or external cron hitting the database hourly reset the idle clock every time. Either consolidate the jobs into the active windows or accept the database as effectively always-on and move it back to provisioned.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Developer tooling.</strong> SSMS or Azure Data Studio left open with an active connection, IntelliSense refresh queries, a dashboard auto-refreshing every 10 minutes. These are the hardest to find because they look like legitimate usage in the metrics. The tell: resume events clustered during business hours with no corresponding application traffic.</p>
+
+<p class="text-gray-300 leading-relaxed">The diagnostic: correlate pause/resume events with the application inventory. If resumes have no matching application deployment or user session, something invisible is waking the database. Enable Azure SQL Auditing temporarily and look at the login history — the client application name in the audit log usually names the culprit within an hour.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">9.7 When to Switch Back to Provisioned</h3>
+
+<p class="text-gray-300 leading-relaxed">Serverless is not a final state; it is a pricing model matched to a workload shape, and workload shapes change. A startup that correctly deployed serverless eighteen months ago may now have a workload running at 8+ vCores for 18 hours a day. At that point the serverless premium — roughly 30–40% more per vCore-hour than provisioned — exceeds the value of the idle windows.</p>
+
+<p class="text-gray-300 leading-relaxed">The switch-back rule: <strong class="text-white">when the trailing-30-day serverless compute bill exceeds the provisioned price for the P95 vCore count, migrate back.</strong> Compute both numbers monthly from the billing data — this is a five-minute query, not a quarterly project. The migration itself is an online tier change with a brief reconnection; schedule it in a maintenance window and set the provisioned size to the measured P95, not the old size.</p>
+
+<p class="text-gray-300 leading-relaxed">Also switch back when latency SLAs tighten. The 30–60 second resume delay after auto-pause is a hard architectural constraint. The moment a serverless database sits behind a user-facing transaction with a sub-second SLA, it is the wrong tier regardless of what the math says. Cost optimization that violates the SLA is not optimization.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">9.8 Infrastructure as Code for Cost-Optimized Serverless</h3>
+
+<p class="text-gray-300 leading-relaxed">Every serverless database should be created from a template that encodes the cost decisions, so the portal defaults never get a vote:</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="text-xs text-gray-300 leading-relaxed"><code># Bicep: serverless database with cost-safe defaults
+resource db 'Microsoft.Sql/servers/databases@2023-05-01-preview' = {
+  name: 'orders-dev'
+  parent: sqlServer
+  location: location
+  sku: {
+    name: 'GP_S_Gen5'
+    tier: 'GeneralPurpose'
+    family: 'Gen5'
+    capacity: 4              // max vCores: measured P99 + 1 step
+  }
+  properties: {
+    computeModel: 'Serverless'
+    minCapacity: '0.5'       // billing floor: keep at minimum
+    autoPauseDelay: 60       // minutes; extend only with justification
+    requestedBackupStorageRedundancy: 'Local'
+    tags: {
+      environment: 'dev'
+      team: 'orders'
+      'auto-shutdown': 'n/a-serverless'  // documents the pause strategy
+    }
+  }
+}</code></pre></div>
+
+<p class="text-gray-300 leading-relaxed">Add an Azure Policy deny rule that rejects serverless databases with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">minCapacity</code> above 1.0 in non-production subscriptions. The 0.5 default is right for almost everything; anyone who needs more can request an exception with measured latency data. Policy-as-code turns the Section 9.3 audit from a monthly chore into a non-event.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">9.9 Serverless vs Provisioned vs Elastic Pool: The Comparative View</h3>
+
+<p class="text-gray-300 leading-relaxed">Serverless is one of three answers to variable database demand on Azure SQL. Choosing well requires comparing all three against the workload shape:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Serverless</strong> wins for single databases with long idle gaps and unpredictable active periods. Its unique advantage is the true $0 compute floor during pauses — neither provisioned nor elastic pools can reach zero.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Provisioned (single database)</strong> wins for steady, predictable workloads. It is the cheapest per vCore-hour of the three and the only choice when sub-second resume latency is an SLA requirement.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Elastic pools</strong> win for fleets of databases with uncorrelated peaks — ten dev databases that are never all busy at once. The pool shares eDTUs/vCores across the set, so you pay for the aggregate peak rather than the sum of individual peaks. For a fleet of intermittent databases, compare the pool price against the sum of individual serverless bills: pools usually win when the databases' active windows overlap significantly (shared capacity is utilized), while serverless wins when each database has long solo idle stretches.</p>
+
+<p class="text-gray-300 leading-relaxed">The common mistake is treating these as a ladder — provisioned → serverless → pool — instead of as overlapping tools. A single subscription commonly needs all three: provisioned for the production OLTP core, serverless for the demo and branch databases, and an elastic pool for the dev fleet. Assign by workload shape, review quarterly, and let the billing data arbitrate the disagreements.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">9.10 Building a Serverless Cost Dashboard</h3>
+
+<p class="text-gray-300 leading-relaxed">Close the loop with a dashboard that answers four questions at a glance: (1) total serverless compute spend vs the provisioned-equivalent price for the same vCore-hours, (2) the efficiency ratio from Section 9.4 per database, (3) pause/resume frequency with keep-awake suspects flagged, and (4) the switch-back signal from Section 9.7 — trailing-30-day serverless cost vs provisioned P95 price.</p>
+
+<p class="text-gray-300 leading-relaxed">Feed it from two sources: Azure Cost Management exports for the billing truth, and the Log Analytics metrics query from Section 9.4 for the operational detail. Refresh daily; review weekly. The dashboard's real job is cultural: when every engineer can see that the demo database cost $4 last month because auto-pause worked, serverless stops being "the risky new tier" and becomes the default for intermittent workloads — which is where the savings live.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Serverless bills allocated vCores, not used vCores**: The minimum vCore setting is a billing floor that applies to every active second and every trailing idle hour before auto-pause. Set it to 0.5 unless measured latency data justifies more — the portal default of matching the old provisioned size is the most expensive possible choice.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Auto-pause only works if the database is actually allowed to idle**: Uptime monitors, aggressive connection validation, hourly jobs, and developer tooling left open all reset the idle clock. Each wake-up costs at minimum the full auto-pause delay window at the minimum vCores — audit resume events and eliminate the invisible keep-awake sources.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The 40/70 rule for workload fit**: Under 40% idle time, serverless usually costs more than provisioned; over 70% idle, it usually wins clearly; between the two, run the actual numbers. Recompute monthly — workloads drift, and today's serverless win is next year's provisioned workload.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Set max vCores from the P99, not from optimism**: A 40-vCore ceiling on a 4-vCore workload turns any spike into a 10x billing event. Cap at measured P99 plus one step, alert on sustained max-allocation, and prefer the visible failure of throttling over the silent failure of a surprise invoice.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Serverless, provisioned, and elastic pools are overlapping tools, not a ladder**: Assign by workload shape — serverless for long idle gaps, provisioned for steady load, pools for uncorrelated fleets — and let a single dashboard arbitrate with billing data rather than opinion.</li>
+
+</div>
+    <div class="mt-14 bg-amber-950/40 border border-amber-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">Query plan visualizer · Index advisor · Slow query dashboard · SQL Server</p>
+      </div>
+      <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
+         class="shrink-0 px-6 py-3 bg-amber-600 hover:bg-amber-500 text-white font-semibold rounded-xl text-sm transition">Download Free</a>
+    </div>
+    <nav class="mt-8 flex flex-col sm:flex-row items-center justify-between gap-3 text-xs"><span><a href="b7-ch08-reserved-vs-on-demand.html" class="text-gray-400 hover:text-amber-300 transition">← Reserved Instances vs Savings Plans vs On-Demand: The Math</a></span><span><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">All Chapters</a></span><span><a href="b7-ch10-idle-detection.html" class="text-gray-400 hover:text-amber-300 transition">Idle Instance Detection and Automated Shutdown →</a></span></nav>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · Database FinOps</div>
+  </footer>
+</body>
+</html>

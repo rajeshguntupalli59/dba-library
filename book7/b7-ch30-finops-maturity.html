@@ -65,7 +65,7 @@
 <p class="text-gray-300 leading-relaxed">Tagging is enforced by AWS Config rules, Azure Policy, or GCP Organization Policy. Cost is allocated to teams through showback dashboards. Rightsizing recommendations from Compute Optimizer are reviewed monthly. At least 60% of steady-state compute is covered by Reserved Instances or Committed Use Discounts. Storage tiers are differentiated between environments. Overspend is 15–30% above baseline.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Stage 4 — Optimized</strong></p>
-<p class="text-gray-300 leading-relaxed">Reserved Instance coverage exceeds 80% for production. Dev and test environments use scheduled start/stop automation. Connection pooling is deployed. Query-level cost attribution exists through pg_stat_statements or Performance Insights. Autoscaling policies have tested upper bounds. Storage has been migrated from gp2 to gp3 where appropriate. Overspend is 5–15% above theoretical minimum.</p>
+<p class="text-gray-300 leading-relaxed">Reserved Instance coverage exceeds 80% for production. Dev and test environments use scheduled start/stop automation. Connection pooling is deployed. Query-level cost attribution exists through Query Store or Performance Insights. Autoscaling policies have tested upper bounds. Storage has been migrated from gp2 to gp3 where appropriate. Overspend is 5–15% above theoretical minimum.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Stage 5 — Autonomous</strong></p>
 <p class="text-gray-300 leading-relaxed">Cost guardrails are embedded in CI/CD pipelines. Anomaly detection alerts fire before the monthly bill. Rightsizing runs on a weekly automated schedule and tickets are auto-created. Reserved Instance coverage is managed programmatically with expiration tracking. The team has a published cost-per-transaction metric reviewed in sprint retrospectives. Overspend is within 5% of theoretical minimum, with variance explained and documented.</p>
@@ -100,7 +100,7 @@ FROM
     your_cur_database.your_cur_table
 WHERE
     line_item_line_item_type IN ('Usage', 'SavingsPlanCoveredUsage')
-    AND product_service_code IN ('AmazonRDS', 'AmazonAurora')
+    AND product_service_code IN ('AmazonRDS')
     AND line_item_usage_start_date &gt;= DATE_TRUNC('month', CURRENT_DATE - INTERVAL '1' MONTH)
     AND line_item_usage_start_date &lt;  DATE_TRUNC('month', CURRENT_DATE)
 GROUP BY
@@ -135,8 +135,7 @@ az costmanagement query \
   --dataset-filter \
     '{"and":[{"or":[
       {"dimensions":{"name":"ResourceType","operator":"In",
-        "values":["Microsoft.DBforPostgreSQL/flexibleServers",
-                  "Microsoft.DBforMySQL/flexibleServers",
+        "values":["Microsoft.Sql/servers",
                   "Microsoft.Sql/servers/databases"]}
       }]}]}' \
   --output table \
@@ -165,7 +164,7 @@ FROM
 WHERE
   service.description IN (
     'Cloud SQL',
-    'AlloyDB for PostgreSQL',
+    
     'Cloud Spanner',
     'Bare Metal Solution'
   )
@@ -281,7 +280,7 @@ REGIONS = ["us-east-1", "us-west-2", "eu-west-1"]
 SAVINGS_THRESHOLD_USD = 5000          # alert if monthly savings opportunity exceeds this
 SNS_TOPIC_ARN = "arn:aws:sns:us-east-1:123456789:db-finops-alerts"
 
-# On-Demand hourly rates for common RDS instance types (us-east-1, MySQL/PostgreSQL)
+# On-Demand hourly rates for common RDS for SQL Server instance types (us-east-1, License Included)
 # Update quarterly from https://aws.amazon.com/rds/pricing/
 ON_DEMAND_RATES = {
     "db.t3.micro":     0.017,
@@ -447,51 +446,7 @@ if __name__ == "__main__":
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Query-Level Cost Attribution</strong></p>
 
-<p class="text-gray-300 leading-relaxed">The cheapest query is the one that never runs. pg_stat_statements on PostgreSQL surfaces which queries drive the most I/O, CPU, and shared buffer pressure — all of which translate directly to instance size requirements.</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: top 20 queries by total execution cost (I/O + CPU proxy)
--- Run on production read replica to avoid overhead on primary
--- Requires: pg_stat_statements extension enabled in postgresql.conf
-
-SELECT
-    queryid,
-    LEFT(query, 120)                                         AS query_preview,
-    calls,
-    ROUND(total_exec_time::NUMERIC, 2)                       AS total_exec_ms,
-    ROUND(mean_exec_time::NUMERIC, 4)                        AS mean_exec_ms,
-    ROUND(stddev_exec_time::NUMERIC, 4)                      AS stddev_exec_ms,
-    rows,
-    ROUND(total_exec_time::NUMERIC / NULLIF(calls, 0), 4)   AS ms_per_call,
-    shared_blks_read                                         AS disk_reads,
-    shared_blks_hit                                          AS buffer_hits,
-    ROUND(
-        100.0 * shared_blks_hit::NUMERIC /
-        NULLIF(shared_blks_hit + shared_blks_read, 0), 2
-    )                                                        AS buffer_hit_pct,
-    shared_blks_written                                      AS dirty_writes,
-    temp_blks_written                                        AS temp_spill_blks,
-    ROUND(
-        (total_exec_time * 0.001) *
-        (shared_blks_read + shared_blks_written) * 0.000008192
-    , 4)                                                     AS approx_io_gb,
-    -- Cost index: high value = high infrastructure pressure
-    ROUND(
-        (total_exec_time / 1000.0) +
-        (shared_blks_read * 0.1) +
-        (temp_blks_written * 0.5)
-    , 2)                                                     AS cost_index
-FROM
-    pg_stat_statements
-WHERE
-    calls &gt; 100
-    AND query NOT LIKE '%pg_stat%'
-    AND query NOT LIKE 'BEGIN%'
-    AND query NOT LIKE 'COMMIT%'
-ORDER BY
-    cost_index DESC
-LIMIT 20;</code></pre>
-
-<p class="text-gray-300 leading-relaxed">Any query with a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">buffer_hit_pct</code> below 85% is a candidate for index review. Any query with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">temp_spill_blks</code> above zero is working memory that could be addressed by tuning <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">work_mem</code> — avoiding the need to scale the instance for additional RAM.</p>
+<p class="text-gray-300 leading-relaxed">The cheapest query is the one that never runs. Query Store on SQL Server surfaces which queries drive the most I/O, CPU, and buffer-pool pressure — all of which translate directly to instance size requirements.</p>
 
 <p class="text-gray-300 leading-relaxed">On SQL Server (Azure SQL / RDS for SQL Server), the equivalent uses <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_query_stats</code>:</p>
 
@@ -836,7 +791,7 @@ def evaluate_instance(cw, instance: dict) -&gt; list[Anomaly]:
         recommendations = {
             "CPUUtilization": (
                 f"Instance {inst_class} CPU at {normalized:.1f}%. "
-                f"Review pg_stat_statements for rogue queries before upsizing. "
+                f"Review Query Store for rogue queries before upsizing. "
                 f"Upsizing to next class adds ~40% to compute cost."
             ),
             "FreeStorageSpace": (
@@ -846,7 +801,7 @@ def evaluate_instance(cw, instance: dict) -&gt; list[Anomaly]:
             ),
             "DatabaseConnections": (
                 f"Connections at {normalized*100:.0f}% of limit ({int(value)}/{max_conns}). "
-                f"Deploy pgBouncer in transaction mode. Typical saving: 60-80% connection "
+                f"Fix client-side connection pooling (Max Pool Size, pooling=true). Typical saving: 60-80% connection "
                 f"reduction, enabling downsizing by one instance class."
             ),
             "ReadIOPS": (
@@ -861,12 +816,12 @@ def evaluate_instance(cw, instance: dict) -&gt; list[Anomaly]:
             ),
             "ReadLatency": (
                 f"Read latency {value*1000:.1f}ms exceeds {crit_thresh*1000:.0f}ms threshold. "
-                f"Check buffer cache hit ratio and consider Aurora read replicas "
+                f"Check buffer cache hit ratio and consider readable secondaries "
                 f"before migrating to io2 storage."
             ),
             "WriteLatency": (
                 f"Write latency {value*1000:.1f}ms exceeds threshold. "
-                f"Check for lock contention via pg_locks. "
+                f"Check for lock contention via sys.dm_tran_locks. "
                 f"Premature io1 provisioning adds $0.065 per IOPS-month."
             ),
         }
@@ -1008,7 +963,7 @@ if __name__ == "__main__":
 #   - jq installed
 
 REGION="us-east-1"
-DB_IDENTIFIER="prod-postgres-primary"
+DB_IDENTIFIER="prod-sqlserver-primary"
 NAMESPACE="DatabaseFinOps"
 DATE_YESTERDAY=$(date -d "yesterday" +%Y-%m-%d)
 DATE_TODAY=$(date +%Y-%m-%d)
@@ -1035,7 +990,7 @@ DAILY_COST=$(aws ce get-cost-and-usage \
   --filter '{
     "And": [
       {"Dimensions": {"Key":"SERVICE","Values":["Amazon RDS"]}},
-      {"Tags": {"Key":"application","Values":["prod-postgres"]}}
+      {"Tags": {"Key":"application","Values":["prod-sqlserver"]}}
     ]
   }' \
   --metrics "UnblendedCost" \
@@ -1131,12 +1086,12 @@ echo "Metrics published to CloudWatch namespace ${NAMESPACE}"</code></pre>
     <div class="mt-14 bg-amber-950/40 border border-amber-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
-        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+        <p class="text-xs text-gray-400">Query plan visualizer · Index advisor · Slow query dashboard · SQL Server</p>
       </div>
       <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
          class="shrink-0 px-6 py-3 bg-amber-600 hover:bg-amber-500 text-white font-semibold rounded-xl text-sm transition">Download Free</a>
     </div>
-    <div class="mt-8 text-xs"><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a></div>
+    <nav class="mt-8 flex flex-col sm:flex-row items-center justify-between gap-3 text-xs"><span><a href="b7-ch29-custom-cost-analyzer.html" class="text-gray-400 hover:text-amber-300 transition">← Building a Custom Database Cost Analyzer</a></span><span><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">All Chapters</a></span></nav>
   </article>
   <footer class="border-t border-gray-800/50 px-6 py-8">
     <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · Database FinOps</div>

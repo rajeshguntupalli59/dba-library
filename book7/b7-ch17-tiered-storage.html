@@ -99,51 +99,22 @@ Annual savings: $8,448 (76% reduction)</code></pre>
 
 <p class="text-gray-300 leading-relaxed">You cannot archive what you cannot identify. The first step is building a clear picture of data age, access patterns, and business rules for retention.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Identifying table-level age distribution in PostgreSQL:</strong></p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Find tables with the oldest average tuple age
--- Run on each RDS PostgreSQL / Aurora PostgreSQL instance
-SELECT
-    schemaname,
-    relname AS table_name,
-    pg_size_pretty(pg_total_relation_size(schemaname || '.' || relname)) AS total_size,
-    pg_total_relation_size(schemaname || '.' || relname) AS total_bytes,
-    n_live_tup AS live_rows,
-    n_dead_tup AS dead_rows,
-    last_vacuum,
-    last_autovacuum,
-    last_analyze,
-    last_autoanalyze,
-    -- Estimate staleness: tables not analyzed in 90 days are candidates
-    CASE
-        WHEN COALESCE(last_autoanalyze, last_analyze) &lt; NOW() - INTERVAL '90 days'
-          OR COALESCE(last_autoanalyze, last_analyze) IS NULL
-        THEN 'Cold candidate'
-        WHEN COALESCE(last_autoanalyze, last_analyze) &lt; NOW() - INTERVAL '30 days'
-        THEN 'Warm - monitor'
-        ELSE 'Active'
-    END AS access_classification
-FROM
-    pg_stat_user_tables
-ORDER BY
-    total_bytes DESC;</code></pre>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Find the date range of data in each table that has a created_at column
--- This query generates dynamic SQL for inspection
+-- This query generates dynamic SQL for inspection (T-SQL string concatenation)
 SELECT
-    'SELECT '''
-    || table_schema || '.' || table_name
-    || ''' AS tbl, MIN(' || column_name || ') AS oldest_row, '
-    || 'MAX(' || column_name || ') AS newest_row, '
-    || 'COUNT(*) AS total_rows '
-    || 'FROM ' || table_schema || '.' || table_name || ';' AS inspection_sql
-FROM
-    information_schema.columns
-WHERE
-    column_name IN ('created_at', 'created_date', 'inserted_at', 'event_time', 'timestamp')
-    AND table_schema NOT IN ('pg_catalog', 'information_schema')
-ORDER BY
-    table_schema, table_name;</code></pre>
+    'SELECT ''' + s.name + '.' + t.name
+    + ''' AS tbl, MIN(' + c.name + ') AS oldest_row, '
+    + 'MAX(' + c.name + ') AS newest_row, '
+    + 'COUNT(*) AS total_rows '
+    + 'FROM ' + s.name + '.' + t.name + ';' AS inspection_sql
+FROM sys.columns c
+JOIN sys.tables t ON c.object_id = t.object_id
+JOIN sys.schemas s ON t.schema_id = s.schema_id
+WHERE c.name IN ('created_at', 'created_date', 'inserted_at', 'event_time', 'timestamp')
+    AND s.name NOT IN ('sys', 'information_schema')
+ORDER BY s.name, t.name;</code></pre>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- For SQL Server / Azure SQL: find table age distribution
 -- using sys.dm_db_index_usage_stats
@@ -179,7 +150,7 @@ ORDER BY
     total_reads ASC,
     table_name;</code></pre>
 
-<p class="text-gray-300 leading-relaxed">Beyond table-level statistics, you need CloudWatch or Azure Monitor metrics to confirm that the storage IOPS consumption is actually coming from a small subset of tables. A table that shows up as large in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_user_tables</code> but consumes zero IOPS is a clean archival candidate. A large table with high IOPS is not—even if most rows are old.</p>
+<p class="text-gray-300 leading-relaxed">Beyond table-level statistics, you need CloudWatch or Azure Monitor metrics to confirm that the storage IOPS consumption is actually coming from a small subset of tables. A table that shows up as large in the file-space diagnostics but consumes zero IOPS is a clean archival candidate. A large table with high IOPS is not—even if most rows are old.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Pulling CloudWatch RDS storage and IOPS metrics via AWS CLI:</strong></p>
 
@@ -187,7 +158,7 @@ ORDER BY
 # Pull RDS IOPS and storage metrics for the last 30 days
 # to identify instances with underutilized storage capacity
 
-DB_INSTANCE="prod-postgres-01"
+DB_INSTANCE="prod-sqlserver-01"
 START_DATE=$(date -u -d '30 days ago' +%Y-%m-%dT%H:%M:%SZ)
 END_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 REGION="us-east-1"
@@ -240,81 +211,44 @@ aws cloudwatch get-metric-statistics \
 
 <p class="text-gray-300 leading-relaxed">The most reliable pattern for tiered storage is range partitioning by time. Once you know which tables have archivable data, you restructure them so that cold partitions can be detached and exported cleanly without touching active data.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Creating a partitioned table in PostgreSQL for future tiering:</strong></p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Creating a partitioned table in SQL Server for future tiering:</strong></p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Convert an existing unpartitioned table to a partitioned structure
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Convert an existing unpartitioned table to quarterly range partitioning
 -- This example handles an audit_events table with 3 years of history
 
--- Step 1: Create the new partitioned parent table
-CREATE TABLE audit_events_partitioned (
-    id          BIGSERIAL,
+-- Step 1: Create the partition function (quarterly boundaries)
+CREATE PARTITION FUNCTION pf_audit_quarterly (DATETIME2)
+AS RANGE RIGHT FOR VALUES (
+    '2022-01-01', '2022-04-01', '2022-07-01', '2022-10-01',
+    '2023-01-01', '2023-04-01', '2023-07-01', '2023-10-01',
+    '2024-01-01', '2024-04-01', '2024-07-01', '2024-10-01',
+    '2025-01-01', '2025-04-01', '2025-07-01', '2025-10-01'
+);
+
+-- Step 2: Create the partition scheme
+CREATE PARTITION SCHEME ps_audit_quarterly
+AS PARTITION pf_audit_quarterly ALL TO ([PRIMARY]);
+
+-- Step 3: Create the partitioned table
+CREATE TABLE dbo.audit_events_partitioned (
+    id          BIGINT IDENTITY(1,1),
     user_id     BIGINT       NOT NULL,
     event_type  VARCHAR(100) NOT NULL,
-    event_data  JSONB,
-    ip_address  INET,
-    created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (id, created_at)
-) PARTITION BY RANGE (created_at);
+    event_data  NVARCHAR(MAX),
+    ip_address  VARCHAR(45),
+    created_at  DATETIME2    NOT NULL DEFAULT SYSDATETIME(),
+    CONSTRAINT PK_audit_events PRIMARY KEY (id, created_at)
+) ON ps_audit_quarterly (created_at);
 
--- Step 2: Create partitions for each quarter going back 2 years
--- Current quarter stays hot; older quarters become archive candidates
-DO $$
-DECLARE
-    start_date DATE := DATE_TRUNC('quarter', NOW() - INTERVAL '2 years');
-    end_date   DATE;
-    part_name  TEXT;
-BEGIN
-    WHILE start_date &lt; DATE_TRUNC('quarter', NOW()) LOOP
-        end_date  := start_date + INTERVAL '3 months';
-        part_name := 'audit_events_'
-                     || TO_CHAR(start_date, 'YYYY_Q"Q"');
-
-        EXECUTE FORMAT(
-            'CREATE TABLE IF NOT EXISTS %I
-             PARTITION OF audit_events_partitioned
-             FOR VALUES FROM (%L) TO (%L)',
-            part_name,
-            start_date,
-            end_date
-        );
-
-        RAISE NOTICE 'Created partition: % covering % to %',
-                     part_name, start_date, end_date;
-
-        start_date := end_date;
-    END LOOP;
-END $$;
-
--- Step 3: Create the current active partition
-CREATE TABLE audit_events_current
-    PARTITION OF audit_events_partitioned
-    FOR VALUES FROM (DATE_TRUNC('quarter', NOW()))
-               TO   (DATE_TRUNC('quarter', NOW()) + INTERVAL '3 months');
-
--- Step 4: Create a default partition for future inserts outside expected range
-CREATE TABLE audit_events_future
-    PARTITION OF audit_events_partitioned
-    DEFAULT;
-
--- Step 5: View partition sizes to understand archival opportunity
-SELECT
-    child.relname                                             AS partition_name,
-    pg_size_pretty(pg_total_relation_size(child.oid))        AS total_size,
-    pg_total_relation_size(child.oid)                        AS bytes,
-    parent.relname                                            AS parent_table
-FROM
-    pg_inherits
-    JOIN pg_class parent ON pg_inherits.inhparent = parent.oid
-    JOIN pg_class child  ON pg_inherits.inhrelid  = child.oid
-WHERE
-    parent.relname = 'audit_events_partitioned'
-ORDER BY
-    child.relname;</code></pre>
+-- Step 4: Migrate data from the old table, then rename
+-- INSERT INTO dbo.audit_events_partitioned (...) SELECT ... FROM dbo.audit_events;
+-- EXEC sp_rename 'dbo.audit_events', 'audit_events_legacy';
+-- EXEC sp_rename 'dbo.audit_events_partitioned', 'audit_events';</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Once partitions exist, the archival workflow is clean: detach a partition, export it to S3/GCS/Blob as Parquet or CSV, verify the export, then drop the partition. The table keeps serving queries with no downtime.</p>
 
 <div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">flowchart LR
-    A[Detach partition] --> B["Export to S3/GCS/Blob<br/>as Parquet/CSV"]
+    A[Switch out partition] --> B["Export to S3/GCS/Blob<br/>as Parquet/CSV"]
     B --> C[Verify checksum + row count]
     C -->|Verified| D[Drop partition from live DB]
     C -->|Failed| E[Keep partition — do not drop]
@@ -322,53 +256,52 @@ ORDER BY
 
 <p class="text-gray-300 leading-relaxed">*The detach → export → verify → drop pipeline: a partition is only dropped from the live database after its export is independently verified.*</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Detach, export, and verify workflow for PostgreSQL on AWS RDS:</strong></p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Switch out, export, and verify workflow for SQL Server on AWS RDS:</strong></p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Step 1: Detach the oldest partition (run during maintenance window or off-peak)
--- Detached partition remains queryable as a standalone table
-ALTER TABLE audit_events_partitioned
-    DETACH PARTITION audit_events_2022_q1;
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Step 1: Switch the oldest partition out to a staging table
+-- The staging table must have an identical schema and be on the same filegroup
+CREATE TABLE dbo.audit_events_2022_q1_stage (
+    id          BIGINT,
+    user_id     BIGINT       NOT NULL,
+    event_type  VARCHAR(100) NOT NULL,
+    event_data  NVARCHAR(MAX),
+    ip_address  VARCHAR(45),
+    created_at  DATETIME2    NOT NULL,
+    CONSTRAINT PK_audit_events_2022_q1 PRIMARY KEY (id, created_at)
+) ON [PRIMARY];
+
+ALTER TABLE dbo.audit_events
+    SWITCH PARTITION 2 TO dbo.audit_events_2022_q1_stage;
+-- Partition switch is metadata-only: instant, no data movement
 
 -- Step 2: Confirm row counts match before export
-SELECT COUNT(*) FROM audit_events_2022_q1;
+SELECT COUNT(*) FROM dbo.audit_events_2022_q1_stage;
 -- Save this number for post-export validation
 
--- Step 3: Export the detached partition via COPY to S3
--- (Use aws_s3 extension on RDS PostgreSQL)
-SELECT aws_s3.query_export_to_s3(
-    'SELECT * FROM audit_events_2022_q1',
-    aws_commons.create_s3_uri(
-        'your-archive-bucket',
-        'database-archive/audit_events/2022/Q1/audit_events_2022_q1.csv',
-        'us-east-1'
-    ),
-    options := 'FORMAT CSV, HEADER true'
-);
+-- Step 3: Export the staging table to S3 via bcp
+-- bcp "SELECT * FROM dbo.audit_events_2022_q1_stage" queryout audit_events_2022_q1.csv -c -t, -S &lt;endpoint&gt; -U &lt;user&gt;
+-- Then: aws s3 cp audit_events_2022_q1.csv s3://your-archive-bucket/database-archive/audit_events/2022/Q1/
 
 -- Step 4: Verify export row count by querying S3 via Athena (run separately)
 -- SELECT COUNT(*) FROM archive_audit_events WHERE year=2022 AND quarter=1;
 
--- Step 5: After verification, drop the partition
--- Only run after confirming S3 export matches row count
-DROP TABLE audit_events_2022_q1;
+-- Step 5: After verification, drop the staging table and merge the boundary
+-- Only run after confirming the S3 export matches the row count
+DROP TABLE dbo.audit_events_2022_q1_stage;
+ALTER PARTITION FUNCTION pf_audit_quarterly() MERGE RANGE ('2022-01-01');
 
 -- Step 6: Record the archival in your metadata tracking table
-INSERT INTO archive_metadata (
-    original_table,
-    partition_name,
-    archive_path,
-    row_count,
-    archived_at,
-    archived_by,
-    verified
+INSERT INTO dbo.archive_metadata (
+    original_table, partition_name, archive_path,
+    row_count, archived_at, archived_by, verified
 ) VALUES (
-    'audit_events_partitioned',
+    'audit_events',
     'audit_events_2022_q1',
     's3://your-archive-bucket/database-archive/audit_events/2022/Q1/',
-    (SELECT COUNT(*) FROM audit_events_2022_q1),  -- captured before DROP
-    NOW(),
-    CURRENT_USER,
-    false  -- set to true after Athena validation
+    0,  -- fill in the count captured in Step 2
+    SYSDATETIME(),
+    SUSER_SNAME(),
+    0   -- set to 1 after Athena validation
 );</code></pre>
 
 <p class="text-gray-300 leading-relaxed">---</p>
@@ -450,12 +383,12 @@ aws s3api get-bucket-lifecycle-configuration \
 db_tiering_scheduler.py
 
 Runs nightly (scheduled via AWS EventBridge or cron).
-Identifies PostgreSQL partitions older than the configured threshold,
+Identifies SQL Server partitions older than the configured threshold,
 exports them to S3 in Parquet format, validates row counts,
-and drops the local partition after confirmation.
+and switches the local partition out after confirmation.
 
 Requirements:
-  pip install psycopg2-binary boto3 pandas pyarrow sqlalchemy
+  pip install pyodbc boto3 pandas pyarrow sqlalchemy
 """
 
 import os
@@ -468,15 +401,14 @@ from typing import Optional
 
 import boto3
 import pandas as pd
-import psycopg2
-from psycopg2.extras import RealDictCursor
+import pyodbc
 import pyarrow as pa
 import pyarrow.parquet as pq
 from sqlalchemy import create_engine, text
 
 # ── Configuration ────────────────────────────────────────────────────────────
-DB_HOST          = os.environ.get("DB_HOST", "prod-postgres-01.xxxx.us-east-1.rds.amazonaws.com")
-DB_PORT          = int(os.environ.get("DB_PORT", 5432))
+DB_HOST          = os.environ.get("DB_HOST", "prod-sqlserver-01.xxxx.us-east-1.rds.amazonaws.com")
+DB_PORT          = int(os.environ.get("DB_PORT", 1433))
 DB_NAME          = os.environ.get("DB_NAME", "production")
 DB_USER          = os.environ.get("DB_USER", "archive_user")
 DB_PASSWORD      = os.environ.get("DB_PASSWORD")   # From AWS Secrets Manager in prod
@@ -508,70 +440,87 @@ log = logging.getLogger(__name__)
 # ── Database helpers ─────────────────────────────────────────────────────────
 
 def get_connection():
-    return psycopg2.connect(
-        host=DB_HOST,
-        port=DB_PORT,
-        dbname=DB_NAME,
-        user=DB_USER,
-        password=DB_PASSWORD,
-        connect_timeout=30
+    conn_str = (
+        "DRIVER={ODBC Driver 18 for SQL Server};"
+        f"SERVER={DB_HOST},{DB_PORT};DATABASE={DB_NAME};"
+        f"UID={DB_USER};PWD={DB_PASSWORD};"
+        "Encrypt=yes;TrustServerCertificate=yes;"
+        "Connection Timeout=30;"
     )
+    return pyodbc.connect(conn_str, autocommit=False)
+
+
+def pf_name_for(conn, table_name: str) -&gt; str:
+    """Return the partition function name backing a partitioned table."""
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT pf.name
+        FROM sys.tables t
+        JOIN sys.indexes i ON i.object_id = t.object_id AND i.index_id IN (0, 1)
+        JOIN sys.partition_schemes ps ON ps.data_space_id = i.data_space_id
+        JOIN sys.partition_functions pf ON pf.function_id = ps.function_id
+        WHERE t.name = ?
+    """, table_name)
+    row = cur.fetchone()
+    cur.close()
+    if not row:
+        raise ValueError(f"Table {table_name} is not partitioned")
+    return row[0]
 
 
 def get_cold_partitions(conn, parent_table: str, threshold_months: int) -&gt; list[dict]:
     """
-    Return partitions whose data ends before the cold threshold date.
+    Return partitions whose boundary value is older than the cold threshold.
     Only returns partitions that have not been archived yet.
     """
     cutoff = datetime.utcnow() - timedelta(days=threshold_months * 30)
 
     query = """
         SELECT
-            child.relname                                      AS partition_name,
-            child.oid                                          AS partition_oid,
-            pg_size_pretty(pg_total_relation_size(child.oid)) AS human_size,
-            pg_total_relation_size(child.oid)                  AS bytes,
-            parent.relname                                     AS parent_table
-        FROM
-            pg_inherits
-            JOIN pg_class parent ON pg_inherits.inhparent = parent.oid
-            JOIN pg_class child  ON pg_inherits.inhrelid  = child.oid
-        WHERE
-            parent.relname = %s
-            AND child.relname NOT IN (
-                SELECT partition_name
-                FROM   archive_metadata
-                WHERE  original_table = %s
-                  AND  verified = true
-            )
-        ORDER BY
-            child.relname ASC;
+            p.partition_number,
+            CAST(rv.value AS DATETIME2) AS boundary_value,
+            SUM(a.total_pages) * 8.0 / 1024 / 1024 AS size_gb
+        FROM sys.tables t
+        JOIN sys.indexes i        ON i.object_id = t.object_id AND i.index_id IN (0, 1)
+        JOIN sys.partitions p     ON p.object_id = t.object_id AND p.index_id = i.index_id
+        JOIN sys.allocation_units a ON a.container_id = p.partition_id
+        JOIN sys.partition_schemes ps ON ps.data_space_id = i.data_space_id
+        JOIN sys.partition_functions pf ON pf.function_id = ps.function_id
+        LEFT JOIN sys.partition_range_values rv
+               ON rv.function_id = pf.function_id
+              AND rv.boundary_id = p.partition_number - 1
+        WHERE t.name = ?
+          AND p.partition_number &gt; 1
+          AND NOT EXISTS (
+                SELECT 1 FROM dbo.archive_metadata am
+                WHERE am.original_table = ?
+                  AND am.partition_name = CAST(p.partition_number AS VARCHAR(10))
+                  AND am.verified = 1
+          )
+        GROUP BY p.partition_number, rv.value
+        ORDER BY p.partition_number ASC;
     """
 
-    with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute(query, (parent_table, parent_table))
-        candidates = cur.fetchall()
+    cur = conn.cursor()
+    cur.execute(query, (parent_table, parent_table))
+    cols = [c[0] for c in cur.description]
+    candidates = [dict(zip(cols, row)) for row in cur.fetchall()]
+    cur.close()
 
-    # Filter by partition name convention: tablename_YYYY_QN or _YYYY_MM
-    cold = []
-    for part in candidates:
-        name = part["partition_name"]
-        # Parse year from partition name (last 4-digit sequence)
-        parts = name.split("_")
-        for segment in reversed(parts):
-            if segment.isdigit() and len(segment) == 4:
-                year = int(segment)
-                # Simple heuristic: if partition year is before cutoff year, it's cold
-                if year &lt; cutoff.year or (year == cutoff.year and cutoff.month &gt; 6):
-                    cold.append(dict(part))
-                break
-
+    # Filter by boundary value: partitions whose data ends before the cutoff
+    cold = [part for part in candidates
+            if part["boundary_value"] is not None
+            and part["boundary_value"] &lt; cutoff]
+    for part in cold:
+        part["partition_name"] = f"{parent_table}_p{part['partition_number']}"
+        part["bytes"] = int(part["size_gb"] * 1024 ** 3)
+        part["human_size"] = f"{part['size_gb']:.2f} GB"
     return cold
 
 
 def export_partition_to_s3(
     conn,
-    partition_name: str,
+    part: dict,
     parent_table: str,
     bucket: str,
     prefix: str,
@@ -580,20 +529,31 @@ def export_partition_to_s3(
     """
     Export partition to S3 as Parquet.
     Returns (s3_path, row_count, checksum).
+    part carries partition_number, partition_name, plus pf_name/ts_column
+    resolved by the caller from the tiering config.
     """
+    partition_name = part["partition_name"]
+    pf_name = part["pf_name"]
+    ts_column = part["ts_column"]
     s3 = boto3.client("s3", region_name=region)
 
-    log.info("Reading partition: %s", partition_name)
-    with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute(f"SELECT * FROM {partition_name}")
-        rows = cur.fetchall()
+    log.info("Reading partition: %s (partition %d)", partition_name, part["partition_number"])
+    cur = conn.cursor()
+    # $PARTITION restricts the read to the single partition being archived
+    cur.execute(
+        f"SELECT * FROM {parent_table} WHERE $PARTITION.{pf_name}({ts_column}) = ?",
+        part["partition_number"],
+    )
+    cols = [c[0] for c in cur.description]
+    rows = cur.fetchall()
+    cur.close()
 
     if not rows:
         log.warning("Partition %s is empty — skipping", partition_name)
         return None, 0, None
 
     row_count = len(rows)
-    df = pd.DataFrame(rows)
+    df = pd.DataFrame.from_records(rows, columns=cols)
 
     # Convert to Parquet in memory
     table = pa.Table.from_pandas(df, preserve_index=False)
@@ -667,47 +627,56 @@ def record_archival(conn, parent_table: str, partition_name: str,
     """
     Insert a record into the archive_metadata tracking table.
     """
-    with conn.cursor() as cur:
-        cur.execute("""
-            INSERT INTO archive_metadata (
-                original_table,
-                partition_name,
-                archive_path,
-                row_count,
-                checksum,
-                archived_at,
-                archived_by,
-                verified
-            ) VALUES (%s, %s, %s, %s, %s, NOW(), CURRENT_USER, %s)
-            ON CONFLICT (partition_name) DO UPDATE
-                SET archive_path = EXCLUDED.archive_path,
-                    row_count     = EXCLUDED.row_count,
-                    checksum      = EXCLUDED.checksum,
-                    archived_at   = EXCLUDED.archived_at,
-                    verified      = EXCLUDED.verified;
-        """, (parent_table, partition_name, s3_path, row_count, checksum, verified))
+    cur = conn.cursor()
+    cur.execute("""
+        MERGE dbo.archive_metadata AS target
+        USING (SELECT ? AS original_table, ? AS partition_name) AS src
+           ON target.partition_name = src.partition_name
+        WHEN MATCHED THEN
+            UPDATE SET archive_path = ?, row_count = ?, checksum = ?,
+                       archived_at = SYSDATETIME(), verified = ?
+        WHEN NOT MATCHED THEN
+            INSERT (original_table, partition_name, archive_path, row_count,
+                    checksum, archived_at, archived_by, verified)
+            VALUES (?, ?, ?, ?, ?, SYSDATETIME(), SUSER_SNAME(), ?);
+    """, (parent_table, partition_name,
+          s3_path, row_count, checksum, verified,
+          parent_table, partition_name, s3_path, row_count, checksum, verified))
+    cur.close()
     conn.commit()
 
 
-def detach_and_drop_partition(conn, parent_table: str, partition_name: str):
+def detach_and_drop_partition(conn, parent_table: str, part: dict, pf_name: str):
     """
-    Detach the partition from the parent table, then drop it.
-    Performed in a transaction with a short lock timeout to avoid blocking.
+    Switch the cold partition out to a staging table, drop the staging
+    table, then merge the partition boundary away.
     """
-    with conn.cursor() as cur:
-        # Set a short lock timeout so we fail fast rather than block production queries
-        cur.execute("SET lock_timeout = '5s'")
-        log.info("Detaching partition %s from %s", partition_name, parent_table)
+    partition_number = part["partition_number"]
+    staging = f"{parent_table}_archive_stage"
+
+    cur = conn.cursor()
+    try:
+        # Switch out is metadata-only: instant, no data movement
+        log.info("Switching partition %d out of %s", partition_number, parent_table)
         cur.execute(
-            f"ALTER TABLE {parent_table} DETACH PARTITION {partition_name}"
+            f"ALTER TABLE dbo.{parent_table} SWITCH PARTITION ? TO dbo.{staging}"
+            .replace("?", str(partition_number))
         )
         conn.commit()
 
-    # Drop outside the detach transaction so the detach is already committed
-    with conn.cursor() as cur:
-        log.info("Dropping partition %s", partition_name)
-        cur.execute(f"DROP TABLE {partition_name}")
+        log.info("Dropping staging table %s", staging)
+        cur.execute(f"DROP TABLE dbo.{staging}")
         conn.commit()
+
+        # Merge the boundary so the partition function no longer has the hole
+        boundary = part["boundary_value"]
+        log.info("Merging partition boundary %s", boundary)
+        cur.execute(
+            f"ALTER PARTITION FUNCTION {pf_name}() MERGE RANGE (?)", boundary
+        )
+        conn.commit()
+    finally:
+        cur.close()
 
 
 # ── Main pipeline ────────────────────────────────────────────────────────────
@@ -725,8 +694,11 @@ def run_tiering_pipeline():
 
         cold_partitions = get_cold_partitions(conn, parent_table, COLD_THRESHOLD_MONTHS)
         log.info("Found %d cold partitions for %s", len(cold_partitions), parent_table)
+        pf_name = pf_name_for(conn, parent_table)
 
         for part in cold_partitions:
+            part["pf_name"] = pf_name
+            part["ts_column"] = ts_column
             partition_name = part["partition_name"]
             bytes_size     = part["bytes"]
             human_size     = part["human_size"]
@@ -736,7 +708,7 @@ def run_tiering_pipeline():
             try:
                 # Export
                 s3_path, row_count, checksum = export_partition_to_s3(
-                    conn, partition_name, parent_table,
+                    conn, part, parent_table,
                     ARCHIVE_BUCKET, ARCHIVE_PREFIX, AWS_REGION
                 )
                 if s3_path is None:
@@ -759,8 +731,8 @@ def run_tiering_pipeline():
                 record_archival(conn, parent_table, partition_name,
                                 s3_path, row_count, checksum, verified=True)
 
-                # Drop from RDS
-                detach_and_drop_partition(conn, parent_table, partition_name)
+                # Switch out from RDS
+                detach_and_drop_partition(conn, parent_table, part, pf_name)
 
                 total_bytes_freed  += bytes_size
                 partitions_archived += 1
@@ -791,7 +763,7 @@ if __name__ == "__main__":
 
 <p class="text-gray-300 leading-relaxed">Archiving data to object storage only works operationally if your team can still query it when needed. The two most common access patterns for archived database data are ad-hoc queries (compliance audits, retroactive investigations) and batch analytics. Both are well served by serverless query engines that scan object storage directly.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Setting up AWS Glue Data Catalog for archived PostgreSQL exports:</strong></p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Setting up AWS Glue Data Catalog for archived SQL Server exports:</strong></p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/usr/bin/env python3
 """
@@ -1181,11 +1153,11 @@ if __name__ == "__main__":
 <p class="text-gray-300 leading-relaxed">Google Cloud SQL supports native export to GCS via the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">gcloud sql export csv</code> command and the Cloud SQL Admin API. The cleanest automation uses Cloud Scheduler → Pub/Sub → Cloud Functions.</p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/bin/bash
-# Export a cold table partition from Cloud SQL PostgreSQL to GCS
+# Export a cold table partition from Cloud SQL for SQL Server to GCS
 # Called from a Cloud Function triggered by Cloud Scheduler
 
 PROJECT_ID="your-gcp-project"
-INSTANCE_NAME="prod-postgres-01"
+INSTANCE_NAME="prod-sqlserver-01"
 DATABASE_NAME="production"
 BUCKET="gs://your-archive-bucket"
 YEAR=2022
@@ -1262,71 +1234,6 @@ if __name__ == "__main__":
 
 <p class="text-gray-300 leading-relaxed">Every byte moved to object storage must be tracked. Without a metadata catalog, archived data becomes inaccessible not because it cannot be queried, but because no one can find it. The metadata table introduced in Section 17.3 needs to evolve into a proper catalog that your application, compliance team, and operations staff can query.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Creating the archive metadata catalog in PostgreSQL:</strong></p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Full archive metadata catalog schema
--- Deploy on a management/control-plane database, not on the archived database itself
-
-CREATE TABLE archive_metadata (
-    id                BIGSERIAL PRIMARY KEY,
-    original_table    VARCHAR(255)  NOT NULL,
-    partition_name    VARCHAR(255)  NOT NULL UNIQUE,
-    archive_path      TEXT          NOT NULL,
-    storage_class     VARCHAR(50)   NOT NULL DEFAULT 'STANDARD',
-    row_count         BIGINT        NOT NULL,
-    uncompressed_bytes BIGINT,
-    compressed_bytes  BIGINT,
-    checksum          VARCHAR(64),           -- SHA-256 hex
-    date_range_start  TIMESTAMPTZ,
-    date_range_end    TIMESTAMPTZ,
-    schema_version    INTEGER       NOT NULL DEFAULT 1,
-    archived_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-    archived_by       VARCHAR(100),
-    verified          BOOLEAN       NOT NULL DEFAULT false,
-    verified_at       TIMESTAMPTZ,
-    retrieval_count   INTEGER       NOT NULL DEFAULT 0,
-    last_retrieved_at TIMESTAMPTZ,
-    retention_policy  VARCHAR(50)   NOT NULL DEFAULT '7_years',
-    delete_after      TIMESTAMPTZ,
-    notes             TEXT,
-    tags              JSONB         NOT NULL DEFAULT '{}'
-);
-
--- Indexes for common lookup patterns
-CREATE INDEX ON archive_metadata (original_table);
-CREATE INDEX ON archive_metadata (date_range_start, date_range_end);
-CREATE INDEX ON archive_metadata (archived_at);
-CREATE INDEX ON archive_metadata (verified);
-CREATE INDEX ON archive_metadata USING GIN (tags);
-
--- View: cost estimation based on storage class
-CREATE VIEW archive_cost_estimate AS
-SELECT
-    original_table,
-    storage_class,
-    COUNT(*)                                 AS partition_count,
-    SUM(row_count)                           AS total_rows,
-    pg_size_pretty(SUM(compressed_bytes))    AS total_compressed,
-    SUM(compressed_bytes) / 1024.0^3        AS total_gb,
-    CASE storage_class
-        WHEN 'STANDARD'      THEN SUM(compressed_bytes) / 1024.0^3 * 0.023
-        WHEN 'STANDARD_IA'   THEN SUM(compressed_bytes) / 1024.0^3 * 0.0125
-        WHEN 'GLACIER_IR'    THEN SUM(compressed_bytes) / 1024.0^3 * 0.004
-        WHEN 'DEEP_ARCHIVE'  THEN SUM(compressed_bytes) / 1024.0^3 * 0.00099
-        ELSE NULL
-    END                                      AS estimated_monthly_cost_usd
-FROM
-    archive_metadata
-WHERE
-    verified = true
-GROUP BY
-    original_table, storage_class
-ORDER BY
-    total_gb DESC;
-
-COMMENT ON VIEW archive_cost_estimate IS
-    'Estimated monthly S3 storage cost for verified archives. Update rates as pricing changes.';</code></pre>
-
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Equivalent SQL Server / Azure SQL catalog schema:</strong></p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Archive metadata catalog for SQL Server / Azure SQL environments
@@ -1390,44 +1297,6 @@ GO</code></pre>
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Tracking retrieval events — closing the feedback loop:</strong></p>
 
 <p class="text-gray-300 leading-relaxed">When someone queries the archive through Athena, Synapse, or BigQuery, that access should be logged back to the metadata catalog. This matters for two reasons: it proves the archive is reachable when compliance auditors ask, and it identifies data that is accessed frequently enough that re-hydration to a warmer storage tier would save money on per-retrieval fees.</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: stored procedure to log a retrieval event
-CREATE OR REPLACE PROCEDURE log_archive_retrieval(
-    p_partition_name VARCHAR(255),
-    p_query_engine   VARCHAR(50),    -- 'athena', 'bigquery', 'synapse', 'direct'
-    p_rows_scanned   BIGINT,
-    p_bytes_scanned  BIGINT,
-    p_cost_usd       NUMERIC(10,6)
-)
-LANGUAGE plpgsql
-AS $$
-BEGIN
-    UPDATE archive_metadata
-    SET
-        retrieval_count    = retrieval_count + 1,
-        last_retrieved_at  = NOW()
-    WHERE
-        partition_name = p_partition_name;
-
-    INSERT INTO archive_retrieval_log (
-        partition_name,
-        query_engine,
-        rows_scanned,
-        bytes_scanned,
-        cost_usd,
-        retrieved_at,
-        retrieved_by
-    ) VALUES (
-        p_partition_name,
-        p_query_engine,
-        p_rows_scanned,
-        p_bytes_scanned,
-        p_cost_usd,
-        NOW(),
-        CURRENT_USER
-    );
-END;
-$$;</code></pre>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server equivalent
 CREATE OR ALTER PROCEDURE dbo.log_archive_retrieval
@@ -1542,120 +1411,7 @@ ORDER BY
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">17.9 Retrieval and Re-Hydration Workflows</h3>
 
-<p class="text-gray-300 leading-relaxed">Most archived data is queried in place through serverless engines and never needs to come back to the live database. But occasionally—regulatory reviews, data corrections, application features that need to resurface old records—you need to re-hydrate data into the live PostgreSQL or SQL Server instance. Doing this well means reading from S3/GCS/ADLS and writing back in bulk without overwhelming the primary instance.</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Re-hydrating a Parquet archive back into PostgreSQL via COPY:</strong></p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/usr/bin/env python3
-"""
-rehydrate_partition.py
-
-Downloads a Parquet file from S3 and bulk-inserts it back into
-the live PostgreSQL database using COPY for maximum throughput.
-Used when a partition needs to be temporarily re-surfaced for
-a compliance review or data correction project.
-"""
-
-import io
-import os
-import logging
-import boto3
-import pyarrow.parquet as pq
-import psycopg2
-from psycopg2 import sql
-
-log = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
-
-DB_HOST     = os.environ.get("DB_HOST")
-DB_PORT     = int(os.environ.get("DB_PORT", 5432))
-DB_NAME     = os.environ.get("DB_NAME")
-DB_USER     = os.environ.get("DB_USER")
-DB_PASSWORD = os.environ.get("DB_PASSWORD")
-
-S3_REGION   = os.environ.get("AWS_REGION", "us-east-1")
-
-
-def rehydrate_from_s3(
-    s3_path: str,
-    target_table: str,
-    batch_size: int = 50_000
-):
-    """
-    Download Parquet from S3 and COPY into target_table.
-    target_table should be a staging table, not the live partitioned parent,
-    to allow review before swapping in.
-    """
-    s3 = boto3.client("s3", region_name=S3_REGION)
-
-    # Parse S3 path
-    path = s3_path[len("s3://"):]
-    bucket, _, key = path.partition("/")
-
-    log.info("Downloading %s", s3_path)
-    obj     = s3.get_object(Bucket=bucket, Key=key)
-    data    = obj["Body"].read()
-    buffer  = io.BytesIO(data)
-
-    table   = pq.read_table(buffer)
-    df      = table.to_pandas()
-    total   = len(df)
-    log.info("Read %d rows from archive", total)
-
-    conn = psycopg2.connect(
-        host=DB_HOST, port=DB_PORT, dbname=DB_NAME,
-        user=DB_USER, password=DB_PASSWORD
-    )
-    conn.autocommit = False
-
-    try:
-        with conn.cursor() as cur:
-            # Use a staging table to allow inspection before promotion
-            staging = f"{target_table}_rehydration_staging"
-            cur.execute(
-                sql.SQL("CREATE TABLE IF NOT EXISTS {} (LIKE {} INCLUDING ALL)")
-                .format(sql.Identifier(staging), sql.Identifier(target_table))
-            )
-            cur.execute(sql.SQL("TRUNCATE {}").format(sql.Identifier(staging)))
-            conn.commit()
-
-            # Stream data in batches via COPY
-            inserted = 0
-            for start in range(0, total, batch_size):
-                batch = df.iloc[start : start + batch_size]
-                buf   = io.StringIO()
-                batch.to_csv(buf, index=False, header=False)
-                buf.seek(0)
-
-                cur.copy_expert(
-                    sql.SQL("COPY {} FROM STDIN WITH (FORMAT CSV)")
-                    .format(sql.Identifier(staging)),
-                    buf
-                )
-                conn.commit()
-                inserted += len(batch)
-                log.info("Inserted %d / %d rows", inserted, total)
-
-        log.info("Re-hydration complete into staging table: %s", staging)
-        log.info("Review data, then run: ALTER TABLE %s RENAME TO %s_old; "
-                 "ALTER TABLE %s RENAME TO %s;",
-                 target_table, target_table, staging, target_table)
-
-    except Exception:
-        conn.rollback()
-        log.exception("Re-hydration failed — rolled back")
-        raise
-    finally:
-        conn.close()
-
-
-if __name__ == "__main__":
-    rehydrate_from_s3(
-        s3_path      = "s3://your-archive-bucket/database-archive/audit_events_partitioned/"
-                       "audit_events_2022_q1/audit_events_2022_q1_20240101T000000Z.parquet",
-        target_table = "audit_events_rehydrated",
-        batch_size   = 50_000
-    )</code></pre>
+<p class="text-gray-300 leading-relaxed">Most archived data is queried in place through serverless engines and never needs to come back to the live database. But occasionally—regulatory reviews, data corrections, application features that need to resurface old records—you need to re-hydrate data into the live SQL Server instance. Doing this well means reading from S3/GCS/ADLS and writing back in bulk without overwhelming the primary instance.</p>
 
 <p class="text-gray-300 leading-relaxed">For SQL Server re-hydration, the equivalent pattern uses <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">BULK INSERT</code> or the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">bcp</code> utility pointed at a blob URL, which Azure SQL supports natively via the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">BULK INSERT ... FROM 'https://...'</code> syntax available in Azure SQL Managed Instance and Azure Synapse dedicated pools.</p>
 
@@ -1676,56 +1432,6 @@ SELECT COUNT(*) FROM dbo.audit_events_rehydration_staging;</code></pre>
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">17.10 Calculating and Reporting Tiering ROI</h3>
 
 <p class="text-gray-300 leading-relaxed">FinOps is only as strong as its measurement layer. Every archival pipeline needs a reporting view that connects bytes moved to dollars saved, so that leadership can see the value and engineers can tune the thresholds.</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL view for tiering ROI report:</strong></p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- ROI reporting view
--- Compares estimated cost of data on RDS gp3 vs actual cost in archive
-
-CREATE VIEW tiering_roi_report AS
-WITH archive_costs AS (
-    SELECT
-        original_table,
-        COUNT(*)                                              AS partitions_archived,
-        SUM(row_count)                                        AS total_rows_archived,
-        SUM(compressed_bytes) / POWER(1024.0, 3)             AS archive_gb,
-        -- Cost in archive (S3 Glacier Instant as a representative tier)
-        SUM(compressed_bytes) / POWER(1024.0, 3) * 0.004     AS archive_monthly_cost_usd,
-        -- What it would cost on gp3
-        -- Assume 4:1 compression: compressed Parquet vs raw PostgreSQL pages
-        SUM(compressed_bytes) * 4.0 / POWER(1024.0, 3) * 0.092
-                                                              AS rds_gp3_equivalent_cost_usd,
-        MIN(date_range_start)                                 AS oldest_archived_date,
-        MAX(date_range_end)                                   AS newest_archived_date,
-        MIN(archived_at)                                      AS first_archived_at
-    FROM
-        archive_metadata
-    WHERE
-        verified = true
-    GROUP BY
-        original_table
-)
-SELECT
-    original_table,
-    partitions_archived,
-    total_rows_archived,
-    ROUND(archive_gb::NUMERIC, 2)                            AS archive_gb,
-    ROUND(archive_monthly_cost_usd::NUMERIC, 2)              AS archive_cost_per_month,
-    ROUND(rds_gp3_equivalent_cost_usd::NUMERIC, 2)           AS avoided_rds_cost_per_month,
-    ROUND((rds_gp3_equivalent_cost_usd
-           - archive_monthly_cost_usd)::NUMERIC, 2)          AS monthly_savings_usd,
-    ROUND((rds_gp3_equivalent_cost_usd
-           - archive_monthly_cost_usd) * 12.0, 2)            AS annualized_savings_usd,
-    ROUND(100.0 * (rds_gp3_equivalent_cost_usd
-           - archive_monthly_cost_usd)
-           / NULLIF(rds_gp3_equivalent_cost_usd, 0), 1)      AS savings_pct,
-    oldest_archived_date,
-    newest_archived_date,
-    first_archived_at
-FROM
-    archive_costs
-ORDER BY
-    monthly_savings_usd DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server equivalent:</strong></p>
 
@@ -1793,7 +1499,7 @@ GO</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Lock contention during partition detach</strong></p>
 
-<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALTER TABLE ... DETACH PARTITION</code> command in PostgreSQL acquires a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ShareUpdateExclusiveLock</code> in PostgreSQL 14+ (using the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CONCURRENTLY</code> option) but requires <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">AccessExclusiveLock</code> in earlier versions. Always set <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">lock_timeout</code> before running detach in production, as shown in the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">detach_and_drop_partition</code> function in Section 17.4. If the lock cannot be acquired within the timeout, the operation fails cleanly rather than blocking production queries for an unknown duration.</p>
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALTER TABLE ... SWITCH PARTITION</code> command in SQL Server is metadata-only and completes instantly, but it requires a schema-modification lock on the table. Run the switch during a low-traffic window as shown in the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">detach_and_drop_partition</code> function in Section 17.4, and always verify the export before dropping the staging table — once the staging table is dropped, the data exists only in S3.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Schema drift breaking external tables</strong></p>
 
@@ -1819,12 +1525,12 @@ GO</code></pre>
     <div class="mt-14 bg-amber-950/40 border border-amber-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
-        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+        <p class="text-xs text-gray-400">Query plan visualizer · Index advisor · Slow query dashboard · SQL Server</p>
       </div>
       <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
          class="shrink-0 px-6 py-3 bg-amber-600 hover:bg-amber-500 text-white font-semibold rounded-xl text-sm transition">Download Free</a>
     </div>
-    <div class="mt-8 text-xs"><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a></div>
+    <nav class="mt-8 flex flex-col sm:flex-row items-center justify-between gap-3 text-xs"><span><a href="b7-ch16-data-compression.html" class="text-gray-400 hover:text-amber-300 transition">← Compressing Data at Rest: Savings and Tradeoffs</a></span><span><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">All Chapters</a></span><span><a href="b7-ch18-query-cost-attribution.html" class="text-gray-400 hover:text-amber-300 transition">Query Cost Attribution: Which Queries Are Burning Money →</a></span></nav>
   </article>
   <footer class="border-t border-gray-800/50 px-6 py-8">
     <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · Database FinOps</div>
