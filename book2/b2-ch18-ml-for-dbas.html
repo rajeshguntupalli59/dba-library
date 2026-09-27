@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Chapter 18: Building ML Models for DBA Work — The AI-Powered DBA</title>
-  <meta name="description" content="The AI-Powered DBA Chapter 18: Building ML Models for DBA Work. AI and AIOps for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
+  <meta name="description" content="The AI-Powered DBA Chapter 18: Building ML Models for DBA Work. AI and AIOps for SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
   <script type="module">
     import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
@@ -50,7 +50,7 @@
 
 <p class="text-gray-300 leading-relaxed">There is a temptation to reach for a general-purpose LLM every time an operations problem feels complex. LLMs are genuinely powerful for query rewriting, documentation generation, and root cause reasoning — tasks covered elsewhere in this book. But for quantitative prediction problems specific to your environment, custom ML models built on your own telemetry consistently outperform generic AI approaches.</p>
 
-<p class="text-gray-300 leading-relaxed">The reason is domain specificity. A general model trained on public data knows nothing about the specific patterns of your OLTP cluster on Monday mornings, the quirks of your ETL pipeline that runs at 2 AM, or the relationship between your application's connection pool behavior and your PostgreSQL autovacuum contention. These are patterns that live entirely within your telemetry — and they are exactly the patterns a custom model learns.</p>
+<p class="text-gray-300 leading-relaxed">The reason is domain specificity. A general model trained on public data knows nothing about the specific patterns of your OLTP cluster on Monday mornings, the quirks of your ETL pipeline that runs at 2 AM, or the relationship between your application's connection pool behavior and lock escalation on your hottest tables. These are patterns that live entirely within your telemetry — and they are exactly the patterns a custom model learns.</p>
 
 <p class="text-gray-300 leading-relaxed">Consider the three problem categories where custom ML models provide the highest operational return for DBAs:</p>
 
@@ -99,35 +99,44 @@ CREATE TABLE dba_ml.dm_metric_snapshots (
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import pandas as pd
 import numpy as np
-import psycopg2
-from sqlalchemy import create_engine, text
+import pyodbc
 from datetime import datetime, timedelta
+
+CONN_STR = (
+    "DRIVER={ODBC Driver 18 for SQL Server};"
+    "SERVER=prod-sql01;DATABASE=DBA;UID=ml_svc;PWD=${ML_SVC_PASSWORD};"
+    "Encrypt=yes;TrustServerCertificate=yes;"
+)
 
 class DBATelemetryFeatureEngineer:
     """
-    Transforms raw database metric snapshots into ML-ready feature vectors.
+    Transforms raw SQL Server metric snapshots into ML-ready feature vectors.
     Designed to run every 5 minutes, appending to a feature store table.
     """
 
-    def __init__(self, pg_conn_string: str, lookback_minutes: int = 60):
-        self.engine = create_engine(pg_conn_string)
+    def __init__(self, conn_str: str = CONN_STR, lookback_minutes: int = 60):
+        self.conn_str = conn_str
         self.lookback_minutes = lookback_minutes
 
-    def load_recent_snapshots(self, datname: str) -&gt; pd.DataFrame:
+    def load_recent_snapshots(self, database_name: str) -&gt; pd.DataFrame:
         cutoff = datetime.utcnow() - timedelta(minutes=self.lookback_minutes)
         query = """
-            SELECT captured_at, numbackends, xact_commit, xact_rollback,
-                   blks_hit, blks_read, tup_inserted, tup_updated, tup_deleted,
-                   deadlocks, temp_files, temp_bytes,
-                   cache_hit_ratio, rollback_ratio
-            FROM dba_ml.pg_metric_snapshots
-            WHERE datname = %(datname)s
-              AND captured_at &gt;= %(cutoff)s
+            SELECT captured_at, batch_requests_per_sec, sql_compilations_per_sec,
+                   page_reads_per_sec, page_writes_per_sec, buffer_cache_hit_ratio,
+                   lock_waits_ms, log_write_waits_ms, network_io_waits_ms,
+                   memory_grant_queue_waits, avg_worker_time_ms, avg_logical_reads,
+                   total_slow_queries
+            FROM dba_ml.dm_metric_snapshots
+            WHERE database_name = ?
+              AND captured_at &gt;= ?
             ORDER BY captured_at
         """
-        return pd.read_sql(query, self.engine,
-                           params={"datname": datname, "cutoff": cutoff},
-                           parse_dates=["captured_at"])
+        conn = pyodbc.connect(self.conn_str)
+        df = pd.read_sql(query, conn,
+                         params=[database_name, cutoff],
+                         parse_dates=["captured_at"])
+        conn.close()
+        return df
 
     def compute_features(self, df: pd.DataFrame) -&gt; pd.DataFrame:
         """
@@ -136,17 +145,19 @@ class DBATelemetryFeatureEngineer:
         df = df.sort_values("captured_at").copy()
 
         # Delta features — rate of change between consecutive snapshots
-        for col in ["xact_commit", "xact_rollback", "blks_read", "tup_updated"]:
+        for col in ["batch_requests_per_sec", "page_reads_per_sec",
+                    "lock_waits_ms", "log_write_waits_ms"]:
             df[f"{col}_delta"] = df[col].diff().fillna(0)
 
         # Rolling statistics — mean and std over the last N observations
         window = 12  # 12 x 5-minute intervals = 1 hour
-        for col in ["numbackends", "cache_hit_ratio", "rollback_ratio", "temp_files"]:
+        for col in ["batch_requests_per_sec", "buffer_cache_hit_ratio",
+                    "avg_worker_time_ms", "total_slow_queries"]:
             df[f"{col}_rolling_mean"] = df[col].rolling(window, min_periods=3).mean()
             df[f"{col}_rolling_std"]  = df[col].rolling(window, min_periods=3).std()
 
         # Z-score deviation: how many std deviations from rolling mean
-        for col in ["numbackends", "cache_hit_ratio"]:
+        for col in ["batch_requests_per_sec", "buffer_cache_hit_ratio"]:
             mean_col = f"{col}_rolling_mean"
             std_col  = f"{col}_rolling_std"
             df[f"{col}_zscore"] = np.where(
@@ -156,12 +167,13 @@ class DBATelemetryFeatureEngineer:
             )
 
         # Cross-metric interaction features
-        df["write_amplification"] = np.where(
-            df["blks_read_delta"] &gt; 0,
-            df["tup_updated_delta"] / (df["blks_read_delta"] + 1),
+        df["lock_pressure"] = np.where(
+            df["batch_requests_per_sec_delta"] &gt; 0,
+            df["lock_waits_ms_delta"] / (df["batch_requests_per_sec_delta"] + 1),
             0.0
         )
-        df["temp_pressure"] = df["temp_bytes"] / (1024**3)  # GB of temp usage
+        df["io_pressure"] = df["page_reads_per_sec"] / (
+            df["buffer_cache_hit_ratio"].clip(lower=1) / 100.0)
 
         # Time-of-day cyclical encoding (captures daily patterns)
         df["hour_sin"] = np.sin(2 * np.pi * df["captured_at"].dt.hour / 24)
@@ -169,18 +181,22 @@ class DBATelemetryFeatureEngineer:
         df["dow_sin"]  = np.sin(2 * np.pi * df["captured_at"].dt.dayofweek / 7)
         df["dow_cos"]  = np.cos(2 * np.pi * df["captured_at"].dt.dayofweek / 7)
 
-        return df.dropna(subset=["numbackends_rolling_mean"])
+        return df.dropna(subset=["batch_requests_per_sec_rolling_mean"])
 
-    def write_to_feature_store(self, features_df: pd.DataFrame, datname: str):
-        features_df["datname"] = datname
-        features_df.to_sql(
-            "pg_feature_store",
-            self.engine,
-            schema="dba_ml",
-            if_exists="append",
-            index=False,
-            method="multi"
-        )</code></pre>
+    def write_to_feature_store(self, features_df: pd.DataFrame, database_name: str):
+        features_df["database_name"] = database_name
+        conn = pyodbc.connect(self.conn_str)
+        cur = conn.cursor()
+        cols = list(features_df.columns)
+        placeholders = ", ".join(["?"] * len(cols))
+        for row in features_df.itertuples(index=False):
+            cur.execute(
+                f"INSERT INTO dba_ml.dm_feature_store ({', '.join(cols)}) "
+                f"VALUES ({placeholders})",
+                tuple(row)
+            )
+        conn.commit()
+        conn.close()</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The cyclical time encoding deserves emphasis: wrapping hour-of-day as sine and cosine components ensures that the model understands that hour 23 and hour 0 are adjacent, not opposite ends of the scale. This alone can meaningfully improve anomaly detection accuracy for workloads with strong daily patterns.</p>
 
@@ -436,7 +452,7 @@ async def score_anomaly(snapshot: MetricSnapshot):
         action = "Immediate investigation recommended: check wait events and active queries"
     elif score &lt; threshold * 1.2:
         confidence = "MEDIUM"
-        action = "Monitor closely: review pg_stat_activity for blocking or long-running queries"
+        action = "Monitor closely: review sys.dm_exec_requests for blocking or long-running queries"
     else:
         confidence = "LOW"
         action = None
@@ -545,7 +561,7 @@ groups:
           summary: "ML anomaly detected on {{ $labels.database }}"
           description: &gt;
             The anomaly detection model has flagged {{ $labels.database }}
-            with a score of {{ $value | humanize }}. Review pg_stat_activity
+            with a score of {{ $value | humanize }}. Review sys.dm_exec_requests
             and recent wait event distribution before escalating.
 
       - alert: DatabaseAnomalyHighConfidence
@@ -561,78 +577,17 @@ groups:
           description: &gt;
             Score {{ $value | humanize }} is well below the anomaly threshold.
             Immediate investigation warranted. Check for lock storms,
-            replication lag, or runaway autovacuum.</code></pre>
+            AG replication lag, or transaction log growth.</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">for: 2m</code> clause on the warning-level alert prevents single-snapshot spikes from generating noise. The critical alert fires after just one minute because a high-confidence score that persists even briefly is genuinely urgent.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL-Side Query Admission Control</strong></p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server Query Admission Control with Resource Governor</strong></p>
 
-<p class="text-gray-300 leading-relaxed">For query classification models — where you have trained a model to predict whether an incoming query will be fast, slow, or catastrophically slow — the natural integration point is a connection pooler like PgBouncer or a custom middleware layer that intercepts queries before they reach the database.</p>
-
-<p class="text-gray-300 leading-relaxed">A simpler approach that works without middleware is a PostgreSQL function that your application can call before executing a high-risk query:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: advisory-based query admission control function
-CREATE OR REPLACE FUNCTION dba_ml.check_query_admission(
-    p_query_fingerprint TEXT,
-    p_estimated_rows    BIGINT,
-    p_table_names       TEXT[]
-)
-RETURNS TABLE (
-    allowed         BOOLEAN,
-    risk_tier       TEXT,
-    recommendation  TEXT
-)
-LANGUAGE plpgsql
-AS $$
-DECLARE
-    v_score          NUMERIC;
-    v_active_slow    INTEGER;
-    v_db_load        NUMERIC;
-BEGIN
-    -- Check current database load from real-time metrics
-    SELECT COUNT(*) INTO v_active_slow
-    FROM pg_stat_activity
-    WHERE state = 'active'
-      AND query_start &lt; NOW() - INTERVAL '30 seconds'
-      AND query NOT ILIKE '%pg_stat_activity%';
-
-    SELECT COALESCE(AVG(EXTRACT(EPOCH FROM (NOW() - query_start))), 0)
-    INTO v_db_load
-    FROM pg_stat_activity
-    WHERE state = 'active';
-
-    -- Simple heuristic risk scoring until ML model is integrated
-    -- (replace v_score with HTTP call to scoring service in production)
-    v_score := 0.0;
-
-    IF p_estimated_rows &gt; 10000000 THEN v_score := v_score + 0.4; END IF;
-    IF v_active_slow &gt; 5           THEN v_score := v_score + 0.3; END IF;
-    IF v_db_load &gt; 60              THEN v_score := v_score + 0.2; END IF;
-    IF p_table_names && ARRAY['orders','transactions','events']
-                                   THEN v_score := v_score + 0.1; END IF;
-
-    RETURN QUERY
-    SELECT
-        v_score &lt; 0.7 AS allowed,
-        CASE
-            WHEN v_score &lt; 0.3 THEN 'LOW'
-            WHEN v_score &lt; 0.7 THEN 'MEDIUM'
-            ELSE 'HIGH'
-        END AS risk_tier,
-        CASE
-            WHEN v_score &gt;= 0.7 THEN
-                'Query deferred: ' || v_active_slow ||
-                ' slow queries active. Retry in 60s or add LIMIT clause.'
-            WHEN v_score &gt;= 0.3 THEN
-                'Query allowed with caution: monitor for lock contention.'
-            ELSE NULL
-        END AS recommendation;
-END;
-$$;</code></pre>
+<p class="text-gray-300 leading-relaxed">For query classification models — where you have trained a model to predict whether an incoming query will be fast, slow, or catastrophically slow — the natural integration point on SQL Server is Resource Governor: a classifier function routes sessions into workload groups based on the model's risk tier, and the engine enforces CPU and memory limits without any application changes.</p>
 
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server equivalent using Resource Governor integration
--- Create a classifier function that routes queries by ML risk tier
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Create a classifier function that routes queries by ML risk tier
 CREATE OR ALTER FUNCTION dba_ml.fn_workload_classifier()
 RETURNS SYSNAME
 WITH SCHEMABINDING
@@ -837,11 +792,17 @@ def run_psi_check(engine, datname: str, training_end_date: str) -&gt; dict:
 
 <p class="text-gray-300 leading-relaxed">The prediction log and drift detection machinery are only as useful as the incident data that flows back into them. Building a lightweight feedback loop — connecting your alerting system to the prediction log — closes the cycle and makes the model progressively more useful over time.</p>
 
-<p class="text-gray-300 leading-relaxed">The simplest implementation uses a webhook from your alerting system (PagerDuty, OpsGenie, or Alertmanager) to write confirmed incidents back to PostgreSQL:</p>
+<p class="text-gray-300 leading-relaxed">The simplest implementation uses a webhook from your alerting system (PagerDuty, OpsGenie, or Alertmanager) to write confirmed incidents back to SQL Server:</p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>from fastapi import FastAPI, Request
-import psycopg2
-from datetime import datetime
+import pyodbc
+from datetime import datetime, timedelta
+
+CONN_STR = (
+    "DRIVER={ODBC Driver 18 for SQL Server};"
+    "SERVER=prod-sql01;DATABASE=DBA;UID=ml_svc;PWD=${ML_SVC_PASSWORD};"
+    "Encrypt=yes;TrustServerCertificate=yes;"
+)
 
 @app.post("/feedback/incident")
 async def record_incident(request: Request):
@@ -850,25 +811,26 @@ async def record_incident(request: Request):
     Links the incident to the closest preceding anomaly prediction.
     """
     body = await request.json()
-    datname       = body.get("database")
+    database_name = body.get("database")
     incident_time = datetime.fromisoformat(body.get("incident_time"))
     confirmed     = body.get("confirmed", True)
 
-    with psycopg2.connect(os.environ["PG_CONN_STRING"]) as conn:
-        with conn.cursor() as cur:
-            # Find the closest anomaly prediction within ±30 minutes
-            cur.execute("""
-                UPDATE dba_ml.prediction_log
-                SET was_confirmed_incident = %s,
-                    feedback_received_at   = NOW()
-                WHERE datname = %s
-                  AND scored_at BETWEEN %s - INTERVAL '30 minutes'
-                                    AND %s + INTERVAL '30 minutes'
-                  AND is_anomaly = TRUE
-                  AND was_confirmed_incident IS NULL
-            """, (confirmed, datname, incident_time, incident_time))
-            rows_updated = cur.rowcount
-        conn.commit()
+    conn = pyodbc.connect(CONN_STR)
+    cur = conn.cursor()
+    # Find the closest anomaly prediction within ±30 minutes
+    cur.execute("""
+        UPDATE dba_ml.prediction_log
+        SET was_confirmed_incident = ?,
+            feedback_received_at   = SYSUTCDATETIME()
+        WHERE database_name = ?
+          AND scored_at BETWEEN DATEADD(MINUTE, -30, ?)
+                            AND DATEADD(MINUTE, 30, ?)
+          AND is_anomaly = 1
+          AND was_confirmed_incident IS NULL
+    """, confirmed, database_name, incident_time, incident_time)
+    rows_updated = cur.rowcount
+    conn.commit()
+    conn.close()
 
     return {"status": "recorded", "predictions_linked": rows_updated}</code></pre>
 
@@ -882,63 +844,10 @@ async def record_incident(request: Request):
 
 <p class="text-gray-300 leading-relaxed">Lock storms are ideal for ML because they have precursor signatures detectable 2–5 minutes before the cascade becomes visible to application users. Human operators typically react after the storm is already underway. A model trained to recognize those precursors can alert — or even automatically terminate the blocking query — before users are affected.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL: Collecting lock precursor features</strong></p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server: Collecting lock precursor features</strong></p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Capture lock chain depth and blocking session characteristics
--- Run every 15 seconds into a dedicated table
-CREATE TABLE dba_ml.lock_precursor_snapshots (
-    snapshot_id         BIGSERIAL PRIMARY KEY,
-    captured_at         TIMESTAMPTZ DEFAULT NOW(),
-    max_lock_chain_depth INTEGER,
-    blocking_sessions    INTEGER,
-    blocked_sessions     INTEGER,
-    oldest_lock_age_sec  NUMERIC,
-    avg_wait_age_sec     NUMERIC,
-    top_blocker_query_hash BIGINT,
-    top_blocker_duration_sec NUMERIC
-);
+<p class="text-gray-300 leading-relaxed">Capture lock chain depth and blocking session characteristics every 15 seconds into a dedicated table, using <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_requests</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_sessions</code>:</p>
 
--- Stored procedure to populate it
-CREATE OR REPLACE PROCEDURE dba_ml.capture_lock_snapshot()
-LANGUAGE plpgsql AS $$
-BEGIN
-    INSERT INTO dba_ml.lock_precursor_snapshots (
-        max_lock_chain_depth,
-        blocking_sessions,
-        blocked_sessions,
-        oldest_lock_age_sec,
-        avg_wait_age_sec,
-        top_blocker_query_hash,
-        top_blocker_duration_sec
-    )
-    WITH lock_tree AS (
-        SELECT
-            pid,
-            pg_blocking_pids(pid) AS blocked_by,
-            EXTRACT(EPOCH FROM (NOW() - query_start)) AS query_age_sec,
-            query_id
-        FROM pg_stat_activity
-        WHERE cardinality(pg_blocking_pids(pid)) &gt; 0
-    ),
-    blocking_sessions AS (
-        SELECT
-            pid,
-            EXTRACT(EPOCH FROM (NOW() - query_start)) AS query_age_sec,
-            query_id
-        FROM pg_stat_activity
-        WHERE pid IN (SELECT UNNEST(blocked_by) FROM lock_tree)
-    )
-    SELECT
-        (SELECT MAX(cardinality(blocked_by)) FROM lock_tree)          AS max_lock_chain_depth,
-        (SELECT COUNT(*) FROM blocking_sessions)                       AS blocking_sessions,
-        (SELECT COUNT(*) FROM lock_tree)                               AS blocked_sessions,
-        (SELECT MAX(query_age_sec) FROM blocking_sessions)             AS oldest_lock_age_sec,
-        (SELECT AVG(query_age_sec) FROM lock_tree)                     AS avg_wait_age_sec,
-        (SELECT query_id FROM blocking_sessions
-         ORDER BY query_age_sec DESC LIMIT 1)                          AS top_blocker_query_hash,
-        (SELECT MAX(query_age_sec) FROM blocking_sessions)             AS top_blocker_duration_sec;
-END;
-$$;</code></pre>
 
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server lock precursor data collection
@@ -1035,7 +944,7 @@ def train_lock_storm_predictor(df: pd.DataFrame,
 
 <p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">TimeSeriesSplit</code> usage is non-negotiable for this type of model. Using standard random cross-validation on time-series data leaks future information into training folds and produces optimistic accuracy estimates that will not hold up in production. Always validate temporal models with temporal splits.</p>
 
-<p class="text-gray-300 leading-relaxed">Once trained, the lock storm predictor integrates into the scoring service alongside the anomaly detector, and its output can drive an automated response: capturing <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_activity</code> for forensics, sending a targeted Slack alert with the top blocker's query text, or — if your operations team agrees — automatically terminating the blocking session via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_terminate_backend()</code>.</p>
+<p class="text-gray-300 leading-relaxed">Once trained, the lock storm predictor integrates into the scoring service alongside the anomaly detector, and its output can drive an automated response: capturing <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_requests</code> for forensics, sending a targeted Slack alert with the top blocker's query text, or — if your operations team agrees — automatically terminating the blocking session via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">KILL</code>.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
@@ -1054,7 +963,7 @@ def train_lock_storm_predictor(df: pd.DataFrame,
     <div class="mt-14 bg-violet-950/40 border border-violet-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
-        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · SQL Server</p>
       </div>
       <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
          class="shrink-0 px-6 py-3 bg-violet-600 hover:bg-violet-500 text-white font-semibold rounded-xl text-sm transition">

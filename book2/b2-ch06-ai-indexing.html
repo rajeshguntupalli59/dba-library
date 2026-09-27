@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Chapter 6: AI-Driven Indexing and Schema Optimization — The AI-Powered DBA</title>
-  <meta name="description" content="The AI-Powered DBA Chapter 6: AI-Driven Indexing and Schema Optimization. AI and AIOps for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
+  <meta name="description" content="The AI-Powered DBA Chapter 6: AI-Driven Indexing and Schema Optimization. AI and AIOps for SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
   <script type="module">
     import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
@@ -42,7 +42,7 @@
     <div class="space-y-4 text-sm">
 <h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 6: AI-Driven Indexing and Schema Optimization</h2>
 
-<p class="text-gray-300 leading-relaxed">Index management is one of the most labor-intensive responsibilities a DBA carries, and it is also one of the areas where human intuition fails most quietly. An index that made sense three years ago may now consume write overhead without benefiting any active query. A missing index on a frequently joined column may never trigger an alert, yet it costs your application hundreds of milliseconds on every request. Traditional index advisory tools — the Database Engine Tuning Advisor, pg_stat_user_indexes, and their relatives — surface candidates but lack the contextual reasoning to weigh trade-offs across competing workloads, schema evolution history, and business access patterns simultaneously. This chapter examines how AI and machine learning change that equation: from using language models to analyze and explain index coverage, to training workload classifiers that recommend schema changes with measurable confidence, to building fully automated pipelines that propose, validate, and deploy index changes with human oversight built in.</p>
+<p class="text-gray-300 leading-relaxed">Index management is one of the most labor-intensive responsibilities a DBA carries, and it is also one of the areas where human intuition fails most quietly. An index that made sense three years ago may now consume write overhead without benefiting any active query. A missing index on a frequently joined column may never trigger an alert, yet it costs your application hundreds of milliseconds on every request. Traditional index advisory tools — the Database Engine Tuning Advisor, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_db_missing_index_details</code>, and Query Store's regression reports — surface candidates but lack the contextual reasoning to weigh trade-offs across competing workloads, schema evolution history, and business access patterns simultaneously. This chapter examines how AI and machine learning change that equation: from using language models to analyze and explain index coverage, to training workload classifiers that recommend schema changes with measurable confidence, to building fully automated pipelines that propose, validate, and deploy index changes with human oversight built in.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
@@ -107,58 +107,61 @@ ORDER BY
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Workload clustering with Python:</strong></p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import psycopg2
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import pyodbc
 import pandas as pd
 import numpy as np
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 from openai import OpenAI
 
-# ── Step 1: Pull query workload from pg_stat_statements ──────────────────────
-conn = psycopg2.connect(
-    host="prod-pg-01",
-    dbname="appdb",
-    user="dba_monitor",
-    password="**redacted**"
+# ── Step 1: Pull query workload from Query Store ───────────────────────────
+conn = pyodbc.connect(
+    "DRIVER={ODBC Driver 18 for SQL Server};"
+    "SERVER=prod-sql-01;DATABASE=appdb;"
+    "UID=dba_monitor;PWD=${DBA_MONITOR_PASSWORD};"
+    "Encrypt=yes;TrustServerCertificate=yes;"
 )
 
 query = """
-    SELECT
-        queryid,
-        query,
-        calls,
-        total_exec_time,
-        mean_exec_time,
-        stddev_exec_time,
-        rows,
-        shared_blks_hit,
-        shared_blks_read,
-        shared_blks_dirtied,
-        temp_blks_read,
-        temp_blks_written
-    FROM pg_stat_statements
-    WHERE calls &gt; 100
-      AND query NOT ILIKE '%pg_stat%'
-    ORDER BY total_exec_time DESC
-    LIMIT 500;
+    SELECT TOP (500)
+        qsq.query_id,
+        qt.query_sql_text                                  AS query,
+        SUM(rs.count_executions)                           AS calls,
+        SUM(rs.avg_duration * rs.count_executions)
+            / NULLIF(SUM(rs.count_executions), 0) / 1000.0 AS total_exec_ms,
+        AVG(rs.avg_duration) / 1000.0                      AS mean_exec_ms,
+        AVG(rs.stdev_duration) / 1000.0                    AS stddev_exec_ms,
+        SUM(rs.avg_rowcount * rs.count_executions)
+            / NULLIF(SUM(rs.count_executions), 0)           AS rows,
+        SUM(rs.avg_logical_io_reads * rs.count_executions) AS logical_reads,
+        SUM(rs.avg_tempdb_space_used
+            * rs.count_executions)                         AS tempdb_kb
+    FROM sys.query_store_query qsq
+    JOIN sys.query_store_query_text qt
+        ON qt.query_text_id = qsq.query_text_id
+    JOIN sys.query_store_plan qp
+        ON qp.query_id = qsq.query_id
+    JOIN sys.query_store_runtime_stats rs
+        ON rs.plan_id = qp.plan_id
+    WHERE rs.last_execution_time &gt; DATEADD(DAY, -30, GETUTCDATE())
+      AND qt.query_sql_text NOT LIKE '%sys.query_store%'
+    GROUP BY qsq.query_id, qt.query_sql_text
+    HAVING SUM(rs.count_executions) &gt; 100
+    ORDER BY total_exec_ms DESC;
 """
 
 df = pd.read_sql(query, conn)
 conn.close()
 
 # ── Step 2: Feature engineering for workload clustering ──────────────────────
-df["cache_hit_ratio"] = df["shared_blks_hit"] / (
-    df["shared_blks_hit"] + df["shared_blks_read"].replace(0, np.nan)
-)
-df["io_intensity"] = (
-    df["shared_blks_read"] + df["temp_blks_read"]
-) / df["calls"]
+df["io_intensity"] = df["logical_reads"] / df["calls"]
+df["tempdb_intensity"] = df["tempdb_kb"] / df["calls"]
 df["mean_rows_per_call"] = df["rows"] / df["calls"]
-df["time_variance"] = df["stddev_exec_time"] / df["mean_exec_time"].replace(0, np.nan)
+df["time_variance"] = df["stddev_exec_ms"] / df["mean_exec_ms"].replace(0, np.nan)
 
 features = [
-    "mean_exec_time", "cache_hit_ratio",
-    "io_intensity", "mean_rows_per_call", "time_variance"
+    "mean_exec_ms", "io_intensity",
+    "tempdb_intensity", "mean_rows_per_call", "time_variance"
 ]
 
 X = df[features].fillna(0)
@@ -169,12 +172,12 @@ X_scaled = scaler.fit_transform(X)
 kmeans = KMeans(n_clusters=6, random_state=42, n_init=10)
 df["workload_cluster"] = kmeans.fit_predict(X_scaled)
 
-# Identify the high-impact cluster: high execution time, low cache hit ratio
+# Identify the high-impact cluster: high execution time, high IO
 cluster_summary = df.groupby("workload_cluster").agg(
-    avg_exec_ms=("mean_exec_time", "mean"),
-    avg_cache_hit=("cache_hit_ratio", "mean"),
+    avg_exec_ms=("mean_exec_ms", "mean"),
     avg_io=("io_intensity", "mean"),
-    query_count=("queryid", "count")
+    avg_tempdb=("tempdb_intensity", "mean"),
+    query_count=("query_id", "count")
 ).sort_values("avg_exec_ms", ascending=False)
 
 print(cluster_summary)
@@ -192,26 +195,26 @@ client = OpenAI()
 # (In production, parse table names from queries programmatically)
 schema_context = """
 TABLE: orders (order_id BIGINT PK, customer_id INT, status VARCHAR(20),
-               created_at TIMESTAMPTZ, total_amount NUMERIC(12,2),
+               created_at DATETIME2, total_amount DECIMAL(12,2),
                fulfillment_region VARCHAR(10))
 
 EXISTING INDEXES:
-  - orders_pkey (order_id) -- primary key
-  - idx_orders_customer_id (customer_id) -- btree
-  - idx_orders_created_at (created_at) -- btree
+  - PK_orders (order_id) -- clustered primary key
+  - IX_orders_customer_id (customer_id) -- nonclustered
+  - IX_orders_created_at (created_at) -- nonclustered
 
 TABLE STATS:
   - Row count: 142 million
   - Daily inserts: ~850,000
   - Update rate: ~120,000/day (mostly status column)
-  - Bloat estimate: 18%
+  - Avg fragmentation on nonclustered indexes: 18%
 """
 
 slow_queries_text = "\n\n".join(
     f"Query {i+1}:\n{q}" for i, q in enumerate(candidate_queries)
 )
 
-prompt = f"""You are a senior PostgreSQL DBA specializing in index optimization.
+prompt = f"""You are a senior SQL Server DBA specializing in index optimization.
 
 SCHEMA AND INDEX CONTEXT:
 {schema_context}
@@ -229,13 +232,13 @@ For each recommendation:
 5. Recommend whether any existing index should be dropped
 
 Do not recommend indexes that duplicate existing coverage. 
-Be specific about include columns and partial index conditions where appropriate.
+Be specific about include columns and filtered index predicates where appropriate.
 """
 
 response = client.chat.completions.create(
     model="gpt-4o",
     messages=[
-        {"role": "system", "content": "You are an expert PostgreSQL DBA. Provide precise, production-safe index recommendations."},
+        {"role": "system", "content": "You are an expert SQL Server DBA. Provide precise, production-safe index recommendations."},
         {"role": "user", "content": prompt}
     ],
     temperature=0.2  # Low temperature for deterministic technical advice
@@ -327,7 +330,7 @@ def run_schema_audit(schema_data: dict, table_stats: dict) -&gt; dict:
     schema_json = json.dumps(schema_data, indent=2, default=str)
     stats_json  = json.dumps(table_stats,  indent=2, default=str)
 
-    prompt = f"""You are auditing a PostgreSQL production schema for optimization opportunities.
+    prompt = f"""You are auditing a SQL Server production schema for optimization opportunities.
 
 SCHEMA DEFINITION (column metadata, cardinality, FK coverage):
 {schema_json}
@@ -377,7 +380,7 @@ with this exact structure:
 }}
 
 For schema_issues, cover: data type mismatches, missing FK constraints, 
-oversized VARCHAR, low-cardinality columns better served by partial indexes,
+oversized VARCHAR, low-cardinality columns better served by filtered indexes,
 and timestamp columns with suboptimal types.
 
 Return ONLY valid JSON. No prose outside the JSON structure.
@@ -420,14 +423,14 @@ safe_index_drops = [
 
 <p class="text-gray-300 leading-relaxed">Moving from ad hoc AI analysis to a scheduled, production-grade advisor requires thinking through the full pipeline: data collection, analysis, validation, human review, and deployment. Each stage has failure modes that need explicit handling.</p>
 
-<p class="text-gray-300 leading-relaxed">The reference architecture for a PostgreSQL index advisor runs as a weekly scheduled job (not continuous — index changes have consequences, and weekly cadence is fast enough to respond to workload drift while slow enough to observe the effect of previous changes before making new ones).</p>
+<p class="text-gray-300 leading-relaxed">The reference architecture for a SQL Server index advisor runs as a weekly scheduled job (not continuous — index changes have consequences, and weekly cadence is fast enough to respond to workload drift while slow enough to observe the effect of previous changes before making new ones).</p>
 
 <div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
-    A["Workload Data<br/>pg_stat_statements / pg_stat_user_indexes / pg_stat_user_tables"] --> B["ML Classifier<br/>XGBoost/sklearn candidate scoring"]
+    A["Workload Data<br/>Query Store / missing-index DMVs / sys.indexes"] --> B["ML Classifier<br/>XGBoost/sklearn candidate scoring"]
     B --> C["LLM Reasoner<br/>GPT-4o/Claude: recommendation + justification"]
-    C --> D["Validation Gate<br/>syntax check, duplicate check, EXPLAIN preview, build-time estimate"]
+    C --> D["Validation Gate<br/>syntax check, duplicate check, SHOWPLAN_XML preview, build-time estimate"]
     D --> E["Human Review<br/>Slack/JIRA approval"]
-    E -->|approved| F["Deployment<br/>CREATE INDEX CONCURRENTLY"]
+    E -->|approved| F["Deployment<br/>CREATE INDEX ... WITH (ONLINE = ON)"]
     F --> G["Before/after measurement<br/>feeds back into ML classifier"]
     G -.-> B</pre></div>
 
@@ -437,10 +440,10 @@ safe_index_drops = [
 
 <p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Syntax validation</strong>: Parse the generated DDL against the target database engine before showing it to anyone.</p>
 <p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Duplicate detection</strong>: Check whether the recommended index already exists or is subsumed by an existing index.</p>
-<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">EXPLAIN preview</strong>: Run EXPLAIN (not EXPLAIN ANALYZE) against the queries the index is meant to accelerate, verifying the planner would actually use it.</p>
-<p class="text-gray-300 leading-relaxed">4. <strong class="text-white">Concurrent build feasibility</strong>: Estimate whether the table size and replication lag make <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE INDEX CONCURRENTLY</code> safe in the current window.</p>
+<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">SHOWPLAN preview</strong>: Run <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SET SHOWPLAN_XML ON</code> (estimated plan, nothing executes) against the queries the index is meant to accelerate, verifying the optimizer would actually choose it.</p>
+<p class="text-gray-300 leading-relaxed">4. <strong class="text-white">Online build feasibility</strong>: Estimate whether the table size and Always On replica lag make an online <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE INDEX ... WITH (ONLINE = ON)</code> safe in the current window.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import psycopg2
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import pyodbc
 import re
 from dataclasses import dataclass
 from typing import Optional
@@ -449,7 +452,7 @@ from typing import Optional
 class IndexValidationResult:
     is_valid: bool
     duplicate_of: Optional[str]
-    explain_uses_index: bool
+    showplan_uses_index: bool
     estimated_build_minutes: float
     warnings: list[str]
     approved_ddl: Optional[str]
@@ -465,84 +468,74 @@ def validate_index_recommendation(
     Does not execute the DDL — only validates it is safe to propose.
     """
     warnings = []
-    conn = psycopg2.connect(conn_str)
-    conn.autocommit = True
+    conn = pyodbc.connect(conn_str, autocommit=True)
     cur = conn.cursor()
 
-    # ── 1. Syntax check via EXPLAIN on a null statement ──────────────────────
-    # PostgreSQL will parse the DDL when used inside a DO block in a
-    # transaction we immediately roll back.
+    # ── 1. Syntax check via SET NOEXEC ───────────────────────────────────────
+    # SET NOEXEC ON parses the DDL without executing it. It must run in its
+    # own batch, then be switched OFF before any subsequent statement.
     is_valid = True
     try:
-        cur.execute("BEGIN;")
-        cur.execute(proposed_ddl.replace(
-            "CREATE INDEX CONCURRENTLY",
-            "CREATE INDEX"            # CONCURRENTLY not allowed in txn
-        ))
-        cur.execute("ROLLBACK;")
-    except psycopg2.errors.SyntaxError as e:
+        cur.execute("SET NOEXEC ON")
+        cur.execute(proposed_ddl)
+        cur.execute("SET NOEXEC OFF")
+    except pyodbc.Error as e:
         warnings.append(f"DDL syntax error: {e}")
         is_valid = False
-        cur.execute("ROLLBACK;")
+        try:
+            cur.execute("SET NOEXEC OFF")
+        except pyodbc.Error:
+            pass
         conn.close()
         return IndexValidationResult(
             is_valid=False,
             duplicate_of=None,
-            explain_uses_index=False,
+            showplan_uses_index=False,
             estimated_build_minutes=0.0,
             warnings=warnings,
             approved_ddl=None
         )
-    except Exception:
-        cur.execute("ROLLBACK;")
 
     # ── 2. Duplicate / subsumption check ─────────────────────────────────────
-    # Extract table name and column list from the proposed DDL
+    # Extract table name and key column list from the proposed DDL.
+    # NOTE: in a raw string, \s and \( are single-backslash escapes —
+    # r'ON\\s' would match a literal backslash followed by 's'.
     table_match = re.search(
-        r'ON\s+[\w.]+\s*\((.*?)\)',
+        r'ON\s+([\w.]+)\s*\((.*?)\)',
         proposed_ddl,
         re.IGNORECASE | re.DOTALL
     )
     proposed_cols = []
+    table_name = None
     if table_match:
+        table_name = table_match.group(1)
         proposed_cols = [
             c.strip().split()[0].lower()
-            for c in table_match.group(1).split(",")
+            for c in table_match.group(2).split(",")
         ]
-
-    table_name_match = re.search(
-        r'ON\s+([\w.]+)\s*\(',
-        proposed_ddl,
-        re.IGNORECASE
-    )
-    table_name = table_name_match.group(1) if table_name_match else None
 
     duplicate_of = None
     if table_name and proposed_cols:
         cur.execute("""
             SELECT
-                i.relname        AS index_name,
-                array_agg(a.attname ORDER BY ix.indkey_subscript)
-                                 AS columns
-            FROM
-                pg_index ix
-                JOIN pg_class i  ON i.oid = ix.indexrelid
-                JOIN pg_class t  ON t.oid = ix.indrelid
-                JOIN LATERAL unnest(ix.indkey)
-                    WITH ORDINALITY AS u(attnum, indkey_subscript)
-                    ON TRUE
-                JOIN pg_attribute a
-                    ON a.attrelid = ix.indrelid
-                    AND a.attnum = u.attnum
-            WHERE
-                t.relname = %s
-            GROUP BY
-                i.relname
-        """, (table_name.split(".")[-1],))
-
+                i.name AS index_name,
+                STRING_AGG(c.name, ',')
+                    WITHIN GROUP (ORDER BY ic.key_ordinal) AS columns
+            FROM sys.indexes i
+            JOIN sys.index_columns ic
+                ON ic.object_id = i.object_id
+               AND ic.index_id = i.index_id
+               AND ic.is_included_column = 0
+            JOIN sys.columns c
+                ON c.object_id = ic.object_id
+               AND c.column_id = ic.column_id
+            WHERE i.object_id = OBJECT_ID(?)
+              AND i.type_desc &lt;&gt; 'HEAP'
+            GROUP BY i.name
+        """, table_name)
         for row in cur.fetchall():
-            existing_cols = [c.lower() for c in row[1]]
-            # Subsumption: proposed cols are a prefix of existing index
+            existing_cols = [c.lower() for c in row[1].split(",")]
+            # Subsumption: proposed cols are a prefix of an existing index
             if existing_cols[:len(proposed_cols)] == proposed_cols:
                 duplicate_of = row[0]
                 warnings.append(
@@ -551,49 +544,59 @@ def validate_index_recommendation(
                 )
                 break
 
-    # ── 3. EXPLAIN preview — does the planner use it? ────────────────────────
-    explain_uses_index = False
+    # ── 3. SHOWPLAN_XML preview — would the optimizer use it? ───────────────
+    # Session-setting note: SET SHOWPLAN_XML ON must be executed as its own
+    # batch — it cannot be combined with the query in the same batch — and
+    # it stays in effect for the session until SET SHOWPLAN_XML OFF is run.
+    # The estimated plan returns as a single-row XML result set; nothing
+    # executes while the setting is ON.
+    showplan_uses_index = False
     if is_valid and not duplicate_of and test_queries:
-        # Apply the index in a transaction, run EXPLAIN, then roll back
         try:
-            cur.execute("BEGIN;")
-            cur.execute(proposed_ddl.replace(
-                "CREATE INDEX CONCURRENTLY",
-                "CREATE INDEX"
-            ))
+            cur.execute(proposed_ddl.replace("WITH (ONLINE = ON)", ""))
             for q in test_queries[:3]:   # test up to 3 representative queries
                 clean_q = q.strip().rstrip(";")
-                cur.execute(f"EXPLAIN (FORMAT JSON) {clean_q}")
-                plan = cur.fetchone()[0]
-                plan_text = str(plan)
-                if "Index" in plan_text:
-                    explain_uses_index = True
+                cur.execute("SET SHOWPLAN_XML ON")
+                cur.execute(clean_q)
+                plan_xml = cur.fetchone()[0]
+                cur.execute("SET SHOWPLAN_XML OFF")
+                if "IndexSeek" in plan_xml or "IndexScan" in plan_xml:
+                    showplan_uses_index = True
                     break
-            cur.execute("ROLLBACK;")
+            # Roll back the staging index — validation only
+            idx_name = re.search(
+                r'CREATE\s+(?:UNIQUE\s+)?INDEX\s+(\w+)',
+                proposed_ddl, re.IGNORECASE
+            )
+            if idx_name and table_name:
+                cur.execute(f"DROP INDEX {idx_name.group(1)} ON {table_name}")
         except Exception as e:
-            warnings.append(f"EXPLAIN preview failed: {e}")
-            cur.execute("ROLLBACK;")
+            warnings.append(f"SHOWPLAN preview failed: {e}")
+            try:
+                cur.execute("SET SHOWPLAN_XML OFF")
+            except pyodbc.Error:
+                pass
 
-    # ── 4. Estimate build time from table size ────────────────────────────────
+    # ── 4. Estimate build time from table size ───────────────────────────────
     estimated_build_minutes = 0.0
     if table_name:
         cur.execute("""
-            SELECT
-                pg_total_relation_size(c.oid) AS total_bytes,
-                c.reltuples
-            FROM pg_class c
-            JOIN pg_namespace n ON n.oid = c.relnamespace
-            WHERE c.relname = %s
-        """, (table_name.split(".")[-1],))
+            SELECT SUM(a.total_pages) * 8.0 / 1024 AS size_mb
+            FROM sys.allocation_units a
+            JOIN sys.partitions p
+                ON p.partition_id = a.container_id
+            JOIN sys.objects o
+                ON o.object_id = p.object_id
+            WHERE o.object_id = OBJECT_ID(?)
+        """, table_name)
         row = cur.fetchone()
-        if row:
-            total_bytes = row[0] or 0
+        if row and row[0]:
             # Conservative estimate: ~1 GB per 5 minutes on typical hardware
-            estimated_build_minutes = (total_bytes / (1024 ** 3)) * 5.0
+            estimated_build_minutes = (row[0] / 1024) * 5.0
             if estimated_build_minutes &gt; 30:
                 warnings.append(
                     f"Index build may take ~{estimated_build_minutes:.0f} min. "
-                    f"Schedule during low-traffic window."
+                    f"Schedule during a low-traffic window with ONLINE = ON."
                 )
 
     conn.close()
@@ -601,13 +604,13 @@ def validate_index_recommendation(
     return IndexValidationResult(
         is_valid=is_valid and duplicate_of is None,
         duplicate_of=duplicate_of,
-        explain_uses_index=explain_uses_index,
+        showplan_uses_index=showplan_uses_index,
         estimated_build_minutes=estimated_build_minutes,
         warnings=warnings,
         approved_ddl=proposed_ddl if (is_valid and not duplicate_of) else None
     )</code></pre>
 
-<p class="text-gray-300 leading-relaxed">An equivalent validation layer for SQL Server uses a different mechanism — <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SET NOEXEC ON</code> for syntax checking, and the Query Store for planner previews — but the conceptual stages are identical:</p>
+<p class="text-gray-300 leading-relaxed">The same four stages — syntax check, duplicate detection, planner preview, and build-time estimation — translate directly into T-SQL for teams that prefer to run the gate inside the database. <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SET NOEXEC ON</code> parses without executing, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.indexes</code> plus <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.index_columns</code> expose existing key structures for subsumption checks, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SET SHOWPLAN_XML ON</code> previews the optimizer's plan choice without running the query:</p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: syntax-only parse without execution
 SET NOEXEC ON;
@@ -684,7 +687,7 @@ def post_recommendation_for_review(
     approval_token = str(uuid.uuid4())[:8].upper()
 
     # Persist the pending recommendation to a review queue
-    # (Redis, Postgres table, or S3 object — implementation omitted)
+    # (Redis, SQL Server table, or S3 object — implementation omitted)
     persist_pending_review(approval_token, recommendation, asdict(validation))
 
     warning_text = (
@@ -694,9 +697,9 @@ def post_recommendation_for_review(
     )
 
     planner_signal = (
-        "✅ EXPLAIN confirms planner would use this index"
-        if validation.explain_uses_index
-        else "⚠️ EXPLAIN did not confirm planner usage — review queries"
+        "✅ SHOWPLAN_XML confirms the optimizer would use this index"
+        if validation.showplan_uses_index
+        else "⚠️ SHOWPLAN_XML did not confirm optimizer usage — review queries"
     )
 
     message = {
@@ -775,31 +778,33 @@ def post_recommendation_for_review(
     )
     response.raise_for_status()</code></pre>
 
-<p class="text-gray-300 leading-relaxed">When the DBA clicks Approve, the downstream handler executes <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE INDEX CONCURRENTLY</code> during the next maintenance window, monitors replication lag throughout the build, and posts a completion summary back to Slack. The entire audit trail — recommendation, validation results, who approved, when deployed, and a before/after plan comparison for the target queries — persists in a dedicated <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">index_changes</code> table.</p>
+<p class="text-gray-300 leading-relaxed">When the DBA clicks Approve, the downstream handler executes <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE INDEX ... WITH (ONLINE = ON)</code> during the next maintenance window, monitors Always On replica lag throughout the build, and posts a completion summary back to Slack. The entire audit trail — recommendation, validation results, who approved, when deployed, and a before/after plan comparison for the target queries — persists in a dedicated <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">index_changes</code> table.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Audit table for index change tracking (PostgreSQL)
-CREATE TABLE IF NOT EXISTS dba_ops.index_changes (
-    change_id          BIGSERIAL PRIMARY KEY,
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Audit table for index change tracking (SQL Server)
+CREATE TABLE dbo.index_changes (
+    change_id          BIGINT IDENTITY(1,1) PRIMARY KEY,
     approval_token     CHAR(8)         NOT NULL,
-    target_table       TEXT            NOT NULL,
-    index_name         TEXT            NOT NULL,
-    ddl_executed       TEXT            NOT NULL,
-    change_type        TEXT            NOT NULL
+    target_table       SYSNAME         NOT NULL,
+    index_name         SYSNAME         NOT NULL,
+    ddl_executed       NVARCHAR(MAX)   NOT NULL,
+    change_type        VARCHAR(16)     NOT NULL
                        CHECK (change_type IN ('create', 'drop', 'rebuild')),
-    recommended_by     TEXT            NOT NULL DEFAULT 'ai_advisor',
-    approved_by        TEXT,
-    approved_at        TIMESTAMPTZ,
-    deployed_at        TIMESTAMPTZ,
-    build_duration_sec INT,
-    pre_deploy_plan    JSONB,
-    post_deploy_plan   JSONB,
-    reverted           BOOLEAN         NOT NULL DEFAULT FALSE,
-    revert_reason      TEXT,
-    notes              TEXT
+    recommended_by     NVARCHAR(128)   NOT NULL DEFAULT 'ai_advisor',
+    approved_by        NVARCHAR(128)   NULL,
+    approved_at        DATETIME2       NULL,
+    deployed_at        DATETIME2       NULL,
+    build_duration_sec INT             NULL,
+    pre_deploy_plan    NVARCHAR(MAX)   NULL,   -- SHOWPLAN_XML snapshot
+    post_deploy_plan   NVARCHAR(MAX)   NULL,   -- SHOWPLAN_XML snapshot
+    reverted           BIT             NOT NULL DEFAULT 0,
+    revert_reason      NVARCHAR(MAX)   NULL,
+    notes              NVARCHAR(MAX)   NULL
 );
 
-CREATE INDEX ON dba_ops.index_changes (target_table, deployed_at DESC);
-CREATE INDEX ON dba_ops.index_changes (approved_by, deployed_at DESC);</code></pre>
+CREATE INDEX IX_index_changes_table_deployed
+    ON dbo.index_changes (target_table, deployed_at DESC);
+CREATE INDEX IX_index_changes_approver_deployed
+    ON dbo.index_changes (approved_by, deployed_at DESC);</code></pre>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
@@ -807,100 +812,8 @@ CREATE INDEX ON dba_ops.index_changes (approved_by, deployed_at DESC);</code></p
 
 <p class="text-gray-300 leading-relaxed">Deploying an index without measuring its effect is the same mistake as deploying any other database change without observability. The AI advisor closes its loop by comparing query performance before and after each deployment.</p>
 
-<p class="text-gray-300 leading-relaxed">PostgreSQL's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> resets when the service restarts and aggregates across all calls, which makes precise before/after comparison difficult without snapshots. A lightweight snapshot strategy solves this:</p>
+<p class="text-gray-300 leading-relaxed">Query Store makes before/after measurement straightforward because it retains historical execution plans and runtime statistics tied to specific plan IDs. Snapshot the target queries' Query Store rows before deployment, deploy the index, then compare the same queries afterward. For programmatic pipelines, a lightweight pyodbc snapshot helper can capture <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">avg_duration</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">avg_logical_io_reads</code>, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">count_executions</code> per query ID into a history table — the same delta math as any metrics pipeline, just sourced from Query Store instead of plan-cache counters that reset on service restart.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import psycopg2
-import json
-from datetime import datetime, UTC
-
-
-def snapshot_query_stats(conn_str: str, query_ids: list[int]) -&gt; dict:
-    """
-    Capture a point-in-time snapshot of pg_stat_statements
-    for a specific set of query IDs (taken before index deployment).
-    """
-    conn = psycopg2.connect(conn_str)
-    cur = conn.cursor()
-
-    placeholders = ",".join(["%s"] * len(query_ids))
-    cur.execute(f"""
-        SELECT
-            queryid,
-            query,
-            calls,
-            total_exec_time,
-            mean_exec_time,
-            stddev_exec_time,
-            rows,
-            shared_blks_hit,
-            shared_blks_read
-        FROM pg_stat_statements
-        WHERE queryid IN ({placeholders})
-    """, query_ids)
-
-    snapshot = {
-        "captured_at": datetime.now(UTC).isoformat(),
-        "stats": {
-            str(row[0]): {
-                "query":           row[1],
-                "calls":           row[2],
-                "total_exec_time": row[3],
-                "mean_exec_time":  row[4],
-                "stddev_exec_time":row[5],
-                "rows":            row[6],
-                "blks_hit":        row[7],
-                "blks_read":       row[8],
-            }
-            for row in cur.fetchall()
-        }
-    }
-
-    conn.close()
-    return snapshot
-
-
-def compare_snapshots(before: dict, after: dict) -&gt; dict:
-    """
-    Compare pre- and post-deployment query stats.
-    Returns improvement metrics for the audit record.
-    """
-    results = {}
-    for qid, before_stats in before["stats"].items():
-        if qid not in after["stats"]:
-            continue
-        after_stats = after["stats"][qid]
-
-        # Delta calls to normalize incremental totals
-        delta_calls = after_stats["calls"] - before_stats["calls"]
-        if delta_calls &lt;= 0:
-            continue
-
-        before_mean = before_stats["mean_exec_time"]
-        after_mean  = after_stats["mean_exec_time"]
-
-        before_hit_ratio = (
-            before_stats["blks_hit"] /
-            max(before_stats["blks_hit"] + before_stats["blks_read"], 1)
-        )
-        after_hit_ratio = (
-            after_stats["blks_hit"] /
-            max(after_stats["blks_hit"] + after_stats["blks_read"], 1)
-        )
-
-        results[qid] = {
-            "mean_exec_ms_before":   round(before_mean, 2),
-            "mean_exec_ms_after":    round(after_mean, 2),
-            "improvement_pct":       round(
-                (before_mean - after_mean) / max(before_mean, 0.001) * 100, 1
-            ),
-            "cache_hit_before":      round(before_hit_ratio, 4),
-            "cache_hit_after":       round(after_hit_ratio, 4),
-            "delta_calls_observed":  delta_calls
-        }
-
-    return results</code></pre>
-
-<p class="text-gray-300 leading-relaxed">For SQL Server, the Query Store provides a cleaner before/after story because it retains historical execution plans and runtime statistics tied to specific plan IDs:</p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: compare query performance before and after index deployment
 -- using Query Store plan history
@@ -971,11 +884,11 @@ ORDER BY
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">Handling Partial Indexes and Covering Indexes with AI Reasoning</h3>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Handling Filtered Indexes and Covering Indexes with AI Reasoning</h3>
 
-<p class="text-gray-300 leading-relaxed">Partial indexes and covering indexes are the two index types where AI assistance provides the most leverage, because their optimal design requires understanding query semantics rather than just column statistics.</p>
+<p class="text-gray-300 leading-relaxed">Filtered indexes and covering indexes are the two index types where AI assistance provides the most leverage, because their optimal design requires understanding query semantics rather than just column statistics.</p>
 
-<p class="text-gray-300 leading-relaxed">A partial index on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">status = 'pending'</code> is useful only if the optimizer's selectivity estimate for that predicate is high enough — which depends on how many rows actually carry that status value, how that fraction changes over time as rows move through a workflow, and whether the queries that filter on status also filter on other columns that should be part of the index. Getting all of this right requires reasoning across multiple artifacts simultaneously.</p>
+<p class="text-gray-300 leading-relaxed">A filtered index on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">status = 'pending'</code> is useful only if the optimizer's selectivity estimate for that predicate is high enough — which depends on how many rows actually carry that status value, how that fraction changes over time as rows move through a workflow, and whether the queries that filter on status also filter on other columns that should be part of the index. Getting all of this right requires reasoning across multiple artifacts simultaneously.</p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>def generate_partial_index_analysis(
     conn_str: str,
@@ -985,15 +898,15 @@ ORDER BY
 ) -&gt; str:
     """
     Collect column value distribution and sample queries,
-    then ask the LLM whether a partial index makes sense and what
+    then ask the LLM whether a filtered index makes sense and what
     the WHERE clause should be.
     """
-    conn = psycopg2.connect(conn_str)
+    conn = pyodbc.connect(conn_str)
     cur = conn.cursor()
 
     # Value distribution
     cur.execute(f"""
-        SELECT
+        SELECT TOP (20)
             {column_name}        AS value,
             COUNT(*)             AS row_count,
             ROUND(
@@ -1001,19 +914,28 @@ ORDER BY
             )                    AS pct
         FROM {table_name}
         GROUP BY {column_name}
-        ORDER BY row_count DESC
-        LIMIT 20;
+        ORDER BY row_count DESC;
     """)
     distribution = cur.fetchall()
 
-    # Recent queries touching this column from pg_stat_statements
-    cur.execute(f"""
-        SELECT query, calls, mean_exec_time
-        FROM pg_stat_statements
-        WHERE query ILIKE %s
-          AND calls &gt; 50
-        ORDER BY mean_exec_time DESC
-        LIMIT 15;
+    # Recent queries touching this column, from Query Store
+    cur.execute("""
+        SELECT TOP (15)
+            qt.query_sql_text,
+            SUM(rs.count_executions)          AS calls,
+            AVG(rs.avg_duration) / 1000.0     AS mean_exec_ms
+        FROM sys.query_store_query qsq
+        JOIN sys.query_store_query_text qt
+            ON qt.query_text_id = qsq.query_text_id
+        JOIN sys.query_store_plan qp
+            ON qp.query_id = qsq.query_id
+        JOIN sys.query_store_runtime_stats rs
+            ON rs.plan_id = qp.plan_id
+        WHERE qt.query_sql_text LIKE ?
+          AND rs.last_execution_time &gt; DATEADD(DAY, -30, GETUTCDATE())
+        GROUP BY qt.query_sql_text
+        HAVING SUM(rs.count_executions) &gt; 50
+        ORDER BY mean_exec_ms DESC;
     """, (f"%{table_name}%{column_name}%",))
     queries = cur.fetchall()
     conn.close()
@@ -1027,7 +949,7 @@ ORDER BY
         for row in queries
     )
 
-    prompt = f"""Analyze whether a partial index on {table_name}.{column_name}
+    prompt = f"""Analyze whether a filtered index on {table_name}.{column_name}
 would be beneficial.
 
 VALUE DISTRIBUTION:
@@ -1037,11 +959,11 @@ QUERIES FILTERING ON THIS COLUMN:
 {query_text}
 
 Evaluate:
-1. Which values (if any) warrant a partial index and why
-2. Whether a partial index or a composite index is more appropriate
+1. Which values (if any) warrant a filtered index and why
+2. Whether a filtered index or a composite index is more appropriate
 3. The exact CREATE INDEX statement including INCLUDE columns if needed
 4. Whether any existing queries would NOT benefit (and why)
-5. The risk that the distribution shifts over time, making the partial 
+5. The risk that the distribution shifts over time, making the filtered
    index less effective
 
 Be specific about the WHERE clause predicate.
@@ -1050,14 +972,14 @@ Be specific about the WHERE clause predicate.
     response = client.chat.completions.create(
         model="gpt-4o",
         messages=[
-            {"role": "system", "content": "You are an expert PostgreSQL performance engineer."},
+            {"role": "system", "content": "You are an expert SQL Server performance engineer."},
             {"role": "user", "content": prompt}
         ],
         temperature=0.2
     )
     return response.choices[0].message.content</code></pre>
 
-<p class="text-gray-300 leading-relaxed">The distribution analysis prevents one of the most common partial index mistakes: creating a partial index on a value that represents the vast majority of rows, which produces an index the optimizer rationally ignores because a sequential scan is cheaper.</p>
+<p class="text-gray-300 leading-relaxed">The distribution analysis prevents one of the most common filtered index mistakes: creating a filtered index on a value that represents the vast majority of rows, which produces an index the optimizer rationally ignores because a table scan is cheaper.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
@@ -1065,13 +987,13 @@ Be specific about the WHERE clause predicate.
 
 <p class="text-gray-300 leading-relaxed">AI-assisted index advisors fail in predictable ways. Understanding the failure modes is as important as understanding the capabilities.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Recency bias in workload data.</strong> If <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> data is collected during a post-incident period when traffic patterns are abnormal, the advisor will recommend indexes optimized for that anomalous workload rather than the normal one. Mitigate by collecting workload snapshots over rolling 30-day windows and weighting recent data no more than 1.5× relative to older data.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Recency bias in workload data.</strong> If Query Store data is collected during a post-incident period when traffic patterns are abnormal, the advisor will recommend indexes optimized for that anomalous workload rather than the normal one. Mitigate by collecting workload snapshots over rolling 30-day windows and weighting recent data no more than 1.5× relative to older data.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Ignoring replica and reporting workloads.</strong> OLTP primaries may look clean from the advisor's perspective while a read replica running analytical queries is suffering from entirely different missing indexes. Replicas need their own <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> collection and their own advisory runs, with the understanding that DDL changes flow from primary to replica automatically.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Ignoring replica and reporting workloads.</strong> OLTP primaries may look clean from the advisor's perspective while a read-scale replica running analytical queries is suffering from entirely different missing indexes. Replicas need their own Query Store collection and their own advisory runs, with the understanding that DDL changes flow from primary to replica automatically.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Optimizer statistics staleness.</strong> An LLM reasoning over column cardinality estimates that are three months stale will produce recommendations calibrated to a schema state that no longer exists. Always run <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ANALYZE</code> on candidate tables before feeding statistics to the advisor pipeline.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Optimizer statistics staleness.</strong> An LLM reasoning over column cardinality estimates that are three months stale will produce recommendations calibrated to a schema state that no longer exists. Always run <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">UPDATE STATISTICS</code> on candidate tables before feeding statistics to the advisor pipeline.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Hallucinated index syntax.</strong> Language models occasionally produce syntactically invalid index definitions — a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">USING BRIN</code> hint on a column with random UUID values, a partial index WHERE clause referencing a column not in the table, or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">INCLUDE</code> columns that duplicate key columns. The validation gate catches these, but they serve as a reminder that LLM output is a draft, not a finished artifact.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Hallucinated index syntax.</strong> Language models occasionally produce syntactically invalid index definitions — a filtered index WHERE clause referencing a column not in the table, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">INCLUDE</code> columns that duplicate key columns, or sort directions that conflict with the query's ORDER BY. The validation gate catches these, but they serve as a reminder that LLM output is a draft, not a finished artifact.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Write amplification underestimation.</strong> Models trained on read-heavy academic datasets tend to underestimate the write cost of indexes on tables with high update rates. When the model rates a recommendation as "low write overhead" but the table receives hundreds of thousands of updates per hour, apply a manual review step that recalculates the write amplification from first principles using the actual update statistics.</p>
 
@@ -1083,14 +1005,14 @@ Be specific about the WHERE clause predicate.
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **AI index advisors operate best as a two-stage pipeline**: a statistical workload clustering stage that scores candidates quantitatively, followed by an LLM reasoning stage that evaluates trade-offs in natural language and produces human-readable justifications with exact DDL.</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Structured output from language models is not optional in production**: requesting JSON with a defined schema converts LLM recommendations into pipeline-ready artifacts that feed validation, ticketing, and deployment automation without brittle string parsing.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The validation gate is the most important component of any automated advisor**: syntax verification, duplicate/subsumption detection, EXPLAIN preview, and build-time estimation must all pass before a recommendation reaches a human reviewer, eliminating the majority of low-quality suggestions automatically.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Partial and covering indexes benefit most from AI-assisted analysis** because their optimal design requires simultaneous reasoning over value distributions, query semantics, and write patterns — exactly the kind of multi-artifact reasoning that statistical tools handle poorly and language models handle well.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The validation gate is the most important component of any automated advisor**: syntax verification, duplicate/subsumption detection, SHOWPLAN_XML preview, and build-time estimation must all pass before a recommendation reaches a human reviewer, eliminating the majority of low-quality suggestions automatically.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Filtered and covering indexes benefit most from AI-assisted analysis** because their optimal design requires simultaneous reasoning over value distributions, query semantics, and write patterns — exactly the kind of multi-artifact reasoning that statistical tools handle poorly and language models handle well.</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Feedback loops close the optimization cycle**: capturing before/after performance metrics for every deployed recommendation and feeding outcomes back into the ML classifier progressively improves candidate quality, turning the advisor into a system that learns from its own production history rather than reasoning from static heuristics alone.</li>
     </div>
     <div class="mt-14 bg-violet-950/40 border border-violet-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
-        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · SQL Server</p>
       </div>
       <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
          class="shrink-0 px-6 py-3 bg-violet-600 hover:bg-violet-500 text-white font-semibold rounded-xl text-sm transition">

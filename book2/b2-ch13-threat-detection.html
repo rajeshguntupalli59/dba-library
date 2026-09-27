@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Chapter 13: AI-Powered Threat Detection — The AI-Powered DBA</title>
-  <meta name="description" content="The AI-Powered DBA Chapter 13: AI-Powered Threat Detection. AI and AIOps for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
+  <meta name="description" content="The AI-Powered DBA Chapter 13: AI-Powered Threat Detection. AI and AIOps for SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
   <script type="module">
     import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
@@ -44,7 +44,7 @@
 
 <p class="text-gray-300 leading-relaxed">Database security has always been a reactive discipline — you patch vulnerabilities after they're disclosed, you audit logs after a breach is reported, and you lock down access after someone abuses it. The threat landscape has outpaced that model entirely. Modern attackers move laterally across systems within minutes, exfiltrate data through legitimate query channels, and blend malicious behavior into normal workload patterns where signature-based detection tools never look. AI changes the equation by shifting threat detection from pattern-matching against known bad behavior to learning what "normal" looks like and flagging meaningful deviations from it — often before a human analyst would notice anything wrong.</p>
 
-<p class="text-gray-300 leading-relaxed">This chapter covers how to build AI-powered threat detection systems for PostgreSQL and SQL Server environments. You'll learn how behavioral baselines are constructed from audit log data, how anomaly detection models identify suspicious query patterns and access behaviors, how large language models can classify and explain threats in plain language for both DBAs and security teams, and how to wire these components together into a production-grade detection pipeline with real alert routing and response hooks.</p>
+<p class="text-gray-300 leading-relaxed">This chapter covers how to build AI-powered threat detection systems for SQL Server environments. You'll learn how behavioral baselines are constructed from audit log data, how anomaly detection models identify suspicious query patterns and access behaviors, how large language models can classify and explain threats in plain language for both DBAs and security teams, and how to wire these components together into a production-grade detection pipeline with real alert routing and response hooks.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
@@ -130,36 +130,36 @@ ORDER BY execution_count DESC;</code></pre>
 import numpy as np
 from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import IsolationForest
-import psycopg2
+import pyodbc
 from datetime import datetime, timedelta
 
 def extract_behavioral_features(conn_string: str, lookback_days: int = 30) -&gt; pd.DataFrame:
     """
-    Extract and engineer behavioral features from PostgreSQL audit logs
+    Extract and engineer behavioral features from SQL Server audit logs
     stored in a structured audit table.
     """
     query = """
         SELECT
             username,
-            DATE_TRUNC('hour', event_time)          AS hour_bucket,
-            COUNT(*)                                 AS query_count,
-            COUNT(DISTINCT object_name)              AS distinct_objects,
-            COUNT(DISTINCT schema_name)              AS distinct_schemas,
-            SUM(rows_affected)                       AS total_rows,
-            AVG(duration_ms)                         AS avg_duration_ms,
+            DATEADD(HOUR, DATEDIFF(HOUR, 0, event_time), 0) AS hour_bucket,
+            COUNT(*)                                          AS query_count,
+            COUNT(DISTINCT object_name)                       AS distinct_objects,
+            COUNT(DISTINCT schema_name)                       AS distinct_schemas,
+            SUM(rows_affected)                                AS total_rows,
+            AVG(CAST(duration_ms AS FLOAT))                   AS avg_duration_ms,
             SUM(CASE WHEN command_type = 'SELECT' THEN 1 ELSE 0 END) AS select_count,
             SUM(CASE WHEN command_type IN ('INSERT','UPDATE','DELETE') THEN 1 ELSE 0 END) AS write_count,
             SUM(CASE WHEN command_type IN ('DROP','TRUNCATE','ALTER') THEN 1 ELSE 0 END) AS ddl_count,
-            COUNT(DISTINCT client_ip)               AS distinct_client_ips,
-            EXTRACT(HOUR FROM DATE_TRUNC('hour', event_time)) AS hour_of_day,
-            EXTRACT(DOW FROM DATE_TRUNC('hour', event_time))  AS day_of_week
-        FROM audit_log
-        WHERE event_time &gt;= NOW() - INTERVAL '%s days'
-        GROUP BY username, DATE_TRUNC('hour', event_time)
+            COUNT(DISTINCT client_ip)                         AS distinct_client_ips,
+            DATEPART(HOUR, DATEADD(HOUR, DATEDIFF(HOUR, 0, event_time)))   AS hour_of_day,
+            DATEPART(WEEKDAY, DATEADD(HOUR, DATEDIFF(HOUR, 0, event_time))) AS day_of_week
+        FROM dbo.audit_log
+        WHERE event_time &gt;= DATEADD(DAY, -?, GETUTCDATE())
+        GROUP BY username, DATEADD(HOUR, DATEDIFF(HOUR, 0, event_time))
         ORDER BY username, hour_bucket
     """
 
-    conn = psycopg2.connect(conn_string)
+    conn = pyodbc.connect(conn_string)
     df = pd.read_sql_query(query, conn, params=(lookback_days,))
     conn.close()
 
@@ -250,7 +250,7 @@ def classify_threat_with_claude(
     client = anthropic.Anthropic(api_key=api_key)
 
     system_prompt = """You are a database security expert specializing in threat detection 
-for PostgreSQL and SQL Server environments. You analyze anomalous database session data 
+for SQL Server environments. You analyze anomalous database session data 
 and classify threats accurately. You respond only with valid JSON matching the schema provided.
 
 Threat categories to use:
@@ -443,34 +443,23 @@ LEFT JOIN sys.sensitivity_classifications sc
 WHERE uoc.new_object_count &gt;= 3    -- Threshold: 3+ new objects in 24h is suspicious
 ORDER BY uoc.new_object_count DESC, nae.username;</code></pre>
 
-<p class="text-gray-300 leading-relaxed">Privilege escalation specifically warrants monitoring the system catalog access pattern. An attacker who has obtained a low-privilege account will frequently probe the catalog to understand what they can reach — querying <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">information_schema</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_catalog</code>, or SQL Server's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys</code> schema at unusual rates is a reliable reconnaissance indicator.</p>
+<p class="text-gray-300 leading-relaxed">Privilege escalation specifically warrants monitoring the system catalog access pattern. An attacker who has obtained a low-privilege account will frequently probe the catalog to understand what they can reach — querying SQL Server's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys</code> schema or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">INFORMATION_SCHEMA</code> views at unusual rates is a reliable reconnaissance indicator.</p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>def detect_catalog_reconnaissance(audit_df: pd.DataFrame) -&gt; pd.DataFrame:
     """
     Identify sessions exhibiting catalog enumeration patterns
     consistent with privilege escalation reconnaissance.
     """
-    catalog_patterns = {
-        'postgresql': [
-            'pg_catalog', 'information_schema', 'pg_tables',
-            'pg_indexes', 'pg_roles', 'pg_user', 'pg_shadow',
-            'pg_stat_user_tables', 'pg_class', 'pg_namespace'
-        ],
-        'sqlserver': [
-            'information_schema', 'sys.tables', 'sys.columns',
-            'sys.database_principals', 'sys.server_principals',
-            'sys.objects', 'sys.schemas', 'sys.permissions',
-            'sys.database_permissions', 'sys.server_permissions'
-        ]
-    }
-
-    all_catalog_terms = (
-        catalog_patterns['postgresql'] + catalog_patterns['sqlserver']
-    )
+    catalog_terms = [
+        'information_schema', 'sys.tables', 'sys.columns',
+        'sys.database_principals', 'sys.server_principals',
+        'sys.objects', 'sys.schemas', 'sys.permissions',
+        'sys.database_permissions', 'sys.server_permissions'
+    ]
 
     # Flag queries touching catalog objects
     audit_df['is_catalog_query'] = audit_df['query_text'].str.lower().apply(
-        lambda q: any(term in q for term in all_catalog_terms)
+        lambda q: any(term in q for term in catalog_terms)
     )
 
     # Aggregate catalog access by user and hour
@@ -659,40 +648,20 @@ def send_slack_alert(
 
 def terminate_suspicious_session(
     db_conn: str,
-    username: str,
-    db_type: str
+    username: str
 ) -&gt; bool:
     """
-    Terminate active sessions for a suspicious user.
-    PostgreSQL uses pg_terminate_backend; SQL Server uses KILL.
+    Terminate active sessions for a suspicious user on SQL Server.
     """
-    if db_type == 'postgresql':
-        import psycopg2
-        conn = psycopg2.connect(db_conn)
-        conn.autocommit = True
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT pg_terminate_backend(pid)
-            FROM pg_stat_activity
-            WHERE usename = %s
-              AND pid &lt;&gt; pg_backend_pid()
-              AND state != 'idle'
-        """, (username,))
-        terminated = cur.rowcount &gt; 0
-        cur.close()
-        conn.close()
-        return terminated
-
-    elif db_type == 'sqlserver':
-        import pyodbc
-        conn = pyodbc.connect(db_conn)
-        cur = conn.cursor()
-        # Collect session IDs then KILL each one
-        cur.execute("""
-            SELECT session_id FROM sys.dm_exec_sessions
-            WHERE login_name = ? AND status != 'sleeping'
-              AND session_id != @@SPID
-        """, username)
+    import pyodbc
+    conn = pyodbc.connect(db_conn)
+    cur = conn.cursor()
+    # Collect session IDs then KILL each one
+    cur.execute("""
+        SELECT session_id FROM sys.dm_exec_sessions
+        WHERE login_name = ? AND status != 'sleeping'
+          AND session_id != @@SPID
+    """, username)
         session_ids = [row.session_id for row in cur.fetchall()]
         for spid in session_ids:
             try:
@@ -932,22 +901,25 @@ def build_feedback_loop(
     and model retraining. This is the human-in-the-loop component
     that keeps the system accurate over time.
     """
-    import psycopg2
+    import pyodbc
 
-    conn = psycopg2.connect(feedback_store_conn)
+    conn = pyodbc.connect(feedback_store_conn)
     conn.autocommit = True
     cur = conn.cursor()
 
     cur.execute("""
-        INSERT INTO threat_alert_feedback
-            (alert_id, analyst_verdict, analyst_notes, feedback_time)
-        VALUES (%s, %s, %s, NOW())
-        ON CONFLICT (alert_id)
-        DO UPDATE SET
-            analyst_verdict = EXCLUDED.analyst_verdict,
-            analyst_notes   = EXCLUDED.analyst_notes,
-            feedback_time   = NOW()
-    """, (alert_id, analyst_verdict, analyst_notes))
+        MERGE dbo.threat_alert_feedback AS target
+        USING (SELECT ? AS alert_id) AS src
+        ON target.alert_id = src.alert_id
+        WHEN MATCHED THEN
+            UPDATE SET analyst_verdict = ?,
+                       analyst_notes   = ?,
+                       feedback_time   = SYSUTCDATETIME()
+        WHEN NOT MATCHED THEN
+            INSERT (alert_id, analyst_verdict, analyst_notes, feedback_time)
+            VALUES (?, ?, ?, SYSUTCDATETIME());
+    """, (alert_id, analyst_verdict, analyst_notes,
+          alert_id, analyst_verdict, analyst_notes))
 
     cur.close()
     conn.close()</code></pre>
@@ -1107,7 +1079,7 @@ def threat_detection_flow(config: dict) -&gt; None:
     <div class="mt-14 bg-violet-950/40 border border-violet-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
-        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · SQL Server</p>
       </div>
       <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
          class="shrink-0 px-6 py-3 bg-violet-600 hover:bg-violet-500 text-white font-semibold rounded-xl text-sm transition">

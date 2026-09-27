@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Chapter 10: Intelligent Automation for DBAs — The AI-Powered DBA</title>
-  <meta name="description" content="The AI-Powered DBA Chapter 10: Intelligent Automation for DBAs. AI and AIOps for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
+  <meta name="description" content="The AI-Powered DBA Chapter 10: Intelligent Automation for DBAs. AI and AIOps for SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
   <script type="module">
     import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
@@ -99,34 +99,36 @@ ORDER BY urgency_score DESC;</code></pre>
 import numpy as np
 from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.preprocessing import StandardScaler
-import psycopg2
+import pyodbc
 from datetime import datetime, timedelta
 
 def build_load_forecast_model(conn_string: str, lookback_days: int = 60):
     """
-    Train a GBM model on historical pg_stat_bgwriter and connection data
+    Train a GBM model on historical DMV snapshot and connection data
     to predict low-load windows for maintenance scheduling.
     """
-    conn = psycopg2.connect(conn_string)
-    
+    conn = pyodbc.connect(conn_string)
+
     # Pull hourly aggregated load metrics from a monitoring table
-    # Assumes you're storing snapshots from pg_stat_bgwriter into a history table
+    # Assumes you're storing DMV snapshots into a history table
     query = """
         SELECT
-            date_trunc('hour', snapshot_time) AS hour_bucket,
-            EXTRACT(DOW FROM snapshot_time) AS day_of_week,
-            EXTRACT(HOUR FROM snapshot_time) AS hour_of_day,
+            DATEADD(HOUR, DATEDIFF(HOUR, 0, snapshot_time), 0) AS hour_bucket,
+            DATEPART(WEEKDAY, snapshot_time) AS day_of_week,
+            DATEPART(HOUR, snapshot_time) AS hour_of_day,
             AVG(active_connections) AS avg_connections,
-            AVG(blks_read_rate) AS avg_blks_read,
-            AVG(blks_hit_rate) AS avg_blks_hit,
-            AVG(tup_returned_rate) AS avg_tup_returned,
-            AVG(tup_fetched_rate) AS avg_tup_fetched,
+            AVG(page_reads_per_sec) AS avg_page_reads,
+            AVG(page_life_expectancy) AS avg_page_life_expectancy,
+            AVG(batch_requests_per_sec) AS avg_batch_requests,
+            AVG(lock_waits_per_sec) AS avg_lock_waits,
             MIN(active_connections) AS min_connections
-        FROM pg_stat_history
-        WHERE snapshot_time &gt; NOW() - INTERVAL '%s days'
-        GROUP BY 1, 2, 3
-        ORDER BY 1;
-    """ 
+        FROM dbo.dmv_stat_history
+        WHERE snapshot_time &gt; DATEADD(DAY, -%d, GETUTCDATE())
+        GROUP BY DATEADD(HOUR, DATEDIFF(HOUR, 0, snapshot_time), 0),
+                 DATEPART(WEEKDAY, snapshot_time),
+                 DATEPART(HOUR, snapshot_time)
+        ORDER BY hour_bucket;
+    """
     df = pd.read_sql(query % lookback_days, conn)
     conn.close()
     
@@ -222,7 +224,7 @@ class MaintenanceAction:
     approved: bool = False
 
 MAINTENANCE_SYSTEM_PROMPT = """
-You are a PostgreSQL database maintenance advisor. You receive a list of database objects
+You are a SQL Server database maintenance advisor. You receive a list of database objects
 that require maintenance, along with their urgency scores and current system context.
 
 Your job is to produce a prioritized maintenance plan as a JSON array.
@@ -302,24 +304,25 @@ def build_maintenance_plan(
 def execute_maintenance_action(action: MaintenanceAction, conn) -&gt; dict:
     """
     Execute a pre-validated maintenance action using parameterized identifiers.
-    All identifiers are validated against pg_class before execution.
+    All identifiers are validated against sys.tables before execution.
     """
     allowed_actions = {
-        'vacuum': 'VACUUM (ANALYZE, VERBOSE) {schema}.{table}',
-        'analyze': 'ANALYZE VERBOSE {schema}.{table}',
-        'reindex': 'REINDEX INDEX CONCURRENTLY {schema}.{index}',
-        'update_statistics': 'ANALYZE {schema}.{table}'
+        'update_statistics': 'UPDATE STATISTICS [{schema}].[{table}] WITH FULLSCAN',
+        'reorganize_index': 'ALTER INDEX [{index}] ON [{schema}].[{table}] REORGANIZE',
+        'rebuild_index': 'ALTER INDEX [{index}] ON [{schema}].[{table}] REBUILD WITH (ONLINE = ON)',
+        'defrag_check': "DBCC SHOWCONTIG ('[{schema}].[{table}]')"
     }
-    
+
     if action.action_type not in allowed_actions:
         raise ValueError(f"Unknown action type: {action.action_type}")
-    
+
     # Validate identifiers exist before executing — never interpolate raw strings
     with conn.cursor() as cur:
         cur.execute("""
-            SELECT COUNT(*) FROM pg_class c
-            JOIN pg_namespace n ON n.oid = c.relnamespace
-            WHERE n.nspname = %s AND c.relname = %s
+            SELECT COUNT(*)
+            FROM sys.tables t
+            JOIN sys.schemas s ON s.schema_id = t.schema_id
+            WHERE s.name = ? AND t.name = ?
         """, (action.target_schema, action.target_table))
         if cur.fetchone()[0] == 0:
             raise ValueError(
@@ -346,7 +349,7 @@ def execute_maintenance_action(action: MaintenanceAction, conn) -&gt; dict:
         'executed_at': start.isoformat()
     }</code></pre>
 
-<p class="text-gray-300 leading-relaxed">The reasoning field stored with every executed action is what separates intelligent automation from black-box scripts. When your on-call engineer reviews the maintenance log at 9 AM, they see not just that a table was vacuumed but *why* — "Dead tuple ratio at 34% on orders table with 2.4M daily seq_scans; vacuum prioritized over analyze given bloat impact on index scan costs." That auditability is the foundation of organizational trust in autonomous operations.</p>
+<p class="text-gray-300 leading-relaxed">The reasoning field stored with every executed action is what separates intelligent automation from black-box scripts. When your on-call engineer reviews the maintenance log at 9 AM, they see not just that statistics were refreshed but *why* — "Index fragmentation at 34% on the orders table with 2.4M daily scans; index rebuild prioritized over statistics refresh given fragmentation impact on scan costs." That auditability is the foundation of organizational trust in autonomous operations.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
@@ -369,19 +372,17 @@ import json
 
 class DatabaseAnomalyDetector:
     """
-    Multi-metric anomaly detector for PostgreSQL using Isolation Forest.
+    Multi-metric anomaly detector for SQL Server using Isolation Forest.
     Designed to run continuously, retraining on a rolling window.
     """
-    
+
     METRIC_QUERIES = {
-        'active_connections': 'pg_stat_activity_count{state="active"}',
-        'lock_wait_count': 'pg_locks_count{mode="ExclusiveLock", granted="false"}',
-        'buffer_hit_ratio': 'pg_stat_database_blks_hit / '
-                           '(pg_stat_database_blks_hit + pg_stat_database_blks_read + 1)',
-        'transaction_rate': 'rate(pg_stat_database_xact_commit[5m]) + '
-                           'rate(pg_stat_database_xact_rollback[5m])',
-        'temp_bytes_rate': 'rate(pg_stat_database_temp_bytes[5m])',
-        'deadlock_rate': 'rate(pg_stat_database_deadlocks[5m])'
+        'active_sessions': 'sqlserver_active_sessions',
+        'lock_wait_count': 'sqlserver_lock_waits',
+        'buffer_cache_hit_ratio': 'sqlserver_buffer_cache_hit_ratio',
+        'batch_request_rate': 'rate(sqlserver_batch_requests[5m])',
+        'tempdb_alloc_rate': 'rate(sqlserver_tempdb_allocations[5m])',
+        'deadlock_rate': 'rate(sqlserver_deadlocks[5m])'
     }
     
     def __init__(self, prometheus_url: str, contamination: float = 0.05):
@@ -448,7 +449,7 @@ class DatabaseAnomalyDetector:
             'feature_contributions': dict(zip(self.feature_names, X[0].tolist()))
         }</code></pre>
 
-<p class="text-gray-300 leading-relaxed">When the detector flags an anomaly, the responder takes over. It pulls the anomaly context, enriches it with recent slow query data, active lock chains, and autovacuum status, then asks the LLM to diagnose the situation and recommend a remediation action from a bounded action library.</p>
+<p class="text-gray-300 leading-relaxed">When the detector flags an anomaly, the responder takes over. It pulls the anomaly context, enriches it with recent slow query data, active lock chains, and Automatic Tuning status, then asks the LLM to diagnose the situation and recommend a remediation action from a bounded action library.</p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>def diagnose_and_remediate(anomaly_state: dict, db_context: dict,
                             openai_api_key: str) -&gt; dict:
@@ -461,15 +462,15 @@ class DatabaseAnomalyDetector:
     client = OpenAI(api_key=openai_api_key)
     
     DIAGNOSIS_PROMPT = """
-You are a PostgreSQL database reliability engineer. An anomaly detection system has
+You are a SQL Server database reliability engineer. An anomaly detection system has
 flagged abnormal metric patterns. Analyze the context and recommend ONE remediation
 action from the allowed action list.
 
 ALLOWED ACTIONS (respond with exactly one):
 - KILL_IDLE_TRANSACTIONS: Terminate connections idle in transaction &gt; threshold
-- CANCEL_LONG_QUERIES: Cancel queries running longer than threshold (minutes)
+- CANCEL_LONG_QUERIES: Kill queries running longer than threshold (minutes)
 - CHECKPOINT_IMMEDIATE: Issue CHECKPOINT to flush dirty buffers
-- VACUUM_TABLE: Run VACUUM on a specific table (provide schema.table)
+- UPDATE_STATISTICS_TABLE: Run UPDATE STATISTICS on a specific table (provide schema.table)
 - ALERT_HUMAN: Escalate to on-call; situation requires human judgment
 - NO_ACTION: Anomaly is likely transient; log and monitor
 
@@ -538,46 +539,54 @@ def execute_remediation(diagnosis: dict, conn, config: dict) -&gt; dict:
         if action == 'KILL_IDLE_TRANSACTIONS':
             threshold_minutes = params.get('idle_threshold_minutes', 10)
             cur.execute("""
-                SELECT pg_terminate_backend(pid)
-                FROM pg_stat_activity
-                WHERE state = 'idle in transaction'
-                  AND state_change &lt; NOW() - INTERVAL '%s minutes'
-                  AND pid &lt;&gt; pg_backend_pid()
+                DECLARE @threshold DATETIME2 = DATEADD(MINUTE, -?, SYSUTCDATETIME());
+                SELECT session_id
+                FROM sys.dm_exec_sessions
+                WHERE status = 'sleeping'
+                  AND open_transaction_count &gt; 0
+                  AND last_request_end_time &lt; @threshold
+                  AND session_id &gt; 50;
             """, (threshold_minutes,))
-            terminated = cur.rowcount
+            idle_sessions = [r[0] for r in cur.fetchall()]
+            for sid in idle_sessions:
+                cur.execute(f"KILL {sid}")
+            terminated = len(idle_sessions)
             result['outcome'] = f'terminated_{terminated}_idle_transactions'
         
         elif action == 'CANCEL_LONG_QUERIES':
             threshold_minutes = params.get('query_threshold_minutes', 30)
             cur.execute("""
-                SELECT pg_cancel_backend(pid)
-                FROM pg_stat_activity
-                WHERE state = 'active'
-                  AND query_start &lt; NOW() - INTERVAL '%s minutes'
-                  AND pid &lt;&gt; pg_backend_pid()
-                  AND query NOT ILIKE '%%vacuum%%'
-                  AND query NOT ILIKE '%%analyze%%'
+                DECLARE @threshold DATETIME2 = DATEADD(MINUTE, -?, SYSUTCDATETIME());
+                SELECT DISTINCT r.session_id
+                FROM sys.dm_exec_requests r
+                WHERE r.status = 'running'
+                  AND r.start_time &lt; @threshold
+                  AND r.command NOT IN ('BACKUP DATABASE', 'DBCC');
             """, (threshold_minutes,))
-            cancelled = cur.rowcount
+            long_sessions = [r[0] for r in cur.fetchall()]
+            for sid in long_sessions:
+                cur.execute(f"KILL {sid}")
+            cancelled = len(long_sessions)
             result['outcome'] = f'cancelled_{cancelled}_long_queries'
         
         elif action == 'CHECKPOINT_IMMEDIATE':
             cur.execute("CHECKPOINT")
             result['outcome'] = 'checkpoint_issued'
         
-        elif action == 'VACUUM_TABLE':
+        elif action == 'UPDATE_STATISTICS_TABLE':
             target = params.get('target_table', '')
             if '.' in target:
                 schema, table = target.split('.', 1)
                 # Validate existence before executing
                 cur.execute("""
-                    SELECT COUNT(*) FROM pg_class c
-                    JOIN pg_namespace n ON n.oid = c.relnamespace
-                    WHERE n.nspname = %s AND c.relname = %s
+                    SELECT COUNT(*)
+                    FROM sys.tables t
+                    JOIN sys.schemas s ON s.schema_id = t.schema_id
+                    WHERE s.name = ? AND t.name = ?
                 """, (schema, table))
                 if cur.fetchone()[0] &gt; 0:
-                    cur.execute(f"VACUUM ANALYZE {schema}.{table}")
-                    result['outcome'] = f'vacuum_analyze_completed_{target}'
+                    cur.execute(f"UPDATE STATISTICS [{schema}].[{table}] WITH FULLSCAN")
+                    result['outcome'] = f'update_statistics_completed_{target}'
                 else:
                     result['outcome'] = f'target_table_not_found_{target}'
             else:
@@ -596,80 +605,9 @@ def execute_remediation(diagnosis: dict, conn, config: dict) -&gt; dict:
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Enriching DB Context for Accurate LLM Diagnosis</h3>
 
-<p class="text-gray-300 leading-relaxed">The quality of LLM diagnosis is directly proportional to the quality of context you provide. A bare anomaly score is nearly useless — the model has no information to reason from. A rich context payload that includes active queries, lock chains, and autovacuum progress gives the model the same information a senior DBA would use to diagnose the situation manually.</p>
+<p class="text-gray-300 leading-relaxed">The quality of LLM diagnosis is directly proportional to the quality of context you provide. A bare anomaly score is nearly useless — the model has no information to reason from. A rich context payload that includes active queries, lock chains, and Automatic Tuning status gives the model the same information a senior DBA would use to diagnose the situation manually.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL context collector:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Comprehensive diagnostic snapshot for LLM context building
-WITH active_queries AS (
-    SELECT
-        pid,
-        usename,
-        application_name,
-        state,
-        wait_event_type,
-        wait_event,
-        ROUND(EXTRACT(EPOCH FROM (NOW() - query_start))::numeric, 1) AS query_age_seconds,
-        LEFT(query, 200) AS query_excerpt,
-        backend_type
-    FROM pg_stat_activity
-    WHERE state != 'idle'
-      AND pid != pg_backend_pid()
-    ORDER BY query_age_seconds DESC
-    LIMIT 20
-),
-lock_chains AS (
-    SELECT
-        blocking.pid AS blocking_pid,
-        blocking.query AS blocking_query,
-        blocked.pid AS blocked_pid,
-        blocked.query AS blocked_query,
-        ROUND(EXTRACT(EPOCH FROM (NOW() - blocked.query_start))::numeric, 1) AS blocked_seconds
-    FROM pg_stat_activity blocked
-    JOIN pg_stat_activity blocking
-        ON blocking.pid = ANY(pg_blocking_pids(blocked.pid))
-    LIMIT 10
-),
-vacuum_progress AS (
-    SELECT
-        relid::regclass AS table_name,
-        phase,
-        heap_blks_scanned,
-        heap_blks_total,
-        ROUND(heap_blks_scanned::numeric / NULLIF(heap_blks_total, 0) * 100, 1) AS pct_complete
-    FROM pg_stat_progress_vacuum
-),
-table_bloat_candidates AS (
-    SELECT
-        schemaname || '.' || relname AS table_name,
-        n_dead_tup,
-        ROUND(n_dead_tup::numeric / NULLIF(n_live_tup + n_dead_tup, 0) * 100, 1) AS dead_pct
-    FROM pg_stat_user_tables
-    WHERE n_dead_tup &gt; 10000
-    ORDER BY n_dead_tup DESC
-    LIMIT 5
-)
-SELECT
-    json_build_object(
-        'active_queries', (SELECT json_agg(aq) FROM active_queries aq),
-        'lock_chains', (SELECT json_agg(lc) FROM lock_chains lc),
-        'vacuum_progress', (SELECT json_agg(vp) FROM vacuum_progress vp),
-        'bloat_candidates', (SELECT json_agg(tb) FROM table_bloat_candidates tb),
-        'database_stats', (
-            SELECT json_build_object(
-                'tup_fetched', tup_fetched,
-                'tup_returned', tup_returned,
-                'conflicts', conflicts,
-                'deadlocks', deadlocks,
-                'temp_bytes', temp_bytes,
-                'blks_read', blks_read,
-                'blks_hit', blks_hit
-            )
-            FROM pg_stat_database
-            WHERE datname = current_database()
-        )
-    ) AS diagnostic_context;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server equivalent:</strong></p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server context collector:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Diagnostic snapshot for LLM context in SQL Server environments
 WITH active_requests AS (
     SELECT TOP 20
@@ -893,42 +831,9 @@ def gated_remediation_pipeline(
 
 <p class="text-gray-300 leading-relaxed">Beyond maintenance automation, LLM-assisted automation can close a second class of operational loops: query performance degradation. When a query plan regresses after a statistics update or schema change, the traditional response is a DBA investigating, identifying the plan, and either forcing a hint or updating statistics. With an intelligent automation layer, this loop can run without human involvement for the majority of cases.</p>
 
-<p class="text-gray-300 leading-relaxed">The pattern combines two PostgreSQL capabilities: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> for tracking query performance over time, and plan hint infrastructure (via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_hint_plan</code> extension or SQL Server's Query Store) for applying targeted corrections.</p>
+<p class="text-gray-300 leading-relaxed">The pattern combines two SQL Server capabilities: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Query Store</code> for tracking query performance and plan history over time, and plan forcing infrastructure (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sp_query_store_force_plan</code>) for applying targeted corrections when the optimizer picks a regressed plan.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Detecting plan regressions in PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify queries whose mean execution time has degraded significantly
--- compared to their 7-day historical baseline
-WITH baseline AS (
-    SELECT
-        queryid,
-        query,
-        calls,
-        mean_exec_time,
-        stddev_exec_time,
-        rows / NULLIF(calls, 0) AS avg_rows
-    FROM pg_stat_statements
-    WHERE calls &gt; 100  -- Sufficient sample size
-),
--- In practice, compare against a snapshot table populated by your monitoring agent
-current_vs_baseline AS (
-    SELECT
-        b.queryid,
-        LEFT(b.query, 300) AS query_text,
-        b.mean_exec_time AS current_mean_ms,
-        b.stddev_exec_time,
-        b.calls,
-        -- Deviation from expected: in a real system, compare against stored baseline
-        b.mean_exec_time / NULLIF(b.stddev_exec_time, 0) AS z_score_proxy
-    FROM baseline b
-    WHERE b.mean_exec_time &gt; 500  -- Only care about queries &gt; 500ms
-)
-SELECT *
-FROM current_vs_baseline
-WHERE z_score_proxy &gt; 3  -- More than 3 standard deviations from own mean
-ORDER BY current_mean_ms DESC
-LIMIT 20;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server Query Store regression detection:</strong></p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Detecting plan regressions with Query Store:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify regressed queries using Query Store plan comparison
 SELECT TOP 20
     qsq.query_id,
@@ -965,7 +870,7 @@ WHERE qsrsi.start_time &gt; DATEADD(HOUR, -2, GETUTCDATE())
   AND qsrs.avg_duration &gt; qsrs_best.avg_duration * 1.5  -- 50% regression threshold
 ORDER BY regression_pct DESC;</code></pre>
 
-<p class="text-gray-300 leading-relaxed">When a regression is detected, the self-healing loop asks the LLM to analyze the query text and available context, then recommends one of three corrective actions: force a statistics update on the relevant tables, force a specific plan via Query Store plan forcing (SQL Server) or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_hint_plan</code> (PostgreSQL), or escalate for human review if the regression pattern is ambiguous.</p>
+<p class="text-gray-300 leading-relaxed">When a regression is detected, the self-healing loop asks the LLM to analyze the query text and available context, then recommends one of three corrective actions: refresh statistics on the relevant tables, force a specific plan via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sp_query_store_force_plan</code>, or escalate for human review if the regression pattern is ambiguous.</p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>QUERY_REGRESSION_PROMPT = """
 You are a database query performance expert. A query performance regression has been
@@ -973,8 +878,8 @@ detected. Analyze the query and recommend a corrective action.
 
 ALLOWED ACTIONS:
 - UPDATE_STATISTICS: Refresh statistics on specific tables (provide table list)
-- FORCE_PLAN: Force a previously known-good plan (SQL Server Query Store only; provide plan_id)
-- ADD_INDEX_HINT: Suggest a pg_hint_plan hint to guide the planner (PostgreSQL only)
+- FORCE_PLAN: Force a previously known-good plan via Query Store (provide plan_id)
+- USE_HINT: Suggest a query hint applied via the OPTION clause (e.g., RECOMPILE, MAXDOP)
 - ESCALATE_TO_DBA: Regression requires manual investigation
 - MONITOR_ONLY: Regression is minor or likely transient
 
@@ -990,25 +895,21 @@ Respond as JSON:
 
 def handle_query_regression(
     regressed_query: dict,
-    db_platform: str,  # 'postgresql' or 'sqlserver'
     llm_client,
     conn,
     config: dict
 ) -&gt; dict:
     """
-    Orchestrate LLM-assisted query regression remediation.
+    Orchestrate LLM-assisted query regression remediation on SQL Server.
     """
     context = {
-        "platform": db_platform,
+        "platform": "sqlserver",
         "query_text": regressed_query['query_text'],
         "current_avg_ms": regressed_query['avg_duration_ms'],
         "regression_pct": regressed_query.get('regression_pct'),
         "execution_count": regressed_query.get('count_executions'),
-        "available_actions": (
-            ["UPDATE_STATISTICS", "ADD_INDEX_HINT", "ESCALATE_TO_DBA", "MONITOR_ONLY"]
-            if db_platform == 'postgresql'
-            else ["UPDATE_STATISTICS", "FORCE_PLAN", "ESCALATE_TO_DBA", "MONITOR_ONLY"]
-        )
+        "available_actions": ["UPDATE_STATISTICS", "FORCE_PLAN", "USE_HINT",
+                              "ESCALATE_TO_DBA", "MONITOR_ONLY"]
     }
     
     response = llm_client.chat.completions.create(
@@ -1029,10 +930,7 @@ def handle_query_regression(
         if action == 'UPDATE_STATISTICS' and recommendation['confidence'] &gt;= 0.7:
             tables = params.get('tables', [])
             for table in tables[:5]:  # Cap to 5 tables per remediation
-                if db_platform == 'postgresql':
-                    cur.execute(f"ANALYZE {table}")
-                else:
-                    cur.execute(f"UPDATE STATISTICS {table}")
+                cur.execute(f"UPDATE STATISTICS {table}")
             conn.commit()
             return {
                 'action_taken': 'update_statistics',
@@ -1040,7 +938,7 @@ def handle_query_regression(
                 'reasoning': recommendation['explanation']
             }
         
-        elif action == 'FORCE_PLAN' and db_platform == 'sqlserver':
+        elif action == 'FORCE_PLAN':
             plan_id = params.get('plan_id')
             query_id = regressed_query.get('query_id')
             if plan_id and query_id:
@@ -1155,7 +1053,7 @@ def record_remediation_outcome(
 <p class="text-gray-300 leading-relaxed">The components built throughout this chapter compose into a coherent autonomous operations system. Here is how the pieces connect in a production deployment:</p>
 
 <div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
-    A["PostgreSQL / SQL Server<br/>pg_stat_statements, pg_stat_user_tables, DMVs"] -->|metrics scrape 60s| B["Prometheus + pg_exporter<br/>90-day retention"]
+    A["SQL Server<br/>Query Store, DMVs, sys views"] -->|metrics scrape 60s| B["Prometheus + sql_exporter<br/>90-day retention"]
     B -->|training data| C["Load Forecast Model<br/>GBM, retrain weekly"]
     B -->|live query| D["Isolation Forest<br/>Anomaly Detector, retrain weekly"]
     C -->|next window| E[Maintenance Scheduler]
@@ -1196,7 +1094,7 @@ def record_remediation_outcome(
     <div class="mt-14 bg-violet-950/40 border border-violet-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
-        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · SQL Server</p>
       </div>
       <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
          class="shrink-0 px-6 py-3 bg-violet-600 hover:bg-violet-500 text-white font-semibold rounded-xl text-sm transition">

@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Chapter 5: Machine Learning for Performance Forecasting — The AI-Powered DBA</title>
-  <meta name="description" content="The AI-Powered DBA Chapter 5: Machine Learning for Performance Forecasting. AI and AIOps for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
+  <meta name="description" content="The AI-Powered DBA Chapter 5: Machine Learning for Performance Forecasting. AI and AIOps for SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
   <script type="module">
     import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
@@ -54,7 +54,7 @@
 
 <p class="text-gray-300 leading-relaxed">ML-based forecasting addresses all three. Time-series models learn the seasonal patterns in your workload — daily, weekly, monthly, end-of-quarter — and produce confidence intervals rather than binary good/bad states. Feature-based regression models learn the *relationships* between metrics, so they can tell you not just that CPU will be high, but that it will be high because TempDB allocation is trending upward and your most expensive report query has a new hash join in its plan.</p>
 
-<p class="text-gray-300 leading-relaxed">The starting point for any forecasting initiative is instrumenting your telemetry collection. Most production environments already have the raw data in places like <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_query_stats</code>, Prometheus exporters, and OS-level metrics. The problem is that this data is collected at fixed intervals and often discarded after 30 days. Effective ML forecasting requires at minimum 90 days of history to capture monthly patterns, and 12 months or more to capture quarterly business cycles.</p>
+<p class="text-gray-300 leading-relaxed">The starting point for any forecasting initiative is instrumenting your telemetry collection. Most production environments already have the raw data in places like Query Store, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_query_stats</code>, Prometheus exporters, and OS-level metrics. The problem is that this data is collected at fixed intervals and often discarded after 30 days. Effective ML forecasting requires at minimum 90 days of history to capture monthly patterns, and 12 months or more to capture quarterly business cycles.</p>
 
 <p class="text-gray-300 leading-relaxed">Before writing a single line of Python, audit what you have:</p>
 
@@ -75,7 +75,7 @@ JOIN sys.query_store_runtime_stats rs
                               ON rs.plan_id = p.plan_id
 WHERE q.is_internal_query = 0;</code></pre>
 
-<p class="text-gray-300 leading-relaxed">If your history is thin, the first operational action is configuring longer retention before you do anything with ML. In SQL Server, increase <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DATA_FLUSH_INTERVAL_SECONDS</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">QUERY_CAPTURE_MODE</code> in Query Store settings. In PostgreSQL, pair <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> with a custom collector that snapshots statistics to a history table on a schedule — more on this architecture in the next section.</p>
+<p class="text-gray-300 leading-relaxed">If your history is thin, the first operational action is configuring longer retention before you do anything with ML. In SQL Server, increase <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DATA_FLUSH_INTERVAL_SECONDS</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">QUERY_CAPTURE_MODE</code> in Query Store settings, and pair Query Store with a custom collector that snapshots key DMV statistics to a history table on a schedule — more on this architecture in the next section.</p>
 
 <p class="text-gray-300 leading-relaxed">The other important realization here is that not every metric is equally forecastable. CPU and I/O tend to be highly seasonal and respond well to time-series models. Individual query latency is noisier, driven by data distribution changes and plan instability, and often needs feature-based approaches. Lock contention is nearly stochastic when viewed in isolation, but becomes predictable when you engineer the right features. Understanding this hierarchy — what you're trying to predict, and with what degree of confidence — shapes the model selection decisions that come next.</p>
 
@@ -85,69 +85,74 @@ WHERE q.is_internal_query = 0;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Raw database metrics are not ML features. A number like <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">buffers_hit = 14,293,812</code> has no predictive value on its own. What matters is the rate of change, the ratio to related metrics, the deviation from the historical baseline at the same time of week, and how these values correlate with downstream outcomes like query latency or connection saturation. The work of transforming raw telemetry into ML-ready features is called feature engineering, and for database performance forecasting it is where most of the model quality gets determined.</p>
 
-<p class="text-gray-300 leading-relaxed">The recommended architecture for a production telemetry pipeline is: database metrics collectors → a time-series store (Prometheus with long-term storage via Thanos or VictoriaMetrics, or TimescaleDB if you prefer PostgreSQL-native) → a feature engineering layer → a feature store or ML training dataset. This keeps raw telemetry separate from derived features, which is important when you need to retrain models without re-collecting data.</p>
+<p class="text-gray-300 leading-relaxed">The recommended architecture for a production telemetry pipeline is: database metrics collectors → a time-series store (Prometheus with long-term storage via Thanos or VictoriaMetrics, or a dedicated SQL Server DBA database with clustered columnstore history tables) → a feature engineering layer → a feature store or ML training dataset. This keeps raw telemetry separate from derived features, which is important when you need to retrain models without re-collecting data.</p>
 
-<p class="text-gray-300 leading-relaxed">For PostgreSQL environments, a practical collector looks like this:</p>
+<p class="text-gray-300 leading-relaxed">For SQL Server environments, a practical collector looks like this:</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import psycopg2
-import psycopg2.extras
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import pyodbc
 import pandas as pd
 from datetime import datetime, timezone
 import time
 
-# Connects to the monitored PG instance and extracts a telemetry snapshot
+# Connects to the monitored SQL Server instance and extracts a telemetry snapshot
 # Returns a dict of named metrics suitable for feature engineering
 
-def collect_pg_snapshot(conn_str: str) -&gt; dict:
-    conn = psycopg2.connect(conn_str)
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+def collect_mssql_snapshot(conn_str: str) -&gt; dict:
+    conn = pyodbc.connect(conn_str)
+    cur = conn.cursor()
     snapshot = {"collected_at": datetime.now(timezone.utc).isoformat()}
 
-    # Buffer cache efficiency
+    # Buffer cache efficiency + page life expectancy
     cur.execute("""
-        SELECT 
-            SUM(blks_hit) AS blks_hit,
-            SUM(blks_read) AS blks_read,
-            ROUND(
-                SUM(blks_hit)::numeric / 
-                NULLIF(SUM(blks_hit) + SUM(blks_read), 0) * 100, 4
-            ) AS cache_hit_ratio
-        FROM pg_stat_database
-        WHERE datname NOT IN ('template0', 'template1');
+        SELECT counter_name, cntr_value
+        FROM sys.dm_os_performance_counters
+        WHERE object_name LIKE '%Buffer Manager%'
+          AND counter_name IN ('Buffer cache hit ratio',
+                               'Buffer cache hit ratio base',
+                               'Page life expectancy')
     """)
-    snapshot.update(dict(cur.fetchone()))
+    counters = {row[0]: row[1] for row in cur.fetchall()}
+    hit = counters.get('Buffer cache hit ratio', 0)
+    base = counters.get('Buffer cache hit ratio base', 1) or 1
+    snapshot['cache_hit_ratio'] = round(hit / base, 4)
+    snapshot['page_life_expectancy'] = counters.get('Page life expectancy', 0)
 
-    # Active connection pressure
+    # Active session pressure and lock waiters
     cur.execute("""
-        SELECT 
-            COUNT(*) FILTER (WHERE state = 'active')         AS active_conns,
-            COUNT(*) FILTER (WHERE state = 'idle')           AS idle_conns,
-            COUNT(*) FILTER (WHERE wait_event_type = 'Lock') AS lock_waiters,
-            MAX(EXTRACT(EPOCH FROM (NOW() - query_start)))
-                FILTER (WHERE state = 'active')              AS max_query_age_sec
-        FROM pg_stat_activity
-        WHERE backend_type = 'client backend';
+        SELECT
+            SUM(CASE WHEN r.status IN ('running','suspended') THEN 1 ELSE 0 END)
+                AS active_conns,
+            SUM(CASE WHEN r.status = 'sleeping' THEN 1 ELSE 0 END)
+                AS idle_conns,
+            SUM(CASE WHEN wt.wait_type LIKE 'LCK%' THEN 1 ELSE 0 END)
+                AS lock_waiters,
+            MAX(DATEDIFF(SECOND, r.start_time, GETDATE()))
+                AS max_query_age_sec
+        FROM sys.dm_exec_sessions s
+        LEFT JOIN sys.dm_exec_requests r ON r.session_id = s.session_id
+        LEFT JOIN sys.dm_os_waiting_tasks wt ON wt.session_id = s.session_id
+        WHERE s.session_id &gt; 50
     """)
-    snapshot.update(dict(cur.fetchone()))
+    cols = [c[0] for c in cur.description]
+    snapshot.update(dict(zip(cols, cur.fetchone())))
 
-    # Top query workload pressure from pg_stat_statements
+    # Top query workload pressure from plan-cache aggregates
     cur.execute("""
-        SELECT 
-            SUM(calls)                           AS stmt_calls_cumulative,
-            SUM(total_exec_time)                 AS total_exec_ms_cumulative,
-            SUM(rows)                            AS rows_returned_cumulative,
-            SUM(shared_blks_hit + shared_blks_read) AS shared_blks_accessed
-        FROM pg_stat_statements
-        WHERE dbid = (SELECT oid FROM pg_database 
-                      WHERE datname = current_database());
+        SELECT
+            SUM(qs.execution_count)                       AS stmt_calls_cumulative,
+            SUM(qs.total_elapsed_time) / 1000.0           AS total_exec_ms_cumulative,
+            SUM(qs.total_rows)                            AS rows_returned_cumulative,
+            SUM(qs.total_logical_reads)                   AS logical_reads_cumulative
+        FROM sys.dm_exec_query_stats qs
     """)
-    snapshot.update(dict(cur.fetchone()))
+    cols = [c[0] for c in cur.description]
+    snapshot.update(dict(zip(cols, cur.fetchone())))
 
     cur.close()
     conn.close()
     return snapshot</code></pre>
 
-<p class="text-gray-300 leading-relaxed">The key insight in this collector is that cumulative counters from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_database</code> are only useful as *deltas between consecutive snapshots*. If you collect every 60 seconds, the delta of <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">total_exec_ms</code> divided by 60 gives you the average milliseconds of query CPU consumed per second — a far more useful feature than the raw cumulative number.</p>
+<p class="text-gray-300 leading-relaxed">The key insight in this collector is that cumulative counters from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_query_stats</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_os_performance_counters</code> are only useful as *deltas between consecutive snapshots*. If you collect every 60 seconds, the delta of <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">total_exec_ms_cumulative</code> divided by 60 gives you the average milliseconds of query CPU consumed per second — a far more useful feature than the raw cumulative number. The same delta logic applies to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_os_wait_stats</code> (covered in Chapter 2), whose counters reset on service restart — handle the restart discontinuity explicitly or your features will show a spurious drop to zero.</p>
 
 <p class="text-gray-300 leading-relaxed">Once you have a history of snapshots stored in TimescaleDB or Prometheus, the feature engineering step creates the lag features, rolling statistics, and calendar features that give ML models their predictive power:</p>
 
@@ -417,7 +422,7 @@ def score_current_snapshot(snapshot_features: dict,
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">SQL Server-Specific Forecasting Features</h3>
 
-<p class="text-gray-300 leading-relaxed">Everything described so far applies to both PostgreSQL and SQL Server, but SQL Server offers a few native mechanisms worth weaving into the forecasting pipeline.</p>
+<p class="text-gray-300 leading-relaxed">Everything described so far is platform-general, but SQL Server offers a few native mechanisms worth weaving into the forecasting pipeline.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Query Store's built-in regression detection</strong> (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_db_tuning_recommendations</code>) surfaces queries where the engine has detected a plan regression. Rather than waiting for your ML model to catch the latency signal, you can poll this DMV on a schedule and treat each recommendation row as a structured anomaly event — a high-quality, database-engine-certified signal that something changed. Feed it directly into your incident feature log:</p>
 
@@ -591,30 +596,34 @@ def _build_recommended_sql(metric: str, predicted_value: float) -&gt; Optional[s
         return """
 -- Identify queries likely contributing to P95 latency elevation
 -- Run on the affected instance
-SELECT 
-    queryid,
-    calls,
-    ROUND(mean_exec_time::numeric, 1) AS mean_ms,
-    ROUND(stddev_exec_time::numeric, 1) AS stddev_ms,
-    ROUND(total_exec_time::numeric / 1000, 1) AS total_sec,
-    LEFT(query, 120) AS query_preview
-FROM pg_stat_statements
-WHERE mean_exec_time &gt; 500
-ORDER BY total_exec_time DESC
-LIMIT 20;
+SELECT TOP 20
+    qs.query_id,
+    rs.count_executions AS calls,
+    ROUND(rs.avg_duration / 1000.0, 1) AS mean_ms,
+    ROUND(rs.stdev_duration / 1000.0, 1) AS stddev_ms,
+    ROUND(rs.avg_duration * rs.count_executions / 1000000.0, 1) AS total_sec,
+    LEFT(qt.query_sql_text, 120) AS query_preview
+FROM sys.query_store_query qs
+JOIN sys.query_store_query_text qt ON qt.query_text_id = qs.query_text_id
+JOIN sys.query_store_plan qp ON qp.query_id = qs.query_id
+JOIN sys.query_store_runtime_stats rs ON rs.plan_id = qp.plan_id
+WHERE rs.avg_duration &gt; 500000  -- microseconds
+  AND rs.last_execution_time &gt; DATEADD(HOUR, -1, GETUTCDATE())
+ORDER BY rs.avg_duration * rs.count_executions DESC;
 """.strip()
     elif metric == "active_conns":
         return """
--- Check connection distribution before scaling decision
-SELECT 
-    application_name,
-    state,
-    wait_event_type,
+-- Check session distribution before a scaling decision
+SELECT
+    s.login_name,
+    s.status,
+    wt.wait_type,
     COUNT(*) AS conn_count,
-    MAX(EXTRACT(EPOCH FROM (NOW() - backend_start))) AS oldest_conn_sec
-FROM pg_stat_activity
-WHERE backend_type = 'client backend'
-GROUP BY application_name, state, wait_event_type
+    MAX(DATEDIFF(SECOND, s.login_time, GETDATE())) AS oldest_conn_sec
+FROM sys.dm_exec_sessions s
+LEFT JOIN sys.dm_os_waiting_tasks wt ON wt.session_id = s.session_id
+WHERE s.session_id &gt; 50
+GROUP BY s.login_name, s.status, wt.wait_type
 ORDER BY conn_count DESC;
 """.strip()
     return None</code></pre>
@@ -623,13 +632,13 @@ ORDER BY conn_count DESC;
 
 <p class="text-gray-300 leading-relaxed">For the <strong class="text-white">automated action</strong> side (not just alerting), the most defensible patterns for DBAs to automate without manual approval are:</p>
 
-<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Increasing <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">work_mem</code> temporarily for a session</strong> — when a forecast predicts that temp file growth will spike in the next 30 minutes, the workflow can issue a session-scoped <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SET work_mem = '...'</code> on the affected connection, or apply the override at the connection-pooler level so it never touches the server-wide default (an <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALTER SYSTEM SET</code> would persist the change for every session, which is a much larger blast radius than intended here).</p>
+<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Increasing the query memory grant temporarily</strong> — when a forecast predicts that tempdb spills will spike in the next 30 minutes, the workflow can apply a session-scoped memory grant override via a Resource Governor classifier function that routes the affected workload to a workload group with a higher <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">REQUEST_MAX_MEMORY_GRANT_PERCENT</code>, or add an <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">OPTION (MIN_GRANT_PERCENT = ...)</code> hint to the specific parameterized query. This keeps the blast radius at the session or query level rather than changing the server-wide default.</p>
 
-<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Routing read traffic to replicas</strong> — when active connection forecasts approach a threshold, a workflow can update PgBouncer or ProxySQL routing rules to shift reporting traffic away from the primary.</p>
+<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Routing read traffic to replicas</strong> — when active connection forecasts approach a threshold, a workflow can update the Availability Group listener's read-only routing configuration to shift reporting traffic to secondaries, or redirect connection strings for reporting workloads to a read-scale replica.</p>
 
-<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Pausing non-critical background jobs</strong> — when P95 latency is forecast to breach its threshold, the workflow can pause <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_cron</code> or SQL Server Agent scheduled jobs that are tagged as deferrable, clearing headroom before the peak arrives.</p>
+<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Pausing non-critical background jobs</strong> — when P95 latency is forecast to breach its threshold, the workflow can pause SQL Server Agent scheduled jobs that are tagged as deferrable, clearing headroom before the peak arrives.</p>
 
-<p class="text-gray-300 leading-relaxed">4. <strong class="text-white">Pre-fetching index statistics</strong> — when a specific query's plan instability anomaly detector fires, triggering an immediate <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ANALYZE</code> on the relevant tables is a safe, idempotent operation that can resolve plan regressions before users notice.</p>
+<p class="text-gray-300 leading-relaxed">4. <strong class="text-white">Refreshing statistics proactively</strong> — when a specific query's plan instability anomaly detector fires, triggering an immediate <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">UPDATE STATISTICS</code> on the relevant tables is a safe, idempotent operation that can resolve plan regressions before users notice.</p>
 
 <p class="text-gray-300 leading-relaxed">Actions that require human approval in all cases include: changing max connections, adding or dropping indexes, killing long-running sessions (unless they have exceeded a policy-defined timeout and are confirmed lock holders), and any schema changes. The golden rule for automated database actions is that they must be reversible, idempotent, and bounded — they should never make a situation worse than it was before the automation ran.</p>
 
@@ -704,7 +713,7 @@ ORDER BY conn_count DESC;
 
 <p class="text-gray-300 leading-relaxed">Several operational realities shape how ML forecasting systems get deployed and maintained in production DBA environments.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Resource isolation.</strong> The inference and feature engineering jobs must not compete with the database workload they are monitoring. Run collectors as lightweight read-only connections. Feature engineering and model training should run on a separate compute instance — never on the database server itself. Even read-only queries against <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_query_stats</code> can cause minor cache pollution under heavy load.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Resource isolation.</strong> The inference and feature engineering jobs must not compete with the database workload they are monitoring. Run collectors as lightweight read-only connections. Feature engineering and model training should run on a separate compute instance — never on the database server itself. Even read-only queries against Query Store or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_query_stats</code> can cause minor cache pollution under heavy load.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Cold start handling.</strong> When a new database instance spins up (in an autoscaling environment or after a blue-green deployment), the forecasting models trained on the old instance's telemetry are immediately stale. Have a defined cold-start policy: for the first 72 hours on a new instance, disable automated actions and use a wider anomaly detection threshold, falling back to static alert thresholds. After 72 hours of telemetry collection, resume ML-based scoring with conservative confidence requirements.</p>
 
@@ -760,7 +769,7 @@ def explain_prediction(model, feature_snapshot: dict,
     <div class="mt-14 bg-violet-950/40 border border-violet-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
-        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · SQL Server</p>
       </div>
       <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
          class="shrink-0 px-6 py-3 bg-violet-600 hover:bg-violet-500 text-white font-semibold rounded-xl text-sm transition">

@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Chapter 15: AI Features in Azure SQL — The AI-Powered DBA</title>
-  <meta name="description" content="The AI-Powered DBA Chapter 15: AI Features in Azure SQL. AI and AIOps for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
+  <meta name="description" content="The AI-Powered DBA Chapter 15: AI Features in Azure SQL. AI and AIOps for SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
   <script type="module">
     import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
@@ -309,46 +309,41 @@ Provide:
     
     return response.choices[0].message.content</code></pre>
 
-<p class="text-gray-300 leading-relaxed">For PostgreSQL on Azure Database for PostgreSQL Flexible Server, Microsoft has added a similar Copilot experience through the Azure portal's query execution surface, but the API integration pattern differs. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_azure_storage</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">azure_ai</code> extensions for Azure Database for PostgreSQL provide direct integration with Azure OpenAI and Azure Cognitive Services from within SQL itself — meaning you can invoke LLM completions and embeddings directly from T-SQL-style function calls in your PostgreSQL queries.</p>
+<p class="text-gray-300 leading-relaxed">Azure SQL Database and Azure SQL Managed Instance go further: native AI functions let you invoke Azure OpenAI completions and embeddings directly from T-SQL. <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sp_invoke_external_rest_endpoint</code> calls any REST endpoint (including Azure OpenAI deployments) from inside a stored procedure, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE EXTERNAL MODEL</code> registers an Azure OpenAI embedding model as a first-class database object so <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">AI_GENERATE_EMBEDDINGS</code> can be called inline in queries.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL (Azure Database for PostgreSQL Flexible Server):</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Enable the azure_ai extension (requires Azure Database for PostgreSQL Flexible Server)
-CREATE EXTENSION IF NOT EXISTS azure_ai;
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Register an Azure OpenAI embedding model as an external model
+CREATE EXTERNAL MODEL product_embeddings
+WITH (
+    LOCATION = 'https://your-resource.openai.azure.com/openai/deployments/text-embedding-3-small',
+    API_FORMAT = 'Azure OpenAI',
+    MODEL_TYPE = EMBEDDINGS,
+    MODEL = 'text-embedding-3-small'
+);
+GO
 
--- Configure the endpoint and API key
-SELECT azure_ai.set_setting('azure_openai.endpoint', 'https://your-resource.openai.azure.com/');
-SELECT azure_ai.set_setting('azure_openai.subscription_key', 'your-api-key');
+-- Generate embeddings for product descriptions directly in T-SQL
+UPDATE dbo.product_catalog
+SET embedding = AI_GENERATE_EMBEDDINGS(product_description USE MODEL product_embeddings)
+WHERE embedding IS NULL;
+GO
 
--- Generate embeddings for text stored in a table using Azure OpenAI from SQL
-SELECT 
-    id,
+-- Semantic search: embed the query text and find nearest neighbors
+DECLARE @q VECTOR(1536) =
+    AI_GENERATE_EMBEDDINGS('lightweight waterproof hiking boots' USE MODEL product_embeddings);
+
+SELECT TOP 10
     product_description,
-    azure_openai.create_embeddings(
-        'text-embedding-3-small',
-        product_description
-    )::vector AS embedding
-FROM product_catalog
-WHERE embedding IS NULL
-LIMIT 100;
-
--- Perform semantic search using the generated embeddings
-SELECT 
-    product_description,
-    1 - (embedding &lt;=&gt; azure_openai.create_embeddings(
-        'text-embedding-3-small',
-        'lightweight waterproof hiking boots'
-    )::vector) AS cosine_similarity
-FROM product_catalog
-ORDER BY cosine_similarity DESC
-LIMIT 10;</code></pre>
+    VECTOR_DISTANCE('cosine', embedding, @q) AS distance
+FROM dbo.product_catalog
+ORDER BY VECTOR_DISTANCE('cosine', embedding, @q);</code></pre>
 
 <p class="text-gray-300 leading-relaxed">This in-database embedding generation pattern eliminates the round-trip to an application tier for semantic search workloads — which matters when you are processing millions of rows for batch classification or building real-time recommendation features.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">Vector Search in Azure SQL and Azure Database for PostgreSQL</h3>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Vector Search in Azure SQL</h3>
 
-<p class="text-gray-300 leading-relaxed">Vector similarity search has moved from a research curiosity to a production requirement for AI-native applications. Azure SQL Database now supports native vector storage and similarity search, and Azure Database for PostgreSQL has supported the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pgvector</code> extension for several years. The DBA's role in these deployments is not just provisioning the extension — it is designing indexes, managing storage growth, and understanding the query performance characteristics of approximate nearest neighbor (ANN) search at scale.</p>
+<p class="text-gray-300 leading-relaxed">Vector similarity search has moved from a research curiosity to a production requirement for AI-native applications. Azure SQL Database supports native vector storage and similarity search through the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR</code> data type, the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_DISTANCE()</code> function, and DiskANN vector indexes. The DBA's role in these deployments is designing indexes, managing storage growth, and understanding the query performance characteristics of approximate nearest neighbor (ANN) search at scale.</p>
 
 <p class="text-gray-300 leading-relaxed">In Azure SQL Database, Microsoft introduced the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR</code> data type and the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_DISTANCE()</code> function. This is a native type, not a JSON or VARBINARY workaround. Azure SQL uses Disk-ANN (Disk-based Approximate Nearest Neighbor) for its vector index implementation, which is designed to handle billion-scale vector datasets that do not fit in memory by organizing the graph structure to minimize disk I/O during traversal.</p>
 
@@ -382,48 +377,16 @@ SELECT TOP 10
 FROM document_embeddings
 ORDER BY distance ASC;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL (Azure Database for PostgreSQL):</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Install pgvector extension
-CREATE EXTENSION IF NOT EXISTS vector;
 
--- Create equivalent table structure
-CREATE TABLE document_embeddings (
-    document_id     SERIAL PRIMARY KEY,
-    document_text   TEXT,
-    source_url      VARCHAR(1000),
-    created_at      TIMESTAMPTZ DEFAULT NOW(),
-    embedding       VECTOR(1536)
-);
+<p class="text-gray-300 leading-relaxed">The production sizing challenge with vector indexes is significant. A table storing 1 million 1536-dimensional float32 vectors consumes approximately 6 GB in raw storage before indexing. The DiskANN vector index adds its graph structure on top of that. When your embedding table reaches 10 to 50 million rows — common for document repositories or product catalogs — index build time and memory pressure during index construction become the primary operational concerns.</p>
 
--- Create HNSW index for approximate nearest neighbor search
--- HNSW provides better query performance than IVFFlat for most production workloads
-CREATE INDEX idx_doc_embeddings_hnsw
-ON document_embeddings
-USING hnsw (embedding vector_cosine_ops)
-WITH (m = 16, ef_construction = 64);
+<p class="text-gray-300 leading-relaxed">The key operational considerations for DiskANN vector indexes in Azure SQL production are:</p>
 
--- Set ef_search at query time to balance recall vs. performance
-SET hnsw.ef_search = 100;
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Metric choice is fixed at index creation.** Choose `cosine`, `euclidean`, or `dot` in the `CREATE VECTOR INDEX ... WITH (metric = ...)` clause based on how your embeddings were normalized. Cosine is the standard choice for OpenAI embeddings.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Index build is resource-intensive.** Building a DiskANN index over tens of millions of vectors needs a generous memory allocation and should be scheduled during a maintenance window, or built on a restored copy and swapped in.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Embedding tables are bulk-loaded.** Because batch embedding jobs insert in bulk rather than OLTP-style single-row writes, update statistics on the embedding table after large loads so the optimizer keeps choosing the vector index with accurate cardinality estimates.</li>
 
--- Semantic search query
-SELECT 
-    document_id,
-    document_text,
-    source_url,
-    1 - (embedding &lt;=&gt; $1::vector) AS cosine_similarity
-FROM document_embeddings
-ORDER BY embedding &lt;=&gt; $1::vector
-LIMIT 10;</code></pre>
-
-<p class="text-gray-300 leading-relaxed">The production sizing challenge with vector indexes is significant. A table storing 1 million 1536-dimensional float32 vectors consumes approximately 6 GB in raw storage before indexing. An HNSW index with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">m=16</code> adds roughly 30 to 50 percent on top of that. When your embedding table reaches 10 to 50 million rows — common for document repositories or product catalogs — index build time, memory pressure during index construction, and autovacuum behavior all become concerns.</p>
-
-<p class="text-gray-300 leading-relaxed">For Azure Database for PostgreSQL, the key operational parameters for pgvector HNSW indexes in production are:</p>
-
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `m`: the number of bidirectional links per node. Higher values improve recall but increase index size and build time. Values of 16 to 32 are standard production choices.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `ef_construction`: controls graph quality during build. Higher values improve recall at the cost of index build time. 64 to 128 is typical.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `hnsw.ef_search`: controls the search beam width at query time. This is a session or GUC-level setting, not stored with the index, so it must be set per connection or in `postgresql.conf`. For high-recall production use cases, 100 to 200 is typical.</li>
-
-<p class="text-gray-300 leading-relaxed">Autovacuum configuration for vector tables needs specific attention. Because embedding tables frequently receive bulk inserts (batch embedding jobs) rather than OLTP-style single-row writes, the default autovacuum cost delay and scale factor settings can allow dead tuple accumulation that degrades index quality and bloats the HNSW graph. Setting <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">autovacuum_vacuum_scale_factor = 0.01</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">autovacuum_analyze_scale_factor = 0.005</code> at the table level (via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALTER TABLE ... SET (...)</code>) is a reasonable starting point for large embedding tables.</p>
+<p class="text-gray-300 leading-relaxed">Monitor vector index usage through Query Store: look for the `VECTOR_DISTANCE` predicate in regressed plans, and confirm the DiskANN index is being chosen over a full scan as the embedding table grows.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
@@ -537,65 +500,69 @@ def run_enrichment_pipeline(batch_size: int = 100, max_workers: int = 4) -&gt; N
 if __name__ == "__main__":
     run_enrichment_pipeline()</code></pre>
 
-<p class="text-gray-300 leading-relaxed">The equivalent PostgreSQL pattern for Azure Database for PostgreSQL uses the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">azure_ai</code> extension's built-in language service integration to push this work directly into SQL without requiring an external pipeline process:</p>
+<p class="text-gray-300 leading-relaxed">The equivalent in-SQL pattern on Azure SQL uses <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sp_invoke_external_rest_endpoint</code> to call the Azure AI Language sentiment API directly from T-SQL, without requiring an external pipeline process:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL (Azure Database for PostgreSQL Flexible Server):</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Configure the Azure AI Language endpoint once
-SELECT azure_ai.set_setting('azure_cognitive.endpoint', 'https://your-language-resource.cognitiveservices.azure.com/');
-SELECT azure_ai.set_setting('azure_cognitive.subscription_key', 'your-subscription-key');
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- One-time: create a database-scoped credential for the Language resource
+CREATE DATABASE SCOPED CREDENTIAL [https://your-language-resource.cognitiveservices.azure.com]
+WITH IDENTITY = 'HTTPEndpointHeaders', SECRET = '{"Ocp-Apim-Subscription-Key": "&lt;key&gt;"}';
+GO
 
 -- Create the enrichment table
-CREATE TABLE review_enrichments (
-    review_id       INT PRIMARY KEY REFERENCES customer_reviews(review_id),
-    sentiment_label TEXT,
+CREATE TABLE dbo.review_enrichments (
+    review_id       INT PRIMARY KEY REFERENCES dbo.customer_reviews(review_id),
+    sentiment_label NVARCHAR(20),
     score_positive  NUMERIC(5,4),
     score_neutral   NUMERIC(5,4),
     score_negative  NUMERIC(5,4),
-    enriched_at     TIMESTAMPTZ DEFAULT NOW()
+    enriched_at     DATETIME2 DEFAULT SYSUTCDATETIME()
 );
+GO
 
--- Batch enrich using the built-in azure_cognitive.analyze_sentiment function
-INSERT INTO review_enrichments (review_id, sentiment_label, score_positive, score_neutral, score_negative)
-SELECT 
-    r.review_id,
-    (azure_cognitive.analyze_sentiment(r.review_text, 'en')).sentiment,
-    (azure_cognitive.analyze_sentiment(r.review_text, 'en')).positive_score,
-    (azure_cognitive.analyze_sentiment(r.review_text, 'en')).neutral_score,
-    (azure_cognitive.analyze_sentiment(r.review_text, 'en')).negative_score
-FROM customer_reviews r
-WHERE NOT EXISTS (
-    SELECT 1 FROM review_enrichments e WHERE e.review_id = r.review_id
-)
-LIMIT 500
-ON CONFLICT (review_id) DO UPDATE SET
-    sentiment_label = EXCLUDED.sentiment_label,
-    score_positive  = EXCLUDED.score_positive,
-    score_neutral   = EXCLUDED.score_neutral,
-    score_negative  = EXCLUDED.score_negative,
-    enriched_at     = NOW();</code></pre>
+-- Batch enrich: call the sentiment endpoint once per review via a loop,
+-- parsing the JSON response with OPENJSON
+DECLARE @review_id INT, @review_text NVARCHAR(MAX), @resp NVARCHAR(MAX);
 
-<p class="text-gray-300 leading-relaxed">One performance note on the in-SQL approach: calling <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">azure_cognitive.analyze_sentiment()</code> four times per row (once per column in the SELECT list) results in four API calls per row rather than one. In practice, you should call it once into a CTE or lateral join and then decompose the composite type result:</p>
+DECLARE review_cur CURSOR LOCAL FAST_FORWARD FOR
+    SELECT TOP (500) r.review_id, r.review_text
+    FROM dbo.customer_reviews r
+    WHERE NOT EXISTS (
+        SELECT 1 FROM dbo.review_enrichments e WHERE e.review_id = r.review_id
+    );
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- More efficient: call analyze_sentiment once per row using a lateral join
-INSERT INTO review_enrichments (review_id, sentiment_label, score_positive, score_neutral, score_negative)
-SELECT 
-    r.review_id,
-    sa.sentiment,
-    sa.positive_score,
-    sa.neutral_score,
-    sa.negative_score
-FROM customer_reviews r
-CROSS JOIN LATERAL azure_cognitive.analyze_sentiment(r.review_text, 'en') sa
-WHERE NOT EXISTS (
-    SELECT 1 FROM review_enrichments e WHERE e.review_id = r.review_id
-)
-LIMIT 500
-ON CONFLICT (review_id) DO UPDATE SET
-    sentiment_label = EXCLUDED.sentiment_label,
-    score_positive  = EXCLUDED.score_positive,
-    score_neutral   = EXCLUDED.score_neutral,
-    score_negative  = EXCLUDED.score_negative,
-    enriched_at     = NOW();</code></pre>
+OPEN review_cur;
+FETCH NEXT FROM review_cur INTO @review_id, @review_text;
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    EXEC sp_invoke_external_rest_endpoint
+        @url = 'https://your-language-resource.cognitiveservices.azure.com/language/:analyze-text?api-version=2023-04-01',
+        @method = 'POST',
+        @credential = [https://your-language-resource.cognitiveservices.azure.com],
+        @payload = N'{"kind":"SentimentAnalysis","parameters":{"opinionMining":false},"analysisInput":{"documents":[{"id":"1","language":"en","text":"' + STRING_ESCAPE(@review_text, 'json') + N'"}]}}',
+        @response = @resp OUTPUT;
+
+    MERGE dbo.review_enrichments AS t
+    USING (
+        SELECT
+            @review_id AS review_id,
+            JSON_VALUE(@resp, '$.results.documents[0].sentiment') AS sentiment,
+            JSON_VALUE(@resp, '$.results.documents[0].confidenceScores.positive') AS pos,
+            JSON_VALUE(@resp, '$.results.documents[0].confidenceScores.neutral') AS neu,
+            JSON_VALUE(@resp, '$.results.documents[0].confidenceScores.negative') AS neg
+    ) AS s ON t.review_id = s.review_id
+    WHEN MATCHED THEN UPDATE SET
+        sentiment_label = s.sentiment, score_positive = s.pos,
+        score_neutral = s.neu, score_negative = s.neg,
+        enriched_at = SYSUTCDATETIME()
+    WHEN NOT MATCHED THEN INSERT
+        (review_id, sentiment_label, score_positive, score_neutral, score_negative)
+        VALUES (s.review_id, s.sentiment, s.pos, s.neu, s.neg);
+
+    FETCH NEXT FROM review_cur INTO @review_id, @review_text;
+END
+CLOSE review_cur;
+DEALLOCATE review_cur;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">One performance note on the in-SQL approach: each <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sp_invoke_external_rest_endpoint</code> call is one API call per row, so batch aggressively and respect the Language service rate limits. Parsing the response once per row with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">OPENJSON</code>/<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">JSON_VALUE</code> keeps the decomposition in the database tier rather than round-tripping per column.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
@@ -795,16 +762,16 @@ Keep the summary under 200 words. Be direct."""
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Azure Defender's threat detection uses behavioral baselines, not signatures.** It requires a calibration period after deployment or major workload changes, and its alerts can be enriched with AI analysis to produce incident summaries that give on-call DBAs immediate context rather than raw JSON alert payloads.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Azure OpenAI and the `azure_ai` PostgreSQL extension enable in-database AI enrichment at two levels.** Python application-layer pipelines give fine-grained control over batching, error handling, and rate limits. In-SQL enrichment using the `azure_ai` extension simplifies the architecture but requires careful attention to how many API calls are generated per row — use `CROSS JOIN LATERAL` patterns to avoid redundant calls.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Azure OpenAI integration in Azure SQL enables in-database AI enrichment at two levels.** Python application-layer pipelines give fine-grained control over batching, error handling, and rate limits. In-SQL enrichment using `sp_invoke_external_rest_endpoint` or `CREATE EXTERNAL MODEL` simplifies the architecture but requires careful attention to how many API calls are generated per row — batch aggressively and parse each JSON response once.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Vector search in Azure SQL (Disk-ANN) and Azure Database for PostgreSQL (pgvector HNSW) both require careful operational sizing.** High-dimensional embeddings consume substantial storage, index build operations have non-trivial memory requirements, and autovacuum configuration for PostgreSQL vector tables needs to be tuned for bulk-insert access patterns rather than OLTP defaults.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Vector search in Azure SQL (DiskANN) requires careful operational sizing.** High-dimensional embeddings consume substantial storage, index build operations have non-trivial memory requirements, and statistics on embedding tables should be refreshed after bulk loads so the optimizer keeps choosing the vector index.</li>
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **AI-generated SQL and AI-enriched security alerts both carry risks that require explicit mitigation.** Query generation should include human review gates before production writes; prompt injection through user data must be anticipated in enrichment pipelines; and Defender alert enrichment prompts should be calibrated toward investigation rather than dismissal to avoid creating a false sense of security.</li>
     </div>
     <div class="mt-14 bg-violet-950/40 border border-violet-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
-        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · SQL Server</p>
       </div>
       <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
          class="shrink-0 px-6 py-3 bg-violet-600 hover:bg-violet-500 text-white font-semibold rounded-xl text-sm transition">

@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Chapter 14: AI for Compliance and Auditing — The AI-Powered DBA</title>
-  <meta name="description" content="The AI-Powered DBA Chapter 14: AI for Compliance and Auditing. AI and AIOps for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
+  <meta name="description" content="The AI-Powered DBA Chapter 14: AI for Compliance and Auditing. AI and AIOps for SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
   <script type="module">
     import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
@@ -42,13 +42,13 @@
     <div class="space-y-4 text-sm">
 <h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 14: AI for Compliance and Auditing</h2>
 
-<p class="text-gray-300 leading-relaxed">Compliance is one of the least glamorous corners of database administration, yet it carries some of the highest organizational risk. A single audit finding — an unmasked PII column visible to an unauthorized role, a missing audit trail for a privileged operation, a retention policy violated by automated data purges — can translate into regulatory fines, legal exposure, or reputational damage that dwarfs the cost of any outage. Traditional compliance tooling forces DBAs into a reactive posture: periodic point-in-time assessments, manual policy reviews, and audit log grep sessions that happen after the fact. AI changes that equation entirely. This chapter shows how to apply large language models, anomaly detection pipelines, and embedding-based search to build continuous, intelligent compliance systems on top of PostgreSQL and SQL Server — systems that not only flag violations but explain them, prioritize them by risk, and generate remediation guidance in plain language.</p>
+<p class="text-gray-300 leading-relaxed">Compliance is one of the least glamorous corners of database administration, yet it carries some of the highest organizational risk. A single audit finding — an unmasked PII column visible to an unauthorized role, a missing audit trail for a privileged operation, a retention policy violated by automated data purges — can translate into regulatory fines, legal exposure, or reputational damage that dwarfs the cost of any outage. Traditional compliance tooling forces DBAs into a reactive posture: periodic point-in-time assessments, manual policy reviews, and audit log grep sessions that happen after the fact. AI changes that equation entirely. This chapter shows how to apply large language models, anomaly detection pipelines, and embedding-based search to build continuous, intelligent compliance systems on top of SQL Server — systems that not only flag violations but explain them, prioritize them by risk, and generate remediation guidance in plain language.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">The Compliance Gap That Manual Auditing Cannot Close</h3>
 
-<p class="text-gray-300 leading-relaxed">Most organizations running PostgreSQL or SQL Server operate under at least one compliance framework — HIPAA, PCI-DSS, SOC 2, GDPR, or a sector-specific regulation like FINRA or FedRAMP. Each framework publishes control requirements that translate, at the database layer, into a checklist: encrypt data at rest and in transit, restrict access to sensitive columns, log privileged operations, retain audit logs for a defined period, demonstrate least-privilege role assignments, and so on.</p>
+<p class="text-gray-300 leading-relaxed">Most organizations running SQL Server operate under at least one compliance framework — HIPAA, PCI-DSS, SOC 2, GDPR, or a sector-specific regulation like FINRA or FedRAMP. Each framework publishes control requirements that translate, at the database layer, into a checklist: encrypt data at rest and in transit, restrict access to sensitive columns, log privileged operations, retain audit logs for a defined period, demonstrate least-privilege role assignments, and so on.</p>
 
 <p class="text-gray-300 leading-relaxed">The fundamental problem is volume and velocity. A moderately sized production database cluster generates millions of audit events per day. Role assignments change. Applications deploy schema migrations that add new tables with PII. Stored procedures are modified. Connection strings in application configuration files are updated with credentials that bypass auditing. Nobody writes a ticket for any of this. The schema drift happens silently, the audit log grows without anyone reading it, and the next formal assessment — which might happen quarterly or annually — is the first time anyone looks at whether the current state matches the policy.</p>
 
@@ -110,10 +110,9 @@ documented and justified. No generic application roles should have unrestricted 
 to cardholder data tables.
 """
 
-pg_checks = translate_policy_to_checks(pci_requirement, "PostgreSQL 15")
-sql_server_checks = translate_policy_to_checks(pci_requirement, "SQL Server 2022")
+mssql_checks = translate_policy_to_checks(pci_requirement, "SQL Server 2022")
 
-print(json.dumps(pg_checks, indent=2))</code></pre>
+print(json.dumps(mssql_checks, indent=2))</code></pre>
 
 <p class="text-gray-300 leading-relaxed">When this runs against the PCI requirement above, the LLM returns structured check objects that look like this:</p>
 
@@ -121,11 +120,11 @@ print(json.dumps(pg_checks, indent=2))</code></pre>
   "description": "Identify roles with SELECT access to cardholder data tables",
   "risk_level": "HIGH",
   "queries": [
-    "SELECT grantee, table_name, privilege_type FROM information_schema.role_table_grants WHERE table_name IN ('card_numbers', 'payment_accounts', 'cardholder_data') AND privilege_type = 'SELECT' ORDER BY grantee, table_name;",
-    "SELECT rolname FROM pg_roles WHERE rolname LIKE 'app_%' AND pg_has_role(rolname, 'cardholder_reader', 'MEMBER');"
+    "SELECT dp.name AS grantee, SCHEMA_NAME(o.schema_id) + '.' + o.name AS table_name FROM sys.database_permissions p JOIN sys.objects o ON p.major_id = o.object_id JOIN sys.database_principals dp ON p.grantee_principal_id = dp.principal_id WHERE p.permission_name = 'SELECT' AND o.name IN ('card_numbers', 'payment_accounts', 'cardholder_data') ORDER BY grantee, table_name;",
+    "SELECT r.name AS role_name FROM sys.database_principals r WHERE r.type = 'R' AND r.name LIKE 'app_%' AND IS_ROLEMEMBER('cardholder_reader', r.name) = 1;"
   ],
   "pass_condition": "All grantees in result must appear in approved_roles.csv",
-  "remediation_hint": "Revoke SELECT on cardholder tables from any role not in the approved list. Use row-level security or column masking for application roles that need partial access."
+  "remediation_hint": "Revoke SELECT on cardholder tables from any role not in the approved list. Use dynamic data masking or row-level security for application roles that need partial access."
 }</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The generated queries are starting points, not production-ready artifacts. You should review them, adjust table names to match your schema, and parameterize the approved role list against your organization's access matrix. But the translation from regulatory language to SQL skeleton now takes seconds instead of hours.</p>
@@ -162,22 +161,41 @@ ORDER BY contains_likely_pii DESC, dp.name, o.name;</code></pre>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Building an AI-Driven Audit Log Analyzer</h3>
 
-<p class="text-gray-300 leading-relaxed">Audit log analysis is where the volume problem becomes acute. PostgreSQL's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pgaudit</code> extension and SQL Server's SQL Server Audit feature can both generate extremely detailed logs, but the firehose of events is only useful if something is actually reading and interpreting it.</p>
+<p class="text-gray-300 leading-relaxed">Audit log analysis is where the volume problem becomes acute. SQL Server's SQL Server Audit feature can generate extremely detailed logs, but the firehose of events is only useful if something is actually reading and interpreting it.</p>
 
 <p class="text-gray-300 leading-relaxed">The approach here combines two AI techniques: a streaming anomaly detection model that runs near real-time, and an LLM-based explanation layer that converts anomaly signals into plain-language summaries with remediation recommendations.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Setting up the audit log pipeline</strong></p>
 
-<p class="text-gray-300 leading-relaxed">For PostgreSQL using <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pgaudit</code>, the relevant configuration in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">postgresql.conf</code> generates per-statement logs:</p>
+<p class="text-gray-300 leading-relaxed">A server audit writing to the Windows Event Log, a file target, or Azure storage captures per-statement activity through SQL Server Audit. The T-SQL below creates a server-level audit plus a database audit specification covering SELECT, INSERT, UPDATE, DELETE, and DDL events:</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>pgaudit.log = 'write, ddl, role'
-pgaudit.log_catalog = on
-pgaudit.log_relation = on
-pgaudit.log_parameter = on
-log_connections = on
-log_disconnections = on</code></pre>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Create the server audit (file target; use TO APPLICATION_LOG or TO URL for other sinks)
+CREATE SERVER AUDIT [ComplianceAudit]
+TO FILE (FILEPATH = 'C:\AuditLogs\', MAXSIZE = 500 MB, MAX_ROLLOVER_FILES = 50)
+WITH (ON_FAILURE = FAIL_OPERATION);
+ALTER SERVER AUDIT [ComplianceAudit] WITH (STATE = ON);
+GO
 
-<p class="text-gray-300 leading-relaxed">For SQL Server, a server audit writing to the Windows Event Log or a file target captures equivalent data through the SQL Server Audit object. Both produce structured event streams that can be parsed into a common schema.</p>
+-- Database-level audit specification: capture reads, writes, and schema changes
+CREATE DATABASE AUDIT SPECIFICATION [ComplianceDbSpec]
+FOR SERVER AUDIT [ComplianceAudit]
+    ADD (SELECT, INSERT, UPDATE, DELETE ON DATABASE::[AppDB] BY [public]),
+    ADD (SCHEMA_OBJECT_CHANGE_GROUP),
+    ADD (DATABASE_PRINCIPAL_CHANGE_GROUP)
+WITH (STATE = ON);
+GO
+
+-- Audit events land in sys.fn_get_audit_file; shred them into a structured table
+SELECT
+    event_time,
+    server_principal_name,
+    database_name,
+    object_name,
+    statement,
+    action_id
+FROM sys.fn_get_audit_file('C:\AuditLogs\*.sqlaudit', DEFAULT, DEFAULT);</code></pre>
+
+<p class="text-gray-300 leading-relaxed">This produces a structured event stream that can be parsed into a common schema for the anomaly models that follow.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Vectorizing audit events for anomaly detection</strong></p>
 
@@ -187,35 +205,35 @@ log_disconnections = on</code></pre>
 import numpy as np
 from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import StandardScaler
-import psycopg2
+import pyodbc
 from datetime import datetime, timedelta
 
 def extract_session_features(conn, lookback_hours: int = 24) -&gt; pd.DataFrame:
     """
-    Aggregate pgaudit log data into per-session feature vectors.
-    Assumes audit logs are parsed into a structured audit_events table.
+    Aggregate SQL Server Audit event data into per-session feature vectors.
+    Assumes audit events are parsed into a structured dbo.audit_events table.
     """
     query = """
-    SELECT 
+    SELECT
         session_id,
         database_user,
         client_addr,
-        EXTRACT(HOUR FROM MIN(event_time)) AS session_start_hour,
+        DATEPART(HOUR, MIN(event_time)) AS session_start_hour,
         COUNT(*) AS total_statements,
         SUM(CASE WHEN command_tag = 'SELECT' THEN 1 ELSE 0 END) AS select_count,
         SUM(CASE WHEN command_tag IN ('INSERT', 'UPDATE', 'DELETE') THEN 1 ELSE 0 END) AS dml_count,
         SUM(CASE WHEN command_tag IN ('CREATE', 'ALTER', 'DROP', 'TRUNCATE') THEN 1 ELSE 0 END) AS ddl_count,
         COUNT(DISTINCT object_name) AS distinct_objects_accessed,
         COALESCE(SUM(rows_affected), 0) AS total_rows_affected,
-        EXTRACT(EPOCH FROM (MAX(event_time) - MIN(event_time))) AS session_duration_seconds,
+        DATEDIFF(SECOND, MIN(event_time), MAX(event_time)) AS session_duration_seconds,
         COUNT(DISTINCT client_addr) AS distinct_source_ips
-    FROM audit_events
-    WHERE event_time &gt;= NOW() - INTERVAL '%s hours'
+    FROM dbo.audit_events
+    WHERE event_time &gt;= DATEADD(HOUR, -?, GETUTCDATE())
     GROUP BY session_id, database_user, client_addr
     HAVING COUNT(*) &gt; 5  -- filter out trivial sessions
     """
-    
-    df = pd.read_sql(query % lookback_hours, conn)
+
+    df = pd.read_sql(query, conn, params=[lookback_hours])
     return df
 
 
@@ -536,21 +554,30 @@ def validate_pii_with_data_sample(conn, column_info: dict, sample_size: int = 50
     table = column_info['table']
     column = column_info['column_name']
 
-    # PostgreSQL version: sample with row-level hashing to avoid exposing raw values
+    # SQL Server version: sample with hashing to avoid exposing raw values
     # to the LLM where possible
-    sample_query_pg = f"""
-    SELECT 
+    sample_query = f"""
+    SELECT TOP ({sample_size})
         -- Return only structural fingerprint, not raw values
-        LENGTH(CAST({column} AS TEXT)) AS value_length,
-        -- Pattern detection without exposing values
-        (CAST({column} AS TEXT) ~ '^[0-9]{{3}}-[0-9]{{2}}-[0-9]{{4}}$') AS matches_ssn_pattern,
-        (CAST({column} AS TEXT) ~ '^[0-9]{{15,16}}$') AS matches_pan_pattern,
-        (CAST({column} AS TEXT) ~ '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{{2,}}$') AS matches_email,
-        (CAST({column} AS TEXT) ~ '^\\+?[0-9]{{10,15}}$') AS matches_phone
-    FROM {schema}.{table}
-    WHERE {column} IS NOT NULL
-    ORDER BY RANDOM()
-    LIMIT {sample_size}
+        LEN(CAST([{column}] AS NVARCHAR(MAX))) AS value_length,
+        -- Pattern detection without exposing values (T-SQL LIKE patterns)
+        CASE WHEN CAST([{column}] AS NVARCHAR(MAX)) LIKE
+            '[0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9][0-9][0-9]'
+            THEN 1 ELSE 0 END AS matches_ssn_pattern,
+        CASE WHEN CAST([{column}] AS NVARCHAR(MAX)) LIKE
+            '[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]'
+            THEN 1 ELSE 0 END AS matches_pan_pattern,
+        CASE WHEN CAST([{column}] AS NVARCHAR(MAX)) LIKE '%@%.%'
+            THEN 1 ELSE 0 END AS matches_email,
+        CASE WHEN CAST([{column}] AS NVARCHAR(MAX)) LIKE
+            '%[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]%'
+            THEN 1 ELSE 0 END AS matches_phone,
+        -- Hashed fingerprint lets the model reason about cardinality
+        -- without ever seeing the value
+        HASHBYTES('SHA2_256', CAST([{column}] AS NVARCHAR(MAX))) AS value_hash
+    FROM [{schema}].[{table}]
+    WHERE [{column}] IS NOT NULL
+    ORDER BY NEWID()
     """
 
     # Execute and aggregate pattern match results
@@ -923,7 +950,7 @@ HIPAA 45 CFR 164.530(j))."""
     <div class="mt-14 bg-violet-950/40 border border-violet-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
-        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · SQL Server</p>
       </div>
       <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
          class="shrink-0 px-6 py-3 bg-violet-600 hover:bg-violet-500 text-white font-semibold rounded-xl text-sm transition">

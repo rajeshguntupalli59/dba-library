@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Chapter 7: AI-Powered Monitoring — The AI-Powered DBA</title>
-  <meta name="description" content="The AI-Powered DBA Chapter 7: AI-Powered Monitoring. AI and AIOps for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
+  <meta name="description" content="The AI-Powered DBA Chapter 7: AI-Powered Monitoring. AI and AIOps for SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
   <script type="module">
     import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
@@ -42,7 +42,7 @@
     <div class="space-y-4 text-sm">
 <h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 7: AI-Powered Monitoring</h2>
 
-<p class="text-gray-300 leading-relaxed">Monitoring a database has always been more art than science. Experienced DBAs develop intuitions over years—learning which metrics matter at 2 AM, recognizing the early warning signs of a lock cascade, knowing that a sudden spike in checkpoint-related I/O on a Tuesday morning usually means someone ran a batch job without coordination. But intuitions don't scale, they don't transfer between engineers, and they fail silently when production systems evolve in ways that outpace human pattern recognition. AI-powered monitoring changes this equation by turning those hard-won intuitions into codified, continuously learning detection systems. This chapter builds a complete picture of what AI monitoring looks like in a PostgreSQL and SQL Server environment: from anomaly detection over time-series metrics, to natural language interfaces for alert triage, to production-grade pipelines that route intelligence into the tools your team already uses.</p>
+<p class="text-gray-300 leading-relaxed">Monitoring a database has always been more art than science. Experienced DBAs develop intuitions over years—learning which metrics matter at 2 AM, recognizing the early warning signs of a lock cascade, knowing that a sudden spike in checkpoint-related I/O on a Tuesday morning usually means someone ran a batch job without coordination. But intuitions don't scale, they don't transfer between engineers, and they fail silently when production systems evolve in ways that outpace human pattern recognition. AI-powered monitoring changes this equation by turning those hard-won intuitions into codified, continuously learning detection systems. This chapter builds a complete picture of what AI monitoring looks like in a SQL Server environment: from anomaly detection over time-series metrics, to natural language interfaces for alert triage, to production-grade pipelines that route intelligence into the tools your team already uses.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
@@ -52,9 +52,9 @@
 
 <p class="text-gray-300 leading-relaxed">Consider a reporting database that runs light OLTP loads from 9 AM to 6 PM and then absorbs a nightly ETL that legitimately pegs CPU at 85% for three hours. A static threshold of 80% CPU generates noise every night—engineers start ignoring pages. When they tune the threshold to 90%, they miss a genuine runaway query that sits at 87% for six hours. This is the classic precision-recall tradeoff applied to alerting, and static thresholds simply cannot navigate it without constant manual recalibration.</p>
 
-<p class="text-gray-300 leading-relaxed">The problem compounds across dozens of databases. Each one has its own usage patterns, its own definition of "normal," and its own failure modes. A DBA team managing 40 PostgreSQL instances and 20 SQL Server instances cannot maintain bespoke thresholds for every metric on every server. Alert fatigue is not just an inconvenience—it is a safety hazard. When engineers route critical pages to Slack and then mute the channel because of noise, the next real incident will be discovered by a customer, not an operator.</p>
+<p class="text-gray-300 leading-relaxed">The problem compounds across dozens of databases. Each one has its own usage patterns, its own definition of "normal," and its own failure modes. A DBA team managing 60 SQL Server instances cannot maintain bespoke thresholds for every metric on every server. Alert fatigue is not just an inconvenience—it is a safety hazard. When engineers route critical pages to Slack and then mute the channel because of noise, the next real incident will be discovered by a customer, not an operator.</p>
 
-<p class="text-gray-300 leading-relaxed">The deeper issue is that individual metrics, viewed in isolation, are poor predictors of problems. A query duration spike means nothing on its own. Combined with a simultaneous drop in buffer hit ratio, a rise in disk read latency, and an increase in autovacuum worker count, it tells a coherent story: a table has bloated, autovacuum is struggling to catch up, and the query planner has started choosing sequential scans over index scans. No threshold on any single metric would catch this. A multivariate model can.</p>
+<p class="text-gray-300 leading-relaxed">The deeper issue is that individual metrics, viewed in isolation, are poor predictors of problems. A query duration spike means nothing on its own. Combined with a simultaneous drop in buffer cache hit ratio, a rise in disk read latency, and a surge in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CXPACKET</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">LCK_M_*</code> waits, it tells a coherent story: statistics went stale after a large data load, the optimizer started choosing table scans over seeks, and blocking chains are forming behind the scans. No threshold on any single metric would catch this. A multivariate model can.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
@@ -67,19 +67,25 @@
 <p class="text-gray-300 leading-relaxed">Python's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">statsmodels</code> library makes this straightforward:</p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import pandas as pd
+import pandas as pd
 import numpy as np
 from statsmodels.tsa.seasonal import STL
-import psycopg2
+import pyodbc
 
-# Pull 30 days of query latency from pg_stat_statements history
-conn = psycopg2.connect("host=pgprod01 dbname=monitoring user=mon_reader")
+# Pull 30 days of query latency from Query Store history
+conn = pyodbc.connect(
+    "DRIVER={ODBC Driver 18 for SQL Server};"
+    "SERVER=sqlmon01;DATABASE=monitoring;"
+    "UID=mon_reader;PWD=${MON_READER_PASSWORD};"
+    "Encrypt=yes;TrustServerCertificate=yes;"
+)
 df = pd.read_sql("""
     SELECT
         recorded_at,
         avg_exec_time_ms
     FROM query_metrics_history
     WHERE metric_name = 'avg_exec_time'
-      AND recorded_at &gt;= NOW() - INTERVAL '30 days'
+      AND recorded_at &gt;= DATEADD(DAY, -30, GETUTCDATE())
     ORDER BY recorded_at
 """, conn, index_col='recorded_at', parse_dates=['recorded_at'])
 
@@ -96,20 +102,6 @@ std_resid = residuals.std()
 df['anomaly'] = np.abs(residuals - mean_resid) &gt; (3 * std_resid)
 anomalies = df[df['anomaly'] == True]
 print(f"Found {len(anomalies)} anomalous intervals in the past 30 days")</code></pre>
-
-<p class="text-gray-300 leading-relaxed">For SQL Server, you'd pull equivalent data from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_query_stats</code> history or a custom collection table:</p>
-
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Pull recent average query duration snapshots for anomaly detection pipeline
-SELECT
-    snapshot_time,
-    AVG(total_elapsed_time / execution_count) AS avg_elapsed_us,
-    COUNT(*) AS query_count
-FROM dbo.query_stats_history
-WHERE snapshot_time &gt;= DATEADD(DAY, -30, GETUTCDATE())
-GROUP BY snapshot_time
-ORDER BY snapshot_time;</code></pre>
-
 
 <p class="text-gray-300 leading-relaxed">STL works well for univariate metrics, but database health is inherently multivariate. As your monitoring matures, you will want models that can detect anomalies across correlated metrics simultaneously. Facebook's Prophet is widely used in infrastructure monitoring and handles seasonality well, but it's fundamentally a univariate forecaster — you run one model per metric (optionally with extra regressors), not one model across many correlated metrics at once. For genuinely multivariate anomaly detection, isolation forests and autoencoders are worth exploring.</p>
 
@@ -129,16 +121,16 @@ features = pd.read_sql("""
         buffer_hit_ratio,
         lock_wait_count,
         checkpoint_duration_s,
-        autovacuum_workers
+        tempdb_spills
     FROM db_health_snapshots
-    WHERE snapshot_time &gt;= NOW() - INTERVAL '14 days'
+    WHERE snapshot_time &gt;= DATEADD(DAY, -14, GETUTCDATE())
     ORDER BY snapshot_time
 """, conn)
 
 feature_cols = [
     'cpu_pct', 'active_connections', 'avg_query_ms',
     'buffer_hit_ratio', 'lock_wait_count',
-    'checkpoint_duration_s', 'autovacuum_workers'
+    'checkpoint_duration_s', 'tempdb_spills'
 ]
 
 scaler = StandardScaler()
@@ -154,9 +146,12 @@ clf.fit(X)
 features['anomaly_score'] = clf.decision_function(X)
 features['is_anomaly'] = clf.predict(X) == -1
 
-# Export anomaly scores back to PostgreSQL for Grafana visualization
+# Export anomaly scores back to SQL Server for Grafana visualization
 from sqlalchemy import create_engine
-engine = create_engine("postgresql://mon_writer:pw@pgprod01/monitoring")
+engine = create_engine(
+    "mssql+pyodbc://mon_writer:${MON_WRITER_PASSWORD}@sqlmon01/monitoring"
+    "?driver=ODBC+Driver+18+for+SQL+Server"
+)
 features[['snapshot_time', 'anomaly_score', 'is_anomaly']].to_sql(
     'anomaly_scores', engine, if_exists='append', index=False
 )</code></pre>
@@ -169,57 +164,28 @@ features[['snapshot_time', 'anomaly_score', 'is_anomaly']].to_sql(
 
 <p class="text-gray-300 leading-relaxed">Anomaly detection is only as good as the data it consumes. Before any model can reliably flag unusual behavior, you need a metrics collection pipeline that is consistent, high-resolution, and queryable at arbitrary time ranges. The typical production stack combines Prometheus for scraping, a time-series database for storage, and Grafana for visualization—with an AI layer sitting alongside this stack and consuming the same data.</p>
 
-<p class="text-gray-300 leading-relaxed">For PostgreSQL, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">postgres_exporter</code> is the standard Prometheus exporter. Configure it to collect from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_bgwriter</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_database</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_user_tables</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code>, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_locks</code>. For SQL Server, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sql_exporter</code> or the official Microsoft <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sql-server-prometheus-exporter</code> covers DMV-level metrics. A representative <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">postgres_exporter</code> query configuration for lock monitoring:</p>
+<p class="text-gray-300 leading-relaxed">For SQL Server, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sql_exporter</code> or the official Microsoft <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sql-server-prometheus-exporter</code> covers DMV-level metrics. A representative exporter query configuration for lock monitoring queries <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_tran_locks</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_os_waiting_tasks</code>:</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># queries.yaml for postgres_exporter
-pg_locks_detail:
-  query: |
-    SELECT
-      mode,
-      relation::regclass::text AS relation_name,
-      COUNT(*) AS lock_count
-    FROM pg_locks
-    WHERE granted = false
-    GROUP BY mode, relation
-  metrics:
-    - mode:
-        usage: LABEL
-        description: Lock mode
-    - relation_name:
-        usage: LABEL
-        description: Relation being waited on
-    - lock_count:
-        usage: GAUGE
-        description: Number of ungranted locks</code></pre>
-
-<p class="text-gray-300 leading-relaxed">A common mistake is collecting metrics at too coarse a resolution. Five-minute intervals are fine for capacity planning but miss the 30-second lock cascade that took your application down. For health-sensitive metrics—active connections, wait events, lock waits, replication lag—collect at 15-second intervals. For heavier queries against <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> or SQL Server DMVs, one-minute intervals are reasonable.</p>
-
-<p class="text-gray-300 leading-relaxed">Store raw metrics in Prometheus (with a long retention VictoriaMetrics backend if you need years of history) and mirror them into a relational or columnar store that your AI pipeline can query with SQL. TimescaleDB on PostgreSQL is an excellent choice for this—it gives you SQL semantics over time-series data, which makes writing the feature engineering queries that feed your models far more natural than Prometheus's PromQL.</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL (TimescaleDB feature store):</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Create a continuous aggregate for 5-minute feature windows
-CREATE MATERIALIZED VIEW db_health_5min
-WITH (timescaledb.continuous) AS
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Collector query: current lock waits by resource and wait type
+-- (run by sql_exporter on a 15-second scrape interval)
 SELECT
-    time_bucket('5 minutes', collected_at) AS bucket,
-    instance_id,
-    AVG(cpu_pct)                  AS avg_cpu,
-    MAX(active_connections)        AS max_connections,
-    AVG(avg_query_ms)              AS avg_query_ms,
-    AVG(buffer_hit_ratio)          AS avg_buffer_hit_ratio,
-    SUM(lock_wait_count)           AS total_lock_waits,
-    MAX(replication_lag_bytes)     AS max_replication_lag
-FROM raw_db_metrics
-GROUP BY bucket, instance_id
-WITH NO DATA;
+    tl.resource_type,
+    tl.request_mode,
+    wt.wait_type,
+    COUNT(*) AS lock_wait_count,
+    MAX(DATEDIFF(MILLISECOND, wt.wait_start, GETDATE())) AS max_wait_ms
+FROM sys.dm_tran_locks tl
+JOIN sys.dm_os_waiting_tasks wt
+    ON wt.resource_address = tl.lock_owner_address
+WHERE tl.request_status = 'WAIT'
+GROUP BY tl.resource_type, tl.request_mode, wt.wait_type;</code></pre>
 
-SELECT add_continuous_aggregate_policy('db_health_5min',
-    start_offset =&gt; INTERVAL '1 hour',
-    end_offset   =&gt; INTERVAL '5 minutes',
-    schedule_interval =&gt; INTERVAL '5 minutes');</code></pre>
+<p class="text-gray-300 leading-relaxed">A common mistake is collecting metrics at too coarse a resolution. Five-minute intervals are fine for capacity planning but miss the 30-second lock cascade that took your application down. For health-sensitive metrics—active connections, wait events, lock waits, replication lag—collect at 15-second intervals. For heavier queries against Query Store or SQL Server DMVs, one-minute intervals are reasonable.</p>
 
+<p class="text-gray-300 leading-relaxed">Store raw metrics in Prometheus (with a long retention VictoriaMetrics backend if you need years of history) and mirror them into a relational or columnar store that your AI pipeline can query with SQL. A dedicated SQL Server monitoring database with clustered columnstore history tables works well for this — it gives you full T-SQL semantics over time-series data, which makes writing the feature engineering queries that feed your models far more natural than Prometheus's PromQL.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Equivalent feature aggregation in SQL Server using a scheduled job
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server (columnstore feature store):</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Feature aggregation into 5-minute windows via a scheduled SQL Agent job
 INSERT INTO dbo.db_health_5min (
     bucket,
     instance_id,
@@ -263,7 +229,7 @@ GROUP BY
     participant E as On-call Engineer
 
     M->>C: anomaly detected (score, top features)
-    C->>C: query pg_stat_activity, wait events, lock waits
+    C->>C: query sys.dm_exec_requests, wait stats, lock waits
     C->>L: structured prompt (score + context)
     L-->>C: narrative (cause, severity, actions)
     C->>A: alert with AI narrative attached
@@ -277,47 +243,64 @@ GROUP BY
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import openai
 import json
-import psycopg2
+import pyodbc
 from datetime import datetime, timedelta
 
 def collect_incident_context(instance_id: str, anomaly_time: datetime) -&gt; dict:
-    conn = psycopg2.connect(f"host={instance_id} dbname=postgres user=mon_reader")
+    conn = pyodbc.connect(
+        "DRIVER={ODBC Driver 18 for SQL Server};"
+        f"SERVER={instance_id};DATABASE=master;"
+        "UID=mon_reader;PWD=${MON_READER_PASSWORD};"
+        "Encrypt=yes;TrustServerCertificate=yes;"
+    )
     cur = conn.cursor()
 
-    # Top wait events at anomaly time
+    # Top wait types at anomaly time
     cur.execute("""
-        SELECT wait_event_type, wait_event, COUNT(*) as session_count
-        FROM pg_stat_activity
-        WHERE state != 'idle'
-        GROUP BY wait_event_type, wait_event
-        ORDER BY session_count DESC
-        LIMIT 10
+        SELECT TOP (10)
+            wait_type,
+            waiting_tasks_count,
+            wait_time_ms
+        FROM sys.dm_os_wait_stats
+        WHERE wait_type NOT IN (
+            'CLR_SEMAPHORE','LAZYWRITER_SLEEP','RESOURCE_QUEUE',
+            'SLEEP_TASK','SLEEP_SYSTEMTASK','SQLTRACE_BUFFER_FLUSH',
+            'WAITFOR','LOGMGR_QUEUE','CHECKPOINT_QUEUE')
+        ORDER BY wait_time_ms DESC
     """)
     wait_events = cur.fetchall()
 
     # Longest running queries
     cur.execute("""
-        SELECT pid, usename, application_name, state,
-               EXTRACT(EPOCH FROM (NOW() - query_start))::int AS duration_s,
-               LEFT(query, 200) AS query_preview
-        FROM pg_stat_activity
-        WHERE state != 'idle'
-          AND query_start IS NOT NULL
+        SELECT TOP (5)
+            r.session_id,
+            s.login_name,
+            s.program_name,
+            r.status,
+            DATEDIFF(SECOND, r.start_time, GETDATE()) AS duration_s,
+            LEFT(t.text, 200) AS query_preview
+        FROM sys.dm_exec_requests r
+        JOIN sys.dm_exec_sessions s ON s.session_id = r.session_id
+        CROSS APPLY sys.dm_exec_sql_text(r.sql_handle) t
+        WHERE r.session_id &gt; 50
         ORDER BY duration_s DESC
-        LIMIT 5
     """)
     long_queries = cur.fetchall()
 
-    # Lock waits
+    # Blocking chains
     cur.execute("""
-        SELECT blocked.pid AS blocked_pid,
-               blocking.pid AS blocking_pid,
-               blocked.query AS blocked_query,
-               blocking.query AS blocking_query
-        FROM pg_stat_activity blocked
-        JOIN pg_stat_activity blocking
-          ON blocking.pid = ANY(pg_blocking_pids(blocked.pid))
-        LIMIT 5
+        SELECT TOP (5)
+            wt.session_id        AS blocked_session,
+            wt.blocking_session_id AS blocking_session,
+            LEFT(t.text, 200)    AS blocked_query,
+            wt.wait_type,
+            DATEDIFF(SECOND, wt.wait_start, GETDATE()) AS wait_s
+        FROM sys.dm_os_waiting_tasks wt
+        CROSS APPLY sys.dm_exec_sql_text(
+            (SELECT sql_handle FROM sys.dm_exec_requests
+             WHERE session_id = wt.session_id)) t
+        WHERE wt.blocking_session_id IS NOT NULL
+        ORDER BY wait_s DESC
     """)
     lock_waits = cur.fetchall()
 
@@ -337,7 +320,7 @@ def generate_alert_narrative(context: dict, anomaly_score: float,
                               top_features: dict) -&gt; str:
     client = openai.OpenAI()
 
-    system_prompt = """You are a senior PostgreSQL DBA analyzing a database health anomaly.
+    system_prompt = """You are a senior SQL Server DBA analyzing a database health anomaly.
 Your job is to interpret the provided metric context and generate a clear, actionable alert 
 narrative for an on-call engineer. Be specific about likely root causes. Do not speculate 
 beyond what the data supports. Format your response as:
@@ -348,7 +331,7 @@ IMMEDIATE ACTIONS: &lt;numbered list of 3-5 concrete steps&gt;
 WATCH FOR: &lt;metrics or conditions that would indicate escalation&gt;"""
 
     user_prompt = f"""
-Anomaly detected on PostgreSQL instance: {context['instance']}
+Anomaly detected on SQL Server instance: {context['instance']}
 Anomaly score: {anomaly_score:.3f} (higher = more anomalous)
 Detected at: {context['anomaly_time']}
 
@@ -415,7 +398,7 @@ Format: LIKELY CAUSE / SEVERITY / IMMEDIATE ACTIONS / ESCALATION TRIGGERS""",
         messages=[{
             "role": "user",
             "content": f"""
-Database: {context['instance']} (PostgreSQL)
+Database: {context['instance']} (SQL Server)
 Anomaly Score: {anomaly_score:.3f}
 Timestamp: {context['anomaly_time']}
 
@@ -443,7 +426,7 @@ Provide your diagnosis.
 
 <p class="text-gray-300 leading-relaxed">AI-generated anomaly scores and narratives are only useful if they appear where engineers already look. The goal is to enrich your existing Grafana dashboards rather than build parallel tooling that no one will check. The integration points are simpler than they might appear.</p>
 
-<p class="text-gray-300 leading-relaxed">Anomaly scores generated by your Python pipeline can be written back to Prometheus via the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">prometheus_client</code> library's push gateway, or persisted in TimescaleDB and exposed through a custom Prometheus exporter. Once the score is a Prometheus metric, it appears in Grafana like any other time series and can trigger standard alerting rules.</p>
+<p class="text-gray-300 leading-relaxed">Anomaly scores generated by your Python pipeline can be written back to Prometheus via the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">prometheus_client</code> library's push gateway, or persisted in your SQL Server monitoring database and exposed through a custom exporter. Once the score is a Prometheus metric, it appears in Grafana like any other time series and can trigger standard alerting rules.</p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>from prometheus_client import CollectorRegistry, Gauge, push_to_gateway
 
@@ -485,7 +468,7 @@ def publish_anomaly_scores(scores: pd.DataFrame, pushgateway_url: str):
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Third row**: Standard operational metrics—connections, query duration percentiles, lock waits, replication lag—for the drill-down that engineers will do after reading the AI narrative.</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Bottom row**: A text panel that queries your narrative storage table and displays the most recent LLM assessment for the selected instance.</li>
 
-<p class="text-gray-300 leading-relaxed">For the narrative storage and retrieval, a simple PostgreSQL table works well:</p>
+<p class="text-gray-300 leading-relaxed">For the narrative storage and retrieval, a simple SQL Server table works well:</p>
 
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE monitoring.ai_alert_narratives (
@@ -530,7 +513,7 @@ WHERE rn = 1;</code></pre>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Natural Language Queries Against Live Database State</h3>
 
-<p class="text-gray-300 leading-relaxed">Beyond alert generation, LLMs open a second monitoring use case: letting engineers query database state in plain English without remembering the exact DMV syntax or pg_stat view column names. This is particularly valuable for less experienced team members who know what they want to know but not necessarily how to express it in SQL.</p>
+<p class="text-gray-300 leading-relaxed">Beyond alert generation, LLMs open a second monitoring use case: letting engineers query database state in plain English without remembering the exact DMV syntax or system view column names. This is particularly valuable for less experienced team members who know what they want to know but not necessarily how to express it in SQL.</p>
 
 <p class="text-gray-300 leading-relaxed">The pattern is a natural language to SQL translation layer, executed against your monitoring database or directly against the target instance's system views. Chapter 3 covered the foundations of NL-to-SQL in detail. In a monitoring context, the key differences are:</p>
 
@@ -541,31 +524,33 @@ WHERE rn = 1;</code></pre>
 <p class="text-gray-300 leading-relaxed">A monitoring-specific NL-to-SQL implementation:</p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import openai
-import psycopg2
-import psycopg2.extras
+import pyodbc
 from typing import Optional
 
 MONITORING_SCHEMA_CONTEXT = """
-You have read-only access to a PostgreSQL monitoring database and the following 
-system views on the target instance:
+You have read-only access to a SQL Server instance via the following DMVs:
 
-pg_stat_activity: columns pid, usename, application_name, state, wait_event_type, 
-  wait_event, query_start, query (current queries and sessions)
-pg_stat_statements: columns userid, dbid, query, calls, total_exec_time, 
-  mean_exec_time, stddev_exec_time, rows (query performance statistics)
-pg_stat_user_tables: columns schemaname, relname, seq_scan, idx_scan, 
-  n_live_tup, n_dead_tup, last_autovacuum, last_analyze (table statistics)
-pg_locks: columns pid, locktype, relation, mode, granted (lock information)
-pg_stat_bgwriter: columns checkpoints_timed, checkpoints_req, 
-  buffers_checkpoint, buffers_clean, maxwritten_clean (background writer)
-pg_stat_replication: columns client_addr, state, sent_lsn, write_lsn, 
-  flush_lsn, replay_lsn, write_lag, flush_lag, replay_lag (replication status)
+sys.dm_exec_sessions: columns session_id, login_name, program_name, status,
+  cpu_time, memory_usage, login_time (current sessions)
+sys.dm_exec_requests: columns session_id, status, command, wait_type,
+  wait_time, blocking_session_id, cpu_time, start_time (active requests)
+sys.dm_os_wait_stats: columns wait_type, waiting_tasks_count, wait_time_ms
+  (cumulative wait statistics)
+sys.dm_tran_locks: columns resource_type, request_mode, request_status,
+  request_session_id (lock information)
+sys.dm_os_performance_counters: columns object_name, counter_name, cntr_value
+  (buffer manager, memory manager, and access method counters)
+sys.dm_hadr_database_replica_states: columns database_id,
+  synchronization_state_desc, log_send_queue_size, redo_queue_size
+  (Availability Group replica health)
+sys.query_store_query_text: columns query_text_id, query_sql_text
+  (query text catalog for Query Store)
 
 Rules:
-- Generate only SELECT statements. Never generate INSERT, UPDATE, DELETE, DROP, 
+- Generate only SELECT statements. Never generate INSERT, UPDATE, DELETE, DROP,
   ALTER, or any DDL/DML.
-- Always include a LIMIT clause (maximum 100 rows unless specifically asked for more).
-- For time-based filters, use NOW() and INTERVAL arithmetic.
+- Always include a TOP clause (maximum 100 rows unless specifically asked for more).
+- For time-based filters, use GETUTCDATE() and DATEADD arithmetic.
 - Return only the SQL query, no explanation.
 """
 
@@ -582,11 +567,11 @@ def nl_to_monitoring_sql(question: str, client: openai.OpenAI) -&gt; str:
 
 
 def execute_monitoring_query(sql: str, conn_string: str,
-                              timeout_ms: int = 5000) -&gt; list[dict]:
-    conn = psycopg2.connect(conn_string)
-    conn.set_session(readonly=True)
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute(f"SET statement_timeout = {timeout_ms}")
+                              timeout_sec: int = 5) -&gt; list[dict]:
+    conn = pyodbc.connect(conn_string, timeout=timeout_sec)
+    cur = conn.cursor()
+    # Read-only enforcement: application intent + explicit transaction abort
+    cur.execute("SET LOCK_TIMEOUT 5000")
 
     # Basic safety check: reject anything that isn't a SELECT
     normalized = sql.strip().upper()
@@ -594,10 +579,11 @@ def execute_monitoring_query(sql: str, conn_string: str,
         raise ValueError(f"Generated SQL is not a SELECT statement: {sql[:100]}")
 
     cur.execute(sql)
-    results = cur.fetchall()
+    cols = [c[0] for c in cur.description]
+    results = [dict(zip(cols, row)) for row in cur.fetchall()]
     cur.close()
     conn.close()
-    return [dict(row) for row in results]
+    return results
 
 
 def narrate_results(question: str, sql: str, results: list[dict],
@@ -640,34 +626,9 @@ def ask_monitoring(question: str, conn_string: str) -&gt; dict:
 
 # Example questions your team can now ask in plain English:
 # ask_monitoring("Which queries have been running for more than 5 minutes?", conn_str)
-# ask_monitoring("Are there any tables that haven't been vacuumed in the last week?", conn_str)
-# ask_monitoring("What is the current replication lag on all standbys?", conn_str)
+# ask_monitoring("Are there any tables whose statistics have not been updated in the last week?", conn_str)
+# ask_monitoring("What is the current redo queue on all AG secondaries?", conn_str)
 # ask_monitoring("Show me the top 10 queries by average execution time today", conn_str)</code></pre>
-
-<p class="text-gray-300 leading-relaxed">The equivalent capability against SQL Server targets uses the same LLM translation layer, but the schema context points at DMVs:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>SQL_SERVER_MONITORING_SCHEMA = """
-You have read-only access to a SQL Server instance via the following DMVs:
-
-sys.dm_exec_requests: columns session_id, status, command, sql_handle, 
-  start_time, total_elapsed_time, wait_type, wait_time, blocking_session_id
-sys.dm_exec_sessions: columns session_id, login_name, host_name, program_name,
-  status, last_request_start_time, reads, writes, logical_reads
-sys.dm_exec_query_stats: columns sql_handle, execution_count, 
-  total_elapsed_time, total_logical_reads, total_logical_writes, 
-  total_worker_time, last_execution_time
-sys.dm_os_wait_stats: columns wait_type, waiting_tasks_count, 
-  wait_time_ms, signal_wait_time_ms
-sys.dm_db_index_usage_stats: columns object_id, index_id, user_seeks, 
-  user_scans, user_lookups, user_updates, last_user_seek
-sys.dm_exec_sql_text(sql_handle): returns query text for a given sql_handle
-
-Rules:
-- Generate only SELECT statements.
-- Use CROSS APPLY for sys.dm_exec_sql_text when joining to get query text.
-- Always include TOP clause instead of LIMIT.
-- Return only the SQL query.
-"""</code></pre>
 
 <p class="text-gray-300 leading-relaxed">This natural language interface pays dividends in post-incident reviews. An engineer can ask "What were the top 5 longest-running queries between 2 AM and 3 AM yesterday?" against the historical snapshot tables in your monitoring database and get a plain-English answer without building a custom report. The cognitive overhead of the investigation drops significantly, which means more time on root cause analysis and less on constructing the right SQL.</p>
 
@@ -689,8 +650,8 @@ class HealthScoreComponents:
     # Rule-based components (0-100 each, 100 = healthy)
     replication_health: float
     connection_headroom: float
-    vacuum_health: float
-    bloat_index: float
+    stats_health: float
+    fragmentation_index: float
 
     # ML-derived components
     anomaly_score_normalized: float  # Convert isolation forest score to 0-100
@@ -700,8 +661,8 @@ class HealthScoreComponents:
     WEIGHTS = {
         'replication_health': 0.25,
         'connection_headroom': 0.15,
-        'vacuum_health': 0.20,
-        'bloat_index': 0.15,
+        'stats_health': 0.20,
+        'fragmentation_index': 0.15,
         'anomaly_score_normalized': 0.15,
         'query_pattern_stability': 0.10
     }
@@ -710,8 +671,8 @@ class HealthScoreComponents:
         components = {
             'replication_health': self.replication_health,
             'connection_headroom': self.connection_headroom,
-            'vacuum_health': self.vacuum_health,
-            'bloat_index': self.bloat_index,
+            'stats_health': self.stats_health,
+            'fragmentation_index': self.fragmentation_index,
             'anomaly_score_normalized': self.anomaly_score_normalized,
             'query_pattern_stability': self.query_pattern_stability
         }
@@ -721,17 +682,21 @@ class HealthScoreComponents:
         )
 
 
-def compute_vacuum_health(conn) -&gt; float:
-    """Score 0-100: 100 means all tables are well-vacuumed"""
+def compute_stats_health(conn) -&gt; float:
+    """Score 0-100: 100 means all tables have fresh optimizer statistics"""
     cur = conn.cursor()
     cur.execute("""
         SELECT
-            COUNT(*) FILTER (
-                WHERE last_autovacuum &lt; NOW() - INTERVAL '7 days'
-                  OR last_autovacuum IS NULL
-            )::float / NULLIF(COUNT(*), 0) AS stale_fraction
-        FROM pg_stat_user_tables
-        WHERE n_live_tup &gt; 1000  -- Only care about non-trivial tables
+            CAST(SUM(CASE
+                WHEN STATS_DATE(s.object_id, s.stats_id)
+                     &lt; DATEADD(DAY, -7, GETUTCDATE())
+                  OR STATS_DATE(s.object_id, s.stats_id) IS NULL
+                THEN 1 ELSE 0 END) AS FLOAT)
+            / NULLIF(COUNT(*), 0) AS stale_fraction
+        FROM sys.stats s
+        JOIN sys.objects o ON o.object_id = s.object_id
+        WHERE o.type = 'U'
+          AND o.is_ms_shipped = 0
     """)
     stale_fraction = cur.fetchone()[0] or 0.0
     return max(0.0, 100.0 * (1.0 - stale_fraction * 2))  # 50% stale = score of 0
@@ -740,7 +705,7 @@ def compute_vacuum_health(conn) -&gt; float:
 def compute_connection_headroom(conn, max_connections: int) -&gt; float:
     """Score 0-100: 100 means well below max connections"""
     cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM pg_stat_activity")
+    cur.execute("SELECT COUNT(*) FROM sys.dm_exec_sessions WHERE session_id &gt; 50")
     current = cur.fetchone()[0]
     utilization = current / max_connections
     # Nonlinear penalty: starts dropping at 70% utilization
@@ -934,7 +899,7 @@ def check_model_drift(model, scaler, conn, instance_id: str,
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **LLMs turn anomaly scores into actionable intelligence.** By collecting incident context—wait events, long-running queries, lock holders—and passing it to a language model at alert time, you replace cryptic metric spikes with human-readable diagnoses that on-call engineers can act on immediately without deep database expertise.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Your metrics pipeline is the foundation everything else rests on.** High-resolution collection (15-second intervals for health-sensitive metrics), a reliable time-series store (TimescaleDB or VictoriaMetrics), and continuous feature aggregation are prerequisites for models that actually work in production.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Your metrics pipeline is the foundation everything else rests on.** High-resolution collection (15-second intervals for health-sensitive metrics), a reliable time-series store (VictoriaMetrics or a SQL Server columnstore history database), and continuous feature aggregation are prerequisites for models that actually work in production.</li>
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Natural language interfaces lower the skill floor for database investigation.** An NL-to-SQL translation layer over system views and DMVs lets engineers of all experience levels interrogate database state in plain English, accelerating post-incident investigations and reducing the cognitive overhead of triage.</li>
 
@@ -943,7 +908,7 @@ def check_model_drift(model, scaler, conn, instance_id: str,
     <div class="mt-14 bg-violet-950/40 border border-violet-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
-        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · SQL Server</p>
       </div>
       <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
          class="shrink-0 px-6 py-3 bg-violet-600 hover:bg-violet-500 text-white font-semibold rounded-xl text-sm transition">
