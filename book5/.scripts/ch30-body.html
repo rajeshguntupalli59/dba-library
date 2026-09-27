@@ -1,0 +1,61 @@
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 30: Monitoring Cloud Databases: CloudWatch, Azure Monitor, and Beyond</h2>
+
+<p class="text-gray-300 leading-relaxed">In the cloud you lose the server room — no walking up to the rack, no local PerfMon console — and gain the platform's telemetry firehose. The monitoring challenge for SQL Server in the cloud is not data scarcity but signal: every platform emits hundreds of metrics, and the DBA's job is to select the thirty that predict incidents, alert on the ten that demand action, and dashboard the rest for diagnosis. This chapter builds the SQL Server monitoring stack per cloud, the alerting discipline, and the integration with your existing observability.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">30.1 What You Lost and What You Gained</h3>
+
+<p class="text-gray-300 leading-relaxed">Lost: direct OS access on managed services (no PerfMon, no Task Manager — you get what the platform exposes), and the single-pane view of a homogeneous estate. Gained: every metric with history by default (no more "we weren't collecting that"), platform-native anomaly detection, log aggregation without agents to maintain, and metrics that correlate database and infrastructure automatically. The philosophy shift: monitor <strong class="text-white">outcomes and leading indicators</strong> (query latency, replication lag, connection failures, backup age) rather than raw counters. A CPU graph is trivia; <em>p95 query latency by workload</em> is the business.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">30.2 CloudWatch: Monitoring RDS and EC2 SQL Server</h3>
+
+<p class="text-gray-300 leading-relaxed">For RDS: the essential metric set is <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CPUUtilization</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">FreeableMemory</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ReadIOPS/WriteIOPS</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ReadLatency/WriteLatency</code> (latency matters more than IOPS), <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DatabaseConnections</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">FreeStorageSpace</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ReplicaLag</code> (where applicable), and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">TransactionLogsDiskUsage</code> (the log-disk-full outage is the most preventable RDS incident). Enable <strong class="text-white">Enhanced Monitoring</strong> for OS-level granularity (process-level CPU/memory on 1-second resolution) and <strong class="text-white">Performance Insights</strong> for the query-level view (top SQL by load, wait events — the managed replacement for digging through DMVs). For EC2 SQL Server, add the CloudWatch agent for PerfMon counters (the full SQL Server counter set: buffer manager, memory manager, SQL statistics, waits) — self-managed means self-instrumented.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">30.3 Azure Monitor: Metrics, Diagnostics, and Log Analytics</h3>
+
+<p class="text-gray-300 leading-relaxed">Azure Monitor covers Azure SQL (Database, Managed Instance, VMs) with platform metrics plus <strong class="text-white">diagnostic settings</strong> streaming to Log Analytics: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">cpu_percent</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">physical_data_read_percent</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">log_write_percent</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dtu_consumption_percent</code> (DTU model), connection counts, and deadlock/timeout counters. The killer feature is <strong class="text-white">Query Store + Intelligent Insights</strong>: the platform detects query regressions, timeouts, and resource exhaustion automatically and reports root causes in plain language. Route diagnostics to Log Analytics for KQL-powered investigation (top queries by duration across the fleet, error log aggregation, audit trails) — the queries you write once become the fleet's shared diagnostics.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Top resource-consuming queries across the fleet (Log Analytics / KQL pattern)
+// AzureDiagnostics | where Category == "QueryStoreRuntimeStatistics"
+// | summarize avg(duration) by query_id | top 20 by avg_duration_
+
+// Or in T-SQL via Query Store on any single database:
+SELECT TOP 20 q.query_id,
+       SUM(rs.avg_duration * rs.count_executions) / 1000 AS total_sec,
+       SUM(rs.count_executions) AS executions
+FROM sys.query_store_query q
+JOIN sys.query_store_plan p ON q.query_id = p.query_id
+JOIN sys.query_store_runtime_stats rs ON p.plan_id = rs.plan_id
+GROUP BY q.query_id
+ORDER BY total_sec DESC;</code></pre>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">30.4 Google Cloud Monitoring for Cloud SQL and GCE</h3>
+
+<p class="text-gray-300 leading-relaxed">Cloud Monitoring covers Cloud SQL for SQL Server with database/cpu/utilization, disk bytes/ops, and connections; Cloud Logging aggregates the SQL Server error log without agent maintenance. For GCE-hosted SQL Server, the Ops Agent collects the Windows/SQL Server metrics into the same dashboards. The GCP strength is <strong class="text-white">uptime checks + alerting policies</strong> integrated with the same monitoring as the application tier — the database and the app that depends on it alert from one system. Query-level insight on Cloud SQL comes from Query Insights (the Performance Insights analog) — enable it; the default metrics alone will not find the bad query.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">30.5 Building Effective Dashboards</h3>
+
+<p class="text-gray-300 leading-relaxed">Three dashboards per database tier: <strong class="text-white">the health dashboard</strong> (one screen: availability, p95 latency, error rate, replication lag, backup age — the "is it healthy" answer in five seconds); <strong class="text-white">the performance dashboard</strong> (top queries by total duration, wait statistics breakdown, CPU/memory/I/O trends, plan regression alerts — the "what's slow" workspace); and <strong class="text-white">the capacity dashboard</strong> (storage growth trajectory, connection trends, CPU headroom — the "when do we act" forecast). Standardize the layout across clouds so a DBA reads any cloud's dashboard without translation (Chapter 24's rule). Every dashboard gets a documented owner and a quarterly review — dashboards nobody looks at are worse than no dashboards, because they create the illusion of observability.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">30.6 Alerting Strategy: Signal Without Fatigue</h3>
+
+<p class="text-gray-300 leading-relaxed">The alerting hierarchy: <strong class="text-white">page</strong> (availability down, failover occurred, backup failed, log disk critical, replication lag beyond tolerance — wake someone up); <strong class="text-white">ticket</strong> (CPU sustained above threshold, storage trending to full in 30 days, query regression detected, certificate expiring — work it this week); <strong class="text-white">log</strong> (everything else — searchable, not notifying). The rules that prevent fatigue: alert on <strong class="text-white">symptoms and leading indicators</strong>, not raw counters (alert "p95 latency above SLO" not "CPU above 80%"); require <strong class="text-white">duration</strong> (5 minutes above threshold, not one spike); give every alert a <strong class="text-white">runbook link</strong> (an alert without a runbook is a notification of confusion); and review alert history monthly — the alert that fires weekly and is always ignored is either miscalibrated or measuring something nobody owns. Kill it or fix it.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">30.7 Common Instrumentation Gaps</h3>
+
+<p class="text-gray-300 leading-relaxed">The gaps that bite: <strong class="text-white">no query-level visibility</strong> (Performance Insights/Query Insights/Query Store not enabled — the platform metrics show <em>that</em> it's slow, never <em>what</em> is slow); <strong class="text-white">no backup/restore monitoring</strong> (backup age and restore-test results are metrics — alert on them like any other); <strong class="text-white">no client-side metrics</strong> (connection failures and timeouts as seen by the application — the database can look healthy while the app can't reach it); <strong class="text-white">no cross-boundary visibility</strong> (replication lag across clouds/regions unmonitored — Chapter 24's rule); and <strong class="text-white">log retention shorter than incident cycles</strong> (keep error logs and audit trails long enough to investigate last month's incident, not just yesterday's).</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">30.8 Integrating with Existing Observability Stacks</h3>
+
+<p class="text-gray-300 leading-relaxed">The cloud platforms are not the whole stack — export to yours. Ship CloudWatch metrics/logs to your central system (Datadog, Grafana, Splunk, ELK) via the platform's export mechanisms; keep the cloud-native dashboards as the deep-drill tool and the central platform as the single pane. Standardize <strong class="text-white">tagging/labels</strong> (environment, tier, owner, application) on every database resource — untagged resources are unmonitorable at fleet scale and unallocatable at billing time. And include the database in the <strong class="text-white">SLO framework</strong>: availability and latency SLOs per tier, error budgets, and the incident review process — the database is a service with customers (the applications), and it deserves the same reliability engineering as any other.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Monitor outcomes, not counters.** p95 latency, error rate, replication lag, backup age — the business's experience of the database, with raw counters for diagnosis.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Enable the query-level tools everywhere.** Performance Insights, Query Store, Query Insights — platform metrics show <em>that</em>; query telemetry shows <em>what</em>.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Three dashboards per tier, one layout across clouds.** Health, performance, capacity — standardized so any DBA reads any cloud.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Alert on symptoms with duration, link every alert to a runbook.** Page/ticket/log hierarchy; monthly alert review; kill or fix the chronic false alarms.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Close the classic gaps.** Backup age, client-side failures, cross-boundary lag, and log retention — the incidents come from the unmonitored corners.</li>

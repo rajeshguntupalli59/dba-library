@@ -1,0 +1,58 @@
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 33: Database Migration to Cloud: The Practical Runbook</h2>
+
+<p class="text-gray-300 leading-relaxed">Migration is the project where cloud database theory meets the production estate: hundreds of databases, decades of accumulated quirks, linked servers, Agent jobs, CLR assemblies, and a business that expects zero surprises. This chapter is the practical runbook — assessment, method selection, the migration wave plan, cutover, rollback, and the post-migration optimization that finishes the job. Chapter 34 covers the zero-downtime techniques in depth; this chapter covers running the whole program.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">33.1 Migration Assessment: Knowing What You're Moving</h3>
+
+<p class="text-gray-300 leading-relaxed">Inventory before anything moves. For each SQL Server: version and edition, database sizes and growth rates, compatibility level, and the feature inventory that determines the target — Agent jobs (Chapter 12), linked servers, replication topologies, CLR assemblies, Service Broker, FILESTREAM/FileTable, Always On AGs, SSIS/SSAS/SSRS dependencies, cross-database queries and three-part naming. Run the platform assessment tools (<strong class="text-white">Azure Data Migration Assistant / Azure Migrate</strong>, <strong class="text-white">AWS DMS Fleet Advisor / Schema Conversion Tool</strong>) — they flag breaking changes and unsupported features mechanically, which beats discovering them during cutover. Classify each database: <strong class="text-white">rehost</strong> (lift-and-shift to EC2/VMs — minimal change), <strong class="text-white">replatform</strong> (to RDS/Azure SQL/MI — some adaptation), or <strong class="text-white">retain/replace</strong> (stays on-premises, or the application is being replaced anyway). The classification drives the wave plan.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">33.2 Choosing the Migration Method per Database</h3>
+
+<table class="w-full text-xs text-gray-300 my-5 border border-gray-800 rounded-xl overflow-hidden">
+<thead><tr class="bg-gray-900 text-white">
+<th class="text-left p-3 border-b border-gray-800">Method</th>
+<th class="text-left p-3 border-b border-gray-800">Downtime</th>
+<th class="text-left p-3 border-b border-gray-800">Best for</th>
+</tr></thead>
+<tbody>
+<tr class="border-b border-gray-800/60"><td class="p-3">Native backup/restore</td><td class="p-3">Hours (restore time)</td><td class="p-3">Small-medium DBs with maintenance windows; universal fallback</td></tr>
+<tr class="border-b border-gray-800/60"><td class="p-3">Log shipping / differential catch-up</td><td class="p-3">Minutes</td><td class="p-3">Large DBs where the seed restores early and logs catch up</td></tr>
+<tr class="border-b border-gray-800/60"><td class="p-3">Transactional replication</td><td class="p-3">Seconds–minutes</td><td class="p-3">Near-zero downtime; publisher stays live until cutover</td></tr>
+<tr class="border-b border-gray-800/60"><td class="p-3">Distributed AG</td><td class="p-3">Seconds</td><td class="p-3">EC2/VM targets; automatic failover semantics for cutover</td></tr>
+<tr class="border-b border-gray-800/60"><td class="p-3">DMS / cloud migration service</td><td class="p-3">Minutes</td><td class="p-3">Managed-service targets; homogeneous SQL Server supported</td></tr>
+</tbody>
+</table>
+
+<p class="text-gray-300 leading-relaxed">The default for most databases: backup/restore for the small ones (simple, well-understood), log-shipping-style catch-up for the large ones, replication or DMS where downtime is constrained. Always have the backup/restore path available as the fallback — the exotic method that fails at 2 AM needs a boring alternative.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">33.3 The Wave Plan: Order, Grouping, and Dependencies</h3>
+
+<p class="text-gray-300 leading-relaxed">Migrate in waves, not all at once: <strong class="text-white">wave zero</strong> (non-production, low-risk databases — proves the pipeline, the tooling, and the runbook); <strong class="text-white">early waves</strong> (independent production databases with tolerant downtime windows); <strong class="text-white">late waves</strong> (the interconnected systems — linked servers, replication chains, shared Agent jobs — migrated as dependency groups, in dependency order). Map the dependencies explicitly (which database's linked server points where, which Agent job touches which databases, which application connects to which) — the migration that breaks an unmapped dependency is the classic program failure. Each wave gets a go/no-go review: the previous wave's lessons incorporated, the next wave's runbook updated.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">33.4 The Target Environment: Built Before the First Migration</h3>
+
+<p class="text-gray-300 leading-relaxed">The cloud landing zone must be production-ready before wave zero: networking (private connectivity, DNS, firewall rules — Chapter 32), identity (Chapter 31), monitoring (Chapter 30), backup (Chapter 29), and the target SQL Server instances sized from the assessment (Chapter 39's right-sizing, applied prospectively). Deploy the <strong class="text-white">automation first</strong>: the Agent job equivalents (Chapter 12), the maintenance routines, the alerting — so the first migrated database lands in an operated environment, not an empty cloud account. And load-test the target: restore the largest production database and run the peak workload against it before the business depends on it.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">33.5 Cutover Runbook: The Final 60 Minutes</h3>
+
+<p class="text-gray-300 leading-relaxed">Every cutover follows the same script (customize per database, rehearse per wave): stop application writes (or put the application in read-only/maintenance mode); let replication/logs drain to zero lag (verify — do not assume); run the final differential/log backup and restore; update statistics and check integrity on the target (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DBCC CHECKDB</code> — the restore that passes CHECKDB is the restore you trust); redirect connection strings (DNS flip, config deployment, or listener update — Chapter 16's redirection discipline); start the application and run the smoke-test suite (the business's critical transactions, not just "can we connect"); and monitor the new production intensely for the first hours (the query plan regressions from a new environment show up fast). Assign every step an owner and a timebox; the runbook with "someone" as the owner is a wish, not a plan.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">33.6 Rollback Plan</h3>
+
+<p class="text-gray-300 leading-relaxed">Define the rollback trigger <em>before</em> cutover (which failures roll back vs roll forward — Chapter 23's discipline applied to migration): keep the source database intact and replication-capable until the migration is declared successful (the rollback window — typically 24–72 hours); for replication-based migrations, reverse replication can return writes to the source; for backup/restore migrations, rollback means redirecting clients back and accepting the writes made on the target (reconcile or lose them — decide in advance which). The rollback that was never tested is a hope; test it on a non-production wave.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">33.7 Post-Migration Optimization</h3>
+
+<p class="text-gray-300 leading-relaxed">Migration is not finished at cutover. The post-migration checklist: <strong class="text-white">update statistics and rebuild fragmented indexes</strong> (the restore process fragments; the new storage has different characteristics); <strong class="text-white">re-baseline performance</strong> (Query Store captures the new normal — compare against pre-migration baselines and investigate regressions immediately); <strong class="text-white">right-size the target</strong> (the assessed size was a guess — Chapter 39 with real cloud metrics, usually downward); <strong class="text-white">enable the cloud-native features</strong> (automated backups verified, monitoring dashboards live, alerting active — the target is not "done" until it's operated); and <strong class="text-white">decommission the source</strong> (on a schedule, with a final backup retained — the source server that lingers "just in case" becomes a security and licensing liability).</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Assess mechanically, classify explicitly.** Feature inventory per database, platform assessment tools, rehost/replatform/retain classification driving the wave plan.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Match the method to the downtime budget.** Backup/restore as the universal fallback; log catch-up, replication, or DMS for constrained windows. Boring beats exotic at 2 AM.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Waves with dependency mapping and go/no-go reviews.** Wave zero proves the pipeline; dependency groups migrate together, in order.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Cutover is a scripted 60 minutes.** Drain to zero lag, CHECKDB the target, redirect clients, smoke-test the business transactions — every step owned and timeboxed.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Migration ends with optimization and decommissioning.** Re-baseline performance, right-size on real metrics, operate the target fully, retire the source on schedule.</li>

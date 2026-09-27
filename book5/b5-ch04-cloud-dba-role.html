@@ -43,17 +43,17 @@
     <div class="space-y-4 text-sm">
 <h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 4: The Cloud DBA Role: What Changes, What Stays</h2>
 
-<p class="text-gray-300 leading-relaxed">If you have spent years tuning PostgreSQL shared_buffers, managing SQL Server Always On Availability Groups, and writing runbooks for failover procedures at 2 AM, the shift to managed cloud databases can feel disorienting. AWS, Azure, and Google Cloud take over large portions of the operational work you once owned completely — OS patching, storage provisioning, replication wiring — while introducing entirely new categories of responsibility that did not exist in your on-premises world. This chapter maps that transition precisely. It identifies what the cloud genuinely removes from your plate, what it hands back to you in a different form, and what it adds as net-new work. Understanding this boundary is the foundation for everything else in this book.</p>
+<p class="text-gray-300 leading-relaxed">If you have spent years tuning SQL Server max server memory, managing Always On Availability Groups, and writing runbooks for failover procedures at 2 AM, the shift to managed cloud databases can feel disorienting. AWS, Azure, and Google Cloud take over large portions of the operational work you once owned completely — OS patching, storage provisioning, replication wiring — while introducing entirely new categories of responsibility that did not exist in your on-premises world. This chapter maps that transition precisely. It identifies what the cloud genuinely removes from your plate, what it hands back to you in a different form, and what it adds as net-new work. Understanding this boundary is the foundation for everything else in this book.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">4.1 The Managed Service Contract: What AWS, Azure, and GCP Actually Own</h3>
 
-<p class="text-gray-300 leading-relaxed">When you move from self-managed PostgreSQL to Amazon RDS, you are entering into an implicit contract. The cloud provider owns the hypervisor, the operating system, the storage subsystem, the replication mechanism, and the software patching lifecycle. You own the database configuration, the schema design, the query performance, the access control model, and the backup retention policy. The line between those two domains is firm, and understanding it prevents both false assumptions and wasted effort.</p>
+<p class="text-gray-300 leading-relaxed">When you move from self-managed SQL Server to Amazon RDS, you are entering into an implicit contract. The cloud provider owns the hypervisor, the operating system, the storage subsystem, the replication mechanism, and the software patching lifecycle. You own the database configuration, the schema design, the query performance, the access control model, and the backup retention policy. The line between those two domains is firm, and understanding it prevents both false assumptions and wasted effort.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">What the provider owns:</strong></p>
 
-<p class="text-gray-300 leading-relaxed">On RDS for PostgreSQL, you will never run <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">apt-get upgrade postgresql</code>, restart the OS, or access <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">/var/lib/postgresql</code> directly. AWS handles minor version patching on a schedule you influence but do not fully control unless you disable auto minor version upgrades explicitly. The storage layer is EBS-backed with automatic replication within an Availability Zone. Multi-AZ deployments add a synchronous standby in a second AZ, and failover is handled automatically — typically completing in 60–120 seconds for RDS, and 30 seconds or less for Aurora.</p>
+<p class="text-gray-300 leading-relaxed">On RDS for SQL Server, you will never run Windows Update on the host, restart the OS, or access the SQL Server installation directories directly. AWS handles patching on a schedule you influence but do not fully control unless you take explicit ownership of the maintenance window. The storage layer is EBS-backed with automatic replication within an Availability Zone. Multi-AZ deployments add a synchronous standby in a second AZ, and failover is handled automatically — typically completing in 60–120 seconds for RDS Multi-AZ (Azure SQL Business Critical generally fails over faster due to its AG-based architecture).</p>
 
 <p class="text-gray-300 leading-relaxed">On Azure SQL Database, Microsoft manages the underlying SQL Server engine, the Always On availability group that provides HA, and the Intelligent Query Processing features that ship with each compatibility level upgrade. Google Cloud SQL similarly abstracts OS management and handles read replica replication lag monitoring internally.</p>
 
@@ -65,36 +65,35 @@
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">4.2 Access Patterns and Permissions: From pg_hba.conf to IAM</h3>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">4.2 Access Patterns and Permissions: From Server Logins to IAM</h3>
 
-<p class="text-gray-300 leading-relaxed">On-premises PostgreSQL access control flows through two files: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">postgresql.conf</code> controls what the engine does, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_hba.conf</code> controls who can connect, from where, and with what authentication method. SQL Server uses logins, server roles, and Windows Authentication through Active Directory. In the cloud, these familiar mechanisms are extended — not replaced — by identity and access management layers that sit above the database engine.</p>
+<p class="text-gray-300 leading-relaxed">On-premises SQL Server access control flows through two layers: server logins control who can connect, and database users and roles control what they can do once connected. Windows Authentication through Active Directory ties both layers to corporate identity. In the cloud, these familiar mechanisms are extended — not replaced — by identity and access management layers that sit above the database engine.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">IAM Authentication on RDS</strong></p>
 
-<p class="text-gray-300 leading-relaxed">With IAM database authentication enabled on RDS PostgreSQL, a user connects using a short-lived authentication token generated by the AWS IAM service rather than a static password. The token is valid for 15 minutes and is generated using the AWS credentials of the calling identity — an EC2 instance profile, a Lambda execution role, or a developer's IAM user. The database-side configuration still uses pg_hba.conf, but the method becomes <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">md5</code> or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">scram-sha-256</code> is bypassed in favor of the IAM token validation path.</p>
+<p class="text-gray-300 leading-relaxed">With IAM database authentication enabled on RDS for SQL Server, a login connects using a short-lived authentication token generated by the AWS IAM service rather than a static password. The token is valid for 15 minutes and is generated using the AWS credentials of the calling identity — an EC2 instance profile, a Lambda execution role, or a developer's IAM user. The database-side configuration still uses SQL Server logins and database users, but the credential presented at connect time is the IAM token instead of the login's password.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Enable IAM authentication on an existing RDS PostgreSQL instance
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Enable IAM authentication on an existing RDS for SQL Server instance
 aws rds modify-db-instance \
-  --db-instance-identifier prod-postgres-01 \
+  --db-instance-identifier prod-sql-01 \
   --enable-iam-database-authentication \
   --apply-immediately
 
-# Generate an authentication token for a database user named "app_user"
+# Generate an authentication token for a login named "app_user"
 aws rds generate-db-auth-token \
-  --hostname prod-postgres-01.cxyz1234.us-east-1.rds.amazonaws.com \
-  --port 5432 \
+  --hostname prod-sql-01.cxyz1234.us-east-1.rds.amazonaws.com \
+  --port 1433 \
   --region us-east-1 \
   --username app_user</code></pre>
 
-<p class="text-gray-300 leading-relaxed">On the database side, the user must exist with the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">rds_iam</code> role granted:</p>
+<p class="text-gray-300 leading-relaxed">On the database side, the login must exist on the instance and be associated with the IAM role:</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Create a database user that authenticates via IAM
-CREATE USER app_user WITH LOGIN;
-GRANT rds_iam TO app_user;
-
--- The user has no password — authentication is entirely token-based
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Create the login for the application service account.
+-- Keep a strong Secrets Manager-backed password as a break-glass fallback;
+-- day-to-day authentication is token-based and never uses the static password.
+CREATE LOGIN [app_user] WITH PASSWORD = '&lt;managed-by-secrets-manager&gt;';
 -- Grant object-level privileges as you normally would
-GRANT SELECT, INSERT, UPDATE ON ALL TABLES IN SCHEMA public TO app_user;</code></pre>
+GRANT SELECT, INSERT, UPDATE ON SCHEMA::dbo TO [app_user];</code></pre>
 
 <p class="text-gray-300 leading-relaxed">This pattern replaces the practice of embedding static database passwords in application configuration files. The calling application retrieves a fresh token before each connection attempt (or connection pool initialization), using the AWS SDK. The conceptual analog is Kerberos authentication with Active Directory — the application proves its identity to a central authority and receives a time-limited credential.</p>
 
@@ -121,53 +120,54 @@ GRANT SELECT, INSERT, UPDATE ON SCHEMA::dbo TO [my-app-service];</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">The Core Shift</strong></p>
 
-<p class="text-gray-300 leading-relaxed">What changes is not the concept of authentication and authorization — it is the locus of control. You now manage database access through the same IAM, RBAC, and identity systems that govern access to every other cloud resource. Permissions are auditable through CloudTrail (AWS), Azure Monitor Activity Log (Azure), and Cloud Audit Logs (GCP). Rotating credentials means updating IAM policies, not editing pg_hba.conf and running <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_reload_conf()</code>. This is a genuine improvement in auditability and a reduction in credential sprawl, but it requires the DBA to become conversant in cloud IAM, which is a new skill domain.</p>
+<p class="text-gray-300 leading-relaxed">What changes is not the concept of authentication and authorization — it is the locus of control. You now manage database access through the same IAM, RBAC, and identity systems that govern access to every other cloud resource. Permissions are auditable through CloudTrail (AWS), Azure Monitor Activity Log (Azure), and Cloud Audit Logs (GCP). Rotating credentials means updating IAM policies, not editing server logins and coordinating password rotations across application servers. This is a genuine improvement in auditability and a reduction in credential sprawl, but it requires the DBA to become conversant in cloud IAM, which is a new skill domain.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">4.3 Configuration Management: Parameter Groups, Server Parameters, and What You Cannot Touch</h3>
 
-<p class="text-gray-300 leading-relaxed">On self-managed PostgreSQL, you edit <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">postgresql.conf</code> directly and control every engine parameter from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_connections</code> to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">wal_level</code> to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">autovacuum_vacuum_cost_delay</code>. On RDS, that file is owned by AWS. You configure the engine through Parameter Groups — a named collection of engine parameters that you apply to one or more DB instances.</p>
+<p class="text-gray-300 leading-relaxed">On self-managed SQL Server, you run <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sp_configure</code> directly and control every engine setting from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max server memory (MB)</code> to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">cost threshold for parallelism</code> to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">fill factor (%)</code>. On RDS, that surface is owned by AWS. You configure the engine through Parameter Groups — a named collection of engine parameters that you apply to one or more DB instances.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">RDS Parameter Groups</strong></p>
 
 <p class="text-gray-300 leading-relaxed">The default parameter group for any RDS engine version is managed by AWS and is not modifiable. You create a custom parameter group, copy defaults into it, modify what you need, and associate it with your instance. Changes to dynamic parameters take effect immediately; changes to static parameters require an instance reboot.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Create a custom parameter group for RDS PostgreSQL 15
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Create a custom parameter group for RDS SQL Server 2022
 aws rds create-db-parameter-group \
-  --db-parameter-group-name prod-pg15-custom \
-  --db-parameter-group-family postgres15 \
-  --description "Production PostgreSQL 15 tuning"
+  --db-parameter-group-name prod-sql2022-custom \
+  --db-parameter-group-family sqlserver-se-16.0 \
+  --description "Production SQL Server 2022 tuning"
 
 # Modify key parameters
 aws rds modify-db-parameter-group \
-  --db-parameter-group-name prod-pg15-custom \
+  --db-parameter-group-name prod-sql2022-custom \
   --parameters \
-    "ParameterName=shared_buffers,ParameterValue={DBInstanceClassMemory/4},ApplyMethod=pending-reboot" \
-    "ParameterName=work_mem,ParameterValue=65536,ApplyMethod=immediate" \
-    "ParameterName=autovacuum_vacuum_scale_factor,ParameterValue=0.01,ApplyMethod=immediate" \
-    "ParameterName=log_min_duration_statement,ParameterValue=1000,ApplyMethod=immediate"
+    "ParameterName=max server memory (MB),ParameterValue={DBInstanceClassMemory/1048576}*3/4,ApplyMethod=pending-reboot" \
+    "ParameterName=cost threshold for parallelism,ParameterValue=50,ApplyMethod=immediate" \
+    "ParameterName=max degree of parallelism,ParameterValue=8,ApplyMethod=immediate" \
+    "ParameterName=fill factor (%),ParameterValue=90,ApplyMethod=pending-reboot" \
+    "ParameterName=optimize for ad hoc workloads,ParameterValue=1,ApplyMethod=immediate"
 
 # Associate with an instance
 aws rds modify-db-instance \
-  --db-instance-identifier prod-postgres-01 \
-  --db-parameter-group-name prod-pg15-custom \
+  --db-instance-identifier prod-sql-01 \
+  --db-parameter-group-name prod-sql2022-custom \
   --apply-immediately</code></pre>
 
-<p class="text-gray-300 leading-relaxed">Note the formula syntax for <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">shared_buffers</code>. RDS supports arithmetic expressions using <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">{DBInstanceClassMemory}</code> as a variable — this is how AWS recommends setting memory-relative parameters so the configuration remains valid if you resize the instance class. For a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.r6g.2xlarge</code> with 64 GB RAM, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">{DBInstanceClassMemory/4}</code> evaluates to 16 GB, which is 25% of RAM — the standard PostgreSQL recommendation.</p>
+<p class="text-gray-300 leading-relaxed">Note the formula syntax for <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max server memory (MB)</code>. RDS supports arithmetic expressions using <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">{DBInstanceClassMemory}</code> as a variable — this is how AWS recommends setting memory-relative parameters so the configuration remains valid if you resize the instance class. For a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.r6i.2xlarge</code> with 64 GB RAM, leaving roughly a quarter of memory for the OS is the standard SQL Server practice, which the formula encodes directly.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">What You Cannot Configure</strong></p>
 
 <p class="text-gray-300 leading-relaxed">This is where experienced DBAs encounter real friction. Several parameters are locked in RDS because they control behaviors that AWS manages on your behalf:</p>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `wal_level` is not directly settable on RDS PostgreSQL — it defaults to `replica` and only moves to `logical` when you enable the `rds.logical_replication` parameter (which requires a reboot); you cannot control it independently of that flag</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `archive_mode` is managed by AWS; you cannot disable it without understanding it breaks PITR</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `listen_addresses` is managed by AWS</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `ssl` is forced on — you cannot disable SSL on RDS connections</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `superuser` access does not exist on RDS; the `rds_superuser` role is a functional substitute but does not grant OS-level access</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Extensions must be whitelisted by AWS; you cannot install arbitrary shared libraries</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Many `sp_configure` options are restricted to the curated set AWS exposes; arbitrary trace flags and startup parameters are unavailable</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Transaction log backup scheduling is managed by AWS; you cannot run your own log backup chain on the instance</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Network protocols and endpoints are managed by AWS</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> TLS is forced on — you cannot disable encryption on RDS connections</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `sysadmin` access does not exist on RDS; the master user is a functional substitute but does not grant OS-level access</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Components must be on the supported list — no SQL Server Agent, no SSIS, SSAS, or SSRS</li>
 
-<p class="text-gray-300 leading-relaxed">The absence of a true superuser is a significant operational change. Tasks that previously required superuser — like terminating backend connections owned by other users, accessing <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_authid</code>, or installing custom extensions — require either the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">rds_superuser</code> role (which handles most cases) or a support ticket to AWS (which handles almost none of the rest gracefully). Plan your extension requirements before migration. If your application depends on an extension that is not in the RDS supported list, you may need AlloyDB on GCP, Aurora, or a self-managed EC2 deployment.</p>
+<p class="text-gray-300 leading-relaxed">The absence of true sysadmin is a significant operational change. On RDS for SQL Server you get a master user with broad but not unlimited privileges — the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">rdsadmin</code> account owns the instance internals, and tasks like killing sessions owned by other logins or accessing server-level internals may require the RDS-specific stored procedures rather than the T-SQL you know. Plan your privilege requirements before migration: anything depending on full sysadmin (certain Agent subsystem access, server-level DDL triggers, OS-level operations) needs a self-managed EC2 deployment instead.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Azure SQL Server-Level vs. Database-Level Parameters</strong></p>
 
@@ -189,51 +189,33 @@ ORDER BY name;</code></pre>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">4.4 High Availability and Failover: Understanding What the Cloud Gives You</h3>
 
-<p class="text-gray-300 leading-relaxed">HA in on-premises environments is expensive to build and maintain. A PostgreSQL streaming replication setup with Patroni, HAProxy, and etcd requires significant operational investment. SQL Server AlwaysOn Availability Groups require Windows Server Failover Clustering, shared storage or synchronous replication, and careful listener configuration. In the cloud, HA is a checkbox during instance creation, and the complexity of maintaining it disappears — but understanding what you got is essential because the behavior is not identical to what you built yourself.</p>
+<p class="text-gray-300 leading-relaxed">HA in on-premises environments is expensive to build and maintain. A self-managed SQL Server Always On availability group with a Windows Server Failover Cluster, listener, and quorum configuration requires significant operational investment. Self-managed failover clustering demands quorum votes, witness configuration, and careful patch sequencing across nodes. In the cloud, HA is a checkbox during instance creation, and the complexity of maintaining it disappears — but understanding what you got is essential because the behavior is not identical to what you built yourself.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">RDS Multi-AZ: What It Is and Is Not</strong></p>
 
 <p class="text-gray-300 leading-relaxed">RDS Multi-AZ deploys a synchronous standby in a second Availability Zone. Writes are committed to both the primary and standby before returning to the application. Failover is automatic and DNS-based — the endpoint DNS name resolves to the standby after promotion, typically within 60–120 seconds including DNS TTL propagation. The standby is not readable. It is a hot standby only for failover purposes.</p>
 
-<p class="text-gray-300 leading-relaxed">This surprises many DBAs coming from Patroni setups where the replica serves read traffic. On RDS Multi-AZ (non-Aurora), you pay for the standby instance in full and receive zero read scaling from it. Read scaling on RDS requires separate Read Replicas, which use asynchronous replication and carry replication lag that is your responsibility to monitor.</p>
+<p class="text-gray-300 leading-relaxed">This surprises many DBAs coming from Always On availability groups where secondaries serve read traffic. On RDS for SQL Server Multi-AZ, you pay for the standby instance in full and receive zero read scaling from it — and unlike other RDS engines, SQL Server has no read-replica option on RDS at all. Read scaling for SQL Server means readable AG secondaries on self-managed EC2/VMs (Chapter 8) or the built-in readable secondaries in Azure SQL's Business Critical and Hyperscale tiers (Chapter 7).</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Aurora: A Different Architecture</strong></p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Azure SQL: A Different Architecture</strong></p>
 
-<p class="text-gray-300 leading-relaxed">Aurora changes this model substantially. Aurora separates compute from storage. All Aurora instances — primary and replicas — share the same distributed storage volume, which replicates data six ways across three Availability Zones. Aurora replicas apply redo log directly from the shared storage layer rather than receiving WAL over the network. This reduces replica lag dramatically — typically under 20 milliseconds in normal operation — and makes reads from Aurora replicas a reliable pattern for production read scaling.</p>
+<p class="text-gray-300 leading-relaxed">Azure SQL changes this model substantially. The Business Critical tier runs an Always On availability group across compute nodes: a primary plus replicas with synchronous commit, one of which is readable at no additional replica cost. Failover promotes a replica that already holds a synchronized copy of the data — typically completing faster than RDS Multi-AZ's storage-level failover — and the readable secondary doubles as the read-scale target (Chapter 7). Hyperscale goes further, disaggregating compute from page servers so storage scales independently and restores complete in minutes regardless of database size (Chapter 15).</p>
 
-<p class="text-gray-300 leading-relaxed">Aurora also has a faster failover model. Because replicas already have access to the same storage volume as the primary, a failover involves promoting a replica to writer status rather than waiting for WAL replay to complete. Aurora typically fails over in under 30 seconds for replicas in the same Region, and some configurations achieve under 15 seconds with cluster-aware drivers.</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Create an Aurora PostgreSQL cluster with two replicas in different AZs
-aws rds create-db-cluster \
-  --db-cluster-identifier prod-aurora-cluster \
-  --engine aurora-postgresql \
-  --engine-version 15.4 \
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Create an RDS for SQL Server instance with Multi-AZ and encryption
+aws rds create-db-instance \
+  --db-instance-identifier prod-sqlserver \
+  --engine sqlserver-se \
+  --engine-version 16.00.4125.1.v1 \
+  --db-instance-class db.r7i.2xlarge \
+  --allocated-storage 500 --storage-type gp3 \
+  --multi-az --storage-encrypted \
   --master-username dbadmin \
   --master-user-password "$(aws secretsmanager get-secret-value \
-      --secret-id prod/aurora/master-password \
+      --secret-id prod/rds-sqlserver/master-password \
       --query SecretString --output text)" \
   --db-subnet-group-name prod-subnet-group \
-  --vpc-security-group-ids sg-0abc123def456 \
-  --storage-encrypted \
-  --kms-key-id alias/prod-rds-key \
-  --backup-retention-period 14 \
-  --preferred-backup-window "03:00-04:00" \
-  --preferred-maintenance-window "sun:04:00-sun:05:00"
-
-# Add a writer instance
-aws rds create-db-instance \
-  --db-cluster-identifier prod-aurora-cluster \
-  --db-instance-identifier prod-aurora-writer \
-  --db-instance-class db.r6g.2xlarge \
-  --engine aurora-postgresql
-
-# Add a reader instance in a different AZ
-aws rds create-db-instance \
-  --db-cluster-identifier prod-aurora-cluster \
-  --db-instance-identifier prod-aurora-reader-1 \
-  --db-instance-class db.r6g.xlarge \
-  --engine aurora-postgresql \
-  --availability-zone us-east-1b</code></pre>
+  --vpc-security-group-ids sg-0abc123 \
+  --backup-retention-period 7</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Azure SQL Business Critical vs. General Purpose</strong></p>
 
@@ -252,13 +234,13 @@ SELECT DATABASEPROPERTYEX(DB_NAME(), 'Updateability') AS replica_role;
 -- Returns: READ_ONLY when connected to secondary
 -- Returns: READ_WRITE when connected to primary</code></pre>
 
-<p class="text-gray-300 leading-relaxed">The HA tiers, failover behaviors, and read-scale capabilities across cloud providers have direct cost implications. Choosing between RDS Multi-AZ, Aurora, Azure SQL General Purpose, and Business Critical is as much an architectural decision as a financial one, and it belongs in the DBA's scope, not just the infrastructure team's.</p>
+<p class="text-gray-300 leading-relaxed">The HA tiers, failover behaviors, and read-scale capabilities across cloud providers have direct cost implications. Choosing between RDS for SQL Server Multi-AZ, SQL Server on EC2 with Always On AGs, Azure SQL General Purpose, and Business Critical is as much an architectural decision as a financial one, and it belongs in the DBA's scope, not just the infrastructure team's.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">4.5 Monitoring: CloudWatch, Azure Monitor, and Cloud Logging vs. What You Had Before</h3>
 
-<p class="text-gray-300 leading-relaxed">On-premises DBAs typically own their full monitoring stack — Prometheus with pg_exporter, Datadog agents, custom scripts querying <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_activity</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_bgwriter</code>, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_locks</code>. In the cloud, the provider delivers a baseline monitoring layer automatically, and the DBA's job shifts from building that layer to interpreting it, extending it, and setting appropriate thresholds.</p>
+<p class="text-gray-300 leading-relaxed">On-premises DBAs typically own their full monitoring stack — Datadog agents, custom scripts querying <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_requests</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_os_wait_stats</code>, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_tran_locks</code>. In the cloud, the provider delivers a baseline monitoring layer automatically, and the DBA's job shifts from building that layer to interpreting it, extending it, and setting appropriate thresholds.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">CloudWatch and Enhanced Monitoring on RDS</strong></p>
 
@@ -268,7 +250,7 @@ SELECT DATABASEPROPERTYEX(DB_NAME(), 'Updateability') AS replica_role;
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Enable Enhanced Monitoring with 15-second granularity
 aws rds modify-db-instance \
-  --db-instance-identifier prod-postgres-01 \
+  --db-instance-identifier prod-sql-01 \
   --monitoring-interval 15 \
   --monitoring-role-arn arn:aws:iam::123456789012:role/rds-monitoring-role \
   --apply-immediately
@@ -277,7 +259,7 @@ aws rds modify-db-instance \
 aws cloudwatch get-metric-statistics \
   --namespace AWS/RDS \
   --metric-name ReplicaLag \
-  --dimensions Name=DBInstanceIdentifier,Value=prod-postgres-reader-1 \
+  --dimensions Name=DBInstanceIdentifier,Value=prod-sql-reader-1 \
   --start-time $(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%SZ) \
   --end-time $(date -u +%Y-%m-%dT%H:%M:%SZ) \
   --period 60 \
@@ -286,9 +268,9 @@ aws cloudwatch get-metric-statistics \
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Performance Insights</strong></p>
 
-<p class="text-gray-300 leading-relaxed">Performance Insights is the cloud analog to Oracle's Active Session History and a significant improvement over what most PostgreSQL on-premises deployments have out of the box. It records database load in terms of active sessions broken down by wait event, SQL statement, host, and user. The default retention is 7 days free; extending to up to 2 years incurs an additional per-vCPU-hour charge — check current AWS pricing.</p>
+<p class="text-gray-300 leading-relaxed">Performance Insights is the cloud analog to Oracle's Active Session History and a significant improvement over what most self-managed SQL Server deployments have out of the box. It records database load in terms of active sessions broken down by wait event, SQL statement, host, and user. The default retention is 7 days free; extending to up to 2 years incurs an additional per-vCPU-hour charge — check current AWS pricing.</p>
 
-<p class="text-gray-300 leading-relaxed">For a production workload investigation, Performance Insights replaces the manual practice of sampling <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_activity</code> every few seconds and correlating the results. The UI presents a visual timeline of database load against the max_vCPUs line — anything above that line indicates the database is CPU-bound or waiting on a bottleneck that requires investigation.</p>
+<p class="text-gray-300 leading-relaxed">For a production workload investigation, Performance Insights replaces the manual practice of sampling <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_requests</code> every few seconds and correlating the results. The UI presents a visual timeline of database load against the max_vCPUs line — anything above that line indicates the database is CPU-bound or waiting on a bottleneck that requires investigation.</p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Retrieve Performance Insights data via boto3
 import boto3
@@ -341,7 +323,7 @@ WHERE rsi.start_time &gt;= DATEADD(HOUR, -24, GETUTCDATE())
 GROUP BY q.query_id, qt.query_sql_text
 ORDER BY total_cpu_ms DESC;</code></pre>
 
-<p class="text-gray-300 leading-relaxed">The monitoring shift is real: you spend less time building monitoring infrastructure and more time interpreting richer, already-collected data. The tradeoff is that cloud monitoring tools have gaps — they do not expose lock wait graphs as clearly as pg_locks queries do on self-managed PostgreSQL, and correlating application traces with database wait events across CloudWatch, X-Ray, and RDS Performance Insights requires more configuration than running a single monitoring agent that sees both layers.</p>
+<p class="text-gray-300 leading-relaxed">The monitoring shift is real: you spend less time building monitoring infrastructure and more time interpreting richer, already-collected data. The tradeoff is that cloud monitoring tools have gaps — they do not expose lock wait graphs as clearly as sys.dm_tran_locks queries do on self-managed SQL Server, and correlating application traces with database wait events across CloudWatch, X-Ray, and RDS Performance Insights requires more configuration than running a single monitoring agent that sees both layers.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
@@ -351,99 +333,20 @@ ORDER BY total_cpu_ms DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Infrastructure as Code for Databases</strong></p>
 
-<p class="text-gray-300 leading-relaxed">In on-premises environments, provisioning a PostgreSQL server involved coordinating with a server team, a storage team, and a network team, filling out a change request, and waiting. In the cloud, a DBA with appropriate IAM permissions can provision a multi-AZ Aurora cluster with encrypted storage, automated backups, and VPC-isolated networking in under 10 minutes using Terraform. The DBA who understands both the database requirements and the infrastructure configuration is in a stronger position than one who waits for an infrastructure team to provision resources.</p>
+<p class="text-gray-300 leading-relaxed">In on-premises environments, provisioning a SQL Server VM involved coordinating with a server team, a storage team, and a network team, filling out a change request, and waiting. In the cloud, a DBA with appropriate IAM permissions can provision a multi-AZ RDS for SQL Server instance with encrypted storage, automated backups, and VPC-isolated networking in under 10 minutes using Terraform. The DBA who understands both the database requirements and the infrastructure configuration is in a stronger position than one who waits for an infrastructure team to provision resources.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Terraform: production Aurora PostgreSQL cluster
-resource "aws_rds_cluster" "prod" {
-  cluster_identifier      = "prod-aurora-pg"
-  engine                  = "aurora-postgresql"
-  engine_version          = "15.4"
-  availability_zones      = ["us-east-1a", "us-east-1b", "us-east-1c"]
-  database_name           = "appdb"
-  master_username         = "dbadmin"
-  manage_master_user_password = true  # Secrets Manager integration
-
-  vpc_security_group_ids  = [aws_security_group.rds.id]
-  db_subnet_group_name    = aws_db_subnet_group.prod.name
-
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Terraform: production RDS for SQL Server instance
+resource "aws_db_instance" "prod" {
+  identifier              = "prod-sqlserver"
+  engine                  = "sqlserver-se"
+  engine_version          = "16.00.4125.1.v1"
+  instance_class          = "db.r7i.2xlarge"
+  allocated_storage       = 500
+  storage_type            = "gp3"
+  multi_az                = true
   storage_encrypted       = true
-  kms_key_id              = aws_kms_key.rds.arn
-
-  backup_retention_period = 14
-  preferred_backup_window = "03:00-04:00"
+  backup_retention_period = 7
   deletion_protection     = true
-
-  enabled_cloudwatch_logs_exports = ["postgresql"]
-
-  db_cluster_parameter_group_name = aws_rds_cluster_parameter_group.prod.name
-
-  tags = {
-    Environment = "production"
-    ManagedBy   = "terraform"
-    Owner       = "database-team"
-  }
-}
-
-resource "aws_rds_cluster_instance" "writer" {
-  identifier         = "prod-aurora-pg-writer"
-  cluster_identifier = aws_rds_cluster.prod.id
-  instance_class     = "db.r6g.2xlarge"
-  engine             = aws_rds_cluster.prod.engine
-  engine_version     = aws_rds_cluster.prod.engine_version
-
-  performance_insights_enabled          = true
-  performance_insights_retention_period = 731  # 2 years
-  monitoring_interval                   = 15
-  monitoring_role_arn                   = aws_iam_role.rds_monitoring.arn
-
-  db_parameter_group_name = aws_db_parameter_group.prod.name
-
-  auto_minor_version_upgrade = false  # control upgrades explicitly in production
-}
-
-resource "aws_rds_cluster_instance" "reader" {
-  count              = 2
-  identifier         = "prod-aurora-pg-reader-${count.index + 1}"
-  cluster_identifier = aws_rds_cluster.prod.id
-  instance_class     = "db.r6g.xlarge"
-  engine             = aws_rds_cluster.prod.engine
-  engine_version     = aws_rds_cluster.prod.engine_version
-
-  performance_insights_enabled          = true
-  performance_insights_retention_period = 731
-  monitoring_interval                   = 15
-  monitoring_role_arn                   = aws_iam_role.rds_monitoring.arn
-
-  db_parameter_group_name = aws_db_parameter_group.prod.name
-}
-
-resource "aws_rds_cluster_parameter_group" "prod" {
-  name   = "prod-aurora-pg15"
-  family = "aurora-postgresql15"
-
-  parameter {
-    name         = "shared_preload_libraries"
-    value        = "pg_stat_statements,auto_explain"
-    apply_method = "pending-reboot"
-  }
-
-  parameter {
-    name         = "log_min_duration_statement"
-    value        = "1000"
-    apply_method = "immediate"
-  }
-
-  parameter {
-    name         = "autovacuum_vacuum_scale_factor"
-    value        = "0.01"
-    apply_method = "immediate"
-  }
-
-  parameter {
-    name         = "autovacuum_analyze_scale_factor"
-    value        = "0.005"
-    apply_method = "immediate"
-  }
 }</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Treating database infrastructure as code gives you version history, peer review, repeatable deployments across environments, and the ability to reconstruct a destroyed environment from source control. These are practices that are standard in software engineering and are now expected of cloud DBAs. If your team does not already do this, starting with a simple Terraform module for a non-production cluster is the practical entry point.</p>
@@ -452,15 +355,13 @@ resource "aws_rds_cluster_parameter_group" "prod" {
 
 <p class="text-gray-300 leading-relaxed">On-premises database costs are largely fixed — server hardware depreciates, storage is bought in bulk, and the marginal cost of running a query is invisible. In the cloud, every instance-hour, every GB of storage, every I/O operation (on gp2 storage), and every GB of data transferred across AZs has a line-item cost. A cloud DBA who understands the cost model can make architecture recommendations that have direct financial impact.</p>
 
-<p class="text-gray-300 leading-relaxed">The most common cost levers for RDS and Aurora are:</p>
+<p class="text-gray-300 leading-relaxed">The most common cost levers for RDS for SQL Server and Azure SQL are:</p>
 
-<p class="text-gray-300 leading-relaxed">*Instance sizing and Reserved Instances.* On-demand pricing for a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.r6g.2xlarge</code> running Aurora PostgreSQL in us-east-1 is meaningful at monthly scale. Purchasing a one-year no-upfront Reserved Instance for the same size produces a substantial discount compared to on-demand — consult the current AWS pricing calculator for exact figures, as prices change. Most production workloads with stable compute requirements should run on Reserved Instances. A common failure pattern is running development and staging instances on on-demand because they were provisioned ad hoc, then leaving them running indefinitely.</p>
+<p class="text-gray-300 leading-relaxed">*Instance sizing and Reserved Instances / Savings Plans.* On-demand pricing for a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.r7i.2xlarge</code> running SQL Server Standard in us-east-1 is meaningful at monthly scale — SQL Server licensing is a large share of that line item. Purchasing a one-year Reserved Instance (or Azure's one-/three-year reservations with Hybrid Benefit) for the same size produces a substantial discount compared to on-demand — consult the current pricing calculator for exact figures, as prices change. Most production workloads with stable compute requirements should run on Reserved Instances. A common failure pattern is running development and staging instances on on-demand because they were provisioned ad hoc, then leaving them running indefinitely.</p>
 
-<p class="text-gray-300 leading-relaxed">*Aurora I/O-Optimized vs. Standard.* Aurora standard pricing includes a per-million I/O charge. Aurora I/O-Optimized pricing eliminates the I/O charge at a higher fixed storage rate. For workloads where I/O cost exceeds a certain percentage of total Aurora cost (check current AWS guidelines for the threshold), I/O-Optimized is the less expensive option. This decision requires pulling the actual I/O metrics from CloudWatch and calculating both pricing models against your current usage.</p>
+<p class="text-gray-300 leading-relaxed">*Storage autoscaling.* RDS supports storage autoscaling — storage grows automatically when free space falls below a threshold. This prevents the 2 AM call about a full disk but can mask unexpected data growth. Set a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">MaxAllocatedStorage</code> limit and alert on storage growth rate, not just absolute free space.</p>
 
-<p class="text-gray-300 leading-relaxed">*Storage autoscaling.* RDS and Aurora both support storage autoscaling — storage grows automatically when free space falls below a threshold. This prevents the 2 AM call about a full disk but can mask unexpected data growth. Set a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">MaxAllocatedStorage</code> limit and alert on storage growth rate, not just absolute free space.</p>
-
-<p class="text-gray-300 leading-relaxed">*Read Replica sizing.* Read Replicas do not need to match the writer's instance class. If your read queries are primarily reporting workloads with high memory requirements for sort and hash operations, sizing replicas differently from the writer may make sense. If the replica is primarily serving simple key-value lookups, a smaller instance class may be sufficient.</p>
+<p class="text-gray-300 leading-relaxed">*Readable-secondary sizing (self-managed).* On SQL Server on EC2 or Azure VMs, Always On secondaries that serve reporting workloads do not need to match the primary's instance class. Size secondaries for the read workload — reporting-heavy secondaries may want more memory for sorts and hashes, while simple lookup secondaries can be smaller. (On RDS for SQL Server there are no readable secondaries, so this lever applies to the VM deployments.)</p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># List all running RDS instances and their costs-relevant attributes
 aws rds describe-db-instances \
@@ -494,7 +395,7 @@ aws ce get-reservation-coverage \
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Architecture Ownership</strong></p>
 
-<p class="text-gray-300 leading-relaxed">The cloud DBA's most expansive new responsibility is architecture ownership — the ability to design and advocate for database solutions that span multiple cloud services rather than a single database engine. An on-premises DBA might optimize a single PostgreSQL cluster indefinitely. A cloud DBA is frequently asked whether data should live in RDS, Aurora, DynamoDB, Redshift, or S3-plus-Athena, and the answer requires understanding access patterns, query shapes, consistency requirements, and cost at scale.</p>
+<p class="text-gray-300 leading-relaxed">The cloud DBA's most expansive new responsibility is architecture ownership — the ability to design and advocate for database solutions that span multiple cloud services rather than a single database engine. An on-premises DBA might optimize a single SQL Server cluster indefinitely. A cloud DBA is frequently asked whether data should live in RDS for SQL Server, SQL Server on EC2, Azure SQL Database, or be offloaded to columnstore analytics (Chapter 22), and the answer requires understanding access patterns, query shapes, consistency requirements, and cost at scale.</p>
 
 <p class="text-gray-300 leading-relaxed">This does not mean the cloud DBA becomes a generalist who knows everything shallowly. It means the DBA's deep expertise in relational database behavior is the anchor for evaluating other options. Understanding why a particular workload is poorly suited for a key-value store, or why an analytical query pattern belongs in a columnar store rather than a row store, is exactly the kind of judgment that deep database expertise develops.</p>
 
@@ -504,24 +405,9 @@ aws ce get-reservation-coverage \
 
 <p class="text-gray-300 leading-relaxed">It is worth being direct about this, because hype around cloud services can create the impression that managed databases are fundamentally different systems that require entirely new skills.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Query optimization does not change.</strong> EXPLAIN and EXPLAIN ANALYZE on RDS PostgreSQL produce the same output as on self-managed PostgreSQL. The same principles govern index selection, join ordering, statistics quality, and plan regression. Query Store on Azure SQL and Performance Insights on RDS give you better visibility into query behavior than most on-premises deployments had, but interpreting that data requires the same foundational knowledge of execution plans and cost estimation.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Query optimization does not change.</strong> Actual execution plans on RDS for SQL Server are produced by the same optimizer as on self-managed SQL Server. The same principles govern index selection, join ordering, statistics quality, and plan regression. Query Store on Azure SQL and Performance Insights on RDS give you better visibility into query behavior than most on-premises deployments had, but interpreting that data requires the same foundational knowledge of execution plans and cost estimation.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: execution plan analysis works identically on RDS and self-managed
-EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
-SELECT
-    o.order_id,
-    o.created_at,
-    c.email,
-    SUM(oi.quantity * oi.unit_price) AS order_total
-FROM orders o
-JOIN customers c ON o.customer_id = c.customer_id
-JOIN order_items oi ON o.order_id = oi.order_id
-WHERE o.created_at &gt;= NOW() - INTERVAL '30 days'
-  AND o.status = 'completed'
-GROUP BY o.order_id, o.created_at, c.email
-ORDER BY o.created_at DESC;
-
--- SQL Server: same analysis approach on Azure SQL
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: plan and IO analysis works identically on RDS, Azure SQL, and self-managed
 SET STATISTICS IO, TIME ON;
 SELECT
     o.order_id,
@@ -536,43 +422,15 @@ WHERE o.created_at &gt;= DATEADD(DAY, -30, GETUTCDATE())
 GROUP BY o.order_id, o.created_at, c.email
 ORDER BY o.created_at DESC;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Schema design does not change.</strong> Normalization, denormalization tradeoffs, partitioning strategies, and foreign key design are engine-level concerns that the cloud provider does not touch. A poorly designed schema that causes table bloat through inefficient updates will bloat just as effectively on Aurora as on a bare-metal PostgreSQL server.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Schema design does not change.</strong> Normalization, denormalization tradeoffs, partitioning strategies, and foreign key design are engine-level concerns that the cloud provider does not touch. A poorly designed schema that causes page splits through inefficient clustered index choices will fragment just as effectively on RDS as on a bare-metal SQL Server.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Backup and recovery reasoning does not change.</strong> The mechanics of backup change — you do not run <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_basebackup</code> manually on RDS, and you do not schedule SQL Server maintenance plan jobs on Azure SQL. But the reasoning about RPO, RTO, backup retention, and recovery testing does not change. The cloud DBA must still define backup retention windows, understand what PITR can recover and what it cannot, and test restore procedures regularly.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Backup and recovery reasoning does not change.</strong> The mechanics of backup change — you do not run <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">BACKUP DATABASE</code> manually on RDS for SQL Server, and you do not schedule SQL Server maintenance plan jobs on Azure SQL. But the reasoning about RPO, RTO, backup retention, and recovery testing does not change. The cloud DBA must still define backup retention windows, understand what PITR can recover and what it cannot, and test restore procedures regularly.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Transaction management and isolation levels do not change.</strong> <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">READ COMMITTED</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">REPEATABLE READ</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SERIALIZABLE</code> — these are engine behaviors that the cloud wrapper does not modify. Application developers who write code with implicit assumptions about transaction boundaries will cause the same data integrity problems on RDS that they would cause on your on-premises server.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Locking and concurrency design does not change.</strong> Advisory locks, row-level locking, table-level locking, deadlock detection — these behave identically. The cloud DBA who knows how to diagnose a lock contention issue using <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_locks</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_activity</code> on self-managed PostgreSQL will apply exactly the same skills on RDS.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Locking and concurrency design does not change.</strong> Application locks via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sp_getapplock</code>, row-level locking, table-level locking, deadlock detection — these behave identically. The cloud DBA who knows how to diagnose a lock contention issue using <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_tran_locks</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_requests</code> on self-managed SQL Server will apply exactly the same skills on RDS.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: identify lock contention (works on RDS, Aurora, Cloud SQL identically)
-SELECT
-    blocked.pid AS blocked_pid,
-    blocked.query AS blocked_query,
-    blocking.pid AS blocking_pid,
-    blocking.query AS blocking_query,
-    blocked_activity.wait_event_type,
-    blocked_activity.wait_event,
-    now() - blocked_activity.query_start AS blocked_duration
-FROM pg_catalog.pg_locks blocked_lock
-JOIN pg_catalog.pg_stat_activity blocked_activity
-    ON blocked_activity.pid = blocked_lock.pid
-JOIN pg_catalog.pg_locks blocking_lock
-    ON blocking_lock.locktype = blocked_lock.locktype
-    AND blocking_lock.DATABASE IS NOT DISTINCT FROM blocked_lock.DATABASE
-    AND blocking_lock.relation IS NOT DISTINCT FROM blocked_lock.relation
-    AND blocking_lock.page IS NOT DISTINCT FROM blocked_lock.page
-    AND blocking_lock.tuple IS NOT DISTINCT FROM blocked_lock.tuple
-    AND blocking_lock.virtualxid IS NOT DISTINCT FROM blocked_lock.virtualxid
-    AND blocking_lock.transactionid IS NOT DISTINCT FROM blocked_lock.transactionid
-    AND blocking_lock.classid IS NOT DISTINCT FROM blocked_lock.classid
-    AND blocking_lock.objid IS NOT DISTINCT FROM blocked_lock.objid
-    AND blocking_lock.objsubid IS NOT DISTINCT FROM blocked_lock.objsubid
-    AND blocking_lock.pid != blocked_lock.pid
-JOIN pg_catalog.pg_stat_activity blocking_activity
-    ON blocking_activity.pid = blocking_lock.pid
-WHERE NOT blocked_lock.granted
-ORDER BY blocked_duration DESC;
-
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: identify blocking chains (works on RDS, Azure SQL, self-managed identically)
 -- SQL Server equivalent (Azure SQL)
 SELECT
     blocked_req.session_id AS blocked_session,
@@ -602,11 +460,11 @@ ORDER BY blocked_req.wait_time DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The practical advice is to develop skills in three areas that complement your existing database expertise and increase your value in a cloud context:</p>
 
-<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Infrastructure as Code fluency.</strong> Terraform or Pulumi for database infrastructure is a baseline expectation on mature cloud teams. If you can write and review Terraform for an Aurora cluster, security groups, parameter groups, and Secrets Manager integration, you can contribute directly to platform work rather than waiting for infrastructure teams to provision what you need.</p>
+<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Infrastructure as Code fluency.</strong> Terraform or Pulumi for database infrastructure is a baseline expectation on mature cloud teams. If you can write and review Terraform for an RDS SQL Server instance, security groups, parameter groups, and Secrets Manager integration, you can contribute directly to platform work rather than waiting for infrastructure teams to provision what you need.</p>
 
 <p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Observability and alerting design.</strong> Building CloudWatch alarms, Azure Monitor alert rules, and dashboard configurations that accurately surface real problems without generating noise is a skill. Knowing which thresholds matter (replica lag exceeding a threshold appropriate for your RPO, connection pool saturation, storage growth rate), and knowing how to page on the right signals, is a DBA-specific contribution to the observability stack.</p>
 
-<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Database migration engineering.</strong> Moving data between environments — from on-premises to cloud, between cloud providers, or between database engines — is a domain where deep database knowledge is essential and where mistakes have serious consequences. AWS Database Migration Service, Azure Database Migration Service, and tools like <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pglogical</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_dump</code> in combination are all in scope. Chapter 9 covers this in depth.</p>
+<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Database migration engineering.</strong> Moving data between environments — from on-premises to cloud, between cloud providers, or between database engines — is a domain where deep database knowledge is essential and where mistakes have serious consequences. AWS Database Migration Service, Azure Database Migration Service, native backup/restore to object storage, and log shipping are all in scope. Chapter 9 covers this in depth.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
@@ -614,7 +472,7 @@ ORDER BY blocked_req.wait_time DESC;</code></pre>
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> The cloud provider owns the OS, storage subsystem, replication wiring, and patching lifecycle; the DBA owns configuration, schema design, query performance, access control policy, and backup retention — this division of responsibility is firm and understanding it prevents both misplaced effort and dangerous assumptions.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Authentication and authorization move from engine-native mechanisms (`pg_hba.conf`, SQL Server logins) to cloud IAM layers (AWS IAM database authentication, Azure Entra ID contained users), requiring the DBA to become conversant in cloud identity systems while retaining all existing knowledge of database-level privilege management.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Authentication and authorization move from engine-native mechanisms (SQL Server logins, Windows authentication) to cloud IAM layers (AWS IAM database authentication, Azure Entra ID contained users), requiring the DBA to become conversant in cloud identity systems while retaining all existing knowledge of database-level privilege management.</li>
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Configuration management shifts from editing flat files to managing Parameter Groups (RDS) or database-scoped configurations (Azure SQL), with certain parameters locked because the provider manages them on your behalf — most notably, true superuser access does not exist on RDS, which affects extension management and some administrative operations.</li>
 
@@ -622,10 +480,14 @@ ORDER BY blocked_req.wait_time DESC;</code></pre>
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Cloud DBAs acquire meaningful net-new responsibilities in infrastructure as code, cost engineering (Reserved Instances, storage tier selection, I/O optimization), and cross-service architecture design, while the organizational context shifts toward database engineering roles embedded in development and platform teams rather than purely operations-focused roles.</li>
     </div>
+    <nav class="mt-10 flex flex-col sm:flex-row gap-3 justify-between" aria-label="Chapter navigation">
+<a href="b5-ch03-cloud-landscape.html" class="flex-1 px-5 py-4 bg-gray-900/60 border border-gray-800 rounded-xl hover:border-orange-700/50 transition group"><span class="block text-xs text-orange-400 mb-1">← Previous</span><span class="block text-sm text-gray-200 group-hover:text-white transition">Chapter 3: The SQL Server Cloud Landscape</span></a>
+<a href="b5-ch05-architecture-patterns.html" class="flex-1 px-5 py-4 bg-gray-900/60 border border-gray-800 rounded-xl hover:border-orange-700/50 transition group text-right"><span class="block text-xs text-orange-400 mb-1">Next →</span><span class="block text-sm text-gray-200 group-hover:text-white transition">Chapter 5: SQL Server Cloud Architecture Patterns</span></a>
+</nav>
     <div class="mt-14 bg-orange-950/40 border border-orange-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
-        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+        <p class="text-xs text-gray-400">Execution-plan visualizer · Index advisor · Slow query dashboard · Built for SQL Server</p>
       </div>
       <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
          class="shrink-0 px-6 py-3 bg-orange-600 hover:bg-orange-500 text-white font-semibold rounded-xl text-sm transition">

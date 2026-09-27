@@ -1,0 +1,81 @@
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 20: SQL Server on Kubernetes in the Cloud</h2>
+
+<p class="text-gray-300 leading-relaxed">Databases on Kubernetes used to be a contrarian idea. It is now a mainstream pattern for specific workloads: dev/test environments that spin up in seconds, CI pipelines that need disposable databases, edge and multi-cloud deployments where Kubernetes is the common substrate, and organizations standardizing every workload on one orchestrator. SQL Server runs well in containers — and Kubernetes adds scheduling, self-healing, and declarative configuration. This chapter covers when SQL Server on Kubernetes makes sense, the storage and availability architecture, and the operational realities.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">20.1 When Kubernetes Fits (and When It Does Not)</h3>
+
+<p class="text-gray-300 leading-relaxed">Kubernetes is the right home for SQL Server when: environments are ephemeral (dev, test, CI — a database per pull request, torn down after merge); you need identical database environments across clouds and on-premises (the container image is the contract); or your platform team already operates Kubernetes and absorbing the database into the same GitOps pipeline reduces organizational friction. It is the <em>wrong</em> home when: you need the highest availability with the least operational effort (RDS, Azure SQL, and Cloud SQL all beat a hand-built Kubernetes HA setup); your team does not already operate Kubernetes (learning Kubernetes <em>and</em> stateful SQL Server simultaneously is a recipe for incidents); or the workload needs every last IOPS (the container and storage layers add overhead versus bare VMs).</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">20.2 The Architecture: StatefulSets, Storage, and Availability</h3>
+
+<p class="text-gray-300 leading-relaxed">SQL Server on Kubernetes runs as a <strong class="text-white">StatefulSet</strong> — the Kubernetes primitive for stateful workloads with stable identities and persistent storage. Each SQL Server pod gets a <strong class="text-white">PersistentVolumeClaim</strong> backed by the cloud's block storage (EBS via the EBS CSI driver, Azure Disk, GCP Persistent Disk). The critical settings:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">One SQL Server per pod, one pod per node (anti-affinity).</strong> For availability groups across pods, spread replicas across nodes and zones with pod anti-affinity rules. Co-located replicas on one node share fate — the opposite of availability.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Storage class matters.</strong> Use the cloud's SSD-backed storage class (gp3/io2 on AWS, Premium SSD/Ultra on Azure) with appropriate IOPS provisioning. The database files live on the persistent volume; the container image holds only the binaries.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">AGs in Kubernetes are real but manual.</strong> Always On availability groups across SQL Server pods work — the AG listener becomes a Kubernetes Service — but failover orchestration, quorum, and health probing are your responsibility. For most teams, a single SQL Server pod with fast storage-level recovery (pod reschedules, volume reattaches) plus solid backups is the pragmatic architecture; multi-pod AGs are for teams with Kubernetes depth.</li>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># SQL Server as a StatefulSet (dev/test pattern)
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mssql-dev
+spec:
+  serviceName: mssql-dev
+  replicas: 1
+  selector:
+    matchLabels: { app: mssql-dev }
+  template:
+    metadata:
+      labels: { app: mssql-dev }
+    spec:
+      containers:
+      - name: mssql
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env:
+        - name: ACCEPT_EULA
+          value: "Y"
+        - name: MSSQL_SA_PASSWORD
+          valueFrom:
+            secretKeyRef: { name: mssql-secrets, key: sa-password }
+        ports:
+        - containerPort: 1433
+        volumeMounts:
+        - name: mssql-data
+          mountPath: /var/opt/mssql
+  volumeClaimTemplates:
+  - metadata:
+      name: mssql-data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: fast-ssd
+      resources:
+        requests: { storage: 200Gi }</code></pre>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">20.3 Configuration, Secrets, and GitOps</h3>
+
+<p class="text-gray-300 leading-relaxed">The Kubernetes-native way to manage SQL Server configuration is declarative: environment variables for server settings (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">MSSQL_</code> prefixed variables cover the common ones), <strong class="text-white">Secrets</strong> for passwords and certificates (backed by the cloud KMS via external-secrets or the CSI secrets driver — never plaintext in manifests), and <strong class="text-white">ConfigMaps</strong> for initialization scripts. Manage the manifests in Git with a GitOps tool (Argo CD, Flux): the database deployment becomes a pull request like any other. Initialization (creating databases, logins, Agent jobs) runs via init containers or post-start hooks executing versioned T-SQL scripts — the same scripts Chapter 12's automation would run, now triggered by the orchestrator.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">20.4 Backup, Monitoring, and Day-2 Operations</h3>
+
+<p class="text-gray-300 leading-relaxed">Kubernetes does not change the fundamentals — it changes the plumbing:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Backups:</strong> SQL Server Agent inside the container (or a sidecar/CronJob) takes native backups to object storage. Volume snapshots of the persistent volume give you crash-consistent copies — fast for dev/test refresh, not a substitute for real backups in production.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Monitoring:</strong> expose SQL Server metrics via a Prometheus exporter sidecar or the built-in telemetry, scraped into the cluster's monitoring stack. Logs go to stdout and into the cluster log aggregator — no more RDP-to-check-the-error-log.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Upgrades:</strong> change the image tag, roll the StatefulSet. Test the upgrade against a copy of production data first — the container makes rollback trivial (previous image tag), which is a genuine operational advantage.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Resource limits:</strong> set CPU and memory requests/limits deliberately. SQL Server's memory model (max server memory) must fit inside the container's memory limit with headroom for the OS — an OOM-killed SQL Server pod is an avoidable outage.</li>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">20.5 Production Readiness Checklist</h3>
+
+<p class="text-gray-300 leading-relaxed">Before running production SQL Server on Kubernetes: pod disruption budgets (so node maintenance does not evict your database unexpectedly); anti-affinity across zones for multi-pod topologies; tested backup restores from object storage (not just volume snapshots); secrets rotation that does not require pod restarts mid-transaction; resource quotas so a noisy neighbor pod cannot starve the database; and a runbook for the scenario every Kubernetes DBA eventually faces — the persistent volume that will not reattach. If that list sounds like significant engineering, it is: production databases on Kubernetes are a platform investment, not a shortcut.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Kubernetes fits ephemeral and standardized workloads.** Dev/test per pull request, CI databases, and multi-cloud consistency are the wins. It is not the low-effort HA path — managed services win that comparison.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **StatefulSet + persistent volumes + anti-affinity.** One SQL Server per pod, SSD-backed storage classes, replicas spread across nodes and zones. AGs across pods work but are operationally demanding.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Manage it declaratively.** Secrets in KMS-backed secret stores, configuration in Git, GitOps deployment, versioned T-SQL init scripts. The database becomes a pull request.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Day-2 operations still apply.** Real backups to object storage (snapshots are not backups), Prometheus-sidecar monitoring, image-tag upgrades with tested rollback, and memory limits that respect max server memory.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Production on Kubernetes is a platform investment.** Pod disruption budgets, zone anti-affinity, quota isolation, and a volume-reattach runbook — budget the engineering or stay on managed services.</li>

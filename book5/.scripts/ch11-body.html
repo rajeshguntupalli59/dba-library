@@ -1,0 +1,95 @@
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 11: Serverless SQL Server: Azure SQL Serverless and Cost-Efficient Alternatives</h2>
+
+<p class="text-gray-300 leading-relaxed">Not every database needs to run at full power 24 hours a day. Development databases sit idle overnight. Departmental applications spike for two hours each morning. SaaS products with a handful of customers have databases that do nothing for long stretches. Paying for provisioned compute through all of that idle time is one of the quietest wastes in cloud database spending — and serverless SQL Server is the answer, with caveats that matter.</p>
+
+<p class="text-gray-300 leading-relaxed">The honest framing first: there is no serverless RDS for SQL Server, and there is no serverless Managed Instance. True serverless SQL Server exists in exactly one place — Azure SQL Database's serverless compute tier. Everything else in this chapter is about achieving serverless-like economics for the workloads that cannot use it: auto-pause patterns, scheduled start/stop, and elastic pools. If your workload can live on Azure SQL Database, the serverless tier may be the cheapest way to run SQL Server in any cloud.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">11.1 Azure SQL Database Serverless: How It Works</h3>
+
+<p class="text-gray-300 leading-relaxed">Serverless is a compute tier of Azure SQL Database, not a separate product. You configure min and max vCores and an auto-pause delay. When the database is idle for the delay period, compute pauses entirely — you pay only for storage. When a connection arrives, compute resumes automatically. Billing is per vCore-second of compute used, with a minimum billable quantum per resume.</p>
+
+<p class="text-gray-300 leading-relaxed">The details that determine whether it fits:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Resume latency.</strong> Waking a paused database takes seconds (typically 30–60 seconds for the first connection, sometimes longer for larger databases). Interactive applications with human users notice; batch jobs and dev workflows do not. Set the auto-pause delay to match the workload's real idle pattern — pausing a database that wakes every 20 minutes costs more in resume overhead than it saves.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Min vCores floor.</strong> The minimum vCore setting (as low as 0.5) bounds how far compute scales down before pausing. A database that is lightly but constantly busy never pauses and bills like a small provisioned database — serverless only wins when there are genuine idle periods.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Feature parity.</strong> Serverless supports the same Azure SQL Database feature set (with the SQL Database limitations from Chapter 7 — no Agent, no linked servers). It is not a back door to full SQL Server compatibility.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Geo-replication limits.</strong> Historically, serverless databases had restrictions on active geo-replication. Verify current support before designing DR around a serverless primary — the safe pattern is serverless for dev/test and lower environments, provisioned for production DR topologies.</li>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Create a serverless database: 0.5–4 vCores, auto-pause after 60 min idle
+az sql db create \
+  --resource-group rg-dev \
+  --server sqlsrv-dev \
+  --name appdb-dev \
+  --edition GeneralPurpose \
+  --family Gen5 \
+  --min-capacity 0.5 \
+  --capacity 4 \
+  --compute-model Serverless \
+  --auto-pause-delay 60
+
+# Convert an existing provisioned database to serverless
+az sql db update \
+  --resource-group rg-dev \
+  --server sqlsrv-dev \
+  --name appdb-dev \
+  --compute-model Serverless \
+  --min-capacity 0.5 \
+  --auto-pause-delay 120</code></pre>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">11.2 The Workloads Serverless Fits (and the Ones It Does Not)</h3>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Ideal fits:</strong> development and QA databases (idle 14+ hours a day — the classic 70% cost reduction), departmental applications with business-hours usage, batch-oriented workloads that run on schedules, SaaS databases for small tenants with sporadic usage, and any database where you can tolerate a cold-start delay on first connection.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Poor fits:</strong> latency-sensitive OLTP with steady traffic (never pauses, bills like provisioned, adds resume risk), databases behind user-facing applications where a 30-second cold start is a support ticket, workloads needing SQL Agent jobs on a schedule (use elastic jobs or provisioned), and anything requiring features outside Azure SQL Database's compatibility surface.</p>
+
+<p class="text-gray-300 leading-relaxed">The decision rule: look at a week of CPU utilization. If the database is below 5% utilization for more than half the week, serverless almost certainly wins. If it never drops below 20%, provisioned is cheaper and more predictable. Between those, model both — the Azure pricing calculator has a serverless mode, but validate with a month of real billing, because resume frequency dominates the math.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">11.3 Elastic Pools: Serverless Economics for Many Databases</h3>
+
+<p class="text-gray-300 leading-relaxed">When you have dozens or hundreds of small databases — the multi-tenant SaaS pattern from Chapter 14 — serverless per database becomes operationally noisy. Elastic pools are the alternative: a shared pool of vCores (or eDTUs) across many databases, where each database bursts against the pool and you pay for the pool's aggregate capacity rather than each database's peak. The economics work when peaks do not coincide: 100 databases that each peak at 2 vCores but average 0.1 vCores fit comfortably in a 20-vCore pool.</p>
+
+<p class="text-gray-300 leading-relaxed">Pools and serverless solve different problems. Serverless optimizes one database's idle time. Pools optimize many databases' uncorrelated peaks. For the SaaS scenario with hundreds of tenant databases, pools are usually the answer; for the single dev database that sleeps all night, serverless is.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">11.4 Serverless-Like Economics on AWS: Scheduled Start/Stop</h3>
+
+<p class="text-gray-300 leading-relaxed">RDS for SQL Server has no auto-pause. But an RDS instance that does not need to run overnight can simply be stopped — you pay for storage while stopped, not compute. For dev, QA, and training environments on RDS, scheduled stop/start is the serverless equivalent, and the savings are comparable: stopping nights and weekends cuts compute cost by roughly two-thirds.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Stop a dev RDS instance (no compute charges while stopped)
+aws rds stop-db-instance \
+  --db-instance-identifier dev-sql-01 \
+  --region us-east-1
+
+# Start it again in the morning
+aws rds start-db-instance \
+  --db-instance-identifier dev-sql-01 \
+  --region us-east-1</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Automate it with EventBridge Scheduler: a cron rule that stops dev instances at 7 PM and starts them at 7 AM on weekdays, with a tag-based scope (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Schedule=dev-hours</code>) so production is never in scope. Two caveats: RDS instances stopped for more than 7 days are automatically restarted by AWS (a guardrail against forgotten instances, which also breaks the "stopped all month" plan — handle it in the automation), and stopping does not pause the 7-day backup retention clock semantics the way you might expect — verify restore windows for long-stopped instances.</p>
+
+<p class="text-gray-300 leading-relaxed">For EC2-based SQL Server, the same pattern uses EC2 stop/start (even cheaper, since you can also drop to smaller volumes or snapshot-and-terminate for long idle periods). An EC2 dev instance stopped nights and weekends, with its EBS volumes snapshotted monthly, costs a fraction of a 24/7 RDS instance.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">11.5 Containers and Ephemeral SQL Server</h3>
+
+<p class="text-gray-300 leading-relaxed">The most serverless-adjacent pattern for SQL Server on AWS is containers: SQL Server Linux container images running on ECS Fargate or EKS, started on demand for batch jobs, integration tests, or ephemeral review environments, and terminated when done. You pay per-second for the task runtime plus storage. This does not replace a persistent database — it replaces the persistent dev/test databases that sit idle between CI runs. A CI pipeline that spins up a SQL Server container, runs migrations and tests, and tears it down uses minutes of compute per run instead of a 24/7 instance.</p>
+
+<p class="text-gray-300 leading-relaxed">Limits are real: containers on Fargate have no persistent local storage guarantees across restarts (use EFS or accept ephemerality), Windows containers remain second-class on most orchestrators (use the Linux SQL Server images), and production OLTP on Fargate is not a serious architecture. But for ephemeral workloads, it is the closest thing to serverless SQL Server outside Azure.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">11.6 Choosing Your Idle-Time Strategy</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">On Azure SQL Database and the workload tolerates cold starts:</strong> serverless tier. Simplest, true per-second billing, zero automation to maintain.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Many small databases with uncorrelated peaks:</strong> elastic pools, on either provisioned or (where supported) serverless pool configurations.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">RDS dev/test with business-hours usage:</strong> EventBridge-scheduled stop/start. Two cron rules replace a serverless tier.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Ephemeral CI/test databases:</strong> SQL Server containers on Fargate/EKS, created and destroyed per run.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Steady production OLTP:</strong> none of the above — provisioned compute, right-sized (Chapter 39), possibly reserved (Chapter 38).</li>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **True serverless SQL Server exists in one place: Azure SQL Database's serverless tier.** Per-vCore-second billing with auto-pause is the cheapest way to run idle-heavy SQL Server workloads — if the workload fits SQL Database's compatibility surface and tolerates resume latency.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Serverless wins on idle time, not on size.** A database below 5% utilization for half the week is the ideal candidate. Steady workloads should stay provisioned — serverless adds resume risk without saving money.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **On AWS, scheduled stop/start is the serverless equivalent for RDS.** EventBridge-driven nights-and-weekends shutdown cuts dev/test compute cost by two-thirds. Watch the 7-day auto-restart behavior.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Elastic pools solve the many-databases problem; containers solve the ephemeral problem.** Match the tool to the idle pattern: correlated single-database idleness → serverless; uncorrelated multi-database peaks → pools; per-run ephemerality → containers.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Production OLTP stays provisioned.** None of the idle-time strategies apply to steady production workloads — right-size them and consider reservations instead (Chapters 38–39).</li>

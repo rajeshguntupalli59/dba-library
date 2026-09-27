@@ -1,0 +1,56 @@
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 22: SQL Server Analytics: Columnstore and Workload Offload</h2>
+
+<p class="text-gray-300 leading-relaxed">Analytical queries — aggregations over millions of rows, year-over-year comparisons, dashboard rollups — are the workload that kills OLTP performance. The rowstore engine that excels at single-row lookups reads entire rows to aggregate one column, and a heavy report can saturate the I/O and CPU that transactions need. This chapter covers SQL Server's in-engine answer (columnstore indexes), the architectural answer (offloading analytics to a separate system), and how to decide between them in the cloud.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">22.1 Columnstore: Analytics Inside SQL Server</h3>
+
+<p class="text-gray-300 leading-relaxed">Columnstore indexes store data column-by-column instead of row-by-row, with heavy compression and batch-mode execution. The result: aggregation queries that scanned gigabytes in rowstore scan megabytes in columnstore — 10x to 100x speedups are routine for the right queries. Two flavors:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Clustered columnstore:</strong> the table <em>is</em> the columnstore. Best for large fact tables that are primarily scanned and rarely updated row-by-row. Compression ratios of 5–10x are typical, which directly reduces cloud storage and I/O costs.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Nonclustered columnstore:</strong> a secondary index on a rowstore table. The OLTP workload keeps its rowstore performance while analytical queries use the columnstore copy. This is the HTAP pattern — one database serving both workloads.</li>
+
+<p class="text-gray-300 leading-relaxed">The operational notes: columnstore segments have a minimum size for efficiency — trickle-loaded tables (constant small inserts) create small, inefficient rowgroups unless you manage them (tuple mover handles this, but monitor rowgroup quality on trickle feeds); updates and deletes in clustered columnstore are expensive (they go through a delete bitmap and the segment is rebuilt on reorganization — design for bulk loads, not row-by-row mutation); and columnstore loves memory (batch mode wants generous memory grants — watch for the memory pressure that analytical queries add to a shared instance).</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Nonclustered columnstore: HTAP on the OLTP table
+CREATE NONCLUSTERED COLUMNSTORE INDEX ncci_orders
+ON dbo.Orders (OrderDate, CustomerId, ProductId, Quantity, UnitPrice);
+
+-- Clustered columnstore for the fact table (analytics-first)
+CREATE CLUSTERED COLUMNSTORE INDEX cci_sales_fact
+ON dbo.SalesFact;
+
+-- Check rowgroup health (aim for ~1M rows per compressed rowgroup)
+SELECT object_name(object_id) AS tbl,
+       state_description,
+       total_rows,
+       deleted_rows
+FROM sys.column_store_row_groups
+WHERE object_id = object_id('dbo.SalesFact');</code></pre>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">22.2 When In-Engine Is Not Enough: Offload Architectures</h3>
+
+<p class="text-gray-300 leading-relaxed">Columnstore handles a great deal, but some analytical workloads belong on a separate system: when the analytics need dedicated elastic scale (burst to hundreds of cores for an hour, then to zero); when the data volume dwarfs the operational database (years of history versus months of hot data); or when the analytics team needs a different engine's capabilities. The offload patterns:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Readable secondary as analytics replica.</strong> Route analytical queries to an async AG secondary (Chapter 21). Zero data movement, near-real-time data — but the secondary shares the primary's schema and sizing, and heavy analytics can still lag replication.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Cloud data warehouse offload.</strong> Replicate or ETL SQL Server data into the cloud's warehouse (BigQuery on GCP, Synapse on Azure, Redshift on AWS). The warehouse scales independently and the analytics team gets its own platform. Cost: data movement latency (minutes to hours), duplicate storage, and a pipeline to operate.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Lakehouse export.</strong> Export to Parquet in object storage (S3/ADLS/GCS) for serverless query engines. Cheapest storage, maximum flexibility, highest latency — the right answer for cold historical analytics.</li>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">22.3 The Decision: In-Engine vs Offload</h3>
+
+<p class="text-gray-300 leading-relaxed">Default to columnstore in-engine: it keeps one system, one security model, and real-time data. Offload when the analytics workload's resource profile (bursty, massive, or team-separate) conflicts with the OLTP database's stability. The hybrid is common: recent hot data analyzed in-engine via columnstore, historical data in the warehouse/lake. And whatever you choose, protect the OLTP workload first — resource governance (workload groups limiting analytics memory/CPU) is not optional when both workloads share an engine. An unbounded dashboard query taking down order entry is the failure this entire chapter exists to prevent.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">22.4 Data Freshness and Pipeline Discipline</h3>
+
+<p class="text-gray-300 leading-relaxed">Every offload architecture is a data pipeline, and pipelines fail. Define the freshness SLA per consumer (real-time for operational dashboards, hourly for management reporting, daily for finance), monitor pipeline lag against it, and alert before the business notices stale numbers. Validate row counts and checksums across the pipeline boundary — the ETL that silently drops 0.1% of rows produces analytics that are confidently wrong. And version the pipeline with the schema: when the source table changes, the pipeline, the warehouse schema, and the downstream dashboards change together, tested as a unit.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Columnstore is the in-engine answer.** Clustered for analytics-first fact tables, nonclustered for HTAP on OLTP tables. 10–100x aggregation speedups with 5–10x compression — monitor rowgroup quality on trickle-loaded tables.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Offload when the resource profiles conflict.** Bursty massive analytics, years of cold history, or a separate analytics team point to a warehouse or lakehouse. Default to in-engine; offload on evidence.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Protect OLTP first.** Resource governance caps on analytics workloads sharing the engine. The dashboard must never take down order entry.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Pipelines are production systems.** Freshness SLAs, lag monitoring, checksum validation across the boundary, and schema changes tested end to end. Silently stale analytics are worse than no analytics.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The hybrid pattern is normal.** Hot data in-engine via columnstore, cold history in the warehouse/lake. Tier by data temperature, not by habit.</li>

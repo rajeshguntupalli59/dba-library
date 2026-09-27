@@ -1,0 +1,175 @@
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 10: RDS Proxy for SQL Server: Connection Management at Scale</h2>
+
+<p class="text-gray-300 leading-relaxed">Connection management is a problem every production DBA has solved before — connection pooling in the application tier, disciplined connection lifetimes, enough headroom for peaks. In the cloud, the problem changes shape: serverless functions open and close connections on every invocation, auto-scaled fleets multiply connection counts unpredictably, and a Multi-AZ failover that should take 60 seconds turns into a 10-minute outage because thousands of clients reconnect simultaneously and overwhelm the new primary. RDS Proxy exists for exactly these problems: a managed connection pooler that sits between your applications and RDS for SQL Server, multiplexing thousands of client connections onto a small pool of database connections and smoothing over failovers.</p>
+
+<p class="text-gray-300 leading-relaxed">A note on history: early versions of RDS Proxy did not support SQL Server, and older documentation — including earlier drafts of this book — said so. That changed: RDS Proxy now supports RDS for SQL Server (engine family <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SQLSERVER</code>), with Secrets Manager-based authentication. This chapter covers the SQL Server reality: creating and configuring the proxy, authentication, monitoring and connection pinning, failover behavior, sizing, limitations, and a runbook for diagnosing pool exhaustion with T-SQL.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">10.1 Why Connection Management Is Different in the Cloud</h3>
+
+<p class="text-gray-300 leading-relaxed">On-premises, you controlled both ends of the connection. You knew how many application servers existed, each ran a fixed-size ADO.NET connection pool, and the total was a number you could compute on a whiteboard. In the cloud, three things break that model:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Serverless connection churn.</strong> An AWS Lambda function that queries SQL Server on every invocation opens a connection, runs one batch, and closes it. At 500 concurrent executions, that is 500 connection setups per burst — each one a TCP handshake, TLS negotiation, and SQL Server login sequence. Login storms like this show up as <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">PREEMPTIVE_OS_AUTHENTICATIONOPS</code> waits and CPU spikes on the database, not in your application metrics.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Elastic fleet scaling.</strong> Auto Scaling groups and ECS/EKS workloads scale connection counts with traffic. Your database's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">user connections</code> setting and worker thread pool are fixed; the fleet is not. The failure mode is <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">THREADPOOL</code> waits — new connections queue because no worker thread is free to run the login task.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Failover reconnect storms.</strong> During a Multi-AZ failover, every client connection breaks at once and every client reconnects at once. Without a proxy, the new primary absorbs a thundering herd of logins while it is still completing crash recovery. With a proxy, the proxy holds the client connections and re-establishes its smaller pool to the new primary — clients see a pause, not an error.</li>
+
+<p class="text-gray-300 leading-relaxed">ADO.NET connection pooling helps within a single process, but it does not help across hundreds of Lambda execution environments or dozens of containers. RDS Proxy pools across all of them, at the infrastructure layer.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">10.2 Creating and Configuring RDS Proxy for SQL Server</h3>
+
+<p class="text-gray-300 leading-relaxed">A proxy needs: a name, the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SQLSERVER</code> engine family, Secrets Manager credentials for the database login, an IAM role the proxy assumes, subnets and security groups, and TLS enforcement. Create it with the CLI:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Create an RDS Proxy for a SQL Server instance
+aws rds create-db-proxy \
+  --db-proxy-name prod-sql-proxy \
+  --engine-family SQLSERVER \
+  --auth '[{
+    "AuthScheme": "SECRETS",
+    "SecretArn": "arn:aws:secretsmanager:us-east-1:123456789012:secret:prod/sqlserver/dbadmin",
+    "IAMAuth": "DISABLED"
+  }]' \
+  --role-arn arn:aws:iam::123456789012:role/rds-proxy-role \
+  --vpc-subnet-ids subnet-0abc123 subnet-0def456 subnet-0ghi789 \
+  --vpc-security-group-ids sg-0proxy123 \
+  --require-tls \
+  --idle-client-timeout 1800 \
+  --debug-logging \
+  --region us-east-1
+
+# Register the RDS for SQL Server instance as the proxy target
+aws rds register-db-proxy-targets \
+  --db-proxy-name prod-sql-proxy \
+  --db-instance-identifiers prod-sql-primary \
+  --region us-east-1</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Key configuration choices:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white"><code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">idle-client-timeout</code>.</strong> How long the proxy keeps an idle client connection before closing it (default 1800 seconds). Serverless workloads benefit from shorter timeouts; long-lived application pools can use the default. Setting it too low causes reconnect churn; too high holds proxy capacity for dead clients.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Connection pool size.</strong> The proxy maintains its own pool to the database, sized as a percentage of the database's capacity (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">MaxConnectionsPercent</code>). Start conservative — the proxy multiplexes efficiently, and the most common misconfiguration is sizing the proxy pool as large as the old direct-connection count, which defeats the purpose.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">TLS.</strong> <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">--require-tls</code> enforces encryption between clients and the proxy. Your client connection strings should already use <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Encrypt=True</code>; the proxy does not excuse plaintext credentials on the wire.</li>
+
+<p class="text-gray-300 leading-relaxed">In Terraform, the equivalent is <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">aws_db_proxy</code> with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">engine_family = "SQLSERVER"</code> and an <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">auth</code> block pointing at the Secrets Manager secret. Keep the proxy definition in the same Terraform stack as the RDS instance so target registration and security group wiring stay consistent.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">10.3 Authentication: Secrets Manager, Not IAM</h3>
+
+<p class="text-gray-300 leading-relaxed">For MySQL and PostgreSQL, RDS Proxy supports IAM database authentication. For SQL Server, it does not — IAM database authentication is a MySQL/PostgreSQL-only feature, and that restriction extends through the proxy. SQL Server proxy authentication goes through Secrets Manager, period.</p>
+
+<p class="text-gray-300 leading-relaxed">The operational pattern: store the SQL login credentials in Secrets Manager, enable automatic rotation on the secret, and let the proxy pick up rotated credentials without restarts. Rotation without application coordination is the entire point — the application authenticates to the proxy, the proxy authenticates to the database with the current secret value, and neither side needs a deployment when the password changes.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Enable automatic rotation on the database secret (30-day rotation)
+aws secretsmanager rotate-secret \
+  --secret-id prod/sqlserver/dbadmin \
+  --rotation-lambda-arn arn:aws:lambda:us-east-1:123456789012:function:SecretsManagerRDSRotation \
+  --rotation-rules AutomaticallyAfterDays=30 \
+  --region us-east-1
+
+# Verify the proxy can still authenticate after rotation
+aws rds describe-db-proxies \
+  --db-proxy-name prod-sql-proxy \
+  --query 'DBProxies[0].[Status,EngineFamily]' \
+  --output table \
+  --region us-east-1</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Windows (Kerberos/NTLM) authentication is not supported through RDS Proxy — applications connecting via the proxy must use SQL authentication with the Secrets Manager secret. If your application currently relies on Windows integrated authentication, the proxy migration includes an authentication migration: create dedicated SQL logins for the proxied workloads, scope their permissions, and store them in Secrets Manager. Plan this before cutover, not during.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">10.4 Monitoring Proxy Performance and Connection Pinning</h3>
+
+<p class="text-gray-300 leading-relaxed">The proxy exposes CloudWatch metrics under the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">AWS/RDS</code> namespace with proxy dimensions. The ones that matter:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white"><code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DatabaseConnections</code> vs <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ClientConnections</code>.</strong> The ratio is your multiplexing efficiency. Hundreds of client connections on dozens of database connections is healthy. If the two converge, the proxy is not multiplexing — something is pinning connections.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white"><code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DatabaseConnectionsCurrentlyBorrowed</code>.</strong> How many database connections are checked out right now. Sustained high values against the pool ceiling mean the pool is too small or pinned connections are leaking.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white"><code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">QueryResponseTime</code> / <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ClientConnectionWaitTime</code>.</strong> Time clients wait for a proxy connection. Spikes here with a healthy database mean pool saturation, not query slowness — do not tune queries for a pooling problem.</li>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Connection pinning</strong> is the proxy's fundamental limitation: when a client connection uses a feature the proxy cannot multiplex safely, the proxy pins that client to a dedicated database connection for the session's lifetime. For SQL Server, the classic pinning causes are open transactions held across batches, temporary tables that must persist across batches on the same connection, session-level <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SET</code> options the proxy cannot track, and MARS (Multiple Active Result Sets) sessions. An application that opens a transaction, does application work, then commits — holding the transaction open for seconds — will pin one database connection per client and get almost no multiplexing benefit.</p>
+
+<p class="text-gray-300 leading-relaxed">Diagnose pinning by correlating proxy metrics with the database side: query <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_sessions</code> for sessions with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">open_transaction_count &gt; 0</code> and old <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">last_request_end_time</code> — those are the pinned sessions. The fix is almost always in the application: shorten transaction scope, avoid holding transactions across network round trips, and do not use temp tables as a cross-batch communication mechanism through the proxy.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">10.5 Failover Behavior: What RDS Proxy Changes</h3>
+
+<p class="text-gray-300 leading-relaxed">During a Multi-AZ failover without a proxy, every client connection breaks and the application tier generates a reconnect storm against the new primary. With a proxy, the architecture changes: clients hold connections to the proxy, the proxy holds a smaller pool to the database. When failover happens, the proxy detects the topology change, re-establishes its database connections to the new primary, and client connections experience a pause rather than an error. AWS documents failover time reductions from 60–120 seconds of client-visible errors to a few seconds of elevated latency.</p>
+
+<p class="text-gray-300 leading-relaxed">What the proxy does not change: in-flight transactions are still rolled back (the new primary recovered without them), DNS still propagates on its own timeline for direct connections that bypass the proxy, and the application still needs retry logic for the pause window. The proxy converts failover from "every connection errors and every client retries at once" to "connections stall briefly and resume." Test it with the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">reboot-db-instance --force-failover</code> procedure from Chapter 9 and measure client-observed recovery with and without the proxy in the path — that measurement is the business case.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">10.6 Sizing and Scaling Considerations</h3>
+
+<p class="text-gray-300 leading-relaxed">Size the proxy pool from the database's sustainable concurrency, not from the client's connection count. A SQL Server instance that comfortably runs 200 concurrent active sessions does not need a proxy pool of 2,000 — it needs a pool slightly above its proven active concurrency, with the proxy queueing the rest. Oversizing the proxy pool reproduces the exact <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">THREADPOOL</code> exhaustion the proxy was meant to prevent.</p>
+
+<p class="text-gray-300 leading-relaxed">RDS Proxy scales by adding capacity behind the endpoint; monitor <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ClientConnectionWaitTime</code> as the scaling signal. One proxy per VPC is the common pattern; separate proxies per workload (OLTP vs reporting vs serverless) let you set different idle timeouts and pool sizes and isolate a misbehaving workload's connection churn from everyone else. And remember the proxy is priced per vCPU-hour of proxy capacity plus data transfer — it is not free, so the cost comparison in your business case should include it.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">10.7 Limitations and When Not to Use RDS Proxy</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">No Windows authentication.</strong> Kerberos/NTLM through the proxy is unsupported. Workloads requiring integrated authentication must connect directly.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">No IAM database authentication for SQL Server.</strong> Secrets Manager only. If your security standard mandates IAM auth, the proxy cannot deliver it for SQL Server.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Pinning-prone workloads gain little.</strong> Applications with long-held transactions, cross-batch temp tables, or MARS will pin connections and see minimal multiplexing. Fix the application patterns first; the proxy amplifies good connection hygiene, it does not replace it.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Single-AZ proxy endpoints.</strong> The proxy itself is multi-AZ, but understand your application's availability requirements end to end — the proxy is one more component in the path, with its own (small) latency addition per query.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">When direct is better.</strong> Steady-state applications with well-tuned ADO.NET pooling, predictable connection counts, and no failover sensitivity often see no benefit from a proxy — just added latency and cost. The proxy earns its keep for serverless, highly elastic, and failover-sensitive workloads.</li>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">10.8 Practical Runbook: Diagnosing Connection Pool Exhaustion</h3>
+
+<p class="text-gray-300 leading-relaxed">Symptom: application errors — timeouts acquiring connections, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">THREADPOOL</code> waits on the server, or proxy <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ClientConnectionWaitTime</code> spikes. Work this sequence:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Step 1: Is the proxy multiplexing or pinned?</strong> Compare <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ClientConnections</code> to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DatabaseConnections</code> in CloudWatch. A collapsing ratio means pinning or pool saturation.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Step 2: Connect directly to the database (bypassing the proxy) and find the sessions.</strong> Keep a direct administrative path that does not go through the proxy — you reserved it for exactly this scenario.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- T-SQL: connect directly to the RDS instance (not via proxy)
+-- Who is connected and what are they doing?
+SELECT s.session_id,
+       s.login_name,
+       s.host_name,
+       s.program_name,
+       s.status,
+       s.open_transaction_count,
+       r.wait_type,
+       r.wait_time AS wait_ms,
+       DATEDIFF(SECOND, r.start_time, GETDATE()) AS running_seconds,
+       SUBSTRING(t.text, 1, 100) AS query_snippet
+FROM sys.dm_exec_sessions s
+LEFT JOIN sys.dm_exec_requests r ON s.session_id = r.session_id
+OUTER APPLY sys.dm_exec_sql_text(r.sql_handle) t
+WHERE s.is_user_process = 1
+ORDER BY running_seconds DESC;
+
+-- Count by program and status: find the connection hog
+SELECT s.program_name,
+       s.status,
+       COUNT(*) AS session_count,
+       SUM(s.open_transaction_count) AS open_transactions
+FROM sys.dm_exec_sessions s
+WHERE s.is_user_process = 1
+GROUP BY s.program_name, s.status
+ORDER BY session_count DESC;
+
+-- Pinned-session suspects: open transactions idle for a long time
+SELECT s.session_id, s.login_name, s.program_name,
+       s.open_transaction_count,
+       DATEDIFF(SECOND, s.last_request_end_time, GETDATE()) AS idle_seconds
+FROM sys.dm_exec_sessions s
+WHERE s.is_user_process = 1
+  AND s.open_transaction_count &gt; 0
+  AND s.status = 'sleeping'
+  AND DATEDIFF(SECOND, s.last_request_end_time, GETDATE()) &gt; 30
+ORDER BY idle_seconds DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Step 3: If idle open transactions are the cause, kill the blockers.</strong> Preview first, kill second, and fix the application third — killing treats the symptom.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- T-SQL: terminate a runaway session (use sparingly; prefer fixing the app)
+-- First identify the session_id from the query above, then:
+KILL 87;  -- replace 87 with the offending session_id
+GO
+
+-- Prevent recurrence: alert on sessions idle with open transactions
+-- (add to your monitoring; threshold to your workload's transaction profile)</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Step 4: Decide whether the pool or the application needs to change.</strong> If sessions are legitimately busy (high <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">running_seconds</code>, real wait types), the workload exceeds the pool — increase <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">MaxConnectionsPercent</code> cautiously or scale the database. If sessions are idle-with-open-transactions or sleeping hordes from a chatty ORM, the application needs connection discipline — the proxy cannot fix a leak, it can only queue it more gracefully.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **RDS Proxy supports SQL Server — with Secrets Manager auth, not IAM.** The old "not supported" guidance is outdated. Plan for SQL authentication through the proxy; Windows authentication must bypass it.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The proxy's value is multiplexing and failover smoothing, not magic.** It converts thousands of client connections into a small database pool and turns failover reconnect storms into brief pauses. It does not fix bad transaction hygiene.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Watch the multiplexing ratio and pinning.** <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ClientConnections</code> vs <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DatabaseConnections</code> tells you whether the proxy is working. Long-held transactions, cross-batch temp tables, and MARS pin connections — diagnose with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_sessions</code> and fix the application.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Size the pool from database concurrency, not client count.** Oversizing the proxy pool reproduces the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">THREADPOOL</code> exhaustion it was meant to prevent. Scale on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ClientConnectionWaitTime</code>, isolate workloads with separate proxies.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Keep a direct administrative path.** When the proxy is the problem, you need a way into the database that does not go through it. Reserve direct connections for diagnostics and run the T-SQL runbook above.</li>

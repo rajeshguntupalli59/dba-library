@@ -1,0 +1,85 @@
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 5: SQL Server Cloud Architecture Patterns</h2>
+
+<p class="text-gray-300 leading-relaxed">Cloud SQL Server deployments repeat a small set of architectural patterns: how availability is achieved, how reads scale, how storage grows, how the network is laid out, how tuning happens when the OS is not yours, how serverless and auto-scaling work, how multi-region DR is designed, how observability is assembled, how cost is engineered, and what each provider constrains. This chapter catalogs the patterns with SQL Server as the engine throughout.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">5.1 High Availability and Failover Architecture</h3>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">RDS for SQL Server Multi-AZ</strong> deploys a synchronous standby in a second Availability Zone using database mirroring internals; the endpoint fails over via DNS, typically in 60–120 seconds. The standby is not readable. <strong class="text-white">Azure SQL</strong> offers multiple HA tiers: General Purpose uses remote storage with a hot standby (failover ~20–30 seconds); Business Critical runs an Always On availability group across nodes (failover typically faster, with a readable secondary included); Hyperscale disaggregates compute from page servers, making failover fast regardless of database size. <strong class="text-white">Cloud SQL for SQL Server</strong> uses regional Persistent Disk with synchronous replication to a standby zone — failover is automatic, typically 60–120 seconds.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Self-managed HA:</strong> SQL Server on EC2, Azure VMs, or GCE supports full Always On availability groups — synchronous replicas across zones, readable secondaries, and (with a witness and stretched configuration) multi-region AGs. This is the HA pattern that gives you readable secondaries on AWS/GCP, where the managed services don't offer them (Chapter 8).</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Terraform: RDS for SQL Server with Multi-AZ and backup retention
+resource "aws_db_instance" "prod" {
+  identifier              = "prod-sqlserver"
+  engine                  = "sqlserver-se"
+  engine_version          = "16.00.4125.1.v1"
+  instance_class          = "db.r7i.2xlarge"
+  allocated_storage       = 1000
+  storage_type            = "gp3"
+  multi_az                = true
+  storage_encrypted       = true
+  backup_retention_period = 14
+  deletion_protection     = true
+}</code></pre>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">5.2 Read Scaling and Replica Patterns</h3>
+
+<p class="text-gray-300 leading-relaxed">RDS for SQL Server has <strong class="text-white">no read replicas</strong> — the managed service on AWS is single-writer with a non-readable standby. Read scaling on AWS means either SQL Server on EC2 with Always On readable secondaries, or offloading reads to a different tier (Chapter 22's columnstore analytics pattern). <strong class="text-white">Azure SQL Hyperscale</strong> supports named replicas (up to 30) that share the underlying page-server storage — Microsoft's answer to read scale-out, with replica lag measured in milliseconds because replicas read from shared pages. <strong class="text-white">Azure SQL Database</strong> geo-replicas are readable secondaries in other regions for both DR and read offload (Chapter 16). <strong class="text-white">Cloud SQL</strong> read replicas serve reads but promote-to-standalone for DR rather than preserving a global endpoint (Chapter 19).</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Connection pooling pattern:</strong> a standalone pooler in front of a replica pool doesn't translate to managed services directly — RDS Proxy (Chapter 10) is the managed alternative for SQL Server connection fan-in on AWS, while Azure and GCP expect application-level pooling with driver-level failover awareness. When replicas have lag (self-managed AG secondaries under heavy write load, cross-region replicas), route lag-tolerant reads to secondaries and lag-sensitive reads to the primary — never assume replica reads are current.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">5.3 Storage Architecture and Auto-Scaling</h3>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">RDS</strong> storage is EBS-backed: gp3 (baseline performance, provisionable IOPS), io1/io2 (high IOPS). Storage increases are permanent — you cannot shrink. Scaling a Multi-AZ instance's storage triggers a failover-like event; plan the operational window. <strong class="text-white">Azure SQL Hyperscale</strong> storage grows to 100 TB independently of compute, and restores complete in minutes regardless of database size because only metadata is rehydrated. <strong class="text-white">Cloud SQL</strong> storage auto-scales to 64 TB. The operational rules: set <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">MaxAllocatedStorage</code> on RDS to bound auto-scaling cost, alert on growth rate not just free space, and remember that storage tier selection (gp3 vs io2 — Chapter 36) is a performance decision disguised as a cost decision.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- T-SQL: compare logical database sizes against provisioned storage
+SELECT DB_NAME(database_id) AS db_name,
+       SUM(size) * 8.0 / 1024 / 1024 AS total_gb,
+       SUM(FILEPROPERTY(name, 'SpaceUsed')) * 8.0 / 1024 / 1024 AS used_gb
+FROM sys.master_files
+GROUP BY database_id
+ORDER BY total_gb DESC;</code></pre>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">5.4 Network Architecture: VPC, Private Link, and Connectivity</h3>
+
+<p class="text-gray-300 leading-relaxed">Every managed instance lives inside the cloud's network: <strong class="text-white">RDS</strong> in a VPC via DB subnet groups spanning at least two AZs, with security groups as stateful firewalls. <strong class="text-white">Azure SQL</strong> reachable via public endpoint with firewall rules, or privately via Azure Private Link with private DNS. <strong class="text-white">Cloud SQL</strong> via authorized networks or private IP through Private Service Connect. The architecture patterns: put databases in private subnets with no internet route; use private endpoints/links so traffic never crosses the public internet; peer or hub-and-spoke VNets/VPCs for cross-region and on-premises connectivity (ExpressRoute, Direct Connect, Cloud Interconnect); and model egress costs — cross-AZ and cross-region traffic is billed (Chapter 40).</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">5.5 Parameter Tuning in Managed Environments</h3>
+
+<p class="text-gray-300 leading-relaxed">Managed services expose a curated subset of engine settings: <strong class="text-white">RDS</strong> via DB parameter groups (the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SQLSERVER_2019</code>/<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SQLSERVER_2022</code> families — Chapter 6); <strong class="text-white">Azure SQL</strong> via database-scoped configuration and portal settings; <strong class="text-white">Cloud SQL for SQL Server</strong> via a narrow documented flag set (most tuning happens through <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sp_configure</code> inside the instance). The tuning pattern: apply changes through IaC (parameter group in Terraform, database-scoped config in scripts) so configuration is versioned; test non-dynamic settings in staging first; and accept that settings the provider doesn't expose (startup parameters, trace flags on some services) are off-limits — design around them (Chapter 35).</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">5.6 Serverless and Auto-Scaling Patterns</h3>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Azure SQL Database serverless</strong> auto-scales vCores between a floor and ceiling and auto-pauses after inactivity — the pattern for intermittent workloads (Chapter 11). Compute auto-scaling for SQL Server is otherwise limited: managed services don't vertically scale on load automatically, so the pattern is <strong class="text-white">scheduled scaling</strong> (scale up before the business day, down at night) and <strong class="text-white">read-scale routing</strong> (direct reporting to Hyperscale replicas or AG secondaries). For containers and Lambda-like workloads generating connection storms, RDS Proxy (Chapter 10) absorbs the fan-in. The serverless decision rule: variable, intermittent workloads with pausable demand belong on serverless; steady production belongs on provisioned with commitments (Chapter 38).</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">5.7 Multi-Region and Disaster Recovery Architecture</h3>
+
+<p class="text-gray-300 leading-relaxed">Cross-region DR patterns by platform: <strong class="text-white">RDS for SQL Server</strong> uses cross-region native backups to S3 plus restore automation, or log shipping to a second region's instance (Chapter 16) — there is no managed cross-region replica for SQL Server on RDS. <strong class="text-white">Azure SQL</strong> offers auto-failover groups: a readable geo-secondary, DNS-level failover, and typically sub-minute RTO for planned failover (Chapter 16). <strong class="text-white">Cloud SQL</strong> cross-region read replicas exist but promote to standalone instances — your automation must handle the endpoint switch (Chapter 19).</p>
+
+<p class="text-gray-300 leading-relaxed">The DR table: for RPO near zero and RTO under minutes, Azure failover groups are the strongest native option; for AWS, cross-region log shipping with tested restore automation is the production pattern (Chapter 16). Whatever the mechanism, DR is only real if tested quarterly — an untested DR plan is a hope (Chapter 29).</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">5.8 Observability Architecture: Metrics, Logs, and Tracing</h3>
+
+<p class="text-gray-300 leading-relaxed">Assemble the three pillars per platform: <strong class="text-white">metrics</strong> (CloudWatch, Azure Monitor, Cloud Monitoring — host and database metrics with dashboards per Chapter 30), <strong class="text-white">logs</strong> (SQL Server error logs exported to CloudWatch Logs / Log Analytics / Cloud Logging, with alerts on severity), and <strong class="text-white">query tracing</strong> (Query Store on Azure, Performance Insights on RDS, Query Insights on Cloud SQL — the query-level layer that identifies <em>what</em> is slow). The architecture pattern: platform metrics answer "is the database healthy," query telemetry answers "which query is the problem," and the alerting hierarchy (page/ticket/log — Chapter 30) routes each signal to the right urgency.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">5.9 Cost Architecture: Designing for Efficiency</h3>
+
+<p class="text-gray-300 leading-relaxed">Design cost in, don't bolt it on: choose the storage tier for the I/O profile (gp3 vs io2 — Chapter 36), commit the stable baseline to reservations (Chapter 38), right-size from measured peak not provisioned headroom (Chapter 39), place secondaries where the economics favor them (Chapter 37), and consolidate where density pays (elastic pools — Chapter 14). The io2-vs-gp3 decision alone can swing storage cost substantially for I/O-heavy workloads — pull actual IOPS from monitoring and price both models (Chapter 36). Cost architecture is capacity architecture done honestly.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">5.10 Feature and Component Constraints by Cloud Provider</h3>
+
+<p class="text-gray-300 leading-relaxed">The constraints that shape architecture: <strong class="text-white">RDS for SQL Server</strong> — no readable secondaries, no IAM database authentication, no SQL Server Agent on some editions (check current docs), limited sysadmin. <strong class="text-white">Azure SQL Database</strong> — no Agent, no cross-database queries without elastic queries, DTU vs vCore model choice. <strong class="text-white">Cloud SQL for SQL Server</strong> — narrower flag surface, regional HA model. <strong class="text-white">Self-managed VMs</strong> — full engine, but you own patching, backups, and AG operations. Every architecture decision in this book is a negotiation with one of these constraint sets (Chapters 6–19 detail each platform).</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Cloud HA is managed abstraction, not magic:** RDS Multi-AZ gives 60–120 second failover with a non-readable standby; Azure Business Critical is faster with a readable secondary included; Hyperscale makes failover fast at any size. Know your platform's numbers.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Read scaling is platform-specific:** RDS for SQL Server has no read replicas — reads scale via AG secondaries on EC2 or Azure's Hyperscale named replicas. Design the read path per platform.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Storage scaling is one-directional and has operational windows:** RDS storage increases are permanent and scaling a Multi-AZ instance triggers an event — plan windows and set MaxAllocatedStorage.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Parameter tuning is curated and versioned:** use DB parameter groups, database-scoped configuration, and IaC so configuration is reviewable and reproducible.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **DR is only real if tested:** cross-region mechanisms differ per platform (Azure failover groups lead natively); quarterly DR tests turn the architecture into a capability.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Every architecture decision negotiates with provider constraints:** no readable secondaries on RDS, no Agent on Azure SQL Database, narrow flags on Cloud SQL — Chapters 6–19 detail each constraint set.</li>

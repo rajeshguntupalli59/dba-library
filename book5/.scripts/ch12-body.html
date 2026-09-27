@@ -1,0 +1,131 @@
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 12: SQL Server Agent, Jobs, and Automation in the Cloud</h2>
+
+<p class="text-gray-300 leading-relaxed">Ask a SQL Server DBA what runs the business at night and the answer is SQL Server Agent: maintenance plans, ETL schedules, index rebuilds, backup jobs, alerting, and the hundred small automations accumulated over a decade. Agent is also one of the first things that breaks — or vanishes — in a cloud migration. RDS restricts it, Azure SQL Database removes it, and Managed Instance keeps it but changes the operational context. This chapter maps the automation surface on each platform and shows how to rebuild your job estate wherever you land.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">12.1 What SQL Server Agent Does for You Today</h3>
+
+<p class="text-gray-300 leading-relaxed">Before replacing anything, inventory what you have. Agent typically carries five workload types, each with different migration needs:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Database maintenance:</strong> integrity checks, index maintenance, statistics updates, backup jobs. These translate directly to any platform — the schedule and the T-SQL survive, only the host changes.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">ETL and data movement:</strong> SSIS package executions, bulk loads, cross-server data syncs. These depend on components (SSIS, linked servers, file shares) that may not exist on the target — the highest-risk category.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Business logic on a schedule:</strong> nightly aggregations, billing runs, archiving, notification generation. The T-SQL usually ports cleanly; the scheduling mechanism changes.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Monitoring and alerting:</strong> jobs that check replication lag, disk space, failed logins, and long-running queries. These get rebuilt on cloud-native monitoring (CloudWatch alarms, Azure Monitor alerts) rather than ported.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Operational glue:</strong> jobs calling xp_cmdshell, PowerShell steps, SSIS-adjacent scripting. These almost never survive migration unchanged — each one needs a redesign decision.</li>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Inventory every Agent job: name, owner, schedule, and step types
+-- Step types tell you what will survive migration and what will not
+SELECT j.name AS job_name,
+       j.enabled,
+       sc.name AS schedule_name,
+       STUFF((
+           SELECT ', ' + s.subsystem
+           FROM msdb.dbo.sysjobsteps s
+           WHERE s.job_id = j.job_id
+           GROUP BY s.subsystem
+           FOR XML PATH('')
+       ), 1, 2, '') AS step_subsystems,
+       j.date_created
+FROM msdb.dbo.sysjobs j
+LEFT JOIN msdb.dbo.sysjobschedules js ON j.job_id = js.job_id
+LEFT JOIN msdb.dbo.sysschedules sc ON js.schedule_id = sc.schedule_id
+ORDER BY j.name;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">step_subsystems</code> column is your triage key: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">TSQL</code> steps port almost anywhere; <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SSIS</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CmdExec</code>, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">PowerShell</code> steps need platform-specific rebuilds.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">12.2 SQL Server Agent on RDS: Available but Restricted</h3>
+
+<p class="text-gray-300 leading-relaxed">RDS for SQL Server includes SQL Server Agent, and for T-SQL maintenance jobs it works the way you expect: create jobs, schedules, and alerts through SSMS or T-SQL against <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">msdb</code>. The restrictions are at the edges:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">No CmdExec or PowerShell steps that touch the OS.</strong> There is no OS to touch — no file system access, no <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">xp_cmdshell</code>, no local scripts. Jobs that shell out must be reimplemented (see section 12.5).</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Replication jobs are limited.</strong> RDS supports SQL Server replication in specific configurations only; Agent jobs tied to replication need verification against the RDS-supported topology.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Multi-AZ failover and msdb.</strong> Agent jobs live in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">msdb</code>, which is a system database — it fails over with the instance on RDS Multi-AZ, so jobs survive failover. But job <em>history</em> and in-flight executions do not transfer; design jobs to be re-runnable and idempotent.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Alerting integration.</strong> Agent alerts (severity-based, performance-condition-based) work, but route notifications through Database Mail to SNS or your mail system — the on-premises operator-to-pager chain does not exist.</li>
+
+<p class="text-gray-300 leading-relaxed">Practical rule: if your Agent estate is 90% T-SQL maintenance and business logic, RDS Agent carries it with minor changes. If it is heavy on CmdExec, PowerShell, and SSIS, you are rebuilding the automation layer regardless of the database platform — start that design early.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">12.3 No Agent on Azure SQL Database: Elastic Jobs and Alternatives</h3>
+
+<p class="text-gray-300 leading-relaxed">Azure SQL Database has no SQL Server Agent. The native replacement is <strong class="text-white">elastic jobs</strong>: an Azure-hosted job service (backed by a dedicated job database) that executes T-SQL across one or many databases on schedules you define. Conceptually it is Agent's T-SQL scheduling extracted into a service:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">What transfers:</strong> T-SQL steps, schedules, multi-database targeting (run the same index maintenance across 200 tenant databases — elastic jobs are genuinely better at this than Agent ever was).</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">What does not:</strong> SSIS steps, CmdExec, PowerShell, replication agents, and anything requiring server scope. Elastic jobs run T-SQL against databases, nothing else.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Operational differences:</strong> job history lives in the job database's tables (query it like any data), credentials use database-scoped credentials, and private connectivity requires the job agent's VNet integration for databases behind private endpoints.</li>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Create the Elastic Job agent (one per logical server region topology)
+az sql elastic-job-agent create \
+  --resource-group rg-prod \
+  --server sqlsrv-prod \
+  --name jobagent-prod
+
+-- T-SQL: define a job that runs index maintenance across all tenant databases
+-- (run in the job database)
+EXEC jobs.sp_add_job @job_name = 'NightlyIndexMaintenance';
+EXEC jobs.sp_add_jobstep
+    @job_name = 'NightlyIndexMaintenance',
+    @command = N'EXEC dbo.usp_AdaptiveIndexMaintenance;',
+    @credential_name = 'job_credential',
+    @target_group_name = 'TenantDatabases';
+EXEC jobs.sp_add_jobschedule
+    @job_name = 'NightlyIndexMaintenance',
+    @enabled = 1,
+    @schedule_interval_type = 'Days',
+    @schedule_interval_count = 1,
+    @schedule_start_time = '2024-01-01 02:00:00';</code></pre>
+
+<p class="text-gray-300 leading-relaxed">For non-T-SQL automation on Azure, the surrounding platform takes over: Azure Automation runbooks (PowerShell/Python with schedules and webhooks), Logic Apps (event-driven workflows with 400+ connectors), and Azure Data Factory (the SSIS replacement — including the SSIS integration runtime for lift-and-shift of existing packages). The pattern is consistent: the database runs queries; the platform runs everything else.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">12.4 SQL Server Agent on Managed Instance: The Familiar Path</h3>
+
+<p class="text-gray-300 leading-relaxed">Managed Instance runs a full SQL Server Agent — jobs, schedules, alerts, operators, proxies, T-SQL steps, SSIS steps (via the SSIS IR integration), and CmdExec/PowerShell steps within the instance's sandbox. For lift-and-shift migrations, this is the path of least resistance: script your jobs from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">msdb</code> on-premises and recreate them on MI. The differences from on-premises Agent are operational, not functional: no OS access (so CmdExec steps cannot touch a file system — they run in a constrained context), Database Mail routes through Azure's mail infrastructure, and job history retention follows the instance's storage.</p>
+
+<p class="text-gray-300 leading-relaxed">One MI-specific consideration: failover groups. Agent jobs live in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">msdb</code> on each instance — they are not replicated to the secondary. After a failover, the secondary has its own copy of the jobs only if you deployed them there. The standard pattern is to deploy identical jobs to both instances and gate execution: jobs check <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_hadr_database_replica_states</code> or the failover group's role and run only on the primary. Skip this and your maintenance jobs either run twice or not at all after a failover.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- MI failover-group-safe job step: only run on the primary replica
+-- Add as the first step of every scheduled job in a failover group topology
+IF EXISTS (
+    SELECT 1
+    FROM sys.dm_hadr_database_replica_states rs
+    JOIN sys.databases d ON rs.database_id = d.database_id
+    WHERE d.name = 'appdb'
+      AND rs.is_local = 1
+      AND rs.role_desc <> 'PRIMARY'
+)
+BEGIN
+    RAISERROR('Not the primary replica — skipping job execution.', 16, 1);
+    RETURN;
+END
+-- ... rest of the job step follows</code></pre>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">12.5 Rebuilding OS-Dependent Automation</h3>
+
+<p class="text-gray-300 leading-relaxed">Every estate has jobs that touch the operating system: copy a backup file, run a PowerShell ETL step, call a web service, manipulate files on a share. None of the managed platforms give you an OS. The rebuild patterns:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">File operations → object storage + platform services.</strong> A job that copies backups to a file share becomes a job that writes to S3 (RDS native backup to S3) or Azure Blob Storage, with lifecycle policies replacing the cleanup script. A job that bulk-loads from a file becomes <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">BULK INSERT</code> from cloud storage or an ADF/S3-triggered pipeline.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">PowerShell/CmdExec steps → Automation runbooks or Lambda.</strong> On AWS, a Lambda function on a schedule (EventBridge) replaces the PowerShell step — it has IAM permissions, VPC access, and logging built in. On Azure, an Automation runbook with a Hybrid Worker or managed identity does the same. The logic ports; the host changes.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">SSIS packages → ADF or EC2.</strong> Existing packages run in Azure Data Factory's SSIS integration runtime (lift-and-shift) or on an EC2 instance with SSIS installed (AWS). New ETL should be evaluated against cloud-native orchestration (ADF pipelines, Step Functions + Lambda/Glue) rather than reflexively rehosting SSIS.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Custom alerting scripts → native monitoring.</strong> The Agent job that emails when disk space is low becomes a CloudWatch alarm or Azure Monitor alert. Do not port monitoring scripts — replace them with the platform's monitoring, which is more reliable than a job on the thing being monitored.</li>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">12.6 Maintenance Plans in the Cloud</h3>
+
+<p class="text-gray-300 leading-relaxed">Maintenance plans deserve explicit attention because every SQL Server estate has them and the cloud changes the calculus. The classic plan — nightly full backup, integrity check, index rebuild, statistics update — needs rethinking:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Backups:</strong> on RDS, automated backups replace most Agent backup jobs (keep Agent jobs only for extra copies or special handling). On Azure SQL, platform backups replace them entirely. On EC2/MI, Agent backup jobs remain — writing to S3/Blob storage.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Integrity checks:</strong> keep them everywhere. <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DBCC CHECKDB</code> on a schedule is non-negotiable on every platform — managed storage can corrupt too, and early detection is the difference between a restore and a resume event.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Index maintenance:</strong> replace blanket rebuilds with intelligent maintenance (Ola Hallengren's scripts or equivalent) that rebuilds only fragmented indexes above a threshold. On cloud storage with provisioned IOPS, a nightly rebuild of every index is both a waste of IOPS and a source of log generation that can hit tier throughput caps.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Statistics:</strong> auto-update statistics handles most cases; add manual updates only for the tables where the optimizer demonstrably needs them (large tables with skewed distributions, ascending keys).</li>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">12.7 The Migration Sequence</h3>
+
+<p class="text-gray-300 leading-relaxed">Migrate the automation estate in this order: first, inventory and triage with the query from section 12.1. Second, migrate pure T-SQL maintenance jobs — they are the easiest win and de-risk the schedule. Third, rebuild monitoring and alerting on native platform tools rather than porting scripts. Fourth, tackle ETL and data movement (the long pole — SSIS/ADF design takes real time). Fifth, handle the operational glue last, replacing each OS-dependent step with its platform equivalent. Throughout, keep the on-premises Agent running in parallel until the cloud automation has executed successfully on its own schedule at least twice — "it ran once" is not proven.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Inventory before you migrate.** Query <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">msdb</code> for every job, owner, schedule, and step subsystem. T-SQL steps port easily; SSIS, CmdExec, and PowerShell steps each need a redesign decision.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Each platform has a different automation story.** RDS: Agent with T-SQL, no OS access. Azure SQL Database: no Agent — elastic jobs for T-SQL scheduling, Azure Automation/Logic Apps/ADF for everything else. Managed Instance: full Agent, the lift-and-shift path, with failover-group gating for jobs.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Do not port monitoring scripts or OS glue — replace them.** CloudWatch alarms, Azure Monitor alerts, Lambda, and Automation runbooks are more reliable than jobs running on the thing they monitor.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Make jobs idempotent and failover-aware.** Jobs must survive being interrupted by failover and must not double-execute in failover-group topologies. Gate on replica role; design for re-runnability.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Rethink maintenance plans for cloud storage.** Intelligent, threshold-based index maintenance instead of blanket rebuilds; platform backups where they exist; <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DBCC CHECKDB</code> on a schedule everywhere, without exception.</li>

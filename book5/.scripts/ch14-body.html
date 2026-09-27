@@ -1,0 +1,76 @@
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 14: Elastic Pools: Multi-Tenant Cost Optimization</h2>
+
+<p class="text-gray-300 leading-relaxed">The SaaS problem: you have 300 customers, each with their own database. Each database averages 2% CPU utilization but peaks at 60% — at different times. Provisioned individually, you pay for 300 peaks. In an elastic pool, you pay for the aggregate: a shared pool of vCores (or eDTUs) that databases draw from as needed. When peaks do not coincide, the pool costs a fraction of the sum of its databases. This chapter covers how elastic pools work, how to size them, how to keep tenants from hurting each other, and the operational patterns for running hundreds of databases as a fleet.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">14.1 How Elastic Pools Work</h3>
+
+<p class="text-gray-300 leading-relaxed">An elastic pool is a pool of compute and storage resources shared by a set of single databases on a logical server. You set the pool's total vCores (or eDTUs), per-database min/max limits, and storage cap. Each database consumes what it needs moment to moment, up to its max; the pool's total is the only thing you pay for. The key insight: you are buying the <em>sum of average utilization plus headroom for coincident peaks</em>, not the sum of peaks.</p>
+
+<p class="text-gray-300 leading-relaxed">Two purchasing models: <strong class="text-white">vCore-based</strong> (the modern model — provisioned compute with per-database min/max vCores, available in General Purpose and Business Critical tiers) and <strong class="text-white">DTU-based</strong> (the legacy bundled model — eDTUs combining CPU, memory, and I/O). New pools should use vCore; DTU pools exist for legacy estates. Per-database settings matter enormously: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">min vCores per database</code> guarantees each tenant a floor (set it above zero for databases that must always be responsive), and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max vCores per database</code> caps any single tenant from consuming the pool.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Create an elastic pool: 50 vCores shared, per-DB guardrails
+az sql elastic-pool create \
+  --resource-group rg-saas \
+  --server sqlsrv-saas \
+  --name pool-tenants \
+  --edition GeneralPurpose \
+  --family Gen5 \
+  --capacity 50 \
+  --db-dtu-max 5 \
+  --db-dtu-min 0 \
+  --storage 500
+
+# Move a database into the pool
+az sql db update \
+  --resource-group rg-saas \
+  --server sqlsrv-saas \
+  --name tenant_042 \
+  --elastic-pool pool-tenants</code></pre>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">14.2 Sizing: The Math That Makes Pools Win</h3>
+
+<p class="text-gray-300 leading-relaxed">Size from measurements, not guesses. For each candidate database, capture a week of CPU, data I/O, and log I/O utilization (Azure Monitor metrics per database, or Query Store wait statistics). The pool size formula:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Sum the averages</strong> across all databases — this is the pool's baseline load.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Add headroom for coincident peaks.</strong> If peaks are uncorrelated, 30–50% headroom over the summed average is typical. If tenants share usage patterns (all B2B customers active 9–5 in one timezone), peaks correlate — size closer to the sum of peaks and reconsider whether pooling fits.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Set per-database max to bound blast radius.</strong> A common starting point: max vCores per database at 25–50% of pool vCores. One tenant's runaway query should degrade that tenant, not exhaust the pool.</li>
+
+<p class="text-gray-300 leading-relaxed">Example: 200 tenant databases averaging 0.25 vCores each (50 vCores of average load), peaks uncorrelated. A 75-vCore pool (50% headroom) replaces 200 individually-provisioned databases — typically a 60–80% cost reduction. The break-even analysis against 200 serverless databases (Chapter 11) depends on idle patterns: pools win when databases are lightly busy around the clock; serverless wins when they are truly idle for long stretches.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">14.3 The Noisy Neighbor Problem</h3>
+
+<p class="text-gray-300 leading-relaxed">Pooling's risk is resource contention: one tenant's workload starves the others. The defenses are layered:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Per-database max caps</strong> (section 14.2) — the first and most important control.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Resource governance alerts.</strong> Alert on pool-level CPU, data I/O, and log I/O utilization, and on per-database utilization approaching its max. The alert should identify the offending database — pool-level metrics alone just tell you the pool is hot.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Query Store per database.</strong> When a tenant degrades, Query Store on that database identifies the regressed query in minutes. This is the diagnostic that makes pools operable at scale.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Tenant isolation tiers.</strong> Not all tenants belong in the pool: your largest tenants get dedicated provisioned databases (or their own pool), the long tail shares the pool. Revisit placement quarterly as tenants grow — a tenant that outgrows the pool's per-database max needs promotion, not a bigger cap.</li>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">14.4 Multi-Tenant Schema Patterns</h3>
+
+<p class="text-gray-300 leading-relaxed">Elastic pools assume the <strong class="text-white">database-per-tenant</strong> pattern. Two alternatives worth knowing: <strong class="text-white">schema-per-tenant</strong> (one database, one schema per tenant — cheaper, but no per-tenant resource isolation and harder per-tenant restore) and <strong class="text-white">shared schema with tenantId</strong> (one database, row-level security — cheapest, weakest isolation). Database-per-tenant in a pool is the sweet spot for most SaaS: per-tenant backup/restore, per-tenant Query Store diagnostics, per-tenant max caps, and straightforward tenant onboarding/offboarding (add/remove database from the pool). Use elastic queries or a catalog database for cross-tenant reporting — cross-database queries from the pool work through elastic query, with the performance characteristics of remote queries.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">14.5 Fleet Operations: Managing Hundreds of Databases</h3>
+
+<p class="text-gray-300 leading-relaxed">At pool scale, you do not manage databases — you manage the fleet:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Schema deployment:</strong> elastic jobs (Chapter 12) execute migrations across all pool databases from a single job definition. Version-gate the rollout: canary tenants first, then waves.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Monitoring:</strong> Azure Monitor at pool scope plus per-database Query Store. Build a fleet dashboard: pool utilization, top databases by CPU/I/O, databases hitting per-database max, and tenant growth trends.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Onboarding/offboarding:</strong> automate database creation from a template (bacpac or copy), pool assignment, elastic job enrollment, and monitoring registration. Tenant provisioning should be an API call, not a ticket.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Backup and PITR per tenant:</strong> Azure SQL backs up each database independently — per-tenant point-in-time restore works even inside a pool. Verify restore drills cover a single-tenant restore, not just pool-level scenarios.</li>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">14.6 When Pools Do Not Fit</h3>
+
+<p class="text-gray-300 leading-relaxed">Do not pool when: tenants have correlated peaks (the pool must be sized near the sum of peaks, erasing the savings); a single tenant needs more than the per-database max the pool can offer; tenants need different service tiers or compliance boundaries (a HIPAA tenant and a dev tenant do not share a pool); or databases need features outside the pool's tier. The honest alternative is a hybrid: pool for the long tail, dedicated provisioned or Hyperscale databases for the head. Most mature SaaS estates end up exactly here.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Elastic pools monetize uncorrelated peaks.** Size from measured averages plus headroom for coincident peaks, not from summed peaks. The typical win is 60–80% over individual provisioning for long-tail SaaS tenants.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Per-database min/max caps are the control plane.** Max caps bound noisy neighbors; min guarantees keep tenants responsive. Set them deliberately and revisit as tenants grow.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Operate the fleet, not the databases.** Elastic jobs for schema rollout, pool-scope monitoring with per-database Query Store diagnostics, automated tenant provisioning, and per-tenant PITR drills.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Tier your tenants.** Pool the long tail; give large, correlated, or compliance-sensitive tenants dedicated databases or their own pools. Promote tenants that outgrow the pool.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Pools vs serverless is an idle-pattern question.** Lightly-busy-around-the-clock fleets belong in pools; truly-idle-for-hours databases belong on serverless. Measure, then choose.</li>

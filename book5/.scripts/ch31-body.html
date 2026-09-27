@@ -1,0 +1,60 @@
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 31: SQL Server Authentication in the Cloud: Entra ID, Secrets, and Kerberos</h2>
+
+<p class="text-gray-300 leading-relaxed">Authentication is where cloud SQL Server diverges most from the on-premises world you know. On-premises, it was Windows authentication against Active Directory — simple, integrated, done. In the cloud, each platform offers a different identity story, SQL logins still exist everywhere, and secrets management becomes a first-class operational concern. This chapter maps the authentication options per platform, the secrets lifecycle, and the hardening that keeps the front door locked. One honest note up front: unlike some other engines, <strong class="text-white">RDS for SQL Server does not support IAM database authentication</strong> — there is no token-based login for SQL Server on RDS. Plan accordingly.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">31.1 The Authentication Landscape per Platform</h3>
+
+<table class="w-full text-xs text-gray-300 my-5 border border-gray-800 rounded-xl overflow-hidden">
+<thead><tr class="bg-gray-900 text-white">
+<th class="text-left p-3 border-b border-gray-800">Platform</th>
+<th class="text-left p-3 border-b border-gray-800">Integrated identity</th>
+<th class="text-left p-3 border-b border-gray-800">SQL logins</th>
+<th class="text-left p-3 border-b border-gray-800">Notes</th>
+</tr></thead>
+<tbody>
+<tr class="border-b border-gray-800/60"><td class="p-3">RDS for SQL Server</td><td class="p-3">Windows Authentication via Managed AD</td><td class="p-3">Yes</td><td class="p-3">No IAM DB auth; Secrets Manager integration for rotation</td></tr>
+<tr class="border-b border-gray-800/60"><td class="p-3">Azure SQL / MI</td><td class="p-3">Microsoft Entra ID (native)</td><td class="p-3">Yes (contained users)</td><td class="p-3">Entra-only authentication mode available</td></tr>
+<tr class="border-b border-gray-800/60"><td class="p-3">EC2 / Azure VMs / GCE</td><td class="p-3">Active Directory / Kerberos (domain-joined)</td><td class="p-3">Yes</td><td class="p-3">Full on-premises parity when domain-joined</td></tr>
+<tr class="border-b border-gray-800/60"><td class="p-3">Cloud SQL for SQL Server</td><td class="p-3">Cloud IAM via Auth Proxy (connectivity)</td><td class="p-3">Yes</td><td class="p-3">Auth Proxy handles IAM-based access control</td></tr>
+</tbody>
+</table>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">31.2 Entra ID Authentication for Azure SQL</h3>
+
+<p class="text-gray-300 leading-relaxed">Azure SQL's native identity is <strong class="text-white">Microsoft Entra ID</strong>: users and managed identities authenticate without passwords in connection strings. The production pattern: applications use <strong class="text-white">managed identities</strong> (no stored credentials at all — the platform injects the identity), humans use their Entra accounts with MFA, and SQL logins exist only where Entra cannot reach (legacy integrations). Enable <strong class="text-white">Entra-only authentication</strong> on servers that have completed the migration — it disables SQL authentication entirely, eliminating the password-spray attack surface. For Managed Instance, Entra authentication works alongside the traditional Windows-auth patterns your team already knows.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">31.3 Secrets Management: Rotation Without Outages</h3>
+
+<p class="text-gray-300 leading-relaxed">Where SQL logins remain (RDS, Cloud SQL, legacy integrations), the credentials live in the platform's secret store — <strong class="text-white">AWS Secrets Manager</strong>, <strong class="text-white">Azure Key Vault</strong>, <strong class="text-white">GCP Secret Manager</strong> — never in code, config files, or (heaven forbid) the deployment pipeline's variables. The rotation discipline: <strong class="text-white">automatic rotation</strong> on a schedule (Secrets Manager natively rotates RDS credentials, including through RDS Proxy — Chapter 10); <strong class="text-white">dual-password rotation</strong> where supported (the old password stays valid during the transition so in-flight connections survive); and <strong class="text-white">application integration</strong> (applications read the secret at startup and handle rotation signals — or better, use the platform's integrated auth and skip passwords entirely). Test rotation in staging first: the rotation that breaks the application's connection pool is discovered at 2 AM on rotation day unless you rehearse it.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">31.4 Kerberos and Active Directory in the Cloud</h3>
+
+<p class="text-gray-300 leading-relaxed">Self-managed SQL Server on EC2, Azure VMs, and GCE can join Active Directory — via <strong class="text-white">AWS Managed Microsoft AD</strong>, <strong class="text-white">Entra Domain Services</strong>, or an extended on-premises domain over the hybrid link (Chapter 27) — giving full Windows authentication parity: Kerberos for AGs and linked servers, Windows logins, group-based access. The operational requirements: <strong class="text-white">SPNs registered correctly</strong> (the AG listener and each replica need proper Service Principal Names — the classic Kerberos failure, now in the cloud); <strong class="text-white">time synchronization</strong> (Kerberos tolerates 5 minutes of skew — the cloud's NTP usually handles this, but verify on domain controllers); and <strong class="text-white">constrained delegation</strong> configured for double-hop scenarios (application → SQL Server → linked server). RDS supports Windows Authentication via Managed AD join — the one integrated-auth path on RDS, and worth the setup for estates with Windows-auth applications.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">31.5 Contained Users and Least Privilege</h3>
+
+<p class="text-gray-300 leading-relaxed">Regardless of platform, the authorization model should be <strong class="text-white">contained database users</strong> where the platform supports them (Azure SQL natively; partially contained on other editions): users authenticated at the database level, portable with the database across failover and migration, with no server-level login to synchronize. The least-privilege discipline: application accounts get exactly the permissions the application needs (execute on specific procedures, not db_owner); human access goes through groups, never individual grants; and the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sa</code> / admin credentials are vaulted, never used by applications, with every use alerted. Review effective permissions quarterly — privilege creep is silent and permanent unless audited.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">31.6 Auditing Authentication: Who Connected, From Where</h3>
+
+<p class="text-gray-300 leading-relaxed">Authentication without auditing is trust without verification. The baseline: <strong class="text-white">SQL Server audit</strong> capturing successful and failed logins (failed logins are the brute-force signal — alert on bursts); <strong class="text-white">platform audit trails</strong> (CloudTrail for Secrets Manager access, Azure Activity Log for Key Vault, Cloud Audit Logs) proving who touched the credentials; and <strong class="text-white">connection source tracking</strong> (client IP/hostname in the audit — the login from an unexpected network is the compromised-credential signal). Ship audit records to immutable storage with retention matching the compliance requirement (Chapter 26). And audit the auditors' access — the team that can read the audit logs can also, in principle, modify them; separation of duties applies to observability too.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">31.7 Troubleshooting Authentication Failures</h3>
+
+<p class="text-gray-300 leading-relaxed">The failure taxonomy, in order of frequency: <strong class="text-white">expired/rotated secrets</strong> (the application holds the old password — check rotation timing vs application restart); <strong class="text-white">network path</strong> (authentication fails because the client cannot reach the domain controller / Entra endpoint / secret store — always verify connectivity before debugging credentials); <strong class="text-white">Kerberos/SPN issues</strong> (falling back to NTLM or failing outright — check SPNs, delegation, and time skew); <strong class="text-white">Entra token problems</strong> (expired tokens, wrong tenant, managed identity misconfiguration — the Azure-side equivalent of Kerberos issues); and <strong class="text-white">permission changes</strong> (the login works but the database denies access — someone changed a role membership). The diagnostic order never changes: network, then credential validity, then identity provider, then authorization. Skipping steps is how a 10-minute fix becomes a 3-hour bridge call.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">31.8 Hardening Beyond Authentication</h3>
+
+<p class="text-gray-300 leading-relaxed">Authentication is one layer. The hardening checklist: <strong class="text-white">TLS everywhere</strong> (Chapter 32 — encrypted connections enforced, not optional); <strong class="text-white">no public endpoints</strong> on production databases (private networking only); <strong class="text-white">MFA for human access</strong> (via Entra / the identity provider — the DBA's account is the highest-value target); <strong class="text-white">break-glass accounts</strong> (vaulted, monitored, tested — for the day the identity provider is the problem); and <strong class="text-white">regular access reviews</strong> (quarterly: who has access, at what level, on every platform — Chapter 24's per-cloud review rule). Security is a process with a checklist, not a feature with a checkbox.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Know each platform's identity story — including the gaps.** Entra ID natively on Azure SQL; Managed AD join for RDS Windows auth; domain-joined VMs for full Kerberos parity. RDS SQL Server has no IAM database authentication — plan around it.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Passwords live in secret stores with automatic rotation.** Never in code or config. Rehearse rotation in staging; prefer managed identities and Entra-only mode where available.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Contained users and least privilege, everywhere.** Portable authentication, application accounts with minimal grants, vaulted admin credentials, quarterly permission reviews.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Audit logins and credential access.** Failed-login alerting, client source tracking, immutable audit storage. Audit the auditors too.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Troubleshoot in order: network, credential, identity provider, authorization.** And harden beyond auth: TLS, no public endpoints, MFA, break-glass accounts, quarterly reviews.</li>

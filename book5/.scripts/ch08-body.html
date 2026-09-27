@@ -1,0 +1,160 @@
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 8: SQL Server on EC2: Self-Managed in the Cloud</h2>
+
+<p class="text-gray-300 leading-relaxed">RDS is the default answer for SQL Server on AWS, and Chapter 6 showed why: automated backups, Multi-AZ failover, and patching without effort. But "default" is not "universal." A meaningful fraction of SQL Server workloads cannot live on RDS — they need components RDS does not offer, control RDS does not grant, or architectures RDS does not support. For those workloads, the answer is SQL Server on EC2: the full product, on infrastructure you control, with cloud-native tooling wrapped around it.</p>
+
+<p class="text-gray-300 leading-relaxed">This chapter is the EC2 playbook: when self-managed beats RDS, how licensing works on EC2, how to size instances and storage, how to build Always On availability groups across Availability Zones, and how to handle patching, backup, and monitoring without the RDS managed layer doing it for you.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">8.1 When EC2 Beats RDS</h3>
+
+<p class="text-gray-300 leading-relaxed">Choose EC2 over RDS when you need something RDS structurally cannot give you:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Engine-adjacent components.</strong> SSIS, SSAS, and SSRS do not run on RDS. If your ETL packages, cubes, or paginated reports must stay close to the database, EC2 hosts the full stack — often on the same instance or a dedicated companion instance in the same AZ.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Readable secondaries.</strong> RDS for SQL Server has no readable secondary (Chapter 6). An Always On availability group on EC2 gives you up to 8 readable secondaries for reporting offload — the standard answer to read pressure on SQL Server.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Instance consolidation.</strong> RDS is one engine per instance. On EC2 you can consolidate multiple instances or dozens of databases per VM, which is often dramatically cheaper for estates with many small databases.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Patch-level control.</strong> RDS patches on its schedule within your window. If your application is certified against a specific cumulative update, or you need a GDR security fix the day it ships, EC2 lets you patch exactly when and to what you choose.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Unrestricted engine surface.</strong> UNSAFE CLR assemblies, linked servers to any provider, replication (transactional, merge, snapshot), PolyBase, Machine Learning Services, FileStream — all fully available on EC2, restricted or absent on RDS.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Custom backup targets.</strong> Back up to S3, to FSx, to a cross-account bucket with your own lifecycle and immutability policies — not just the RDS backup window.</li>
+
+<p class="text-gray-300 leading-relaxed">The honest cost of EC2 is operational: you own the OS, the patching, the failover cluster, and the 3 AM pages. Chapter 2 quantified that trade-off. This chapter assumes you have decided the control is worth it and shows how to do it well.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">8.2 Licensing on EC2: License Included vs BYOL</h3>
+
+<p class="text-gray-300 leading-relaxed">EC2 offers two licensing paths for SQL Server, and the choice dwarfs most technical decisions in dollar terms.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">License Included (LI) AMIs.</strong> AWS publishes Windows Server AMIs with SQL Server pre-installed (Express, Web, Standard, Enterprise). The license cost is folded into the hourly EC2 rate. This is the simplest path: no license paperwork, no true-up, per-second billing. It is also the most expensive per hour for Standard and especially Enterprise. LI is ideal for short-lived, elastic, or uncertain workloads — dev/test, burst capacity, migrations in flight.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Bring Your Own License (BYOL).</strong> Deploy SQL Server on a plain Windows Server EC2 instance using your existing licenses. For production, this almost always means <strong class="text-white">License Mobility through Software Assurance</strong>: with active SA, you may run your SQL Server licenses on shared-tenancy EC2. Without SA, BYOL on shared tenancy is generally not permitted — you would need Dedicated Hosts or Dedicated Instances, which changes the economics. The rules here are a licensing conversation with your Microsoft reseller, not an AWS configuration: get the answer in writing before you build.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">The per-core math that matters.</strong> SQL Server Enterprise is licensed per core (4-core minimum per VM). On EC2, vCPUs map to hyperthreads — SQL Server licensing counts physical cores, so a VM with 8 vCPUs generally needs 4 core licenses. Size the VM to the license footprint, not just the workload: an r6i.2xlarge (8 vCPU) needs 4 Enterprise core licenses whether it is 10% busy or 90% busy. Consolidation is the lever — putting four departmental databases on one licensed VM instead of four VMs can quarter the license cost.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Find the latest AWS-provided SQL Server 2022 Enterprise AMI (License Included)
+aws ec2 describe-images \
+  --owners amazon \
+  --filters "Name=name,Values=Windows_Server-2022-English-Full-SQL_2022_Enterprise*" \
+  --query 'Images | sort_by(@, &CreationDate) | [-1].[ImageId,Name,CreationDate]' \
+  --output table \
+  --region us-east-1
+
+# For BYOL: start from a plain Windows Server AMI and install your media
+aws ec2 describe-images \
+  --owners amazon \
+  --filters "Name=name,Values=Windows_Server-2022-English-Full-Base*" \
+  --query 'Images | sort_by(@, &CreationDate) | [-1].[ImageId,Name]' \
+  --output table \
+  --region us-east-1</code></pre>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">8.3 Instance and Storage Sizing</h3>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Instance families.</strong> The same guidance as RDS applies, minus the managed layer: R-family (r7i, r6i) for memory-heavy OLTP, M-family for balanced workloads, and dedicated hosts only if your licensing requires them. Two EC2-specific notes: first, EBS-optimized instances are effectively standard on modern families, but verify <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ebsOptimized</code> is enabled — without it, EBS traffic contends with network traffic and your storage benchmarks will lie to you. Second, for the most demanding log-write workloads, consider instances with NVMe instance-store volumes for tempdb (more below).</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Storage layout: separate everything.</strong> On RDS, storage is one volume you cannot see into. On EC2, you design the layout: data files on one EBS volume (or striped set), log files on another, tempdb on a third — or on NVMe instance-store volumes for maximum throughput. The rules are the on-premises rules, enforced with EBS knobs:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Data:</strong> gp3 with provisioned IOPS, or io2 for the highest durability and IOPS ceilings. Stripe multiple volumes with Windows Storage Spaces or dynamic disks if a single volume's throughput ceiling binds you.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Log:</strong> dedicated gp3/io2 volume sized for write latency, not capacity. Log writes are sequential and latency-sensitive — this is the volume where provisioned IOPS pays for itself.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Tempdb:</strong> NVMe instance-store volumes (ephemeral — data lost on stop/start, which is fine for tempdb) or a dedicated gp3 volume. Multiple equally-sized tempdb data files, one per logical processor up to 8, as ever.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Backups:</strong> a dedicated volume as a staging area, then lifecycle to S3. Never back up to the data or log volume — a runaway backup filling the log volume is a classic self-inflicted outage.</li>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Format for performance.</strong> Use 64 KB allocation unit size on SQL Server data and log volumes — the same best practice as on-premises. It is easy to forget on cloud-provisioned volumes and costs measurable throughput on write-heavy workloads.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># PowerShell: verify EBS optimization and volume layout on the instance
+Get-EC2Instance -InstanceId i-0abc123def456789 |
+  Select-Object -ExpandProperty Instances |
+  Select-Object InstanceType, EbsOptimized
+
+# List attached volumes with their device mapping
+aws ec2 describe-volumes \
+  --filters Name=attachment.instance-id,Values=i-0abc123def456789 \
+  --query 'Volumes[*].[VolumeId,Size,VolumeType,Iops,Attachments[0].Device]' \
+  --output table \
+  --region us-east-1</code></pre>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">8.4 Provisioning: AMIs, SysPrep, and Infrastructure as Code</h3>
+
+<p class="text-gray-300 leading-relaxed">Do not build SQL Server EC2 instances by hand in the console. Build a golden AMI pipeline: start from the AWS SQL Server AMI (or your BYOL base + slipstreamed media), apply your standard configuration (data/log/tempdb volume layout, 64K formatting, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max server memory</code>, backup jobs, CloudWatch agent, SSM agent), generalize with SysPrep, and bake the AMI. New instances — including AG secondaries and DR nodes — launch from that AMI in minutes with identical configuration. Configuration drift between "identical" manually-built instances is one of the most common sources of failover surprises.</p>
+
+<p class="text-gray-300 leading-relaxed">Terraform or CloudFormation should own the instance, volumes, security groups, and IAM roles. The SQL Server configuration itself (AG creation, logins, jobs) belongs in a configuration management tool or a tested PowerShell DSC/Ansible playbook run at launch via user data. Keep the two layers separate: infrastructure code builds the VM, configuration code builds the SQL Server.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">8.5 Always On Availability Groups Across Availability Zones</h3>
+
+<p class="text-gray-300 leading-relaxed">This is the reason most teams choose EC2: a real Always On availability group with readable secondaries, spanning AZs for resilience. The architecture is standard AG technology with cloud-specific adaptations for networking and quorum.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Topology.</strong> Two or three replicas in different Availability Zones (three AZs with one replica each is the resilient pattern — it survives an AZ loss with quorum intact). Each replica is an EC2 instance running SQL Server Standard or Enterprise. Note the edition math: Basic availability groups (Standard Edition) support one database per group and no readable secondaries; full AGs with readable secondaries require Enterprise. If read offload is the goal, Enterprise is the requirement — price it accordingly.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">The listener problem.</strong> On-premises, the AG listener is a clustered network name with a single IP that floats. In a VPC, an IP cannot float across AZs — subnets are AZ-scoped. The solution is a <strong class="text-white">multi-subnet listener</strong>: the listener gets one IP per AZ subnet, DNS returns all of them, and the client connection string uses <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">MultiSubnetFailover=True</code> so the driver tries all IPs in parallel and connects to whichever is live. Without that connection-string parameter, clients wait out TCP timeouts on dead IPs during failover — the single most common AG-on-AWS client misconfiguration.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Quorum without shared storage.</strong> Traditional failover clustering wants a shared disk witness. In AWS, use a <strong class="text-white">file share witness</strong> — an SMB share on a small third-AZ instance or on Amazon FSx for Windows File Server. For a two-replica AG, the witness holds the deciding vote; without it, losing one AZ takes the AG offline. With three replicas across three AZs, node majority alone sustains quorum through a single AZ loss, and the witness becomes belt-and-suspenders.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- T-SQL: verify AG health the same way on EC2 as on-premises
+-- (this is the query RDS Multi-AZ never lets you run)
+SELECT ar.replica_server_name,
+       rs.role_desc,
+       rs.connected_state_desc,
+       rs.synchronization_state_desc,
+       drs.log_send_queue_size AS log_send_queue_kb,
+       drs.redo_queue_size AS redo_queue_kb,
+       drs.last_commit_time
+FROM sys.dm_hadr_availability_replica_states rs
+JOIN sys.availability_replicas ar ON rs.replica_id = ar.replica_id
+JOIN sys.dm_hadr_database_replica_states drs ON drs.replica_id = rs.replica_id
+WHERE drs.is_local = 0;
+
+-- Failover Cluster Manager equivalent: check quorum configuration
+-- (run in PowerShell on any cluster node)
+Get-ClusterQuorum | Select-Object QuorumResource, QuorumType</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Failover Cluster Instances (FCI):</strong> an alternative to AGs when you need instance-level protection (system databases, Agent jobs, linked servers fail over together). FCI requires shared storage — on EC2 that means EBS multi-attach (io1/io2 volumes attached to multiple instances in the same AZ, so FCIs are single-AZ) or a third-party shared-storage solution. Because FCI is single-AZ on native EBS, most cloud AG designs prefer availability groups over FCIs. Use FCI only when instance-level failover semantics are a hard requirement.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">8.6 Patching Without RDS</h3>
+
+<p class="text-gray-300 leading-relaxed">On EC2, patching is yours: Windows updates and SQL Server cumulative updates. The disciplined pattern is a monthly cycle driven by AWS Systems Manager (SSM): patch AMIs first, test the AMI against a restored copy of production, then roll the fleet — secondaries before primaries, with AG failover orchestrating the primary patch. Never patch the primary first; the rollback story is always "fail back to the unpatched secondary."</p>
+
+<p class="text-gray-300 leading-relaxed">Slipstream CUs into your golden AMI pipeline so new instances launch current. And keep a tested rollback: for AGs, rollback is failing over to a replica you have not patched yet — which means staging patches one replica at a time and validating the workload on the patched secondary (readable secondaries earn their keep here as canaries) before committing the primary.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">8.7 Backup to S3: Native Backups, Your Lifecycle</h3>
+
+<p class="text-gray-300 leading-relaxed">Without RDS automated backups, you run native SQL Server backups — which is a feature, not just a burden. Native <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">BACKUP DATABASE ... TO URL</code> (SQL Server 2016+ with the S3-compatible credential, or via AWS Systems Manager / custom tooling writing to S3) gives you portable backup files you can restore anywhere: another EC2 instance, RDS (via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">rds_restore_database</code>), or back on-premises. That portability is your exit strategy and your DR story in one.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Native backup with compression to a local staging volume,
+-- then lifecycle to S3 (run as a SQL Agent job)
+BACKUP DATABASE [appdb]
+TO DISK = 'E:\Backups\appdb_full.bak'
+WITH COMPRESSION, CHECKSUM,
+     STATS = 10;
+GO
+
+-- Verify the backup before it leaves the building
+RESTORE VERIFYONLY FROM DISK = 'E:\Backups\appdb_full.bak';
+GO
+
+-- Log backups every 15 minutes keep RPO tight
+BACKUP LOG [appdb]
+TO DISK = 'E:\Backups\appdb_log.trn'
+WITH COMPRESSION, CHECKSUM;
+GO</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Push staging backups to S3 with versioning and Object Lock (compliance mode) for immutability — ransomware cannot encrypt what it cannot overwrite. Cross-region replication on the bucket gives you geographic DR for the price of storage. And test restores monthly with an automated job that restores the latest backup to a throwaway instance and runs <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DBCC CHECKDB</code>: an untested backup is a rumor, not a recovery plan.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">8.8 Monitoring: What RDS Was Hiding From You</h3>
+
+<p class="text-gray-300 leading-relaxed">On EC2 you get everything back: full PerfMon counters, Extended Events sessions of your design, the SQL Server error log on disk, Windows event logs, and OS-level metrics via the CloudWatch agent. The monitoring stack to build:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">SQL Server counters:</strong> <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Page life expectancy</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Buffer cache hit ratio</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Batch Requests/sec</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Lock Waits/sec</code>, log flush waits — the same counters as on-premises, shipped to CloudWatch via the agent.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">AG health:</strong> the DMV query from section 8.5 on a schedule, alerting on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">log_send_queue_kb</code> growth and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">synchronization_state_desc != 'SYNCHRONIZED'</code> for synchronous replicas.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">OS and EBS:</strong> disk queue depth and latency per volume (your early warning for EBS contention), memory pressure, and network throughput on the replication path between AZs.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Backup verification:</strong> alert on missed backup jobs and failed <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">RESTORE VERIFYONLY</code> results — the managed backup safety net is gone, so this alert is load-bearing.</li>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">8.9 The Cost Comparison, Honestly</h3>
+
+<p class="text-gray-300 leading-relaxed">EC2 is cheaper than RDS per compute-hour for the same instance class — AWS charges a management premium for RDS. But the honest comparison includes: your engineering time for patching, monitoring, and failover testing; the license footprint (consolidation favors EC2, per-VM licensing punishes sprawl); and the cost of the secondaries. An RDS Multi-AZ deployment and a two-replica EC2 AG both run two copies of the workload — the EC2 version adds your labor and subtracts the RDS premium. For a single production database with standard requirements, RDS usually wins on total cost. For consolidated estates, readable-secondary architectures, or workloads needing full engine surface, EC2 wins. Model both for your actual topology; the answer varies more than the marketing suggests.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Choose EC2 when RDS structurally cannot serve the workload.** Readable secondaries, SSIS/SSAS/SSRS, unrestricted engine surface (CLR, replication, linked servers), instance consolidation, and patch-level control are the legitimate reasons — not vague discomfort with managed services.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Licensing dominates the EC2 economics.** License Included AMIs are simplest; BYOL via License Mobility with Software Assurance is usually cheapest for steady production. Size VMs to the license footprint and consolidate aggressively — per-core Enterprise licensing punishes sprawl.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **AGs on EC2 need cloud-specific design.** Multi-subnet listeners with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">MultiSubnetFailover=True</code>, file share witnesses for quorum, three AZs for real resilience. The on-premises AG knowledge transfers; the networking and quorum pieces do not.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Own the undifferentiated heavy lifting with automation.** Golden AMI pipelines, IaC for infrastructure, config management for SQL Server, SSM-driven patching with secondaries-first rollout. EC2 without automation is just on-premises with extra latency.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Native backups to S3 are a feature.** Portable backup files, Object Lock immutability, cross-region replication, and automated restore testing give you a DR and exit story that managed backups cannot match — at the cost of owning the backup jobs yourself.</li>
