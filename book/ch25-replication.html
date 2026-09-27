@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Chapter 25: Data Replication — The DBA Handbook</title>
-  <meta name="description" content="The DBA Handbook Chapter 25: Data Replication. PostgreSQL and SQL Server — a practical DBA guide by Rajesh Guntupalli." />
+  <meta name="description" content="The DBA Handbook Chapter 25: Data Replication. SQL Server — a practical DBA guide by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
   <script type="module">
     import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
@@ -42,100 +42,62 @@
     <div class="space-y-4 text-sm">
 <h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 25: Data Replication</h2>
 
-<p class="text-gray-300 leading-relaxed">Data replication is the process of copying and synchronizing data from one database instance to another, and it sits at the heart of nearly every high-availability, disaster recovery, and scale-out architecture you will encounter in production. Whether you are maintaining a warm standby that can take over within seconds of a primary failure, distributing read traffic across multiple replicas, or synchronizing data between geographically separated data centers, understanding how replication works at a deep level is what separates a reactive DBA from a proactive one. This chapter covers the replication mechanisms available in PostgreSQL and SQL Server, explains how they differ philosophically and technically, and builds toward the real-world decisions — configuration choices, monitoring strategies, failure handling, and latency management — that determine whether your replication setup holds up under production load or quietly degrades until it fails you at the worst possible moment.</p>
+<p class="text-gray-300 leading-relaxed">Data replication is the process of copying and synchronizing data from one database instance to another, and it sits at the heart of nearly every high-availability, disaster recovery, and scale-out architecture you will encounter in production. Whether you are maintaining a warm standby that can take over within seconds of a primary failure, distributing read traffic across multiple replicas, or synchronizing data between geographically separated data centers, understanding how replication works at a deep level is what separates a reactive DBA from a proactive one. This chapter covers the replication mechanisms available in SQL Server — Always On Availability Groups, transactional replication, and log shipping — and builds toward the real-world decisions — configuration choices, monitoring strategies, failure handling, and latency management — that determine whether your replication setup holds up under production load or quietly degrades until it fails you at the worst possible moment.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">How Replication Works: Models, Terminology, and Trade-offs</h3>
 
-<p class="text-gray-300 leading-relaxed">Before touching a single configuration file or wizard, it helps to understand the landscape of replication models, because both PostgreSQL and SQL Server offer multiple mechanisms, and choosing the wrong one for your workload can cost you months of rework.</p>
+<p class="text-gray-300 leading-relaxed">Before touching a single configuration dialog or script, it helps to understand the landscape of replication models, because SQL Server offers multiple mechanisms, and choosing the wrong one for your workload can cost you months of rework.</p>
 
 <p class="text-gray-300 leading-relaxed">Replication falls into two broad categories: <strong class="text-white">physical replication</strong> and <strong class="text-white">logical replication</strong>. Physical replication copies the raw byte-level changes from data files — it does not care what those bytes mean semantically, only that the replica ends up with identical disk pages as the primary. Logical replication, by contrast, copies higher-level change descriptions: which rows were inserted, updated, or deleted in which tables. Each model has a distinct set of strengths and constraints.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Physical replication</strong> is byte-for-byte faithful. The replica will match the primary exactly, including indexes, vacuum maps, and system catalog entries. This makes physical replicas fast to set up and simple to reason about — you never have to worry about schema divergence. The downside is that a physical replica must run the same major version of the database software, cannot have a different schema, and cannot be used to replicate selectively. You replicate everything or nothing.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Log-based replication</strong> — the model behind Availability Groups — is byte-for-byte faithful. The replica matches the primary exactly, including indexes and system catalog entries, because both apply the same transaction log records. This makes replicas simple to reason about: you never worry about schema divergence. The downside is that a log-based replica cannot have a different schema and cannot replicate selectively. You replicate the whole database or nothing.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Logical replication</strong> offers far more flexibility. You can replicate a single table, replicate to a different PostgreSQL major version, filter rows, or even replicate between heterogeneous systems. The trade-off is additional overhead and more opportunities for things to go wrong: schema changes on the publisher are not automatically propagated, sequences are not replicated, and large objects require special handling.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Row-based replication</strong> — SQL Server's transactional replication — offers far more flexibility. You can replicate a single table, filter rows, or feed heterogeneous subscribers. The trade-off is additional overhead and more opportunities for things to go wrong: schema changes on the publisher are not automatically propagated, and identity ranges need explicit management across publisher and subscribers.</p>
 
 <p class="text-gray-300 leading-relaxed">There is also a distinction between <strong class="text-white">synchronous</strong> and <strong class="text-white">asynchronous</strong> replication. In synchronous mode, the primary does not acknowledge a commit to the application until at least one replica has confirmed it received (and possibly applied) the change. This eliminates data loss on primary failure but adds commit latency proportional to network round-trip time. In asynchronous mode, the primary commits immediately and replication happens in the background. Asynchronous replication is far more common in practice because the latency impact of synchronous replication is difficult to absorb in OLTP workloads.</p>
 
 <p class="text-gray-300 leading-relaxed">A third concept worth establishing early is <strong class="text-white">replication lag</strong> — the difference in time or transaction volume between what has been committed on the primary and what has been applied on the replica. Understanding, measuring, and controlling replication lag is one of the recurring themes throughout this chapter.</p>
 
-<p class="text-gray-300 leading-relaxed">SQL Server approaches replication with a broader menu of named technologies: <strong class="text-white">Always On Availability Groups</strong>, <strong class="text-white">Transactional Replication</strong>, <strong class="text-white">Merge Replication</strong>, <strong class="text-white">Snapshot Replication</strong>, and <strong class="text-white">Log Shipping</strong>. PostgreSQL offers <strong class="text-white">Streaming Replication</strong> (physical), <strong class="text-white">Logical Replication</strong>, and the ecosystem of extensions like <strong class="text-white">pglogical</strong> and tools like <strong class="text-white">Patroni</strong> that build on top of these primitives. The core mechanisms are more alike than they appear on the surface, but the interfaces, configuration models, and failure behaviors differ significantly.</p>
+<p class="text-gray-300 leading-relaxed">SQL Server approaches replication with a menu of named technologies, each with a distinct job. <strong class="text-white">Always On Availability Groups</strong> are the high-availability and read-scale-out workhorse: whole databases, automatic failover, readable secondaries. <strong class="text-white">Transactional Replication</strong> moves selected tables and filtered rows to subscribers with low latency — the reporting-feed and data-distribution tool. <strong class="text-white">Merge Replication</strong> handles bidirectional sync for occasionally-connected clients. <strong class="text-white">Snapshot Replication</strong> refreshes whole copies on a schedule. <strong class="text-white">Log Shipping</strong> is the simple, robust DR primitive: scheduled log backups restored on a standby. Pick the mechanism that matches the problem; they compose poorly when forced into each other's roles.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">Streaming Replication in PostgreSQL</h3>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">How Availability Groups Move Data: Log Transport Under the Hood</h3>
 
-<p class="text-gray-300 leading-relaxed">PostgreSQL's streaming replication is the foundation of almost every high-availability PostgreSQL deployment in production today. It works by having the primary continuously stream Write-Ahead Log (WAL) records to one or more standby servers, which replay those records to stay current. Because WAL is the authoritative record of every change made to the database — every insert, update, delete, index update, vacuum action — replaying WAL on a standby is guaranteed to produce an identical database state.</p>
+<p class="text-gray-300 leading-relaxed">An Availability Group looks like magic from the outside — write on the primary, read on the secondary — but underneath it is a log-shipping engine with precise, observable mechanics. Understanding those mechanics is what lets you diagnose lag, size secondaries, and predict failover behavior instead of guessing.</p>
 
-<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">sequenceDiagram
-    participant P as Primary
-    participant S1 as Sync Standby
-    participant S2 as Async Standby
-    P->>P: Write commits to local WAL
-    P->>S1: Stream WAL record
-    S1->>S1: write + flush to disk
-    S1-->>P: Acknowledge (flush_lsn)
-    P->>P: Commit confirmed to client
-    P->>S2: Stream WAL record (async, no wait)
-    S2->>S2: write + flush + replay</pre></div>
+<p class="text-gray-300 leading-relaxed">Everything starts with the transaction log. When a transaction commits on the primary, its log records are hardened to the primary's log disk first — durability is never outsourced. Then, in parallel, the primary ships <strong class="text-white">log blocks</strong> (batches of log records, compressed in transit) to every secondary. Each secondary hardens the blocks to its own log disk and then <strong class="text-white">redoes</strong> them — replaying the changes into its data files. Hardening and redo are separate stages, and that separation is the key to reading every replication metric correctly.</p>
 
-<p class="text-gray-300 leading-relaxed">*Figure: Streaming replication protocol — the primary waits for a synchronous standby to flush before confirming the commit, while an asynchronous standby receives the same WAL stream without blocking the primary.*</p>
+<p class="text-gray-300 leading-relaxed">With <strong class="text-white">synchronous commit</strong>, the primary waits until each synchronous secondary has hardened the log blocks before acknowledging the commit to the client. Note what it waits for: hardening, not redo. The secondary has the data durably; it just may not have applied it to data pages yet. With <strong class="text-white">asynchronous commit</strong>, the primary ships the blocks and moves on — the secondary can fall arbitrarily far behind under a write burst, which is exactly what the send and redo queues measure.</p>
 
-<p class="text-gray-300 leading-relaxed">Setting up streaming replication starts with the primary's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">postgresql.conf</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_hba.conf</code>, a base backup, and a handful of parameters on the standby. On the primary, you need to set <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">wal_level = replica</code> (or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">logical</code> if you plan to layer logical replication on top), configure <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_wal_senders</code> to the number of standby connections you want to support, and create a replication user.</p>
+<p class="text-gray-300 leading-relaxed">Two queues tell the whole story, both visible in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_hadr_database_replica_states</code>. The <strong class="text-white">log send queue</strong> (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">log_send_queue_size</code>) is log that the primary has hardened but not yet shipped — it grows when the network can't keep up or the secondary stops acknowledging. The <strong class="text-white">redo queue</strong> (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">redo_queue_size</code>) is log the secondary has received but not yet applied — it grows when the secondary's I/O or redo thread can't keep pace. A growing send queue points at the network or the primary; a growing redo queue points at the secondary. Diagnose accordingly.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- On the primary: create a replication user
-CREATE ROLE replicator WITH REPLICATION LOGIN PASSWORD 'strongpassword';</code></pre>
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">sequenceDiagram\n    participant P as Primary\n    participant S1 as Sync secondary\n    participant S2 as Async secondary\n    P->>P: Transaction commits to local log\n    P->>S1: Ship log blocks\n    S1->>S1: Harden to log disk\n    S1-->>P: Acknowledge hardened\n    P->>P: Commit confirmed to client\n    P->>S2: Ship log blocks (async, no wait)\n    S2->>S2: Harden + redo</pre></div>
 
-<p class="text-gray-300 leading-relaxed">The standby is initialized from a base backup using <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_basebackup</code>, and its behavior is controlled by a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">standby.signal</code> file (PostgreSQL 12 and later) combined with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">primary_conninfo</code> in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">postgresql.conf</code> or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">postgresql.auto.conf</code>. Once the standby starts, it connects to the primary, reports its current WAL position, and the primary begins streaming from that point forward.</p>
+<p class="text-gray-300 leading-relaxed">*Figure: AG log transport — the primary waits for a synchronous secondary to harden log blocks before confirming the commit, while an asynchronous secondary receives the same stream without blocking the primary.*</p>
 
-<p class="text-gray-300 leading-relaxed">You can monitor the state of all connected standbys from the primary using the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_replication</code> view. This view is one of the most valuable tools in day-to-day replication management.</p>
-
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Check Always On AG replica synchronization state
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- AG replication health: send and redo queues per database
 SELECT
     ar.replica_server_name,
-    adc.database_name,
-    drs.synchronization_state_desc,
-    drs.synchronization_health_desc,
-    drs.log_send_queue_size,
-    drs.log_send_rate,
-    drs.redo_queue_size,
-    drs.redo_rate,
-    drs.last_commit_time
-FROM sys.dm_hadr_database_replica_states drs
+    dbrs.database_name,
+    dbrs.synchronization_state_desc,
+    dbrs.log_send_queue_size,
+    dbrs.redo_queue_size,
+    dbrs.estimated_data_loss_seconds
+FROM sys.dm_hadr_database_replica_states dbrs
 JOIN sys.availability_replicas ar
-    ON drs.replica_id = ar.replica_id
-JOIN sys.availability_databases_cluster adc
-    ON drs.group_database_id = adc.group_database_id;</code></pre>
+    ON dbrs.replica_id = ar.replica_id
+ORDER BY dbrs.redo_queue_size DESC;</code></pre>
 
-<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_replication</code> output shows four LSN (Log Sequence Number) positions for each standby: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sent_lsn</code> (how far WAL has been sent), <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">write_lsn</code> (how far the standby has written to its local disk), <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">flush_lsn</code> (how far it has been flushed to durable storage), and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">replay_lsn</code> (how far it has actually been applied to the standby's data files). The gap between <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sent_lsn</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">replay_lsn</code> in bytes gives you a raw measure of lag. For time-based lag, use the companion view <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_replication_slots</code> or calculate it from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_wal_lsn_diff()</code> combined with WAL generation rate.</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Replication slots</strong> are a significant feature introduced in PostgreSQL 9.4. Without a replication slot, if a standby falls behind or disconnects, the primary is free to recycle WAL segments that the standby has not yet consumed. When the standby reconnects, it may find that the WAL it needs is gone, forcing a full re-sync. A replication slot causes the primary to retain WAL until the slot consumer acknowledges it. This solves the "standby missed WAL" problem but introduces a new one: if a standby with a slot goes offline indefinitely, the primary's pg_wal directory will grow without bound, potentially filling the disk. In production, always monitor slot lag with an alert, and consider whether an unmonitored slot is worth the risk.</p>
-
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- No direct equivalent to slots; check log send queue in AG DMV
-SELECT
-    ar.replica_server_name,
-    drs.log_send_queue_size AS retained_log_kb,
-    drs.log_send_rate AS send_rate_kb_per_sec,
-    CASE
-        WHEN drs.log_send_rate &gt; 0
-        THEN drs.log_send_queue_size / drs.log_send_rate
-        ELSE NULL
-    END AS estimated_catchup_seconds
-FROM sys.dm_hadr_database_replica_states drs
-JOIN sys.availability_replicas ar
-    ON drs.replica_id = ar.replica_id
-WHERE drs.is_local = 0;</code></pre>
-
-<p class="text-gray-300 leading-relaxed">Synchronous streaming replication in PostgreSQL is controlled by the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">synchronous_standby_names</code> parameter. Setting it to the name of a standby forces the primary to wait for that standby's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">flush_lsn</code> (or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">apply_lsn</code> with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">synchronous_commit = remote_apply</code>) before acknowledging commits. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">FIRST N (...)</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ANY N (...)</code> syntax allows you to express quorum-based synchronous replication — for example, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ANY 2 (standby1, standby2, standby3)</code> ensures any two of three standbys must confirm before commit proceeds, adding resilience against any single standby being slow.</p>
+<p class="text-gray-300 leading-relaxed">One more mechanic with outsized operational impact: the transaction log on the primary cannot be truncated past the oldest log needed by any secondary. If a secondary disconnects for a day, the primary's log grows for a day — check <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">log_reuse_wait_desc</code> and you will see <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">AVAILABILITY_REPLICA</code> staring back at you. This is by design (you asked for no data loss), but it means a dead secondary is a disk-full incident waiting to happen. Monitor it like one.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Always On Availability Groups in SQL Server</h3>
 
-<p class="text-gray-300 leading-relaxed">SQL Server's primary high-availability and disaster recovery mechanism for modern deployments is <strong class="text-white">Always On Availability Groups</strong>, introduced in SQL Server 2012 and substantially improved through 2016, 2017, 2019, and 2022. An Availability Group (AG) is a container for one or more user databases that fail over together as a unit. The AG has a primary replica and one or more secondary replicas, with data synchronized via the transaction log — conceptually parallel to WAL-based streaming in PostgreSQL.</p>
+<p class="text-gray-300 leading-relaxed">SQL Server's primary high-availability and disaster recovery mechanism for modern deployments is <strong class="text-white">Always On Availability Groups</strong>, introduced in SQL Server 2012 and substantially improved through 2016, 2017, 2019, and 2022. An Availability Group (AG) is a container for one or more user databases that fail over together as a unit. The AG has a primary replica and one or more secondary replicas, with data synchronized via the transaction log, as described in the previous section.</p>
 
 <p class="text-gray-300 leading-relaxed">AGs require Windows Server Failover Clustering (WSFC) in traditional deployments, though SQL Server 2017 introduced support for Linux and a "clusterless" configuration using the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CLUSTER_TYPE = NONE</code> option, which is useful for read-scale scenarios where automatic failover is not required. SQL Server 2022 further improved cross-platform flexibility.</p>
 
@@ -160,21 +122,7 @@ JOIN sys.availability_replicas ar
 JOIN sys.dm_hadr_availability_replica_states ars
     ON ar.replica_id = ars.replica_id;</code></pre>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL equivalent: check streaming replication state
-SELECT
-    pid,
-    usename,
-    application_name,
-    client_addr,
-    state,
-    sync_state,
-    sent_lsn,
-    replay_lsn,
-    write_lag,
-    flush_lag,
-    replay_lag
-FROM pg_stat_replication
-ORDER BY application_name;</code></pre>
+
 
 <p class="text-gray-300 leading-relaxed">Failover behavior is a major consideration. In an AG with synchronous replicas and WSFC-based automatic failover configured, SQL Server can fail over to a synchronous secondary automatically when the primary becomes unavailable, with zero data loss guaranteed by definition of synchronous replication. Asynchronous replicas can only be used for manual failover, and because they may lag behind, a forced failover may involve data loss. SQL Server quantifies this with the <strong class="text-white">recovery point objective (RPO)</strong> metric visible in the DMVs — the amount of committed transaction log that has not yet been hardened on the secondary.</p>
 
@@ -184,9 +132,9 @@ ORDER BY application_name;</code></pre>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Logical Replication: Selective, Flexible, and Version-Aware</h3>
 
-<p class="text-gray-300 leading-relaxed">Logical replication in PostgreSQL became a built-in feature in version 10, and it addresses use cases that physical streaming replication cannot — specifically, replicating a subset of tables, replicating between different major versions during an upgrade, and building custom data pipelines. SQL Server's Transactional Replication serves a similar function in the SQL Server ecosystem.</p>
+<p class="text-gray-300 leading-relaxed">Transactional replication addresses use cases that Availability Groups cannot — replicating a subset of tables, filtering rows per subscriber, bridging versions during an upgrade, and feeding reporting servers or heterogeneous subscribers. Where an AG replicates whole databases for availability, transactional replication distributes selected data for consumption.</p>
 
-<p class="text-gray-300 leading-relaxed">PostgreSQL logical replication uses a <strong class="text-white">publisher/subscriber</strong> model. The publisher defines a <strong class="text-white">publication</strong> — a named collection of tables (or all tables in a schema) whose changes should be broadcast. The subscriber creates a <strong class="text-white">subscription</strong> pointing at a publisher's publication and begins consuming those changes.</p>
+<p class="text-gray-300 leading-relaxed">Transactional replication uses a <strong class="text-white">publisher / distributor / subscriber</strong> model. The publisher defines <strong class="text-white">articles</strong> — tables or filtered row subsets — grouped into a <strong class="text-white">publication</strong>. The distributor (often co-located with the publisher) stores the changes; subscribers consume them. Two agents do the work: the <strong class="text-white">Log Reader Agent</strong> harvests committed transactions from the publication database's transaction log, and the <strong class="text-white">Distribution Agent</strong> applies them to each subscriber.</p>
 
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: Create a transactional publication (via T-SQL)
@@ -208,23 +156,23 @@ EXEC sp_addarticle
     @source_object = N'orders',
     @type = N'logbased';</code></pre>
 
-<p class="text-gray-300 leading-relaxed">The mechanics behind PostgreSQL logical replication involve the <strong class="text-white">logical decoding</strong> infrastructure. When <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">wal_level = logical</code>, PostgreSQL writes additional information into the WAL that makes it possible to reconstruct row-level changes rather than just page-level changes. The logical replication worker on the subscriber connects to the publisher, opens a replication slot, and receives a decoded stream of changes that it applies to local tables.</p>
+<p class="text-gray-300 leading-relaxed">The Log Reader Agent scans the publication database's transaction log for marked transactions and writes them to the distribution database — it reads the log rather than using triggers, so the overhead on the publisher is modest. But the log cannot be truncated past the reader's position: a stalled Log Reader Agent grows the publisher's log, exactly like an AG secondary that stops receiving. Monitor the agent's latency and the log's reuse wait as a pair.</p>
 
-<p class="text-gray-300 leading-relaxed">A key limitation to understand: logical replication in PostgreSQL does <strong class="text-white">not</strong> replicate DDL changes. If you <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALTER TABLE orders ADD COLUMN discount_pct numeric</code> on the publisher, that change must be manually applied on the subscriber before the replication stream attempts to apply rows with that column — otherwise the subscription will error out and stop. This is a fundamental operational difference from physical streaming replication, where DDL is just more WAL and gets replicated automatically.</p>
+<p class="text-gray-300 leading-relaxed">A key limitation to understand: schema changes are <strong class="text-white">not</strong> replicated by default. If you add a column on the publisher, apply it with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sp_repladdcolumn</code> / <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sp_repldropcolumn</code> or enable schema-change replication on the publication — otherwise the subscriber's schema drifts and the Distribution Agent errors out on the first row referencing the new column. This is the fundamental operational difference from AGs, where DDL is just more log and replicates automatically.</p>
 
 <p class="text-gray-300 leading-relaxed">Sequences are another gap. Because sequences generate values independently on each instance, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">NEXTVAL</code> calls on the publisher do not update the sequence on the subscriber. After a failover or migration using logical replication, sequence positions on the new primary must be manually advanced past any values that were used by the old primary.</p>
 
 <p class="text-gray-300 leading-relaxed">SQL Server's Transactional Replication also reads from the transaction log but does so through the <strong class="text-white">Log Reader Agent</strong>, a component that runs as a SQL Server Agent job. The Log Reader scans the publisher's transaction log for changes marked for replication and writes them to the <strong class="text-white">distribution database</strong> — a staging database that holds the pending changes. The <strong class="text-white">Distribution Agent</strong> then reads from the distribution database and applies changes to the subscriber. This three-tier architecture (publisher → distributor → subscriber) gives SQL Server replication more flexibility in routing and scheduling but adds more moving parts to monitor.</p>
 
-<p class="text-gray-300 leading-relaxed">Merge Replication, which SQL Server offers and PostgreSQL does not have a direct equivalent of, handles bidirectional synchronization where both publisher and subscriber can make changes that need to be reconciled. This is powerful for occasionally-connected scenarios like mobile or branch office databases, but conflict resolution — what happens when the same row is updated differently on both sides — is notoriously complex to configure correctly and debug. Most modern architectures avoid Merge Replication in favor of application-level conflict handling or eventual-consistency designs.</p>
+<p class="text-gray-300 leading-relaxed">Merge Replication handles bidirectional synchronization where both publisher and subscriber can make changes that need to be reconciled. This is powerful for occasionally-connected scenarios like mobile or branch office databases, but conflict resolution — what happens when the same row is updated differently on both sides — is notoriously complex to configure correctly and debug. Most modern architectures avoid Merge Replication in favor of application-level conflict handling or eventual-consistency designs.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Monitoring Replication Health and Managing Lag in Production</h3>
 
-<p class="text-gray-300 leading-relaxed">A replication topology that is not actively monitored is a topology that will surprise you during an incident. The operational reality of replication is that lag accumulates gradually under high load, replica connections drop due to network blips, and WAL accumulates on paused slots — all silently, unless you have built the observability layer.</p>
+<p class="text-gray-300 leading-relaxed">A replication topology that is not actively monitored is a topology that will surprise you during an incident. The operational reality of replication is that lag accumulates gradually under high load, replica connections drop due to network blips, and the send queue accumulates on a stalled secondary — all silently, unless you have built the observability layer.</p>
 
-<p class="text-gray-300 leading-relaxed">The fundamental metric to watch is replication lag. In PostgreSQL, time-based lag (more meaningful than byte-based lag for most alerting purposes) became directly available in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_replication</code> starting with PostgreSQL 10, in the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">write_lag</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">flush_lag</code>, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">replay_lag</code> columns. These report how long ago the primary wrote data that the standby has yet to write, flush, or replay, respectively.</p>
+<p class="text-gray-300 leading-relaxed">The fundamental metric to watch is replication lag. For AGs, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_hadr_database_replica_states</code> exposes <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">log_send_queue_size</code> (log the primary hasn't shipped), <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">redo_queue_size</code> (log the secondary hasn't applied), and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">estimated_data_loss_seconds</code> for async replicas. Time-based alerting on redo-queue growth catches a struggling secondary before a failover becomes unsafe — a secondary with a ten-minute redo queue is ten minutes of potential data loss away from being a good failover target.</p>
 
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Monitor AG lag and estimated data loss window
@@ -245,22 +193,22 @@ JOIN sys.availability_databases_cluster adc
 WHERE drs.is_local = 0
 ORDER BY drs.redo_queue_size DESC;</code></pre>
 
-<p class="text-gray-300 leading-relaxed">Lag spikes almost always have one of three causes. The first is a sudden burst of writes on the primary — a large batch job, a bulk load, or a runaway update — that temporarily outpaces the replication throughput. The second is I/O saturation on the standby, where the standby's disk cannot keep up with writing and flushing the incoming WAL. The third is network bandwidth exhaustion between primary and standby, particularly relevant for cross-datacenter replication or when WAL compression is not enabled.</p>
+<p class="text-gray-300 leading-relaxed">Lag spikes almost always have one of three causes. The first is a sudden burst of writes on the primary — a large batch job, a bulk load, or a runaway update — that temporarily outpaces the replication throughput. The second is I/O saturation on the standby, where the secondary's disk cannot keep up with hardening the incoming log blocks. The third is network bandwidth exhaustion between primary and standby, particularly relevant for cross-datacenter replication over a saturated link.</p>
 
-<p class="text-gray-300 leading-relaxed"><code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">wal_compression</code> in PostgreSQL is worth enabling in most environments. It compresses full-page images in WAL (which can be verbose immediately after a checkpoint) and reduces the bandwidth consumed by replication. The CPU cost is usually negligible compared to the bandwidth savings.</p>
+<p class="text-gray-300 leading-relaxed">AG log transport compresses log blocks in flight, so cross-datacenter bandwidth is rarely the bottleneck — but the send queue still grows when a write burst outpaces the link. When it does, the fix is reducing the burst (batch the load) or increasing the pipe, not a compression knob: there isn't one to turn.</p>
 
 <p class="text-gray-300 leading-relaxed">In SQL Server, the equivalent concern is log send queue growth. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">log_send_rate</code> from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dm_hadr_database_replica_states</code> tells you how fast log is being shipped. If <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">log_send_queue_size</code> is growing faster than <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">log_send_rate</code> can drain it, you have a sending bottleneck — either network bandwidth, or the secondary's redo rate is causing backpressure.</p>
 
 <p class="text-gray-300 leading-relaxed">For proactive alerting, a production-grade setup should alert on:</p>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Replication lag (bytes and time) exceeding thresholds — PostgreSQL alerts at >30s, page at >5min is a reasonable starting point</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Replication slots that are inactive or whose lag exceeds a WAL retention limit (e.g., 10 GB)</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Replication lag (redo queue growth / estimated data loss) exceeding thresholds — alert at >30s, page at >5min is a reasonable starting point</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Log send queues growing without bound — a secondary that stops acknowledging holds the primary's log from truncating; alert on log_send_queue_size and on log_reuse_wait_desc = 'AVAILABILITY_REPLICA'</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Any standby that has been disconnected for more than a configurable window</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> In SQL Server, any AG secondary whose synchronization health is not HEALTHY</li>
 
-<p class="text-gray-300 leading-relaxed">For PostgreSQL environments, integrating with Prometheus via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">postgres_exporter</code> makes all the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_replication</code> metrics available as time-series data, which is invaluable for understanding lag trends over time. A lag spike that lasts two minutes during a nightly batch run is normal and acceptable; a spike that lasts two minutes every hour at random is a symptom that needs investigation.</p>
+<p class="text-gray-300 leading-relaxed">For trend analysis, ship the AG DMV metrics into your monitoring system — the Prometheus sql_exporter, Telegraf, or SCOM all expose them. A redo-queue spike that lasts two minutes during a nightly batch run is normal and acceptable; a spike that lasts two minutes every hour at random is a symptom that needs investigation.</p>
 
-<p class="text-gray-300 leading-relaxed">Planned maintenance on a physical standby in PostgreSQL — patching the OS, upgrading hardware — is straightforward: take it out of the pool, do the work, and bring it back. The standby will reconnect and stream forward from where it paused, as long as the WAL it needs has not been recycled (use replication slots to guarantee this). After a long maintenance window, you may need to increase <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">wal_keep_size</code> or rely on a slot to ensure the primary retained enough WAL.</p>
+<p class="text-gray-300 leading-relaxed">Planned maintenance on an AG secondary — patching the OS, upgrading SQL Server — is straightforward: if it's the primary, fail over first; do the work; fail back. Rolling through the replicas this way gives you zero-downtime patching, and the secondary simply resumes log transport where it paused when it rejoins.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
@@ -268,11 +216,11 @@ ORDER BY drs.redo_queue_size DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Replication topology is only as valuable as your ability to act on it when the primary fails. The failover process — promoting a standby to primary — looks straightforward on paper but involves enough edge cases and post-promotion tasks that it deserves careful planning and regular testing.</p>
 
-<p class="text-gray-300 leading-relaxed">In PostgreSQL, promoting a standby to primary is accomplished either by calling <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_promote()</code> from a session connected to the standby, or by creating a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">promote</code> trigger file in the data directory (the legacy method, still functional). After promotion, the standby exits recovery mode, begins accepting writes, generates a new timeline, and starts advancing its own WAL sequence.</p>
+<p class="text-gray-300 leading-relaxed">A planned manual failover is <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALTER AVAILABILITY GROUP [ag] FAILOVER</code> — the primary and a synchronous secondary coordinate so no committed data is lost, and the AG listener follows the role change. Automatic failover does the same without human intervention when the cluster detects a primary failure and quorum agrees.</p>
 
-<p class="text-gray-300 leading-relaxed">The timeline mechanism is a critical safety feature. When a new primary is promoted, it starts writing WAL on a new timeline identifier. Any old standbys that were connected to the original primary will refuse to follow the new primary's WAL if they detect a timeline conflict, preventing the split-brain scenario where two instances both believe they are primary and both accept writes. The DBA must explicitly reconfigure old standbys to follow the new primary, which typically involves either running <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_rewind</code> to resync the standby's WAL history or rebuilding the standby from a base backup.</p>
+<p class="text-gray-300 leading-relaxed">Forced failover — allowing data loss — is the disaster option: the secondary comes online without the primary's cooperation, and any log that never arrived is gone. The old primary must never accept writes afterward; the cluster enforces this by removing it from membership, because a resurrected old primary taking writes is the classic split-brain. After a forced failover, the old primary cannot simply rejoin as a secondary — its log chain diverged, so it must be re-seeded (automatic seeding or backup/restore) before rejoining the AG.</p>
 
-<p class="text-gray-300 leading-relaxed"><code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_rewind</code> is a tool that compares the diverged standby's WAL history against the new primary and rewinds the standby's data directory to the point of divergence, then lets streaming replication fill in the gap. It is faster than a full base backup for standbys that are not far behind, but it requires that <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">wal_log_hints</code> is enabled on the primary, or that checksums were enabled at initdb time.</p>
+<p class="text-gray-300 leading-relaxed">Automatic seeding handles the common case: when a replica rejoins after a divergence, SQL Server streams the database across and rebuilds it. For very large databases or slow links, seed from a backup instead — restore WITH NORECOVERY on the secondary and join it to the AG; log transport takes it from there.</p>
 
 <p class="text-gray-300 leading-relaxed">In SQL Server Always On, failover is more formalized. A <strong class="text-white">planned manual failover</strong> to a synchronous secondary involves connecting to the primary, verifying the secondary is synchronized, and executing the failover command:</p>
 
@@ -280,9 +228,12 @@ ORDER BY drs.redo_queue_size DESC;</code></pre>
 -- (Connect to the secondary you want to promote)
 ALTER AVAILABILITY GROUP [SalesAG] FAILOVER;</code></pre>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: Promote a standby to primary programmatically
--- (Connect to the standby)
-SELECT pg_promote(wait := true, wait_seconds := 60);</code></pre>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Planned manual failover of an availability group (no data loss)
+-- Run on the intended new primary (a synchronous secondary)
+ALTER AVAILABILITY GROUP [ProductionAG] FAILOVER;
+
+-- Forced failover after a primary disaster (allows data loss)
+-- ALTER AVAILABILITY GROUP [ProductionAG] FORCE_FAILOVER_ALLOW_DATA_LOSS;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">A <strong class="text-white">forced failover</strong> in SQL Server — used when the primary is unavailable — requires the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WITH DATA_LOSS</code> clause and should only be used with full understanding that any unconfirmed transactions from the old primary will be lost:</p>
 
@@ -292,13 +243,13 @@ ALTER AVAILABILITY GROUP [SalesAG] FORCE_FAILOVER_ALLOW_DATA_LOSS;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">After any failover, whether planned or forced, a checklist of post-failover tasks must be executed before the new topology can be considered stable.</p>
 
-<p class="text-gray-300 leading-relaxed">For PostgreSQL, the post-failover checklist includes:</p>
+<p class="text-gray-300 leading-relaxed">The post-failover checklist includes:</p>
 
-<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Update connection strings</strong> — application connection strings, pgBouncer or other pooler configurations, and monitoring agents must point to the new primary.</p>
-<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Reconfigure or rebuild old standbys</strong> — use <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_rewind</code> or a fresh base backup to bring old standbys into the new topology as followers of the new primary.</p>
+<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Verify the listener follows</strong> — with the AG listener this is normally automatic, but direct-connect strings, linked servers, and monitoring agents that bypass the listener must point at the new primary.</p>
+<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Re-seed the old primary</strong> — after a forced failover, rejoin it as a secondary via automatic seeding or a restored backup before trusting the topology again.</p>
 <p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Advance sequences</strong> — if the old primary had sequences that outpaced the replica's last-replicated values, set them forward manually on the new primary to avoid duplicate key errors.</p>
 <p class="text-gray-300 leading-relaxed">4. <strong class="text-white">Drop and recreate replication slots</strong> — slots from the old primary are invalid. Any logical replication subscribers that were connected to the old primary need their subscriptions refreshed against the new primary.</p>
-<p class="text-gray-300 leading-relaxed">5. <strong class="text-white">Verify WAL archiving</strong> — if you use continuous archiving, ensure the archive_command or archive_library is correctly configured and functioning on the new primary.</p>
+<p class="text-gray-300 leading-relaxed">5. <strong class="text-white">Verify log backups</strong> — ensure transaction log backup jobs are running against the new primary; a failover that nobody told the backup jobs about is how you discover gaps in the log chain during the next restore drill.</p>
 <p class="text-gray-300 leading-relaxed">6. <strong class="text-white">Update monitoring and alerting</strong> — any metrics pointing at the old primary hostname need to be redirected.</p>
 
 <p class="text-gray-300 leading-relaxed">For SQL Server, the post-failover checklist adds:</p>
@@ -315,11 +266,11 @@ ALTER AVAILABILITY GROUP [SalesAG] FORCE_FAILOVER_ALLOW_DATA_LOSS;</code></pre>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Replication and Schema Changes</h3>
 
-<p class="text-gray-300 leading-relaxed">Schema changes in a replicated environment deserve their own section because they are the source of a disproportionate number of replication outages. The behavior of DDL under replication is fundamentally different between physical and logical replication, and between PostgreSQL and SQL Server.</p>
+<p class="text-gray-300 leading-relaxed">Schema changes in a replicated environment deserve their own section because they are the source of a disproportionate number of replication outages. The behavior of DDL under replication is fundamentally different between Availability Groups and transactional replication.</p>
 
-<p class="text-gray-300 leading-relaxed">Under <strong class="text-white">physical streaming replication</strong> in PostgreSQL, DDL is fully replicated — because physical replication copies WAL byte-for-byte and DDL is recorded in WAL just like DML. You can run <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALTER TABLE</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE INDEX CONCURRENTLY</code>, or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DROP TABLE</code> on the primary and it will automatically propagate to all physical standbys. There is no special handling required. The only subtlety is that long-running DDL on the primary may hold locks that block reads on the standby if the standby is being used for read queries, because the standby must replay the WAL including the lock acquisition.</p>
+<p class="text-gray-300 leading-relaxed">Under <strong class="text-white">Availability Groups</strong>, DDL is fully replicated — AGs ship transaction log records, and DDL is logged just like DML. You can run <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALTER TABLE</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE INDEX</code> (including <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ONLINE</code>), or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DROP TABLE</code> on the primary and it propagates to all secondaries automatically. There is no special handling required. The only subtlety is that long-running DDL holds schema locks that also block redo on the secondaries — a big index build can stall readable-secondary queries until it finishes.</p>
 
-<p class="text-gray-300 leading-relaxed">Under <strong class="text-white">logical replication</strong> in PostgreSQL, DDL is not replicated at all. The subscriber maintains its own schema independently. This means you must apply schema changes manually to the subscriber before the change is applied on the publisher — or at least before any DML arrives that references the new schema. The safe sequence for an additive change (adding a column) is:</p>
+<p class="text-gray-300 leading-relaxed">Under <strong class="text-white">transactional replication</strong>, DDL is not replicated by default. The subscriber maintains its own schema, so apply schema changes with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sp_repladdcolumn</code> / <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sp_repldropcolumn</code> or enable schema-change replication on the publication — before any DML arrives that references the new schema. The safe sequence for an additive change (adding a column) is:</p>
 
 <p class="text-gray-300 leading-relaxed">1. Apply the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALTER TABLE ... ADD COLUMN</code> on the subscriber first.</p>
 <p class="text-gray-300 leading-relaxed">2. Apply the same change on the publisher.</p>
@@ -338,25 +289,16 @@ SELECT
 FROM syspublications
 WHERE name = 'sales_pub';</code></pre>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: Check logical replication subscription status and errors
-SELECT
-    subname,
-    subenabled,
-    subslotname,
-    subpublications,
-    subconninfo
-FROM pg_subscription;
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Post a tracer token to measure end-to-end replication latency
+DECLARE @token INT;
+EXEC sp_posttracertoken
+    @publication = N'MyPublication',
+    @tracer_token_id = @token OUTPUT;
 
--- Check for replication worker errors
-SELECT
-    pid,
-    relid::regclass AS target_table,
-    received_lsn,
-    last_msg_send_time,
-    last_msg_receipt_time,
-    latest_end_lsn,
-    latest_end_time
-FROM pg_stat_subscription;</code></pre>
+-- Read back how long the token took through each agent
+EXEC sp_helptracertokenhistory
+    @publication = N'MyPublication',
+    @tracer_id = @token;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The general principle across all replication types: schema changes need a plan that accounts for where the change must be applied, in what order, and what happens to in-flight replication if a mismatch exists even briefly. For zero-downtime deployments, expand-contract patterns work well — add the new column as nullable first, backfill it, make it non-nullable or add the constraint, and only then remove the old column — because each individual step can be replicated safely while the application continues running.</p>
 
@@ -366,37 +308,35 @@ FROM pg_stat_subscription;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Not all replication topologies are simple primary-to-single-standby configurations. Production environments frequently need cascading replication — where a standby itself serves as the source for additional standbys downstream — or fan-out configurations where a single primary sends to many replicas simultaneously.</p>
 
-<p class="text-gray-300 leading-relaxed">PostgreSQL supports cascading streaming replication natively. A standby in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">hot_standby</code> mode can itself act as a WAL sender to other standbys, as long as <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">wal_level = replica</code> (or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">logical</code>) is set on the upstream instance. This is particularly useful when the primary is bandwidth-constrained or geographically distant from a group of standbys: a single regional relay standby receives WAL from the primary and re-streams it locally to a cluster of readers, reducing the transcontinental bandwidth requirements.</p>
+<p class="text-gray-300 leading-relaxed">AGs do not cascade: a secondary cannot forward log blocks to another secondary. For fan-out across sites, use a <strong class="text-white">distributed availability group</strong> — an AG of AGs, where a forwarder secondary on the remote site receives log blocks and feeds the remote AG's primary, which then fans out locally. One transcontinental stream instead of one per replica.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: A cascading standby's primary_conninfo points to an intermediate standby,
--- not the original primary. Check that the cascading standby is receiving WAL:
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- On the distributed AG forwarder: confirm log is flowing to the remote AG
 SELECT
-    pg_is_in_recovery() AS is_standby,
-    pg_last_wal_receive_lsn() AS received_lsn,
-    pg_last_wal_replay_lsn() AS replayed_lsn,
-    pg_wal_lsn_diff(
-        pg_last_wal_receive_lsn(),
-        pg_last_wal_replay_lsn()
-    ) AS receive_replay_diff_bytes,
-    now() - pg_last_xact_replay_timestamp() AS replay_lag
-FROM pg_stat_replication -- run on the intermediate standby to see its downstreams
-LIMIT 1;</code></pre>
+    ar.replica_server_name,
+    dbrs.database_name,
+    dbrs.synchronization_state_desc,
+    dbrs.log_send_queue_size,
+    dbrs.redo_queue_size
+FROM sys.dm_hadr_database_replica_states dbrs
+JOIN sys.availability_replicas ar
+    ON dbrs.replica_id = ar.replica_id
+WHERE ar.replica_server_name = N'RemoteForwarder';</code></pre>
 
 <p class="text-gray-300 leading-relaxed">In SQL Server, Always On AGs do not natively support cascading in the same sense, but <strong class="text-white">Distributed Availability Groups</strong> (introduced in SQL Server 2016) allow one AG to act as the primary data source for a second AG in a different WSFC cluster or on Linux. This enables cross-cluster, cross-region topologies where the two AGs are independently manageable but synchronized through a global primary-to-global secondary relationship.</p>
 
-<p class="text-gray-300 leading-relaxed">Fan-out topologies — where many subscribers consume from a single publisher — are straightforward in PostgreSQL logical replication. Each subscriber opens its own replication slot on the publisher and receives the same change stream independently. The concern with large fan-out is that each active slot consumes a WAL sender process (controlled by <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_wal_senders</code>) and that all active slots must be kept current to prevent WAL accumulation. A publication with fifty subscribers, all of which must stay reasonably current, requires careful sizing of <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_wal_senders</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_replication_slots</code>.</p>
+<p class="text-gray-300 leading-relaxed">Fan-out topologies — where many subscribers consume from a single publisher — are straightforward in transactional replication, and subscribers can republish to build a tree. The concern with large fan-out is that each subscriber adds a Distribution Agent and another copy of the data to keep current. Keep trees shallow: every level adds latency and another distribution database to monitor.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Replication for Zero-Downtime Upgrades</h3>
 
-<p class="text-gray-300 leading-relaxed">One of the most practically valuable applications of logical replication is enabling <strong class="text-white">zero-downtime major version upgrades</strong> of PostgreSQL. Because logical replication can stream changes between different major versions (subject to the subscriber running at least the minimum version that supports the relevant protocol), you can run the old and new versions in parallel and cut over with minimal downtime.</p>
+<p class="text-gray-300 leading-relaxed">One of the most practically valuable patterns is the <strong class="text-white">rolling upgrade</strong> of an Availability Group. Patch the secondaries first, fail over, then patch the old primary: zero downtime, zero data movement, and the AG keeps serving throughout.</p>
 
 <p class="text-gray-300 leading-relaxed">The procedure in outline:</p>
 
-<p class="text-gray-300 leading-relaxed">1. Set up the new-version PostgreSQL instance (e.g., PostgreSQL 16) alongside the existing instance (e.g., PostgreSQL 14).</p>
-<p class="text-gray-300 leading-relaxed">2. Copy the initial data to the new instance using <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_dump</code> / <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_restore</code> or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_basebackup</code> followed by a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_upgrade</code>.</p>
-<p class="text-gray-300 leading-relaxed">3. Set <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">wal_level = logical</code> on the old primary and create a publication covering all tables to be migrated.</p>
+<p class="text-gray-300 leading-relaxed">1. For a major version upgrade (e.g., SQL Server 2019 to 2022), build the new-version replicas alongside the existing AG and join them with a distributed availability group — the AG protocol supports mixed versions during the migration window.</p>
+<p class="text-gray-300 leading-relaxed">2. Seed the new replicas from a backup (restore WITH NORECOVERY) or automatic seeding, then let log transport keep them current until cutover.</p>
+<p class="text-gray-300 leading-relaxed">3. Fail over to the new version, verify the workload, then decommission the old side. Transactional replication can bridge the same gap for databases that can't take an AG: replicate from the old publisher to the new subscriber and cut over when lag is near zero.</p>
 <p class="text-gray-300 leading-relaxed">4. Create a subscription on the new instance pointing at the publication on the old instance.</p>
 <p class="text-gray-300 leading-relaxed">5. Allow the subscription to synchronize fully — the initial table sync copies all existing data, then streaming logical replication keeps the new instance current.</p>
 <p class="text-gray-300 leading-relaxed">6. Monitor replication lag until it is near zero.</p>
@@ -411,9 +351,9 @@ LIMIT 1;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The nightmare scenario in any replication topology is <strong class="text-white">split-brain</strong>: two nodes both believing they are the primary, both accepting writes, with no mechanism to reconcile the divergence. Split-brain is not merely a theoretical concern — it happens in real production environments due to network partitions, misconfigured fencing, and automation bugs.</p>
 
-<p class="text-gray-300 leading-relaxed">PostgreSQL's physical streaming replication by itself does not provide automatic failover. A standby will promote itself only if you tell it to (via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_promote()</code> or a trigger file), which means that if you are doing manual failover, split-brain requires human error — running promotion on the standby while the primary is actually still alive and reachable by clients. With automated failover managers like <strong class="text-white">Patroni</strong>, <strong class="text-white">repmgr</strong>, or <strong class="text-white">pg_auto_failover</strong>, split-brain prevention depends on the fencing mechanism the tool uses. Patroni, for example, uses a distributed consensus store (etcd, Consul, or ZooKeeper) to ensure that only one node holds the primary lease at any given time. If a node cannot reach the consensus store, it will demote itself rather than risk split-brain.</p>
+<p class="text-gray-300 leading-relaxed">AGs never fail over on replication state alone — failover decisions belong to the Windows Server Failover Cluster. Automatic failover requires synchronous commit plus cluster quorum; without quorum, no failover happens, which is the safe direction to fail. Manual failover during a real outage is how split-brain starts: forcing a secondary online while the old primary is still reachable by clients.</p>
 
-<p class="text-gray-300 leading-relaxed">A critically important Patroni concept is <strong class="text-white">STONITH</strong> ("Shoot The Other Node In The Head") or more generally <strong class="text-white">fencing</strong>: the ability to forcibly shut down or isolate a node that might still believe it is primary. Without fencing, even with a consensus store, there is a window during which the old primary might continue to accept writes from clients who have not yet learned of the failover. Fencing closes that window by ensuring the old primary is definitively stopped before the new primary begins accepting writes.</p>
+<p class="text-gray-300 leading-relaxed">The cluster's equivalent of fencing: when a node loses quorum or fails its health check, the cluster evicts it from membership and the AG role moves. A node that cannot see quorum cannot become primary — this is what prevents split-brain during a network partition. The dangerous window is the one you create yourself with forced failover; treat <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">FORCE_FAILOVER_ALLOW_DATA_LOSS</code> as the break-glass it is, and re-establish quorum before trusting the topology again.</p>
 
 <p class="text-gray-300 leading-relaxed">In SQL Server with WSFC-based Availability Groups, split-brain is prevented by the quorum mechanism: the cluster requires a majority of quorum votes to remain operational, so a network partition that isolates a subset of nodes will cause that subset to lose quorum and stop accepting writes. The cluster configuration must be designed so that no minority partition can independently achieve quorum — this typically involves careful placement of the File Share Witness or Cloud Witness in a third failure domain.</p>
 
@@ -432,13 +372,15 @@ SELECT
     quorum_state_desc
 FROM sys.dm_hadr_cluster;</code></pre>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: Check Patroni-managed cluster state (via REST API or patronictl)
--- From SQL, you can check whether the instance believes it is primary:
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Check what role each replica currently holds and its health
 SELECT
-    pg_is_in_recovery() AS is_replica,
-    pg_postmaster_start_time() AS instance_start_time,
-    inet_server_addr() AS listening_addr,
-    current_setting('cluster_name') AS cluster_name;</code></pre>
+    ar.replica_server_name,
+    ars.role_desc,
+    ars.operational_state_desc,
+    ars.connected_state_desc
+FROM sys.dm_hadr_availability_replica_states ars
+JOIN sys.availability_replicas ar
+    ON ars.replica_id = ar.replica_id;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The engineering principle underlying all split-brain prevention is the same: <strong class="text-white">no node should be able to promote itself to primary without first confirming that no other node currently holds the primary role</strong>, and that confirmation must come from a quorum or consensus mechanism that is itself partition-tolerant.</p>
 
@@ -446,20 +388,20 @@ SELECT
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Physical replication** (PostgreSQL streaming replication, SQL Server AG log shipping) replicates byte-level changes and produces identical replicas automatically, including DDL — but requires the same major version and schema on all nodes. **Logical replication** replicates row-level changes selectively, enabling cross-version upgrades and partial replication, but requires explicit DDL management on subscribers and does not replicate sequences.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Log-based replication** (Availability Groups) ships transaction log records and produces identical replicas automatically, including DDL — but every replica shares the database's schema and version family. **Row-based replication** (transactional replication) replicates selectively and can bridge versions, but requires explicit DDL management and has no automatic failover.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Replication lag** is the central operational metric for any replicated environment. Monitor it in time-based units (PostgreSQL's `write_lag`, `flush_lag`, `replay_lag`; SQL Server's `estimated_data_loss_seconds` and `redo_queue_size`), alert on thresholds appropriate for your RPO, and investigate systematically — spikes trace to write bursts, standby I/O saturation, or network bandwidth constraints.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Replication lag** is the central operational metric for any replicated environment. Monitor log_send_queue_size, redo_queue_size, and estimated_data_loss_seconds; alert on thresholds appropriate for your RPO; and investigate systematically — spikes trace to write bursts, secondary I/O saturation, or network bandwidth constraints.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Replication slots** in PostgreSQL guarantee WAL retention for downstream consumers but introduce a disk-filling risk if a slot consumer goes offline. Always monitor slot lag with alerting, and consider whether unmonitored slots should be dropped rather than left dormant indefinitely.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **A stalled secondary holds the primary's log hostage.** Whether it's an AG secondary that stopped receiving or a Log Reader Agent that stopped reading, log_reuse_wait_desc tells you who is blocking truncation. Alert on it — an unmonitored stall fills the log disk.</li>
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Failover is not complete at the moment of promotion.** Post-failover tasks — redirecting applications, reconfiguring or rebuilding old standbys, advancing sequences, transferring SQL Server Agent jobs, verifying AG listeners — are as important as the promotion itself. The only way to know your failover procedure is reliable is to test it regularly under realistic conditions.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Split-brain prevention requires a fencing or quorum mechanism** beyond replication itself. PostgreSQL deployments using automated failover tools like Patroni depend on a distributed consensus store and STONITH/fencing to ensure only one primary is active at any time. SQL Server AGs rely on WSFC quorum. Understanding how your specific tooling prevents split-brain — and what happens to it during a partial network partition — is not optional knowledge for a DBA responsible for a high-availability database.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Split-brain prevention requires quorum, not just replication.** AG automatic failover depends on WSFC quorum — understand what happens to failover during a partial network partition before it happens to you in production.</li>
     </div>
     <div class="mt-14 bg-blue-950/40 border border-blue-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
-        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · SQL Server</p>
       </div>
       <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
          class="shrink-0 px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded-xl text-sm transition">

@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Chapter 15: Automation — The DBA Handbook</title>
-  <meta name="description" content="The DBA Handbook Chapter 15: Automation. PostgreSQL and SQL Server — a practical DBA guide by Rajesh Guntupalli." />
+  <meta name="description" content="The DBA Handbook Chapter 15: Automation. SQL Server — a practical DBA guide by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
   <script type="module">
     import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
@@ -42,19 +42,19 @@
     <div class="space-y-4 text-sm">
 <h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 15: Automation</h2>
 
-<p class="text-gray-300 leading-relaxed">Automation is what separates a reactive DBA from a proactive one. When you are managing one database, doing everything by hand is manageable. When you are managing dozens — or when those databases serve millions of users across time zones — manual processes become a liability. This chapter covers how to automate the everyday tasks that consume DBA time: maintenance jobs, health checks, alerting, deployments, and routine administrative work. Both PostgreSQL and SQL Server offer native scheduling and scripting capabilities, and this chapter walks through both ecosystems in depth, from writing your first scheduled job to building fully automated operational pipelines that require minimal human intervention.</p>
+<p class="text-gray-300 leading-relaxed">Automation is what separates a reactive DBA from a proactive one. When you are managing one database, doing everything by hand is manageable. When you are managing dozens — or when those databases serve millions of users across time zones — manual processes become a liability. This chapter covers how to automate the everyday tasks that consume DBA time: maintenance jobs, health checks, alerting, deployments, and routine administrative work. SQL Server offers native scheduling through SQL Server Agent plus PowerShell and dbatools scripting, and this chapter walks through that ecosystem in depth, from writing your first scheduled job to building fully automated operational pipelines that require minimal human intervention.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Why Automation Belongs at the Core of DBA Work</h3>
 
-<p class="text-gray-300 leading-relaxed">The instinct to do things manually is understandable. When something breaks, you want to touch it directly, see what is happening, and fix it with your own hands. That instinct is correct in the moment of an incident. But that same instinct, applied to routine work, creates fragility. Maintenance that depends on someone remembering to run it will eventually not get run. A VACUUM that should have happened at 2 AM did not happen because the DBA was on vacation and no one else knew about the script sitting in a home directory.</p>
+<p class="text-gray-300 leading-relaxed">The instinct to do things manually is understandable. When something breaks, you want to touch it directly, see what is happening, and fix it with your own hands. That instinct is correct in the moment of an incident. But that same instinct, applied to routine work, creates fragility. Maintenance that depends on someone remembering to run it will eventually not get run. An index rebuild that should have happened at 2 AM did not happen because the DBA was on vacation and no one else knew about the script sitting in a home directory.</p>
 
 <p class="text-gray-300 leading-relaxed">Automation is not about removing the DBA from the picture. It is about making the DBA's decisions persistent. When you decide that index maintenance should happen every Sunday at midnight, automation ensures that decision executes reliably every week, whether you are in the office or not. When you decide that any table bloat exceeding 20% should trigger an alert, automation ensures that condition is monitored continuously without anyone having to run a query.</p>
 
 <p class="text-gray-300 leading-relaxed">There is also a compounding benefit. Every task you automate is a task you are no longer paying attention to during on-call hours. That freed attention can go toward architecture decisions, performance tuning, and the kinds of problems that actually require human judgment. Automation raises the floor of your operational quality and frees you to work on the ceiling.</p>
 
-<p class="text-gray-300 leading-relaxed">Both PostgreSQL and SQL Server have matured significantly in this area. PostgreSQL relies on cron-based scheduling at the OS level, the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_cron</code> extension for database-native scheduling, and scripting in Bash or Python. SQL Server has SQL Server Agent, which provides a full job scheduling framework inside the engine. Each approach has trade-offs, and experienced DBAs often combine native tools with external orchestration depending on the scale of the environment.</p>
+<p class="text-gray-300 leading-relaxed">SQL Server's automation stack centers on SQL Server Agent — a full job scheduling framework inside the engine — plus PowerShell and the dbatools module for scripting, with external orchestration (Azure DevOps, Jenkins, Kubernetes CronJobs) layered on for deployment pipelines. Experienced DBAs combine Agent jobs for database-local maintenance with external orchestration for cross-system workflows.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
@@ -62,14 +62,11 @@
 
 <p class="text-gray-300 leading-relaxed">Every production database accumulates dead rows, stale statistics, and fragmented indexes. Left unmanaged, these problems degrade performance. Automation ensures that maintenance runs on schedule without manual intervention.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL: pg_cron and OS-Level Cron</strong></p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server Agent: The Built-in Scheduler</strong></p>
 
-<p class="text-gray-300 leading-relaxed">PostgreSQL does not ship with a built-in job scheduler in the way SQL Server does. The two most common approaches are OS-level cron and the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_cron</code> extension.</p>
+<p class="text-gray-300 leading-relaxed">SQL Server Agent is the built-in job scheduling framework — jobs, steps, schedules, alerts, and operators, all stored in msdb and manageable from SSMS or T-SQL. A job is a sequence of steps (T-SQL, PowerShell, SSIS, CmdExec); each step runs as a proxy account or the Agent service account, with success/failure flow control between steps. Schedules are first-class objects you attach to jobs, and alerts can fire jobs in response to errors, performance conditions, or WMI events.</p>
 
-<p class="text-gray-300 leading-relaxed">OS cron is the simpler path. A typical maintenance script runs <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">psql</code> to connect to the database and execute maintenance commands. This works well for environments where the database and the cron host are the same machine or where a centralized cron server has network access to the database.</p>
-
-<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_cron</code> extension runs inside the PostgreSQL process itself, which means it uses a database connection to schedule and execute jobs. This is useful in cloud environments where you may not have shell access but do have access to SQL — for example, RDS or Aurora PostgreSQL. After installing <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_cron</code>, jobs are scheduled using standard cron syntax directly from SQL.</p>
-
+<p class="text-gray-300 leading-relaxed">Three Agent disciplines separate reliable shops from the rest. First, <strong class="text-white">job ownership</strong>: jobs owned by a personal login break when that login is disabled or leaves — own every production job with a dedicated service account. Second, <strong class="text-white">failure notification</strong>: a job that fails silently is worse than no job; configure operators, alert on every failure, and monitor <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">msdb.dbo.sysjobhistory</code> for jobs that haven't run when they should have. Third, <strong class="text-white">idempotency</strong>: maintenance jobs must be safe to re-run. The adaptive pattern in the example below — only rebuilding what's actually fragmented — is idempotent by construction, while fixed-scope scripts are not.</p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Create a SQL Server Agent job for nightly index maintenance
 USE msdb;
@@ -116,9 +113,9 @@ EXEC sp_add_jobserver
 
 <p class="text-gray-300 leading-relaxed">The SQL Server example above shows the idiomatic pattern: dynamic T-SQL builds the maintenance statement based on current fragmentation levels from the DMV, so the job adapts to the actual state of indexes each time it runs rather than blindly rebuilding everything. This kind of adaptive maintenance is significantly more efficient than rebuilding all indexes unconditionally.</p>
 
-<p class="text-gray-300 leading-relaxed">For PostgreSQL environments using OS cron, the pattern is typically a shell script that calls <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">psql</code>. The script can include logic to decide what maintenance to run based on bloat queries, making it equally adaptive.</p>
+<p class="text-gray-300 leading-relaxed">For environments where Agent isn't available — or for cross-instance orchestration — the pattern is a PowerShell/dbatools script run from Task Scheduler or a pipeline: it can query fragmentation and job health across dozens of instances and invoke maintenance remotely, making it equally adaptive at fleet scale.</p>
 
-<p class="text-gray-300 leading-relaxed">One subtlety to keep in mind: in PostgreSQL, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">REINDEX CONCURRENTLY</code> cannot run inside a transaction block, which means it cannot simply be wrapped in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_cron</code>'s default execution model the same way an ordinary statement can. <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_cron</code> is a separate extension with its own release history independent of the PostgreSQL server version, and its handling of commands that cannot run inside a transaction block has evolved over its releases — check the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_cron</code> changelog for the version you have installed rather than assuming behavior based on your PostgreSQL server version.</p>
+<p class="text-gray-300 leading-relaxed">One subtlety to keep in mind: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ONLINE</code> index rebuilds require Enterprise edition, so a maintenance job that assumes <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ONLINE = ON</code> will fail on Standard — parameterize the edition check (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SERVERPROPERTY('EngineEdition')</code>) and degrade gracefully to offline rebuilds inside the window. Similarly, always test maintenance procedures as the Agent service account, not as sysadmin in SSMS: permission and context differences between your session and the job's runtime are the classic "works for me" failure.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
@@ -126,7 +123,7 @@ EXEC sp_add_jobserver
 
 <p class="text-gray-300 leading-relaxed">Scheduled maintenance keeps the database in good shape. Health checks catch problems before they become outages. Automated alerting then closes the loop by notifying the right people at the right time.</p>
 
-<p class="text-gray-300 leading-relaxed">A health check script typically checks a set of known indicators: connection pool saturation, replication lag, long-running queries, lock waits, tablespace usage, and autovacuum activity. The goal is to detect drift from normal operating conditions early enough to intervene before users are affected.</p>
+<p class="text-gray-300 leading-relaxed">A health check script typically checks a set of known indicators: connection pool saturation, AG replication lag, long-running queries, lock waits, filegroup usage, and Agent job health. The goal is to detect drift from normal operating conditions early enough to intervene before users are affected.</p>
 
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Check for blocked sessions longer than 5 minutes
@@ -184,7 +181,7 @@ ORDER BY ag.name, ar.replica_server_name;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">This approach works across both database platforms and solves several problems simultaneously. First, it makes deployments repeatable: the exact same scripts are applied to development, staging, and production environments in order. Second, it creates an audit trail: you can see exactly what changed, when, and in what order. Third, it enables rollback planning: each migration can optionally have a corresponding undo script.</p>
 
-<p class="text-gray-300 leading-relaxed">For PostgreSQL, online schema changes require additional care. Adding a column with a default in PostgreSQL versions before 11 locked the table for the entire duration of the rewrite. Since PostgreSQL 11, adding a column with a non-volatile default is instant because the default is stored in metadata rather than written to every row. For index creation, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE INDEX CONCURRENTLY</code> should be the default in production because it builds the index without holding a lock that blocks writes.</p>
+<p class="text-gray-300 leading-relaxed">For SQL Server, online schema changes center on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ONLINE</code> index operations (Enterprise edition) and resumable builds for large tables — <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WITH (ONLINE = ON, RESUMABLE = ON)</code> lets a multi-hour build pause and resume across maintenance windows instead of starting over. For table restructures, the expand-contract pattern (add the new structure, dual-write, backfill, switch reads, drop the old) keeps deployments online without exotic tooling.</p>
 
 <p class="text-gray-300 leading-relaxed">For SQL Server, online index operations are available in Enterprise Edition using the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ONLINE = ON</code> option. This allows <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALTER INDEX REBUILD</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE INDEX</code> to run without blocking reads and writes for the duration of the operation. In Standard Edition, you must plan these operations for low-traffic windows.</p>
 
@@ -235,7 +232,7 @@ EXEC sp_executesql @sql;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The idempotency here is intentional. Both scripts check whether the object already exists before trying to create it. This means the script can be run multiple times safely — once during initial provisioning, again if someone is verifying the state, and again if something went wrong the first time. Idempotency is a design principle that makes automation reliable under real-world conditions where things do not always go as planned.</p>
 
-<p class="text-gray-300 leading-relaxed">Beyond user provisioning, runbook scripts cover common scenarios like rotating backup retention policies, updating connection pool configurations across application servers, archiving old partitions, and refreshing statistics on tables that the autovacuum daemon has not analyzed recently. Each of these procedures, once encoded and tested, becomes a reliable tool rather than a source of anxiety.</p>
+<p class="text-gray-300 leading-relaxed">Beyond user provisioning, runbook scripts cover common scenarios like rotating backup retention policies, updating connection pool configurations across application servers, archiving old partitions, and refreshing statistics on tables that auto-update has not kept current. Each of these procedures, once encoded and tested, becomes a reliable tool rather than a source of anxiety.</p>
 
 <p class="text-gray-300 leading-relaxed">Version controlling these scripts in Git provides the same benefits as version-controlling application code: history, diff review, rollback, and branching. When a procedure changes — because the environment has changed or a better approach has been found — the change goes through a pull request and code review before being deployed, just like any other code change.</p>
 
@@ -251,7 +248,7 @@ EXEC sp_executesql @sql;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">A third integration point is observability. Automated jobs should emit structured logs that feed into the same logging and monitoring system used by the rest of the infrastructure. When a maintenance job runs, it should log its start time, end time, what it did, and whether it succeeded. When an alert fires, it should include enough context — which server, which database, what the metric value was, what the threshold is — for the on-call engineer to understand the situation without having to run additional queries. Storing job outcomes in a dedicated database table alongside timestamps enables trend analysis: you can tell whether nightly maintenance jobs are taking longer over time, which might indicate that table sizes are growing faster than expected.</p>
 
-<p class="text-gray-300 leading-relaxed">For PostgreSQL environments running on Kubernetes, the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_cron</code> approach can be supplemented or replaced by Kubernetes CronJobs that run database maintenance scripts in containers. This gives you the full Kubernetes operational model — resource limits, restart policies, pod logs, events — applied to database maintenance. The trade-off is that the maintenance jobs are now external to the database process, which means they count toward the connection limit and must handle the case where the database is temporarily unavailable.</p>
+<p class="text-gray-300 leading-relaxed">For SQL Server environments running on Kubernetes or inside CI/CD pipelines, Agent jobs can be supplemented by Kubernetes CronJobs or pipeline-scheduled containers running dbatools scripts. This gives you the full platform operational model — resource limits, restart policies, pod logs — applied to database maintenance. The trade-off is that external jobs consume connections and must handle the database being temporarily unavailable during failovers.</p>
 
 <p class="text-gray-300 leading-relaxed">For SQL Server in Azure, Azure Automation Runbooks and Azure Logic Apps provide managed scheduling and workflow capabilities that can execute T-SQL against Azure SQL Database or Managed Instance. These services handle the infrastructure concerns of running scheduled jobs — compute, availability, retry logic — so the DBA can focus on the SQL logic rather than the operational concerns of keeping a scheduling service running.</p>
 
@@ -262,15 +259,15 @@ EXEC sp_executesql @sql;</code></pre>
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Automation makes DBA decisions persistent and reliable, replacing processes that depend on memory or availability with scripts that execute consistently whether or not anyone is watching.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> PostgreSQL automation relies on a combination of OS-level cron, the `pg_cron` extension for database-native scheduling, and external scripting in Bash or Python; SQL Server provides SQL Server Agent as a built-in, feature-complete job scheduling framework.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Adaptive maintenance — where scripts query current state (fragmentation percentages, bloat ratios, vacuum statistics) and perform only the work that is actually needed — is significantly more efficient than fixed-scope maintenance that runs unconditionally.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> SQL Server automation centers on SQL Server Agent as the built-in job scheduling framework, with PowerShell and dbatools for scripting and external orchestration for deployment pipelines — and every production job needs an owner that isn't a person, failure alerting, and idempotent logic.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Adaptive maintenance — where scripts query current state (fragmentation percentages, statistics age, job history) and perform only the work that is actually needed — is significantly more efficient than fixed-scope maintenance that runs unconditionally.</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Runbooks encoded as idempotent scripts provide the repeatability and testability of automation while preserving the institutional knowledge that would otherwise live only in documentation that drifts out of date.</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Production-grade automation integrates with secrets management for secure credential handling, version control for change tracking and rollback, and observability pipelines so that job outcomes are visible in the same monitoring system used by the rest of the infrastructure.</li>
     </div>
     <div class="mt-14 bg-blue-950/40 border border-blue-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
-        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · SQL Server</p>
       </div>
       <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
          class="shrink-0 px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded-xl text-sm transition">

@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Chapter 35: Cost Optimization — The DBA Handbook</title>
-  <meta name="description" content="The DBA Handbook Chapter 35: Cost Optimization. PostgreSQL and SQL Server — a practical DBA guide by Rajesh Guntupalli." />
+  <meta name="description" content="The DBA Handbook Chapter 35: Cost Optimization. SQL Server — a practical DBA guide by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
   <script type="module">
     import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
@@ -50,15 +50,15 @@
 
 <p class="text-gray-300 leading-relaxed">Before optimizing anything, you need an accurate picture of what you're actually paying for. Database costs fall into a few broad categories, and the distribution varies significantly depending on your deployment model.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Compute</strong> is usually the largest line item in cloud deployments. PostgreSQL on AWS RDS, Azure Database for PostgreSQL, or Google Cloud SQL all charge by instance size (vCPUs and RAM), and it's common to find instances that were provisioned at peak expectations years ago and never revisited. SQL Server adds licensing complexity on top of compute — Enterprise Edition licensing alone can cost tens of thousands of dollars per core per year, and that cost follows you into the cloud whether you bring your own license or pay the included rate.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Compute</strong> is usually the largest line item in cloud deployments. SQL Server on AWS RDS, Azure SQL Database / Managed Instance, or Google Cloud SQL all charge by instance size (vCPUs and RAM), and it's common to find instances that were provisioned at peak expectations years ago and never revisited. SQL Server adds licensing complexity on top of compute — Enterprise Edition licensing alone can cost tens of thousands of dollars per core per year, and that cost follows you into the cloud whether you bring your own license or pay the included rate.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Storage</strong> tends to be underestimated. Databases grow over time, and most teams don't have a strategy for data lifecycle management. That means old data accumulates, indexes proliferate, and the storage bill quietly inflates. Automated backups compound this — retention policies set to "keep everything forever" are surprisingly common.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">I/O</strong> is a cost driver that's easy to miss because it's embedded inside compute bills on most cloud platforms. Provisioned IOPS on RDS or Azure Disk can dwarf the compute cost if your workload is I/O-heavy and the storage tier was chosen without measurement.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Connections and connection pooling</strong> matter more than people expect. Every idle connection in PostgreSQL holds memory. Every connection spike in SQL Server creates thread overhead. At scale, connection management becomes a resource efficiency problem with direct cost implications.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Connections and connection pooling</strong> matter more than people expect. Every idle connection holds a thread and memory. Every connection spike creates scheduler contention and thread overhead. At scale, connection management becomes a resource efficiency problem with direct cost implications.</p>
 
-<p class="text-gray-300 leading-relaxed">The diagnostic starting point is measuring what you currently have — not what was provisioned. Both PostgreSQL and SQL Server expose usage statistics that let you see actual consumption versus available capacity.</p>
+<p class="text-gray-300 leading-relaxed">The diagnostic starting point is measuring what you currently have — not what was provisioned. SQL Server exposes usage statistics that let you see actual consumption versus available capacity.</p>
 
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Check database size and available space
@@ -97,7 +97,7 @@ ORDER BY total_mb DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Measuring actual CPU and memory utilization</strong> is the starting point. Cloud platforms provide this data natively through CloudWatch, Azure Monitor, or equivalent services. On-premises systems require OS-level monitoring or database internal statistics.</p>
 
-<p class="text-gray-300 leading-relaxed">In PostgreSQL, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_activity</code> shows you what's running right now, but for historical utilization you typically rely on external monitoring (pg_activity, pgBadger, or cloud-native tools). What you *can* measure internally is memory pressure through shared buffer hit rates — a low buffer hit rate suggests you need more memory, while a consistently high rate with unused headroom suggests you can scale down.</p>
+<p class="text-gray-300 leading-relaxed">In SQL Server, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_sessions</code> shows you what's running right now, but for historical utilization you typically rely on external monitoring (Prometheus + sql_exporter, or cloud-native tools). What you *can* measure internally is memory pressure through the buffer cache hit ratio and page life expectancy — a low hit rate suggests you need more memory, while a consistently high rate with unused headroom suggests you can scale down.</p>
 
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Measure buffer pool hit rate
@@ -132,17 +132,17 @@ WHERE is_user_process = 1
   AND status = 'sleeping'
 ORDER BY idle_minutes DESC;</code></pre>
 
-<p class="text-gray-300 leading-relaxed">For SQL Server specifically, right-sizing has a licensing dimension that PostgreSQL avoids entirely. SQL Server Standard Edition is limited to 24 cores and 128 GB of memory per instance — if you're running Enterprise Edition because of that 140 GB memory footprint, it's worth asking whether the workload could be redesigned to run within Standard Edition limits, since the licensing cost difference is enormous. Conversely, if your instance has Enterprise Edition features disabled and you're paying Enterprise prices, that's money left on the table.</p>
+<p class="text-gray-300 leading-relaxed">Right-sizing has a licensing dimension unique to commercial databases. SQL Server Standard Edition is limited to 24 cores and 128 GB of memory per instance — if you're running Enterprise Edition because of that 140 GB memory footprint, it's worth asking whether the workload could be redesigned to run within Standard Edition limits, since the licensing cost difference is enormous. Conversely, if your instance has Enterprise Edition features disabled and you're paying Enterprise prices, that's money left on the table.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Connection pooling</strong> is a right-sizing strategy for connection overhead, not just instances. PostgreSQL's architecture creates a backend process per connection — running 500 direct connections means 500 processes with their own memory allocations. PgBouncer, Pgpool-II, or RDS Proxy (in AWS) reduces this to a managed pool. SQL Server handles connections with threads, which is lighter, but pooling at the application layer via connection pool settings in ADO.NET, JDBC, or equivalent still prevents expensive connection churn.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Connection pooling</strong> is a right-sizing strategy for connection overhead, not just instances. SQL Server handles connections with threads rather than processes, which is lighter — but 500 direct connections still means 500 threads with their own memory allocations. Pooling at the application layer via ADO.NET/SqlClient connection pool settings (or RDS Proxy in AWS) reduces this to a managed pool and prevents expensive connection churn.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Storage Optimization: Reclaiming Space and Managing Growth</h3>
 
-<p class="text-gray-300 leading-relaxed">Storage costs compound silently. Databases accumulate dead tuples, orphaned indexes, oversized TOAST/LOB data, and historical records that nobody queries anymore. A disciplined approach to storage hygiene can reduce costs while simultaneously improving query performance — a rare win-win.</p>
+<p class="text-gray-300 leading-relaxed">Storage costs compound silently. Databases accumulate fragmented indexes, orphaned indexes, oversized LOB data, and historical records that nobody queries anymore. A disciplined approach to storage hygiene can reduce costs while simultaneously improving query performance — a rare win-win.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Dead tuple reclamation in PostgreSQL</strong> is handled by VACUUM. Every UPDATE and DELETE in PostgreSQL leaves behind dead tuples that occupy space until VACUUM runs. Autovacuum handles most of this automatically, but heavily updated tables can accumulate bloat faster than autovacuum keeps up, especially if autovacuum cost delay parameters are tuned too conservatively. Checking bloat proactively is a production habit worth building.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Fragmentation reclamation in SQL Server</strong> is handled by index rebuilds and reorganizes. Every UPDATE and DELETE fragments indexes and leaves forwarded records in heaps. Scheduled maintenance handles most of this automatically, but heavily updated tables can accumulate fragmentation faster than the maintenance window keeps up — especially if maintenance is tuned too conservatively. Checking fragmentation proactively is a production habit worth building.</p>
 
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify fragmented indexes consuming excess space
@@ -186,11 +186,11 @@ GROUP BY i.object_id, i.index_id, i.name, i.type_desc,
 HAVING ISNULL(us.user_seeks, 0) + ISNULL(us.user_scans, 0) + ISNULL(us.user_lookups, 0) = 0
 ORDER BY size_mb DESC;</code></pre>
 
-<p class="text-gray-300 leading-relaxed">Unused indexes are a storage problem and a performance problem simultaneously. Every index you maintain costs write overhead on every INSERT, UPDATE, and DELETE. An index that's never read is pure overhead. The queries above identify candidates — but before dropping any index, verify across the full business cycle (monthly reports might scan an index that weekly snapshots don't show), and always script the drop with the corresponding CREATE INDEX CONCURRENTLY (PostgreSQL) or CREATE INDEX WITH (ONLINE=ON) (SQL Server) so you can rebuild if needed.</p>
+<p class="text-gray-300 leading-relaxed">Unused indexes are a storage problem and a performance problem simultaneously. Every index you maintain costs write overhead on every INSERT, UPDATE, and DELETE. An index that's never read is pure overhead. The queries above identify candidates — but before dropping any index, verify across the full business cycle (monthly reports might scan an index that weekly snapshots don't show), and always script the drop with the corresponding CREATE INDEX WITH (ONLINE=ON) so you can rebuild if needed.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Data archival and partitioning</strong> are longer-term storage strategies. Tables that accumulate years of historical data — order history, audit logs, event streams — often have active queries that only touch recent data. Partitioning the table by date range means older partitions can be moved to cheaper storage tiers, compressed more aggressively, or detached entirely.</p>
 
-<p class="text-gray-300 leading-relaxed">In PostgreSQL, declarative partitioning makes it straightforward to detach an old partition and attach it to a cold storage tablespace. In SQL Server, partition switching allows you to move old data to a separate filegroup that maps to a slower (cheaper) disk tier without a full table rebuild.</p>
+<p class="text-gray-300 leading-relaxed">In SQL Server, partition switching allows you to move old data to a separate filegroup that maps to a slower (cheaper) disk tier without a full table rebuild.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Backup retention</strong> is one of the most overlooked storage costs. Keeping 90 days of daily full backups plus transactional log backups at 15-minute intervals adds up fast. Review your recovery objectives honestly: does your business actually need 90-day point-in-time recovery, or would 30 days with monthly archive snapshots meet the real requirement at a third of the cost?</p>
 
@@ -202,7 +202,7 @@ ORDER BY size_mb DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The goal here isn't to make every query as fast as possible — it's to identify the queries that collectively consume the most resources and fix those first. A query that runs in 5 seconds but executes once a week costs almost nothing. A query that runs in 200 milliseconds but fires 50,000 times per hour is your actual cost driver.</p>
 
-<p class="text-gray-300 leading-relaxed">Both PostgreSQL and SQL Server have built-in views that expose cumulative execution statistics, making it straightforward to rank queries by total resource consumption rather than individual execution time.</p>
+<p class="text-gray-300 leading-relaxed">SQL Server has built-in views that expose cumulative execution statistics, making it straightforward to rank queries by total resource consumption rather than individual execution time.</p>
 
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Top resource-consuming queries by total CPU time
@@ -251,7 +251,7 @@ ORDER BY qs.total_worker_time DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server licensing deserves careful attention</strong> in cloud migrations. Migrating SQL Server on-premises to cloud VMs preserves your existing licenses through Azure Hybrid Benefit or AWS License Mobility — this can cut the effective SQL Server cost by 40% or more compared to pay-as-you-go rates. Many organizations pay the full rate simply because nobody evaluated the hybrid benefit option during migration.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL's licensing model is, of course, free</strong> — which is one of its cost advantages and a reason many organizations migrate to PostgreSQL from SQL Server when the workload allows it. When evaluating a migration, the DBA should quantify the SQL Server licensing savings against the migration cost and ongoing operational difference. For a 32-core SQL Server Enterprise instance, that calculation often favors migration strongly.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server licensing is a cost lever worth its own review.</strong> Azure Hybrid Benefit lets you bring existing licenses with Software Assurance to Azure SQL, cutting compute costs roughly in half versus license-included pricing. On RDS, the choice is license-included versus BYOL. And Standard versus Enterprise is a standing question: if you are paying Enterprise prices without using Enterprise features (partitioning, online rebuilds, availability groups), that is money left on the table — a 32-core Enterprise instance costs several times its Standard equivalent.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Monitoring and alerting</strong> on cost is a discipline that pays for itself. Configuring budget alerts in your cloud console catches runaway instances, accidental provisioning of wrong instance sizes, and forgotten dev databases that stayed online. It's not glamorous, but it's the kind of operational hygiene that prevents the surprise invoice that appears three months after a deployment.</p>
 
@@ -267,11 +267,11 @@ ORDER BY qs.total_worker_time DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Tagging and attribution</strong> matter in organizations where multiple teams share database infrastructure. Without proper resource tagging, cost spikes are impossible to attribute and therefore impossible to act on. Every database instance, storage volume, and backup configuration should be tagged with the owning team and application.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Automated cleanup</strong> handles the low-level hygiene without manual attention. Autovacuum in PostgreSQL and automatic statistics updates in SQL Server keep basic maintenance current. Lifecycle policies on backup storage prevent indefinite accumulation. Connection pool limits prevent runaway connection counts. Automated scripts that identify and report on unused indexes monthly keep the index inventory from ballooning.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Automated cleanup</strong> handles the low-level hygiene without manual attention. Automatic statistics updates and scheduled index maintenance in SQL Server keep basic maintenance current. Lifecycle policies on backup storage prevent indefinite accumulation. Connection pool limits prevent runaway connection counts. Automated scripts that identify and report on unused indexes monthly keep the index inventory from ballooning.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Schema design decisions made early</strong> have compounding cost effects. A table designed with TEXT columns storing large serialized objects that should have been in a separate table will cost progressively more over time as the table grows. Normalizing that design early costs engineering time; not normalizing it costs storage and I/O money for the lifetime of the application. The DBA's role in schema review is partly a cost governance function, even if nobody calls it that.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Compression</strong> deserves a standing evaluation in every cost review. PostgreSQL supports TOAST compression for large column values automatically, and table-level compression via PGLZ or LZ4 (in PostgreSQL 14+). SQL Server offers row, page, and columnstore compression — Enterprise Edition includes all options, but Standard Edition includes row and page compression. Columnstore compression on historical, read-heavy tables can reduce storage by 70–90% while simultaneously speeding up analytical queries. That combination of cost reduction and performance improvement is rare enough that it should be considered for any table where analytics workloads dominate.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Compression</strong> deserves a standing evaluation in every cost review. SQL Server offers row, page, and columnstore compression — Enterprise Edition includes all options, but Standard Edition includes row and page compression. Columnstore compression on historical, read-heavy tables can reduce storage by 70–90% while simultaneously speeding up analytical queries. That combination of cost reduction and performance improvement is rare enough that it should be considered for any table where analytics workloads dominate.</p>
 
 <p class="text-gray-300 leading-relaxed">The culture piece matters as much as the technical piece. Cost optimization stalls when it's treated as the DBA's problem alone. Application developers who write inefficient queries, architects who provision oversized instances "just in case," and product managers who specify 5-year data retention without business justification are all contributors to database cost. The most effective DBAs build cost awareness into the entire development lifecycle — flagging expensive query patterns in code review, publishing monthly cost reports that developers can see, and framing optimization work in terms of infrastructure budget saved rather than technical metrics that nobody outside the database team understands.</p>
 
@@ -284,7 +284,7 @@ ORDER BY qs.total_worker_time DESC;</code></pre>
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Immediate actions (days to weeks):</strong></p>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Measure actual CPU, memory, and storage utilization on every production instance. Compare against provisioned capacity.</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Identify idle connections and implement or tune connection pooling if idle counts are high.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Pull the top-20 queries by total resource consumption from `pg_stat_statements` or `sys.dm_exec_query_stats` and review for obvious index gaps or N+1 patterns.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Pull the top-20 queries by total resource consumption from `sys.dm_exec_query_stats` or Query Store and review for obvious index gaps or N+1 patterns.</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Audit backup retention policies against actual recovery objectives and reduce where over-specified.</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Check for unused indexes consuming write overhead and storage.</li>
 
@@ -337,14 +337,14 @@ ORDER BY total_mb DESC;</code></pre>
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Cost is a measurable operational metric.** Treating database spend as a fixed background cost is a choice, not a necessity. Actual utilization data — CPU, memory, I/O, storage — consistently shows significant headroom between provisioned capacity and real consumption, and that gap is recoverable budget.</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Storage hygiene and index discipline compound in both directions.** Unused indexes, dead tuples, and unarchived historical data grow quietly and erode both your storage budget and your write performance simultaneously. Regular bloat and index usage audits are among the highest-ROI maintenance habits a DBA can establish.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Query resource consumption is the fulcrum of infrastructure cost.** The size of instance you need is largely determined by the efficiency of your workload. Fixing the top resource-consuming queries — identified through `pg_stat_statements` or `sys.dm_exec_query_stats` — often delays or eliminates an instance tier upgrade that would have cost far more.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Query resource consumption is the fulcrum of infrastructure cost.** The size of instance you need is largely determined by the efficiency of your workload. Fixing the top resource-consuming queries — identified through `sys.dm_exec_query_stats` or Query Store — often delays or eliminates an instance tier upgrade that would have cost far more.</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **SQL Server licensing decisions have outsized cost impact.** Edition selection, Azure Hybrid Benefit, and License Mobility together represent a cost lever that has no equivalent in open-source databases. Every SQL Server deployment should be evaluated for licensing optimization before committing to a cloud pricing model.</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Sustainable cost management requires process, not just periodic fixes.** One-time optimizations regress. The teams that maintain efficient database infrastructure combine automated maintenance, regular review cadences, cross-team cost visibility, and schema review discipline into a repeating governance loop that prevents the re-accumulation of waste.</li>
     </div>
     <div class="mt-14 bg-blue-950/40 border border-blue-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
-        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · SQL Server</p>
       </div>
       <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
          class="shrink-0 px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded-xl text-sm transition">

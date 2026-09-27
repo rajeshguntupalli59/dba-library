@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Chapter 38: System Audits — The DBA Handbook</title>
-  <meta name="description" content="The DBA Handbook Chapter 38: System Audits. PostgreSQL and SQL Server — a practical DBA guide by Rajesh Guntupalli." />
+  <meta name="description" content="The DBA Handbook Chapter 38: System Audits. SQL Server — a practical DBA guide by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
   <script type="module">
     import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
@@ -42,7 +42,7 @@
     <div class="space-y-4 text-sm">
 <h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 38: System Audits</h2>
 
-<p class="text-gray-300 leading-relaxed">A system audit is not just a compliance checkbox — it is one of the most powerful diagnostic and security tools a DBA has. Whether you are responding to a security incident, proving regulatory compliance, troubleshooting an unexpected data change, or simply establishing a health baseline for your environment, auditing gives you a traceable record of what happened, who did it, and when. This chapter covers how auditing works in both PostgreSQL and SQL Server, from the fundamental concepts of what you should be capturing to the architecture decisions that determine whether your audit system helps or hurts your production workload. By the end, you will know how to design, implement, and maintain an audit strategy that holds up under scrutiny — from internal reviews to regulatory bodies.</p>
+<p class="text-gray-300 leading-relaxed">A system audit is not just a compliance checkbox — it is one of the most powerful diagnostic and security tools a DBA has. Whether you are responding to a security incident, proving regulatory compliance, troubleshooting an unexpected data change, or simply establishing a health baseline for your environment, auditing gives you a traceable record of what happened, who did it, and when. This chapter covers how auditing works in SQL Server, from the fundamental concepts of what you should be capturing to the architecture decisions that determine whether your audit system helps or hurts your production workload. By the end, you will know how to design, implement, and maintain an audit strategy that holds up under scrutiny — from internal reviews to regulatory bodies.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
@@ -64,28 +64,43 @@
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">PostgreSQL Audit Architecture</h3>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Audit Granularity: What to Capture</h3>
 
-<p class="text-gray-300 leading-relaxed">PostgreSQL does not ship with a built-in, GUI-driven audit module, but it provides robust primitives from which a complete audit system can be built. The two main mechanisms are the built-in logging system and the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pgaudit</code> extension.</p>
+<p class="text-gray-300 leading-relaxed">SQL Server Audit works at two levels: server audit specifications capture server-scoped events (logins, permission changes, server role membership), while database audit specifications capture database-scoped events (DDL, DML on selected objects, permission changes). The discipline is the same as anywhere: audit at the object level for compliance evidence, because session-level capture of everything produces enormous volumes of noise.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL's native logging</strong> is controlled through <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">postgresql.conf</code> parameters. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">log_connections</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">log_disconnections</code> parameters record session lifecycle events. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">log_statement</code> parameter accepts values of <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">none</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ddl</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">mod</code>, or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">all</code>, providing coarse-grained control over which SQL statements are written to the server log. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">log_min_duration_statement</code> parameter is primarily a performance tool, but it creates an implicit audit trail of slow queries. These native logs land in flat files and are useful but unstructured — they are difficult to query systematically, and they do not cleanly separate audit information from operational noise.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server's native error log</strong> records session lifecycle and startup events, but it is not an audit trail. Treat the error log as a complement to SQL Server Audit, not a substitute: login auditing (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Failed logins only</code> at minimum) catches authentication probing, while the audit specifications capture the authorized-but-interesting actions. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">log_connections</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">log_disconnections</code> parameters record session lifecycle events. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">log_statement</code> parameter accepts values of <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">none</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ddl</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">mod</code>, or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">all</code>, providing coarse-grained control over which SQL statements are written to the server log. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">log_min_duration_statement</code> parameter is primarily a performance tool, but it creates an implicit audit trail of slow queries. These native logs land in flat files and are useful but unstructured — they are difficult to query systematically, and they do not cleanly separate audit information from operational noise.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">pgaudit</strong> is the production-grade solution. It is an open-source extension maintained by the pgaudit project and supported on PostgreSQL versions back through 9.5. It hooks into the executor and produces clean, structured audit log records that are interleaved with the PostgreSQL log but clearly identifiable by their <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">AUDIT:</code> prefix. pgaudit operates at two levels: <strong class="text-white">session-level</strong> auditing, which applies to the entire connection, and <strong class="text-white">object-level</strong> auditing, which applies to specific tables, views, or functions.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server Audit</strong> is the production-grade solution. It hooks into the engine's eventing infrastructure and produces clean, structured audit records written to a file, the Windows Security log, the Application log, or Azure storage. It operates at two levels: <strong class="text-white">server-level</strong> auditing, which applies to the whole instance, and <strong class="text-white">database-level</strong> auditing, which applies to specific databases and objects.</p>
 
-<p class="text-gray-300 leading-relaxed">Installing and enabling pgaudit requires adding it to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">shared_preload_libraries</code>, installing the extension, and then configuring which statement classes to capture:</p>
+<p class="text-gray-300 leading-relaxed">Enabling the audit requires creating the server audit, attaching the server and database audit specifications that select which action groups to capture, and then enabling the audit:</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># postgresql.conf
-shared_preload_libraries = 'pgaudit'
-pgaudit.log = 'ddl, role, connection'
-pgaudit.log_catalog = off
-pgaudit.log_relation = on
-pgaudit.log_parameter = on</code></pre>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Production audit baseline: failed logins, DDL, permission changes
+CREATE SERVER AUDIT ProdAudit
+TO FILE (FILEPATH = N'C:\Audit\', MAXSIZE = 100 MB, MAX_ROLLOVER_FILES = 20)
+WITH (ON_FAILURE = FAIL_OPERATION);
 
-<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pgaudit.log</code> parameter accepts a comma-separated list of statement classes: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">read</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">write</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">function</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">role</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ddl</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">misc</code>, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">all</code>. Setting <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">log_catalog = off</code> prevents audit noise from internal catalog lookups, which PostgreSQL generates aggressively during normal operation.</p>
+CREATE SERVER AUDIT SPECIFICATION ProdServerSpec
+FOR SERVER AUDIT ProdAudit
+ADD (FAILED_LOGIN_GROUP),
+ADD (SERVER_PERMISSION_CHANGE_GROUP);
 
-<p class="text-gray-300 leading-relaxed">Once pgaudit is active, a DDL event produces a log entry like this:</p>
+CREATE DATABASE AUDIT SPECIFICATION ProdDbSpec
+FOR SERVER AUDIT ProdAudit
+ADD (SCHEMA_OBJECT_CHANGE_GROUP),
+ADD (DATABASE_PERMISSION_CHANGE_GROUP)
+WITH (STATE = ON);
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>AUDIT: SESSION,1,1,DDL,CREATE TABLE,,,CREATE TABLE employees (id serial, name text);,&lt;none&gt;</code></pre>
+ALTER SERVER AUDIT ProdAudit WITH (STATE = ON);</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The audit action groups accept a fixed vocabulary of event classes — <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">FAILED_LOGIN_GROUP</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SCHEMA_OBJECT_CHANGE_GROUP</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DATABASE_OBJECT_CHANGE_GROUP</code> — so be deliberate: auditing <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DATABASE_OBJECT_CHANGE_GROUP</code> on a busy OLTP database captures every DML statement, which is usually far more than compliance requires. Scope object-level auditing to the tables that actually hold regulated data.</p>
+
+<p class="text-gray-300 leading-relaxed">Once the audit is active, a DDL event produces a record you can read back like this:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- A DDL event captured by the database audit specification
+SELECT event_time, server_principal_name, database_name, object_name, statement
+FROM sys.fn_get_audit_file('C:\Audit\ProdAudit_*.sqlaudit', DEFAULT, DEFAULT)
+WHERE statement LIKE '%CREATE TABLE%'
+ORDER BY event_time DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Each field is positional: audit type (SESSION or OBJECT), statement number, substatement number, statement class, command, object type, object name, statement text, and parameter list. This structure makes log parsing tractable.</p>
 
@@ -156,9 +171,9 @@ WITH (STATE = ON);</code></pre>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Reading and Querying Audit Data</h3>
 
-<p class="text-gray-300 leading-relaxed">An audit trail is only useful if you can interrogate it. The mechanics of reading audit data differ significantly between the two platforms.</p>
+<p class="text-gray-300 leading-relaxed">An audit trail is only useful if you can interrogate it. The mechanics of reading audit data depend on the audit target you chose.</p>
 
-<p class="text-gray-300 leading-relaxed">In PostgreSQL with pgaudit, audit records live in the PostgreSQL log files. On most Linux deployments using systemd, you can capture logs with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">journalctl</code>, or you can configure PostgreSQL to write to CSV format using <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">log_destination = 'csvlog'</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">logging_collector = on</code>. CSV logging makes the audit records machine-readable without a parsing script:</p>
+<p class="text-gray-300 leading-relaxed">With SQL Server Audit writing to files, audit records are queried with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.fn_get_audit_file</code> — a table-valued function that reads the binary audit files as rows, so you can filter, aggregate, and join audit data with plain T-SQL (see the example below). File targets keep the audit trail machine-readable without a parsing script:</p>
 
 
 <p class="text-gray-300 leading-relaxed">For SQL Server, audit records written to file are read using the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.fn_get_audit_file</code> function, which presents them as a relational result set:</p>
@@ -183,7 +198,7 @@ ORDER BY event_time DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The wildcard in the file path allows the function to read across rollover files, which is essential in production where a single query window might span multiple audit files. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">action_id</code> column is a four-character code (for example, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SL</code> for SELECT, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">IN</code> for INSERT) — you can cross-reference these against <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_audit_actions</code> to get human-readable action names.</p>
 
-<p class="text-gray-300 leading-relaxed">Both platforms benefit from moving audit data into a centralized repository. Many organizations ship PostgreSQL CSV logs to Elasticsearch or Splunk via Filebeat or Logstash. SQL Server shops frequently forward audit records to Azure Monitor or a centralized SQL table using scheduled jobs. In either case, the design principle is the same: audit data should not live only on the database server it was generated from, because that server is also the thing that might be compromised.</p>
+<p class="text-gray-300 leading-relaxed">Every deployment benefits from moving audit data into a centralized repository. Many organizations forward audit records to Azure Monitor, Elasticsearch, or Splunk, or load them into a centralized SQL table using scheduled jobs that call <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.fn_get_audit_file</code>. The design principle is the same: audit data should not live only on the database server it was generated from, because that server is also the thing that might be compromised.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
@@ -191,12 +206,12 @@ ORDER BY event_time DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The tension between comprehensive auditing and system performance is real. Full DML auditing on a table that receives 50,000 inserts per second will produce audit records faster than most systems can write and store them. Production audit design must account for this.</p>
 
-<p class="text-gray-300 leading-relaxed">In PostgreSQL, the performance cost of pgaudit is primarily I/O — writing more data to the log pipeline. You can reduce this pressure by being selective about which tables and operations require object-level auditing, and by tuning <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">log_rotation_size</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">log_rotation_age</code> to keep log files manageable. You can also configure <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pgaudit.log_parameter</code> carefully — logging query parameters captures the actual values (essential for DML auditing) but adds significant log volume compared to capturing only statement text.</p>
+<p class="text-gray-300 leading-relaxed">In SQL Server, the performance cost of auditing is primarily I/O — writing more data to the log pipeline. You can reduce this pressure by being selective about which tables and operations require object-level auditing, and by tuning <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">MAXSIZE</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">MAX_ROLLOVER_FILES</code> to keep audit files manageable. Auditing DML with parameters captures the actual values (essential for change forensics) but adds significant volume compared to capturing only statement text.</p>
 
-<p class="text-gray-300 leading-relaxed">Another technique in PostgreSQL is using trigger-based auditing for high-value DML rather than relying on pgaudit's session-level write class. Triggers execute within the transaction, can capture old and new row values, and write directly to an audit table with whatever structure you define:</p>
+<p class="text-gray-300 leading-relaxed">Another technique is using trigger-based auditing for high-value DML rather than relying on the audit's statement-level capture. Triggers execute within the transaction, can capture old and new row values, and write directly to an audit table with whatever structure you define:</p>
 
 
-<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SECURITY DEFINER</code> clause means the function executes with the permissions of its owner (typically a privileged DBA account), not the session user. This prevents a user from bypassing the audit by revoking INSERT on the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">audit_log</code> table from themselves.</p>
+<p class="text-gray-300 leading-relaxed">Use <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">EXECUTE AS OWNER</code> on the trigger so it executes with the permissions of its owner (typically a privileged DBA account), not the session user. This prevents a user from bypassing the audit by revoking INSERT on the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">audit_log</code> table from themselves.</p>
 
 <p class="text-gray-300 leading-relaxed">In SQL Server, the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">QUEUE_DELAY</code> parameter you saw earlier is the primary performance knob for the native audit. For very high-throughput environments, the file-based audit target is generally preferable to the Windows Event Log because it offers better write performance and supports larger rollover configurations. When the audit file target cannot keep up, SQL Server also supports using Extended Events sessions as an alternative or complement to native audit — Extended Events can write asynchronously to a ring buffer in memory or to an <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">.xel</code> file, and they add virtually no overhead when the buffer is not full.</p>
 
@@ -208,7 +223,7 @@ ORDER BY event_time DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">An audit trail is only trustworthy if it cannot be silently modified. This is more nuanced than it sounds. Most DBAs intuitively protect the audit destination from ordinary users, but a determined attacker with superuser or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sysadmin</code> access can often modify or delete audit records if the destination is on the same system as the database.</p>
 
-<p class="text-gray-300 leading-relaxed">In PostgreSQL, protect audit integrity through several layers. First, ensure the PostgreSQL server process does not own the log directory with write-modify-delete access for any other OS user. Second, restrict who can reconfigure <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pgaudit</code> settings — only superusers can set <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pgaudit.log</code>, so managing superuser access tightly is directly related to audit integrity. Third, for trigger-based audit tables, deny <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">TRUNCATE</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DELETE</code>, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DROP</code> on the audit table to all application roles:</p>
+<p class="text-gray-300 leading-relaxed">In SQL Server, protect audit integrity through several layers. First, write audit files to a directory where the SQL Server service account is the only writer. Second, restrict who can reconfigure the audit: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALTER ANY SERVER AUDIT</code> is a sysadmin-equivalent power, so managing sysadmin membership tightly is directly related to audit integrity. Third, for trigger-based audit tables, deny <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">TRUNCATE</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DELETE</code>, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DROP</code> on the audit table to all application roles:</p>
 
 
 <p class="text-gray-300 leading-relaxed">For trigger-based audit tables, also consider partitioning by month and creating new partitions at the beginning of each period. Once a partition is past its period, it can be set to read-only (by revoking write permissions) and archived off-system before being detached.</p>
@@ -240,7 +255,7 @@ ORDER BY event_time DESC;</code></pre>
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Effective auditing requires intentional scope — capturing authentication events, privilege changes, DDL, and targeted DML on sensitive tables covers most regulatory requirements without burying your system in log volume.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> PostgreSQL auditing is built on `pgaudit` for structured session and object-level logging, optionally supplemented by trigger-based audit tables that capture old and new row values directly to a queryable schema.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> SQL Server auditing is built on SQL Server Audit for structured server- and database-level logging, optionally supplemented by trigger-based audit tables that capture old and new row values directly to a queryable schema.</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> SQL Server's native audit architecture — Server Audit, Server Audit Specification, and Database Audit Specification — provides a layered, enterprise-grade system where audit action groups simplify configuration and the binary file format provides tamper evidence.</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> High-volume environments must balance audit completeness against I/O cost; asynchronous write modes, selective object-level scoping, and off-server archival are the primary tools for managing that trade-off.</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Audit integrity depends not just on capturing events but on protecting the audit destination from modification — deny destructive operations on audit tables, monitor for audit configuration changes, and archive records to write-once storage outside the database server's control.</li>
@@ -248,7 +263,7 @@ ORDER BY event_time DESC;</code></pre>
     <div class="mt-14 bg-blue-950/40 border border-blue-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
-        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · SQL Server</p>
       </div>
       <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
          class="shrink-0 px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded-xl text-sm transition">

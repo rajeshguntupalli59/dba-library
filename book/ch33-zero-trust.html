@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Chapter 33: Zero-Trust Security — The DBA Handbook</title>
-  <meta name="description" content="The DBA Handbook Chapter 33: Zero-Trust Security. PostgreSQL and SQL Server — a practical DBA guide by Rajesh Guntupalli." />
+  <meta name="description" content="The DBA Handbook Chapter 33: Zero-Trust Security. SQL Server — a practical DBA guide by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
   <script type="module">
     import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
@@ -42,7 +42,7 @@
     <div class="space-y-4 text-sm">
 <h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 33: Zero-Trust Security</h2>
 
-<p class="text-gray-300 leading-relaxed">The traditional security model for databases assumed that anything inside the network perimeter was trustworthy. Once a user or application cleared the firewall, they were given broad access to the database layer with minimal additional scrutiny. That model is dead. Modern infrastructure — cloud-hosted databases, containerized workloads, remote developers, third-party integrations, and microservices — has dissolved the concept of a trusted perimeter entirely. Zero-trust security replaces perimeter trust with a principle that has become the foundation of serious production security: *never trust, always verify*. This chapter walks through what zero-trust means specifically for PostgreSQL and SQL Server environments, how to implement it at every layer of the database stack, and how to build systems that are genuinely difficult to compromise even when individual components are.</p>
+<p class="text-gray-300 leading-relaxed">The traditional security model for databases assumed that anything inside the network perimeter was trustworthy. Once a user or application cleared the firewall, they were given broad access to the database layer with minimal additional scrutiny. That model is dead. Modern infrastructure — cloud-hosted databases, containerized workloads, remote developers, third-party integrations, and microservices — has dissolved the concept of a trusted perimeter entirely. Zero-trust security replaces perimeter trust with a principle that has become the foundation of serious production security: *never trust, always verify*. This chapter walks through what zero-trust means specifically for SQL Server environments, how to implement it at every layer of the database stack, and how to build systems that are genuinely difficult to compromise even when individual components are.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
@@ -52,7 +52,7 @@
 
 <p class="text-gray-300 leading-relaxed">The first principle is *explicit verification*. Every connection to a database — regardless of where it originates — must be authenticated and authorized using the strongest mechanism available. A service account connecting from an internal Kubernetes pod is not implicitly trustworthy simply because it is inside the cluster. It must prove identity, and that identity must be checked against access policies every time, not cached indefinitely.</p>
 
-<p class="text-gray-300 leading-relaxed">The second principle is *least privilege*. Users and applications receive only the permissions they need to perform their specific function, and nothing more. A reporting service that reads from three tables has no business holding INSERT or DELETE privileges anywhere. An application user has no business seeing the database schema, the pg_stat_activity view, or the system catalog tables beyond what it explicitly needs.</p>
+<p class="text-gray-300 leading-relaxed">The second principle is *least privilege*. Users and applications receive only the permissions they need to perform their specific function, and nothing more. A reporting service that reads from three tables has no business holding INSERT or DELETE privileges anywhere. An application user has no business seeing the database schema, the sys.dm_exec_sessions view, or the system catalog views beyond what it explicitly needs.</p>
 
 <p class="text-gray-300 leading-relaxed">The third principle is *assume breach*. Security controls should not be designed with the goal of preventing all unauthorized access — they must also detect and contain unauthorized access when it occurs. This means comprehensive audit logging, anomaly detection, and clear response procedures for when something goes wrong.</p>
 
@@ -62,29 +62,35 @@
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Authentication: Proving Identity at Every Layer</h3>
 
-<p class="text-gray-300 leading-relaxed">Authentication is the gateway to everything else. Before any privilege question is asked, the database must know — with certainty — who is asking. Both PostgreSQL and SQL Server offer multiple authentication mechanisms, and the choice matters enormously in a zero-trust context.</p>
+<p class="text-gray-300 leading-relaxed">Authentication is the gateway to everything else. Before any privilege question is asked, the database must know — with certainty — who is asking. SQL Server offers multiple authentication mechanisms, and the choice matters enormously in a zero-trust context.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL Authentication</strong></p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Hardening SQL Server Authentication</strong></p>
 
-<p class="text-gray-300 leading-relaxed">PostgreSQL's authentication is controlled through the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_hba.conf</code> file, which defines rules for how each connection is authenticated based on connection type, database, user, and source address. In a zero-trust environment, the configuration should lean heavily toward certificate-based authentication (via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">cert</code> method) or SCRAM-SHA-256 rather than plaintext passwords (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">password</code>) or the insecure <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">md5</code> method.</p>
+<p class="text-gray-300 leading-relaxed">SQL Server has no host-based access file — authentication policy lives in the logins themselves and the protocols the instance listens on. The zero-trust baseline: disable the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sa</code> account and never use it for applications; require Windows or Microsoft Entra authentication for humans; restrict SQL logins to service accounts with long generated passwords stored in a secrets manager; and disable unused protocols and the Browser service so the attack surface is just TCP/IP on the trusted interface.</p>
 
-<p class="text-gray-300 leading-relaxed">A properly locked-down <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_hba.conf</code> for a production environment looks like this:</p>
+<p class="text-gray-300 leading-relaxed">A hardened login baseline for a production environment looks like this:</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Reject all by default
-# local connections for the postgres superuser only, using peer
-local   all             postgres                                peer
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Disable sa; it should never authenticate in production
+ALTER LOGIN sa DISABLE;
 
-# Application accounts via SSL with certificate validation
-hostssl appdb           appuser         10.0.10.0/24            scram-sha-256
+-- Least-privilege service login: no server roles, explicit grants only
+CREATE LOGIN etl_service WITH PASSWORD = N'&lt;from secrets manager&gt;';
+-- then grant CONNECT + database role membership per database; never sysadmin
 
-# Reject everything else
-host    all             all             0.0.0.0/0               reject</code></pre>
+-- Audit which logins can still authenticate at the server level
+SELECT name, type_desc, is_disabled
+FROM sys.server_principals
+WHERE type_desc IN ('SQL_LOGIN', 'WINDOWS_LOGIN', 'EXTERNAL_LOGIN')
+  AND is_disabled = 0
+ORDER BY name;</code></pre>
 
-<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">hostssl</code> method requires that the connection use TLS — without it, the connection is rejected before a password is even asked for. Combined with SCRAM-SHA-256, this means passwords are never sent in plaintext and are verified using a challenge-response mechanism that prevents replay attacks.</p>
+<p class="text-gray-300 leading-relaxed">Requiring TLS plus strong authentication means credentials are never sent in plaintext. Combined with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Force Encryption</code> on the instance, every login — human or service — travels over an encrypted channel before credentials are even presented.</p>
 
-<p class="text-gray-300 leading-relaxed">For service accounts in automated systems, certificate authentication eliminates passwords entirely. The database validates the client certificate's CN (Common Name) against the username being claimed:</p>
+<p class="text-gray-300 leading-relaxed">For service accounts in automated systems, certificate-based logins or Microsoft Entra managed identities eliminate passwords entirely — the database trusts the identity provider's token, not a shared secret stored in a config file:</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>hostssl appdb           etl_service     10.0.20.0/24            cert clientcert=verify-full</code></pre>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Managed identity: no password exists to steal or rotate
+CREATE USER [myapp-identity] FROM EXTERNAL PROVIDER;
+ALTER ROLE db_app_readwrite ADD MEMBER [myapp-identity];</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server Authentication</strong></p>
 
@@ -105,7 +111,7 @@ FROM sys.server_principals
 WHERE type_desc IN ('SQL_LOGIN', 'WINDOWS_LOGIN', 'EXTERNAL_LOGIN')
 ORDER BY type_desc, name;</code></pre>
 
-<p class="text-gray-300 leading-relaxed">Multi-factor authentication (MFA) deserves specific mention here. For human DBA accounts connecting to production databases, MFA is non-negotiable in a zero-trust model. PostgreSQL does not implement MFA natively, but it can be layered in through PAM (Pluggable Authentication Modules) on Linux, which allows integration with RADIUS-based MFA systems, Duo Security, or TOTP mechanisms. SQL Server integrates with Azure AD Conditional Access policies that enforce MFA before a token is issued, which means MFA enforcement happens at the identity provider layer rather than at the database layer — the right place for it.</p>
+<p class="text-gray-300 leading-relaxed">Multi-factor authentication (MFA) deserves specific mention here. For human DBA accounts connecting to production databases, MFA is non-negotiable in a zero-trust model. SQL Server integrates with Microsoft Entra Conditional Access policies that enforce MFA before a token is issued — MFA enforcement happens at the identity provider layer rather than at the database layer, the right place for it. For on-premises estates, Windows Authentication with smart cards or Windows Hello provides the second factor without any database-side MFA plumbing.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
@@ -115,9 +121,9 @@ ORDER BY type_desc, name;</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Role Hierarchies and Ownership</strong></p>
 
-<p class="text-gray-300 leading-relaxed">Both PostgreSQL and SQL Server implement role-based access control (RBAC). The key discipline is to build a role hierarchy that reflects job functions, assign permissions to roles rather than individual users, and assign users to roles — never grant privileges directly to user accounts.</p>
+<p class="text-gray-300 leading-relaxed">SQL Server implements role-based access control (RBAC). The key discipline is to build a role hierarchy that reflects job functions, assign permissions to roles rather than individual users, and assign users to roles — never grant privileges directly to user accounts.</p>
 
-<p class="text-gray-300 leading-relaxed">In PostgreSQL, roles and users are unified concepts. A well-structured role model for an application database looks like this:</p>
+<p class="text-gray-300 leading-relaxed">In SQL Server, server logins, database users, and database roles are distinct concepts. A well-structured role model for an application database looks like this:</p>
 
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Create database roles
@@ -141,7 +147,7 @@ REVERT;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Least privilege does not stop at the table boundary. In many systems, different users need to see different columns or different rows within the same table. Both databases provide mechanisms for this.</p>
 
-<p class="text-gray-300 leading-relaxed">PostgreSQL's Row-Level Security (RLS) allows you to define policies that filter rows based on the current user context. This is particularly powerful for multi-tenant SaaS applications where a single table holds data for multiple customers:</p>
+<p class="text-gray-300 leading-relaxed">SQL Server's Row-Level Security (RLS) allows you to define policies that filter rows based on the current user context. This is particularly powerful for multi-tenant SaaS applications where a single table holds data for multiple customers:</p>
 
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server Row-Level Security
@@ -192,7 +198,7 @@ ORDER BY sp.name;</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">TLS Everywhere</strong></p>
 
-<p class="text-gray-300 leading-relaxed">PostgreSQL enforces TLS through <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ssl = on</code> in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">postgresql.conf</code> and the use of <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">hostssl</code> entries in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_hba.conf</code>. Setting <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ssl_min_protocol_version = 'TLSv1.2'</code> in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">postgresql.conf</code> ensures that outdated protocol versions like TLS 1.0 and TLS 1.1 are rejected. TLS 1.3 is recommended where client library support allows.</p>
+<p class="text-gray-300 leading-relaxed">SQL Server enforces TLS through the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Force Encryption</code> setting in SQL Server Configuration Manager, where a server certificate is bound to the instance. Clients request encryption with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Encrypt=yes</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">TrustServerCertificate=no</code>; the minimum TLS version is set via Schannel registry settings on Windows, or through the portal's minimum-TLS-version setting (1.2 or higher) on Azure SQL Database. TLS 1.3 is recommended where client library support allows.</p>
 
 <p class="text-gray-300 leading-relaxed">The SSL certificate configuration requires a server certificate, private key, and root CA certificate. For mutual TLS (mTLS), clients also present a certificate, and the database validates it against the CA. mTLS is the strongest option for service-to-database authentication because it eliminates passwords from the authentication flow entirely.</p>
 
@@ -204,7 +210,7 @@ ORDER BY sp.name;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">In practice, this means:</p>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Database servers live in a dedicated private subnet with no public IP addresses.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Security groups or firewall rules allow inbound traffic only on the database port (5432 for PostgreSQL, 1433 for SQL Server) from specific application subnets or instance IDs.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Security groups or firewall rules allow inbound traffic only on the database port (1433) from specific application subnets or instance IDs.</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Egress from the database subnet is tightly restricted — databases should not be initiating outbound connections to arbitrary destinations.</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> VPC endpoints or Private Link are used in cloud environments to ensure that traffic between application and database layers never transits the public internet, even if both are cloud-hosted.</li>
 
@@ -218,7 +224,7 @@ ORDER BY sp.name;</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Vault-Based Dynamic Credentials</strong></p>
 
-<p class="text-gray-300 leading-relaxed">HashiCorp Vault's database secrets engine is the reference implementation for this pattern. Vault connects to PostgreSQL or SQL Server using a privileged account, and when an application requests credentials, Vault creates a new database user with the appropriate permissions, issues the credentials to the application with a TTL (time to live) of minutes or hours, and automatically drops the user when the TTL expires.</p>
+<p class="text-gray-300 leading-relaxed">HashiCorp Vault's database secrets engine is the reference implementation for this pattern. Vault connects to SQL Server using a privileged account, and when an application requests credentials, Vault creates a new database user with the appropriate permissions, issues the credentials to the application with a TTL (time to live) of minutes or hours, and automatically drops the user when the TTL expires.</p>
 
 <p class="text-gray-300 leading-relaxed">The application never stores a password. It authenticates to Vault using its own identity (a Kubernetes service account token, an AWS IAM role, or a TLS certificate), receives short-lived credentials, uses them to connect to the database, and the credentials expire before an attacker who intercepts them could reuse them meaningfully.</p>
 
@@ -234,7 +240,7 @@ ORDER BY sp.name;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">*Figure: Zero-trust credential flow — the application never holds a static password; it exchanges its own verified identity for a database credential that Vault creates and automatically revokes.*</p>
 
-<p class="text-gray-300 leading-relaxed">On the PostgreSQL side, Vault's management role needs permission to create and drop roles:</p>
+<p class="text-gray-300 leading-relaxed">On the SQL Server side, Vault's management login needs permission to create and drop logins:</p>
 
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Create the Vault management login at the server level
@@ -257,7 +263,7 @@ ORDER BY create_date DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">In Kubernetes environments, the External Secrets Operator can sync secrets from AWS Secrets Manager, Azure Key Vault, or GCP Secret Manager into Kubernetes Secrets, while the secrets management system handles rotation. The database password that a pod uses is never baked into an image or a ConfigMap — it is fetched at startup from the secrets store and refreshed on a schedule.</p>
 
-<p class="text-gray-300 leading-relaxed">AWS IAM authentication for RDS PostgreSQL and Aurora takes this further by eliminating passwords entirely for IAM-aware applications. The application generates a short-lived authentication token using its IAM role's credentials and presents that token as the database password. The token expires after 15 minutes and is cryptographically tied to the IAM role — an attacker who intercepts it has a narrow window and cannot use it without the corresponding IAM role.</p>
+<p class="text-gray-300 leading-relaxed">AWS IAM authentication for RDS for SQL Server takes this further by eliminating passwords entirely for IAM-aware applications. The application generates a short-lived authentication token using its IAM role's credentials and presents that token as the database password. The token expires after 15 minutes and is cryptographically tied to the IAM role — an attacker who intercepts it has a narrow window and cannot use it without the corresponding IAM role.</p>
 
 <p class="text-gray-300 leading-relaxed">Password rotation for traditional accounts should be automated through the secrets management system, not performed manually. Manual rotation processes are error-prone and inconsistent. When a rotation is needed — after a suspected compromise, after an employee departure, on a regular schedule — the secrets manager updates the credential in the database and propagates the new value to all consuming applications without human intervention.</p>
 
@@ -279,34 +285,34 @@ ORDER BY create_date DESC;</code></pre>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> All connection and disconnection events for privileged accounts</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Failed authorization attempts (queries rejected due to insufficient privilege)</li>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL Audit Logging</strong></p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Configuring SQL Server Audit</strong></p>
 
-<p class="text-gray-300 leading-relaxed">PostgreSQL's built-in logging parameters capture many of these events, but <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pgaudit</code> — an open-source extension — provides structured, role-aware audit logging that is designed specifically for compliance and security use cases.</p>
+<p class="text-gray-300 leading-relaxed">SQL Server Audit captures server- and database-level events to a file, the Security log, or the Application log. A production baseline audits failed logins, permission changes, and DDL — enough to reconstruct who did what, without drowning in row-level noise:</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Install pgaudit (after loading the shared library in postgresql.conf)
--- shared_preload_libraries = 'pgaudit'
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Server-level audit: failed logins and permission changes
+CREATE SERVER AUDIT ProdAudit
+TO FILE (FILEPATH = N'C:\Audit\', MAXSIZE = 100 MB, MAX_ROLLOVER_FILES = 20)
+WITH (ON_FAILURE = FAIL_OPERATION);
+CREATE SERVER AUDIT SPECIFICATION ProdServerSpec
+FOR SERVER AUDIT ProdAudit
+ADD (FAILED_LOGIN_GROUP),
+ADD (SERVER_PERMISSION_CHANGE_GROUP);
+ALTER SERVER AUDIT ProdAudit WITH (STATE = ON);
 
--- Configure audit logging at the session level
-SET pgaudit.log = 'ddl, role, read, write';
+-- Database-level audit: DDL and permission changes
+CREATE DATABASE AUDIT SPECIFICATION ProdDbSpec
+FOR SERVER AUDIT ProdAudit
+ADD (SCHEMA_OBJECT_CHANGE_GROUP),
+ADD (DATABASE_PERMISSION_CHANGE_GROUP)
+WITH (STATE = ON);</code></pre>
 
--- Or configure globally in postgresql.conf:
--- pgaudit.log = 'ddl, role'
--- pgaudit.log_relation = on
--- pgaudit.log_parameter = on
+<p class="text-gray-300 leading-relaxed">The error log complements the audit trail — make sure login auditing captures at least failed logins, and that ERRORLOG files are retained:</p>
 
--- Check current pgaudit configuration
-SHOW pgaudit.log;
-SHOW pgaudit.log_relation;</code></pre>
-
-<p class="text-gray-300 leading-relaxed">PostgreSQL's standard logging parameters, independent of pgaudit, should also be configured:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>log_connections = on
-log_disconnections = on
-log_failed_connections = on
-log_statement = 'ddl'         -- at minimum; 'all' for high-security environments
-log_duration = on
-log_min_duration_statement = 1000  -- log slow queries (over 1 second)
-log_line_prefix = '%t [%p]: [%l-1] user=%u,db=%d,app=%a,client=%h '</code></pre>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SSMS: Server Properties &gt; Security &gt; Login auditing = "Failed logins only" (minimum)
+-- Retain history: cycle the error log on a schedule and keep 30+ archives
+EXEC sp_cycle_errorlog;
+-- Verify the audit is actually running
+SELECT name, status_desc FROM sys.dm_server_audit_status;</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server Audit Logging</strong></p>
 
@@ -368,7 +374,7 @@ ORDER BY event_time DESC;</code></pre>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Zero-trust replaces perimeter trust with continuous verification.** Every connection to the database must authenticate using strong mechanisms — SCRAM-SHA-256 or certificate-based authentication for PostgreSQL, Kerberos or Azure AD with MFA for SQL Server — regardless of where the connection originates.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Zero-trust replaces perimeter trust with continuous verification.** Every connection to the database must authenticate using strong mechanisms — Kerberos or Microsoft Entra with MFA for humans, certificate-based logins or managed identities for services — regardless of where the connection originates.</li>
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Least privilege must be actively maintained, not just initially configured.** Role hierarchies should map to job functions, row-level and column-level security should restrict data access within tables, and privilege audits should run regularly to identify and remediate privilege creep before it becomes a liability.</li>
 
@@ -376,12 +382,12 @@ ORDER BY event_time DESC;</code></pre>
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Static credentials are a fundamental vulnerability.** Dynamic secrets management through HashiCorp Vault, AWS IAM authentication, or equivalent systems eliminates long-lived passwords from the attack surface. Credentials that expire in minutes cannot be effectively exploited even if intercepted.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Audit logging generates the evidence; detection rules generate the alerts.** Structured audit logging through pgaudit or SQL Server Audit, shipped to a SIEM with behavioral detection rules, is what converts the zero-trust philosophy into operational security — the ability to detect, investigate, and respond to anomalies before they become breaches.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Audit logging generates the evidence; detection rules generate the alerts.** Structured audit logging through SQL Server Audit, shipped to a SIEM with behavioral detection rules, is what converts the zero-trust philosophy into operational security — the ability to detect, investigate, and respond to anomalies before they become breaches.</li>
     </div>
     <div class="mt-14 bg-blue-950/40 border border-blue-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
-        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · SQL Server</p>
       </div>
       <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
          class="shrink-0 px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded-xl text-sm transition">

@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Chapter 26: Event-Driven Design — The DBA Handbook</title>
-  <meta name="description" content="The DBA Handbook Chapter 26: Event-Driven Design. PostgreSQL and SQL Server — a practical DBA guide by Rajesh Guntupalli." />
+  <meta name="description" content="The DBA Handbook Chapter 26: Event-Driven Design. SQL Server — a practical DBA guide by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
   <script type="module">
     import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
@@ -42,7 +42,7 @@
     <div class="space-y-4 text-sm">
 <h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 26: Event-Driven Design</h2>
 
-<p class="text-gray-300 leading-relaxed">Modern applications rarely operate in isolation. A user places an order, and a warehouse system needs to know. A payment clears, and a notification service fires. A record changes in one table, and three downstream consumers need to react. This chapter is about how databases fit into that world — how PostgreSQL and SQL Server can both participate in event-driven architectures, either as producers that emit events when data changes or as consumers that process event streams. We'll cover the mechanisms each platform provides natively, how to build reliable event pipelines on top of them, and where the edge cases and failure modes live in production systems that depend on this pattern.</p>
+<p class="text-gray-300 leading-relaxed">Modern applications rarely operate in isolation. A user places an order, and a warehouse system needs to know. A payment clears, and a notification service fires. A record changes in one table, and three downstream consumers need to react. This chapter is about how databases fit into that world — how SQL Server can participate in event-driven architectures, either as a producer that emits events when data changes or as a consumer that processes event streams. We'll cover the mechanisms SQL Server provides natively, how to build reliable event pipelines on top of them, and where the edge cases and failure modes live in production systems that depend on this pattern.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
@@ -54,7 +54,7 @@
 
 <p class="text-gray-300 leading-relaxed">The canonical answer to the dual-write problem is the <strong class="text-white">Transactional Outbox Pattern</strong>: instead of writing directly to an external message broker, you write an event record into a table within the same transaction as your business data change. A separate process then reads from that outbox table and forwards events onward. If the process crashes, it can replay from where it left off. The event is guaranteed to exist if and only if the business transaction committed — atomicity is preserved because both writes happen in the same transaction.</p>
 
-<p class="text-gray-300 leading-relaxed">This concept is straightforward, but the implementation details determine whether it works in production. Let's walk through how it works structurally, and then we'll look at the native mechanisms both PostgreSQL and SQL Server provide that build on or replace it.</p>
+<p class="text-gray-300 leading-relaxed">This concept is straightforward, but the implementation details determine whether it works in production. Let's walk through how it works structurally, and then we'll look at the native mechanisms SQL Server provides that build on or replace it.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
@@ -136,16 +136,9 @@ COMMIT TRANSACTION;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Writing events from application code is reliable when applications are disciplined. It breaks down when data is modified through migration scripts, bulk imports, administrative tools, or legacy code paths that bypass the event-writing logic. The more durable solution is to have the database itself emit events for every data change, regardless of source. This is Change Data Capture — CDC.</p>
 
-<p class="text-gray-300 leading-relaxed">Both PostgreSQL and SQL Server implement CDC by reading the transaction log rather than polling tables. The log is the most faithful record of what changed and when, and it imposes almost no overhead on the primary write path.</p>
+<p class="text-gray-300 leading-relaxed">SQL Server implements CDC by reading the transaction log rather than polling tables. The log is the most faithful record of what changed and when, and it imposes almost no overhead on the primary write path.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL Logical Replication and Logical Decoding</strong></p>
-
-<p class="text-gray-300 leading-relaxed">PostgreSQL exposes its write-ahead log (WAL) for consumption through logical decoding. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_logical</code> replication slot mechanism lets an external process subscribe to a decoded stream of row-level changes. The popular open-source tool Debezium uses this mechanism to forward changes into Kafka, but you can also consume the stream directly using PostgreSQL's built-in replication protocol.</p>
-
-<p class="text-gray-300 leading-relaxed">To use logical decoding, the server must have <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">wal_level = logical</code> set in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">postgresql.conf</code>. This is now the default in PostgreSQL 15 and above.</p>
-
-
-<p class="text-gray-300 leading-relaxed">Slot lag is the single most important metric in any logical replication setup. When a consumer falls behind, the WAL files it hasn't yet processed cannot be deleted. Unchecked slot lag can fill your disk and crash the primary. Every production deployment using logical replication slots should alert when lag exceeds a threshold — typically a few hundred megabytes in a busy system — and should drop the slot if the consumer has been absent for more than a few hours.</p>
+<p class="text-gray-300 leading-relaxed">SQL Server's native answer is Change Data Capture, covered next — the log-reading approach with the capture and cleanup jobs as its operational surface, and no slot management on your side.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server Change Data Capture</strong></p>
 
@@ -190,26 +183,15 @@ FROM cdc.fn_cdc_get_all_changes_dbo_orders(
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">Using LISTEN/NOTIFY and Service Broker for Lightweight Messaging</h3>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Using Service Broker for Lightweight Messaging</h3>
 
 <p class="text-gray-300 leading-relaxed">Not every event-driven need requires a full CDC pipeline or an external message broker. Both databases have built-in lightweight notification mechanisms that work well for low-to-moderate volume use cases: real-time dashboard updates, cache invalidation, workflow triggers, and inter-process coordination within a single database.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL LISTEN/NOTIFY</strong></p>
-
-<p class="text-gray-300 leading-relaxed">PostgreSQL's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">LISTEN</code>/<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">NOTIFY</code> mechanism lets database sessions send and receive messages over named channels. A notifying session sends a string payload over a channel; all listening sessions on that channel receive it asynchronously. Notifications survive within a session but are not persisted — if no one is listening when a notification fires, it is silently dropped.</p>
-
-<p class="text-gray-300 leading-relaxed">This makes <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">LISTEN</code>/<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">NOTIFY</code> unsuitable as a guaranteed delivery mechanism, but excellent as a wake-up signal for a relay process. The canonical pattern is: write to the outbox table within your transaction, then issue a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">NOTIFY</code> at the end of the transaction. The relay process, which is sleeping in a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">LISTEN</code> loop, wakes up immediately and processes the new rows. Without this, the relay must poll on a timer, introducing unnecessary latency.</p>
-
-<p class="text-gray-300 leading-relaxed">A trigger on the outbox table can fire the notification automatically:</p>
-
-
-<p class="text-gray-300 leading-relaxed">The relay subscribes with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">LISTEN outbox_event</code> and blocks until a notification arrives, then immediately polls the outbox for unprocessed rows. This hybrid approach — outbox for durability, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">NOTIFY</code> for low latency — is robust and elegant.</p>
-
-<p class="text-gray-300 leading-relaxed">One constraint: the payload in a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">NOTIFY</code> is limited to 8000 bytes. This is plenty for identifiers and metadata but not for large JSON documents. Keep notification payloads small; include identifiers and let the receiver query for full data if needed.</p>
+<p class="text-gray-300 leading-relaxed">For lightweight database-native messaging in SQL Server, the answer is Service Broker — persistent queues with transactional enqueue/dequeue and poison-message handling, covered next.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server Service Broker</strong></p>
 
-<p class="text-gray-300 leading-relaxed">SQL Server Service Broker is a more heavyweight native messaging system built directly into the SQL Server engine. It provides persistent queues, guaranteed ordered delivery, and transactional message enqueue/dequeue — all within the database. Unlike <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">LISTEN</code>/<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">NOTIFY</code>, messages survive server restarts and are not dropped if there's no active receiver.</p>
+<p class="text-gray-300 leading-relaxed">SQL Server Service Broker is a more heavyweight native messaging system built directly into the SQL Server engine. It provides persistent queues, guaranteed ordered delivery, and transactional message enqueue/dequeue — all within the database. Messages survive server restarts and are not dropped if there is no active receiver.</p>
 
 <p class="text-gray-300 leading-relaxed">Service Broker models communication as conversations between services, each backed by queues. The setup is verbose by modern standards, but the guarantees are strong.</p>
 
@@ -269,7 +251,7 @@ FROM OrderEventQueue;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">At-least-once delivery is the realistic default in any reliable messaging system. Networks fail; processes crash; relay jobs restart. Consumers will receive duplicate events. The correct response is to design consumers to be idempotent — processing the same event twice should produce the same result as processing it once.</p>
 
-<p class="text-gray-300 leading-relaxed">Idempotency strategies include: tracking processed event IDs in a table and skipping duplicates; using upsert semantics (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">INSERT ... ON CONFLICT DO UPDATE</code> in PostgreSQL, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">MERGE</code> in SQL Server) so re-processing a create event doesn't fail; or making business logic naturally idempotent (setting a status to "shipped" twice is harmless; incrementing a counter twice is not).</p>
+<p class="text-gray-300 leading-relaxed">Idempotency strategies include: tracking processed event IDs in a table and skipping duplicates; using upsert semantics (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">MERGE</code>) so re-processing a create event doesn't fail; or making business logic naturally idempotent (setting a status to "shipped" twice is harmless; incrementing a counter twice is not).</p>
 
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: idempotent event processing using MERGE
@@ -305,7 +287,7 @@ WHEN NOT MATCHED THEN
 
 <p class="text-gray-300 leading-relaxed">A system inserting 10,000 orders per minute also inserts 10,000 outbox rows per minute. Depending on table layout and index cardinality, that can double the I/O budget. The mitigation is batching at the relay level — reading and forwarding events in batches rather than one at a time. This trades latency (events take slightly longer to be forwarded) for throughput.</p>
 
-<p class="text-gray-300 leading-relaxed">The outbox relay should also use <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SELECT ... FOR UPDATE SKIP LOCKED</code> in PostgreSQL or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WITH (UPDLOCK, READPAST)</code> in SQL Server to allow multiple relay instances to run concurrently without contending for the same rows. This is the correct pattern for competing consumers on a database-backed queue.</p>
+<p class="text-gray-300 leading-relaxed">The outbox relay should also use <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WITH (UPDLOCK, READPAST)</code> to allow multiple relay instances to run concurrently without contending for the same rows. This is the correct pattern for competing consumers on a database-backed queue.</p>
 
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: batch relay with READPAST for concurrent relay workers
@@ -351,7 +333,7 @@ EXEC sys.sp_cdc_change_job
 
 <p class="text-gray-300 leading-relaxed">Production event-driven systems need observability across three dimensions: lag (how far behind are consumers?), error rate (how many events are landing in the dead letter queue?), and throughput (events per second, which reveals upstream problems when it drops unexpectedly).</p>
 
-<p class="text-gray-300 leading-relaxed">In PostgreSQL, replication slot lag is visible in<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_replication_slots</code>, as shown earlier. Outbox backlog is trivially queryable:</p>
+<p class="text-gray-300 leading-relaxed">In SQL Server, CDC capture latency is visible in the capture job's history and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">cdc.lsn_time_mapping</code>. Outbox backlog is trivially queryable:</p>
 
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: monitor outbox backlog depth and oldest unprocessed event
@@ -393,7 +375,7 @@ ORDER BY jh.run_date DESC, jh.run_time DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">When a database column changes — a field is renamed, a type is widened, a new required field appears — downstream consumers that depend on the event schema may break. This is the event schema evolution problem, and it's strictly harder than API versioning because events may already be in-flight or stored in a log.</p>
 
-<p class="text-gray-300 leading-relaxed">The mitigation is to treat event schemas as versioned contracts. Use a schema registry (Confluent Schema Registry is the most common Kafka-adjacent option) to enforce compatibility rules before a new schema version is accepted. PostgreSQL's JSONB flexibility can hide schema drift in local queries, but it doesn't protect downstream consumers from receiving a field they didn't expect to be absent or renamed.</p>
+<p class="text-gray-300 leading-relaxed">The mitigation is to treat event schemas as versioned contracts. Use a schema registry (Confluent Schema Registry is the most common Kafka-adjacent option) to enforce compatibility rules before a new schema version is accepted. SQL Server's JSON flexibility can hide schema drift in local queries, but it doesn't protect downstream consumers from receiving a field they didn't expect to be absent or renamed.</p>
 
 <p class="text-gray-300 leading-relaxed">Practically speaking, backward-compatible changes — adding optional fields — are safe. Removing fields, renaming fields, or changing field types are breaking changes that require versioned event types and coordinated consumer upgrades.</p>
 
@@ -411,32 +393,32 @@ ORDER BY jh.run_date DESC, jh.run_time DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Event sourcing takes the event-driven idea further: instead of storing current state in rows and emitting events as a side effect, the event log itself is the system of record. Current state is derived by replaying events. This is a distinct architectural decision with its own trade-offs, and it sits further from the traditional DBA domain — but it interacts with databases in specific ways worth understanding.</p>
 
-<p class="text-gray-300 leading-relaxed">PostgreSQL is a reasonable event store for low-to-moderate volume event-sourced systems. An append-only events table with good indexing on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">aggregate_id</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sequence_number</code> can handle write throughput that satisfies many applications. Dedicated event store products (EventStoreDB, for instance) offer subscription and snapshot features purpose-built for the pattern, but the operational simplicity of staying in PostgreSQL has real value.</p>
+<p class="text-gray-300 leading-relaxed">SQL Server is a reasonable event store for low-to-moderate volume event-sourced systems. An append-only events table with good indexing on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">aggregate_id</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sequence_number</code> can handle write throughput that satisfies many applications. Dedicated event store products (EventStoreDB, for instance) offer subscription and snapshot features purpose-built for the pattern, but the operational simplicity of staying in SQL Server has real value.</p>
 
 
 <p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">UNIQUE</code> constraint on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">(aggregate_id, sequence_number)</code> enforces optimistic concurrency: if two processes try to append the same sequence number for the same aggregate simultaneously, one will fail with a unique violation. Application code catches this and retries. This is the event sourcing equivalent of an optimistic lock.</p>
 
 <p class="text-gray-300 leading-relaxed">To read current state, you replay the event stream for a given aggregate:</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: load all events for an aggregate in order
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- T-SQL: load all events for an aggregate in order
 SELECT
     sequence_number,
     event_type,
     payload,
     occurred_at
 FROM domain_events
-WHERE aggregate_id = $1
+WHERE aggregate_id = @aggregate_id
 ORDER BY sequence_number ASC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">For long-lived aggregates with many events, full replay on every read becomes expensive. Snapshots solve this: periodically store a materialized snapshot of current state alongside the event sequence number it represents, and on load, start from the most recent snapshot and replay only the events after it.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: snapshot table for event-sourced aggregates
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- T-SQL: snapshot table for event-sourced aggregates
 CREATE TABLE aggregate_snapshots (
-    aggregate_id    UUID        NOT NULL,
-    aggregate_type  TEXT        NOT NULL,
-    sequence_number BIGINT      NOT NULL,
-    state           JSONB       NOT NULL,
-    taken_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    aggregate_id    UNIQUEIDENTIFIER NOT NULL,
+    aggregate_type  NVARCHAR(128)    NOT NULL,
+    sequence_number BIGINT           NOT NULL,
+    state           NVARCHAR(MAX)    NOT NULL,   -- JSON document
+    taken_at        DATETIME2        NOT NULL DEFAULT SYSUTCDATETIME(),
 
     CONSTRAINT pk_snapshots PRIMARY KEY (aggregate_id, sequence_number)
 );
@@ -445,9 +427,9 @@ CREATE TABLE aggregate_snapshots (
 WITH latest_snapshot AS (
     SELECT sequence_number, state
     FROM aggregate_snapshots
-    WHERE aggregate_id = $1
+    WHERE aggregate_id = @aggregate_id
     ORDER BY sequence_number DESC
-    LIMIT 1
+    OFFSET 0 ROWS FETCH NEXT 1 ROWS ONLY
 )
 SELECT
     e.sequence_number,
@@ -455,7 +437,7 @@ SELECT
     e.payload
 FROM domain_events e
 LEFT JOIN latest_snapshot s ON TRUE
-WHERE e.aggregate_id = $1
+WHERE e.aggregate_id = @aggregate_id
   AND e.sequence_number &gt; COALESCE(s.sequence_number, 0)
 ORDER BY e.sequence_number ASC;</code></pre>
 
@@ -467,9 +449,9 @@ ORDER BY e.sequence_number ASC;</code></pre>
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The transactional outbox pattern solves the dual-write problem** by writing events into a table within the same database transaction as the business data change. The relay process forwards events after commit, so atomicity is guaranteed without distributed coordination.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Change Data Capture reads the transaction log**, not the tables directly, making it the most reliable way to capture all data changes regardless of which application path caused them. PostgreSQL uses logical replication slots with the `pgoutput` plugin; SQL Server uses the `sp_cdc_enable_table` system procedure and SQL Server Agent jobs. Both require active monitoring — slot lag in PostgreSQL and Agent job health in SQL Server are the most common sources of silent failure.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Change Data Capture reads the transaction log**, not the tables directly, making it the most reliable way to capture all data changes regardless of which application path caused them. SQL Server uses the `sp_cdc_enable_table` system procedure plus Agent capture and cleanup jobs — monitor Agent job health and change-table retention; a stalled capture job is the most common source of silent failure.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **LISTEN/NOTIFY in PostgreSQL and Service Broker in SQL Server** provide native, in-database messaging for lower-volume scenarios. LISTEN/NOTIFY is best used as a low-latency wake signal paired with a durable outbox, not as a standalone delivery mechanism. Service Broker provides durable, transactional queuing fully inside SQL Server, suitable for internal workflow orchestration.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Service Broker** provides native, in-database messaging for lower-volume scenarios: durable, transactional queuing fully inside SQL Server, suitable for internal workflow orchestration and as the wake-signal behind a durable outbox relay.</li>
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Idempotent consumers and at-least-once delivery** are the practical production standard. Design consumers to handle duplicate events using upsert semantics with sequence-number guards, and implement dead letter queues for events that repeatedly fail processing rather than allowing a single bad event to block the entire pipeline.</li>
 
@@ -478,7 +460,7 @@ ORDER BY e.sequence_number ASC;</code></pre>
     <div class="mt-14 bg-blue-950/40 border border-blue-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
-        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · SQL Server</p>
       </div>
       <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
          class="shrink-0 px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded-xl text-sm transition">

@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Chapter 12: Disaster Recovery — The DBA Handbook</title>
-  <meta name="description" content="The DBA Handbook Chapter 12: Disaster Recovery. PostgreSQL and SQL Server — a practical DBA guide by Rajesh Guntupalli." />
+  <meta name="description" content="The DBA Handbook Chapter 12: Disaster Recovery. SQL Server — a practical DBA guide by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
   <script type="module">
     import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
@@ -42,7 +42,7 @@
     <div class="space-y-4 text-sm">
 <h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 12: Disaster Recovery</h2>
 
-<p class="text-gray-300 leading-relaxed">Databases fail. Hardware dies without warning, human error wipes out tables, ransomware encrypts your data volumes, and entire data centers go offline. Disaster recovery is the discipline that determines whether your organization survives those events or doesn't. This chapter covers how to think about recovery, how to build the mechanisms that make it possible, and how to test and operate those mechanisms so that when the moment comes — and it will come — you are not improvising. Both PostgreSQL and SQL Server have mature, battle-tested tools for this work, and understanding both systems side by side gives you the mental model to design and defend recovery strategies across any environment.</p>
+<p class="text-gray-300 leading-relaxed">Databases fail. Hardware dies without warning, human error wipes out tables, ransomware encrypts your data volumes, and entire data centers go offline. Disaster recovery is the discipline that determines whether your organization survives those events or doesn't. This chapter covers how to think about recovery, how to build the mechanisms that make it possible, and how to test and operate those mechanisms so that when the moment comes — and it will come — you are not improvising. SQL Server has mature, battle-tested tools for this work, and this chapter gives you the mental model to design and defend recovery strategies in any SQL Server environment.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
@@ -74,7 +74,7 @@
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Logical backups</strong> export the data in a human-readable or SQL-based format. They are portable, useful for moving data between versions or platforms, and can be selectively restored at the table or row level. The tradeoff is that they are slow to create and restore for large databases and do not natively support point-in-time recovery.</p>
 
-<p class="text-gray-300 leading-relaxed">In PostgreSQL, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_dump</code> is the primary logical backup tool, while <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_basebackup</code> is the physical backup tool. In SQL Server, native backups (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">BACKUP DATABASE</code>) are physical, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">bcp</code>, SSIS, or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">BACPAC</code> exports are logical equivalents.</p>
+<p class="text-gray-300 leading-relaxed">In SQL Server, native backups (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">BACKUP DATABASE</code>) are physical, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">bcp</code>, SSIS, or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">BACPAC</code> exports are the logical equivalents for migrations and selective object recovery.</p>
 
 <p class="text-gray-300 leading-relaxed">#### Full Backups</p>
 
@@ -82,11 +82,11 @@
 
 <p class="text-gray-300 leading-relaxed">#### Differential and Incremental Backups</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Differential backups</strong> (SQL Server) capture all changes since the last full backup. They grow over time and are faster to restore than a long chain of incremental backups. <strong class="text-white">Incremental backups</strong> (PostgreSQL WAL-based, using tools like pgBackRest or Barman) capture only changes since the last incremental or full backup, minimizing storage but requiring the full chain during restore.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Differential backups</strong> capture all changes since the last full backup, tracked by the differential bitmap. They grow over time and are faster to restore than a long chain of log backups. <strong class="text-white">Log backups</strong> capture only changes since the last log backup, minimizing backup size and RPO but requiring the full chain during restore — which is why the most common production rhythm is weekly full, daily differential, frequent log.</p>
 
 <p class="text-gray-300 leading-relaxed">#### Transaction Log Backups</p>
 
-<p class="text-gray-300 leading-relaxed">This is where point-in-time recovery lives. By continuously capturing transaction logs (PostgreSQL: WAL segments; SQL Server: transaction log backups), you can restore a database to any specific moment between backup events. This is the mechanism that lets you say: "Restore to exactly 2:47:23 PM, before the developer dropped the table."</p>
+<p class="text-gray-300 leading-relaxed">This is where point-in-time recovery lives. By continuously capturing transaction log backups, you can restore a database to any specific moment between backup events. This is the mechanism that lets you say: "Restore to exactly 2:47:23 PM, before the developer dropped the table."</p>
 
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Full backup
@@ -143,29 +143,13 @@ ORDER BY name;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Point-in-time recovery (PITR) is the most frequently used disaster recovery mechanism in production environments. A developer runs <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DROP TABLE orders;</code> at 3:12 PM. You restore the database to 3:11:59 PM. This is the scenario PITR was built for, and understanding its mechanics prepares you to execute under pressure.</p>
 
-<p class="text-gray-300 leading-relaxed">#### PostgreSQL PITR</p>
+<p class="text-gray-300 leading-relaxed">#### Recovery Models: The Choice That Gates Everything</p>
 
-<p class="text-gray-300 leading-relaxed">PostgreSQL's PITR relies on the WAL (Write-Ahead Log) archive. The process:</p>
+<p class="text-gray-300 leading-relaxed">Before any restore sequence works, the database's recovery model must allow it. <strong class="text-white">SIMPLE</strong> truncates the log on checkpoint — no log backups, no point-in-time recovery; your RPO equals your last full or differential backup. <strong class="text-white">FULL</strong> keeps log records until a log backup truncates them — this is what makes point-in-time recovery possible, and it's the only honest choice for production data you can't afford to lose. <strong class="text-white">BULK_LOGGED</strong> is the middle ground: minimally logged bulk operations (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">BULK INSERT</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SELECT INTO</code>, index rebuilds) don't bloat the log, but you lose point-in-time recovery across the bulk window — you can only restore to the end of a log backup containing bulk-logged changes, not to a moment inside it.</p>
 
-<p class="text-gray-300 leading-relaxed">1. Restore a base backup to the target data directory</p>
-<p class="text-gray-300 leading-relaxed">2. Create a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">recovery.signal</code> file in the data directory (PostgreSQL 12+)</p>
-<p class="text-gray-300 leading-relaxed">3. Configure <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">recovery_target_time</code> or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">recovery_target_lsn</code> in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">postgresql.conf</code></p>
-<p class="text-gray-300 leading-relaxed">4. Start PostgreSQL — it will replay WAL segments up to the target</p>
+<p class="text-gray-300 leading-relaxed">The classic production mistake is a database in FULL recovery model with no log backup job — the log grows until the disk fills, and the application stops. Check <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.databases</code> for <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">log_reuse_wait_desc</code>: a value of <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">LOG_BACKUP</code> means exactly this. Conversely, a database accidentally left in SIMPLE after a migration silently discards your RPO. Audit recovery models as part of every deployment checklist and every restore validation.</p>
 
-<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">restore_command</code> tells PostgreSQL where to fetch archived WAL segments during recovery. This is the inverse of <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">archive_command</code>.</p>
-
-<p class="text-gray-300 leading-relaxed">A full <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">postgresql.conf</code> recovery block looks like this (added to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">postgresql.conf</code> before starting):</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>restore_command = 'cp /mnt/wal_archive/%f %p'
-recovery_target_time = '2024-03-15 15:11:59'
-recovery_target_action = 'promote'</code></pre>
-
-<p class="text-gray-300 leading-relaxed">Then create the signal file:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>touch /var/lib/postgresql/data/recovery.signal</code></pre>
-
-<p class="text-gray-300 leading-relaxed">When you start the server, PostgreSQL will read available WAL segments and stop at the specified time. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">recovery_target_action = 'promote'</code> instruction tells it to become a writable primary after reaching the target, rather than pausing for inspection.</p>
-
+<p class="text-gray-300 leading-relaxed">Switching from SIMPLE to FULL doesn't retroactively create recoverability — you need a full backup after the switch to start the log chain. Until that base exists, log backup attempts will fail. This bites during incident response: someone switches to FULL, schedules log backups, and discovers at restore time that the chain was never valid.</p>
 
 <p class="text-gray-300 leading-relaxed">#### SQL Server PITR</p>
 
@@ -223,50 +207,17 @@ WITH NO_TRUNCATE,
 
 <p class="text-gray-300 leading-relaxed">High availability (HA) and disaster recovery (DR) are related but distinct. HA addresses failures within a single site — a server crash, a disk failure, a network card dying. DR addresses site-level failures — an entire data center going offline, a fire, a flood, a regional network outage. Good architectures address both, and the tools for each overlap significantly.</p>
 
-<p class="text-gray-300 leading-relaxed">#### PostgreSQL Streaming Replication</p>
+<p class="text-gray-300 leading-relaxed">#### Log Shipping: The Simple DR Standby</p>
 
-<p class="text-gray-300 leading-relaxed">PostgreSQL's native streaming replication sends WAL data from a primary to one or more standby servers in near real-time. The standby applies the WAL continuously, staying within seconds of the primary. This serves both HA (failover within the same data center) and DR (standby in a different region).</p>
+<p class="text-gray-300 leading-relaxed">Log shipping is SQL Server's simplest DR standby technology: a SQL Server Agent job takes transaction-log backups on the primary, copies them to the standby server, and another job restores them on a schedule — with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">STANDBY</code> (read-only between restores) or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">NORECOVERY</code>. There's no automatic failover; on disaster you manually bring the standby online with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">RESTORE ... WITH RECOVERY</code> and redirect applications. RPO equals your shipping interval (typically 15 minutes); RTO is measured in minutes of manual work.</p>
 
-<p class="text-gray-300 leading-relaxed">Key configuration on the primary (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">postgresql.conf</code>):</p>
+<p class="text-gray-300 leading-relaxed">What log shipping buys you over "just backups" is automation and currency: the standby stays within one interval of the primary without anyone remembering to copy files. It needs no WSFC, works across domains, and runs on Standard Edition — which makes it the pragmatic DR choice for a cross-region standby where an AG's continuous transport isn't justified. Monitor it through the log shipping status tables (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">msdb.dbo.log_shipping_monitor_primary/secondary</code>); an unmonitored shipper is just a backup job with extra steps.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>wal_level = replica
-max_wal_senders = 5
-wal_keep_size = 512MB    # keep 512MB of WAL segments on primary</code></pre>
-
-<p class="text-gray-300 leading-relaxed">On the standby, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">postgresql.conf</code> is identical to the primary (it was copied during <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_basebackup</code>), but a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">standby.signal</code> file is placed in the data directory, and the recovery source is configured:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>primary_conninfo = 'host=primary_host port=5432 user=replication_user password=secret'
-primary_slot_name = 'standby1_slot'  # replication slot keeps WAL from being removed</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Synchronous vs. Asynchronous Replication</strong> is the critical architectural choice. With asynchronous replication (default), the primary commits the transaction and notifies the client immediately, then ships the WAL to standbys. This gives excellent write performance but means the standby might be slightly behind if the primary fails — potential data loss within that lag window. With synchronous replication, the primary waits for at least one standby to confirm WAL receipt before acknowledging the commit. Zero data loss, but write latency increases by the round-trip time between primary and standby.</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Synchronous standby configuration on primary
-synchronous_standby_names = 'FIRST 1 (standby1, standby2)'</code></pre>
-
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Monitor Always On AG synchronization state
-SELECT ag.name AS ag_name,
-       ar.replica_server_name,
-       ars.role_desc,
-       ars.synchronization_health_desc,
-       ars.connected_state_desc,
-       adbrs.database_name,
-       adbrs.synchronization_state_desc,
-       adbrs.log_send_queue_size,
-       adbrs.redo_queue_size,
-       adbrs.last_commit_time
-FROM sys.availability_groups ag
-JOIN sys.availability_replicas ar
-    ON ag.group_id = ar.group_id
-JOIN sys.dm_hadr_availability_replica_states ars
-    ON ar.replica_id = ars.replica_id
-JOIN sys.dm_hadr_database_replica_states adbrs
-    ON ar.replica_id = adbrs.replica_id
-ORDER BY ag.name, ar.replica_server_name;</code></pre>
+<p class="text-gray-300 leading-relaxed">The operational discipline that matters: test the manual failover. Log shipping failovers are rare enough that the runbook rots — server names change, copy-share permissions drift, the standby's SQL version falls behind. A quarterly rehearsal (bring the standby online on an isolated network, verify the data, throw it away) is what makes log shipping a DR strategy instead of a DR hope.</p>
 
 <p class="text-gray-300 leading-relaxed">#### SQL Server Always On Availability Groups</p>
 
-<p class="text-gray-300 leading-relaxed">SQL Server's primary HA and DR technology is <strong class="text-white">Always On Availability Groups (AG)</strong>. An AG groups one or more databases and replicates them as a unit to secondary replicas. Like PostgreSQL streaming replication, secondaries can be synchronous or asynchronous. Unlike basic streaming replication, AGs include:</p>
+<p class="text-gray-300 leading-relaxed">SQL Server's primary HA and DR technology is <strong class="text-white">Always On Availability Groups (AG)</strong>. An AG groups one or more databases and replicates them as a unit to secondary replicas. Secondaries can be synchronous or asynchronous. Unlike basic streaming replication, AGs include:</p>
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> A **listener** — a virtual network name and IP address that clients connect to, which redirects to the current primary automatically</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Automatic failover** — when configured with synchronous replicas and a Windows Server Failover Cluster (WSFC) or Pacemaker quorum, the AG can fail over automatically</li>
@@ -278,16 +229,12 @@ ORDER BY ag.name, ar.replica_server_name;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Failover — whether planned or emergency — follows a different procedure than restore. In a planned failover (maintenance, hardware upgrade), you synchronize data completely, then switch primary responsibility to the standby. In an emergency failover (primary is dead), you promote the standby with whatever data it received up to the moment of failure.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL — promote a standby:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Graceful promote (if primary is still reachable, use planned switchover)
-pg_ctl promote -D /var/lib/postgresql/data
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server — verify after failover:</strong></p>
 
-# Or using psql trigger function
-# SELECT pg_promote();</code></pre>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Confirm promotion succeeded
-SELECT pg_is_in_recovery();   -- should return false after promotion
--- Also check pg_stat_replication to verify other standbys are now connected to the new primary</code></pre>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Confirm the new primary is writable and replicas are healthy
+SELECT DATABASEPROPERTYEX('OrdersDB', 'Updateability');  -- should return READ_WRITE
+SELECT replica_server_name, role_desc, synchronization_state_desc
+FROM sys.dm_hadr_availability_replica_states;</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server — manual failover of an AG:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Connect to the target secondary replica and initiate failover
@@ -330,7 +277,7 @@ JOIN msdb.dbo.backupmediafamily bmf
 WHERE bs.database_name = 'AdventureWorks'
 ORDER BY bs.backup_start_date DESC;</code></pre>
 
-<p class="text-gray-300 leading-relaxed">For PostgreSQL, pgBackRest has a built-in verification command (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pgbackrest verify</code>) that checks backup integrity, confirms WAL segments are in place, and validates that a restore chain is complete. If you use pg_basebackup directly without a tool like pgBackRest or Barman, you need to periodically test restores manually.</p>
+<p class="text-gray-300 leading-relaxed"><code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">RESTORE VERIFYONLY</code> validates that a backup file is readable and its header is intact — but it does not validate the data inside. True verification means test restores: restore the backup to an isolated instance and run <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DBCC CHECKDB</code>. Automate this on a schedule; an untested backup is a hope, not a recovery strategy.</p>
 
 
 <p class="text-gray-300 leading-relaxed">#### Database Consistency Checks</p>
@@ -352,7 +299,7 @@ WITH NO_INFOMSGS;
 DBCC CHECKTABLE ('Sales.Orders')
 WITH NO_INFOMSGS;</code></pre>
 
-<p class="text-gray-300 leading-relaxed">PostgreSQL does not have a built-in equivalent to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DBCC CHECKDB</code> for running storage-level checks while online. The closest approach combines <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_dump</code> (which reads every page and will fail on corruption) with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">amcheck</code> extension for index validation.</p>
+<p class="text-gray-300 leading-relaxed"><code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DBCC CHECKDB</code> is SQL Server's storage-level integrity check — run it on a schedule in production and always after a restore. For very large databases, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">PHYSICAL_ONLY</code> catches hardware-level corruption cheaply between full checks.</p>
 
 
 <p class="text-gray-300 leading-relaxed">#### Regular Restore Testing</p>
@@ -363,7 +310,7 @@ WITH NO_INFOMSGS;</code></pre>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Quarterly**: perform a full PITR exercise — simulate a specific type of failure, execute the recovery runbook from scratch, measure actual time to recovery</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Annually**: execute a full DR simulation — fail over to the DR site, validate all applications connect and function, fail back</li>
 
-<p class="text-gray-300 leading-relaxed">Document every test result: what you restored, when it was taken, how long the restore took, what you verified, and what you found. The pattern across tests tells you whether your RPO and RTO are achievable in practice. When tests reveal gaps — a restore taking twice the RTO, a missing WAL segment, a permission error on the restore account — those are production failures that happened safely in a test environment.</p>
+<p class="text-gray-300 leading-relaxed">Document every test result: what you restored, when it was taken, how long the restore took, what you verified, and what you found. The pattern across tests tells you whether your RPO and RTO are achievable in practice. When tests reveal gaps — a restore taking twice the RTO, a broken log chain, a permission error on the restore account — those are production failures that happened safely in a test environment.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
@@ -371,7 +318,7 @@ WITH NO_INFOMSGS;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Tools and mechanisms are only half of disaster recovery. The other half is the runbook — a written, step-by-step procedure that tells whoever is on call exactly what to do, in what order, without needing to reconstruct the plan from memory while the business is down and people are watching. A DR runbook written during an incident is worse than no runbook at all, because it creates the illusion of process while actually being improvised under pressure.</p>
 
-<p class="text-gray-300 leading-relaxed">A useful runbook is specific to failure scenarios, not a single generic document. At minimum, most environments need separate runbooks for: a single table or row-level data loss (restore to a point in time, extract the affected rows, apply them back), a full server failure (promote a standby, redirect application connections), and a full site failure (fail over to the DR region, validate every dependent service, communicate status to stakeholders). Each runbook should specify the exact commands to run, not a description of what needs to happen — "restore the backup" is not a runbook step; the actual <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">RESTORE DATABASE</code> or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_basebackup</code> invocation, with the real file paths and server names for that environment, is.</p>
+<p class="text-gray-300 leading-relaxed">A useful runbook is specific to failure scenarios, not a single generic document. At minimum, most environments need separate runbooks for: a single table or row-level data loss (restore to a point in time, extract the affected rows, apply them back), a full server failure (promote a standby, redirect application connections), and a full site failure (fail over to the DR region, validate every dependent service, communicate status to stakeholders). Each runbook should specify the exact commands to run, not a description of what needs to happen — "restore the backup" is not a runbook step; the actual <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">RESTORE DATABASE</code> invocation, with the real file paths and server names for that environment, is.</p>
 
 <p class="text-gray-300 leading-relaxed">Every runbook should also name who is authorized to declare a disaster and initiate failover, because the biggest delay in real incidents is often not technical — it is the minutes lost while people debate whether the situation is bad enough to justify a risky, potentially-lossy failover. Deciding that threshold in advance, during a calm planning session, removes that hesitation when it matters.</p>
 
@@ -384,15 +331,15 @@ WITH NO_INFOMSGS;</code></pre>
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **RPO and RTO, defined with business stakeholders before a disaster happens, determine every technical decision that follows** — backup frequency, replication mode, and whether you need a hot standby or can tolerate restoring from a nightly backup.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Physical and logical backups solve different problems and most production environments need both.** Physical backups (`pg_basebackup`, SQL Server native `BACKUP DATABASE`) are fast and support point-in-time recovery; logical backups (`pg_dump`, BACPAC) are portable and support selective, table-level restores.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Point-in-time recovery is the mechanism behind "restore to right before the mistake happened."** PostgreSQL achieves it through WAL replay to a target time or LSN; SQL Server achieves it through a full/differential restore followed by ordered log restores with `STOPAT` — and in SQL Server, a tail-log backup taken before the restore sequence begins can reduce data loss to zero even in an unplanned incident.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Physical and logical backups solve different problems and most production environments need both.** Physical backups (SQL Server native `BACKUP DATABASE`) are fast and support point-in-time recovery; logical backups (BACPAC, `bcp`) are portable and support selective, table-level restores.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Point-in-time recovery is the mechanism behind "restore to right before the mistake happened."** SQL Server achieves it through a full/differential restore followed by ordered log restores with `STOPAT` — and a tail-log backup taken before the restore sequence begins can reduce data loss to zero even in an unplanned incident.</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **HA and DR are related but distinct, and most production architectures need both**: a synchronous local standby for fast, lossless failover within a site, plus an asynchronous remote standby for recovery from a site-level disaster, accepting a small data-loss window in exchange for avoiding cross-region write latency.</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **An untested backup and an unrehearsed runbook are both just assumptions.** Regular restore testing (monthly, quarterly, annually, at increasing scope) and a runbook that specifies exact commands — reviewed, corrected after every drill, and accessible even when your primary infrastructure is down — are what separate a DR plan that works from one that only looks like it would.</li>
     </div>
     <div class="mt-14 bg-blue-950/40 border border-blue-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
-        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · SQL Server</p>
       </div>
       <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
          class="shrink-0 px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded-xl text-sm transition">

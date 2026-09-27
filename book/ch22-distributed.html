@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Chapter 22: Distributed Systems — The DBA Handbook</title>
-  <meta name="description" content="The DBA Handbook Chapter 22: Distributed Systems. PostgreSQL and SQL Server — a practical DBA guide by Rajesh Guntupalli." />
+  <meta name="description" content="The DBA Handbook Chapter 22: Distributed Systems. SQL Server — a practical DBA guide by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
   <script type="module">
     import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
@@ -42,7 +42,7 @@
     <div class="space-y-4 text-sm">
 <h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 22: Distributed Systems</h2>
 
-<p class="text-gray-300 leading-relaxed">Distributed systems represent one of the most profound shifts in how databases are architected, operated, and reasoned about. When a single server is no longer sufficient — whether due to data volume, throughput demands, fault tolerance requirements, or geographic distribution — databases must be spread across multiple nodes, and suddenly the comfortable guarantees DBAs rely on in standalone systems begin to bend. This chapter examines how PostgreSQL and SQL Server approach distributed architectures: the theory that underpins them, the replication and sharding mechanisms that make them possible, the consistency trade-offs that must be navigated, and the operational realities that separate a well-run distributed database from one that causes production incidents at 2 a.m.</p>
+<p class="text-gray-300 leading-relaxed">Distributed systems represent one of the most profound shifts in how databases are architected, operated, and reasoned about. When a single server is no longer sufficient — whether due to data volume, throughput demands, fault tolerance requirements, or geographic distribution — databases must be spread across multiple nodes, and suddenly the comfortable guarantees DBAs rely on in standalone systems begin to bend. This chapter examines how SQL Server approaches distributed architectures: the theory that underpins them, the replication and sharding mechanisms that make them possible, the consistency trade-offs that must be navigated, and the operational realities that separate a well-run distributed database from one that causes production incidents at 2 a.m.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
@@ -70,7 +70,7 @@
 
 <p class="text-gray-300 leading-relaxed">The practical reality is that network partitions are not optional — they happen in any real distributed system. This means every distributed database is choosing between consistency and availability during a partition event. Most production systems actually operate on a spectrum rather than at hard extremes, and the nuanced version of this idea is captured by the PACELC model, which adds latency into the equation: even when there is no partition, distributed systems must trade off latency against consistency.</p>
 
-<p class="text-gray-300 leading-relaxed">PostgreSQL's native streaming replication sits toward the CP end when synchronous commit is required: the primary waits for at least one standby to acknowledge a WAL record before confirming the transaction to the client. If the standby is unreachable, writes can be blocked. With asynchronous replication, the system leans toward availability, accepting the possibility that a failover will reveal a small data loss window.</p>
+<p class="text-gray-300 leading-relaxed">SQL Server's Availability Groups sit toward the CP end when synchronous commit is required: the primary waits for at least one synchronous secondary to harden the log record before confirming the transaction to the client. If the standby is unreachable, writes can be blocked. With asynchronous replication, the system leans toward availability, accepting the possibility that a failover will reveal a small data loss window.</p>
 
 <p class="text-gray-300 leading-relaxed">SQL Server's Always On Availability Groups offer the same spectrum. A synchronous-commit replica guarantees no data loss at failover but introduces latency on every write. An asynchronous-commit replica allows faster writes but accepts potential data loss measured in seconds or minutes depending on replication lag.</p>
 
@@ -80,18 +80,11 @@
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">Replication Architecture in PostgreSQL and SQL Server</h3>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Replication Architecture in SQL Server</h3>
 
-<p class="text-gray-300 leading-relaxed">Replication is the foundation of most distributed database deployments. Both PostgreSQL and SQL Server have mature replication subsystems, but they implement them differently, and choosing between replication topologies depends on the workload and failure model.</p>
+<p class="text-gray-300 leading-relaxed">Replication is the foundation of most distributed database deployments. SQL Server offers several replication types plus Availability Groups, and choosing between them depends on the workload and failure model.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL Streaming Replication</strong></p>
-
-<p class="text-gray-300 leading-relaxed">PostgreSQL's built-in replication is physical streaming replication. The primary server generates Write-Ahead Log (WAL) records for every data change. Standby servers connect to the primary, receive the WAL stream, and replay it against their own copy of the data. Because WAL operates at the block level, standbys receive an exact byte-for-byte replica of the primary's data files.</p>
-
-<p class="text-gray-300 leading-relaxed">This approach is reliable and straightforward, but it has constraints. A standby server must be at the same major PostgreSQL version. It inherits everything from the primary — all databases, all tables, all schemas — with no ability to replicate a subset. Read-only queries can be routed to standbys using <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">hot_standby = on</code>, but standbys cannot accept writes.</p>
-
-<p class="text-gray-300 leading-relaxed">Replication slots ensure that standbys do not fall so far behind that the primary discards WAL they still need. However, an abandoned slot with a lagging standby can cause WAL to accumulate indefinitely, filling the disk on the primary. This is one of the most common operational mistakes in PostgreSQL replication deployments.</p>
-
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Transactional replication</strong> is the workhorse for low-latency data propagation. The Log Reader Agent reads committed transactions from the publication database's transaction log and stores them in the distribution database; Distribution Agents then deliver those changes to subscribers. Unlike log-level replication, transactional replication is selective — specific tables, columns, or even filtered rows can be included in a publication. Monitor delivery latency in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">distribution.dbo.MSdistribution_status</code>:</p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Check replication distributor agent status and latency
 SELECT publisher_db,
@@ -104,14 +97,7 @@ SELECT publisher_db,
 FROM distribution.dbo.MSdistribution_status
 ORDER BY delivery_latency DESC;</code></pre>
 
-<p class="text-gray-300 leading-relaxed">Logical replication, introduced in PostgreSQL 10, provides a different model. Rather than replicating raw WAL blocks, logical replication decodes WAL into row-level change events (INSERT, UPDATE, DELETE) and streams those to subscribers. Subscribers can be different major versions of PostgreSQL, can replicate a single table or a filtered subset of tables, and can apply changes to databases with a different schema structure. This flexibility makes logical replication valuable for zero-downtime major version upgrades, cross-region data synchronization, and feeding data pipelines.</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server Replication and Availability Groups</strong></p>
-
-<p class="text-gray-300 leading-relaxed">SQL Server offers several replication types: snapshot, transactional, and merge. Transactional replication is the workhorse for low-latency data propagation. The Log Reader Agent reads committed transactions from the publication database's transaction log and stores them in the distribution database. Distribution Agents then deliver those changes to subscribers. Unlike PostgreSQL streaming replication, transactional replication can be selective — specific tables, columns, or even filtered rows can be included in a publication.</p>
-
-<p class="text-gray-300 leading-relaxed">Always On Availability Groups (AG) are the modern high-availability mechanism in SQL Server, functioning more like PostgreSQL streaming replication in that they replicate at the log block level. An AG groups databases together and synchronizes them to secondary replicas. Readable secondaries allow read workloads to be offloaded. Automatic failover can be configured for synchronous replicas within the same data center, while asynchronous replicas in remote data centers serve as disaster recovery targets.</p>
-
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Always On Availability Groups</strong> replicate at the log block level: an AG groups databases together and synchronizes them to secondary replicas. Readable secondaries allow read workloads to be offloaded via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ApplicationIntent=ReadOnly</code> routing. Automatic failover can be configured for synchronous replicas within the same data center, while asynchronous replicas in remote data centers serve as disaster recovery targets. Monitor send/redo queues per database per replica — growing queues are your early warning:</p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Check Always On AG replica health and synchronization lag
 SELECT ag.name AS ag_name,
@@ -135,8 +121,7 @@ JOIN sys.dm_hadr_database_replica_states adbs
     AND ars.replica_id = adbs.replica_id
 ORDER BY ag.name, ar.replica_server_name;</code></pre>
 
-
-<p class="text-gray-300 leading-relaxed">One important operational distinction: PostgreSQL streaming replication is built into the database engine and is free. SQL Server Always On Availability Groups require Enterprise Edition or, in limited form, Standard Edition. This cost consideration influences architecture decisions in cost-sensitive environments and should be factored into total cost of ownership calculations.</p>
+<p class="text-gray-300 leading-relaxed">One important operational distinction: Always On Availability Groups require Enterprise Edition or, in limited form, Standard Edition (basic AGs: one database per group, no readable secondaries). This cost consideration influences architecture decisions in cost-sensitive environments and should be factored into total cost of ownership calculations.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
@@ -151,49 +136,44 @@ ORDER BY ag.name, ar.replica_server_name;</code></pre>
 <p class="text-gray-300 leading-relaxed">Hash-based sharding distributes writes evenly, eliminating hotspots. The trade-off is that range queries must scatter to all shards, which increases latency and coordination overhead.</p>
 
 <div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
-    Client["Application"] --> Coordinator["Coordinator / Router\n(Citus coordinator, shard map)"]
-    Coordinator -->|shard key hash 0-33| Shard1[("Shard 1\nusers 1-1M")]
-    Coordinator -->|shard key hash 34-66| Shard2[("Shard 2\nusers 1M-2M")]
-    Coordinator -->|shard key hash 67-100| Shard3[("Shard 3\nusers 2M-3M")]
-    Coordinator -.->|cross-shard query:\nscatter-gather| Shard1
-    Coordinator -.-> Shard2
-    Coordinator -.-> Shard3</pre></div>
+    App["Application"] --> Router["Shard map / router\n(shard key → shard DB)"]
+    Router -->|customer_id 1-1M| Shard1[("Shard DB 1")]
+    Router -->|customer_id 1M-2M| Shard2[("Shard DB 2")]
+    Router -->|customer_id 2M-3M| Shard3[("Shard DB 3")]
+    Router -.->|cross-shard query:\nscatter-gather| Shard1
+    Router -.-> Shard2
+    Router -.-> Shard3</pre></div>
 
 <p class="text-gray-300 leading-relaxed">*Figure: A sharded architecture — the coordinator routes single-shard-key queries directly to the owning shard, but a query without a shard-key filter must scatter to every shard and gather results.*</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL and Sharding</strong></p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Sharding with SQL Server: the Shard-Map Pattern</strong></p>
 
-<p class="text-gray-300 leading-relaxed">PostgreSQL does not have built-in sharding in the same way it has built-in replication. Declarative table partitioning, introduced in PostgreSQL 10 and significantly improved through version 14 and beyond, handles partitioning within a single instance. Postgres Foreign Data Wrappers (FDW) with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">postgres_fdw</code> can make remote tables appear local, enabling a primitive form of manual sharding, but this lacks sophisticated query planning across shards.</p>
+<p class="text-gray-300 leading-relaxed">SQL Server has no native sharding, so sharded designs use the <strong class="text-white">shard-map pattern</strong>: a small metadata database maps each shard-key range to a shard database, and the application (or data-access library) resolves the shard per request. Azure SQL's Elastic Database client library implements this with shard maps, and elastic jobs run schema changes and maintenance across all shards. The honest guidance stands: you probably don't need sharding — a single well-tuned primary handles enormous write throughput, and most systems never reach its limit.</p>
 
-<p class="text-gray-300 leading-relaxed">For genuine distributed sharding, the ecosystem relies on third-party solutions: Citus (now part of the Microsoft ecosystem but still open source), which transforms PostgreSQL into a sharded distributed database; Patroni for HA coordination; and PgBouncer for connection pooling across shards.</p>
+<p class="text-gray-300 leading-relaxed">When you do shard, the shard key is the entire design. Every hot-path query must filter on the shard key so it resolves to exactly one shard; queries that can't are scatter-gather across all shards and don't scale. Co-locate related tables on the same key (orders and order_items both sharded by customer_id) so joins stay single-shard. And design for re-sharding from day one — a split/merge procedure that moves a key range to a new shard — because your initial shard boundaries will be wrong.</p>
 
-<p class="text-gray-300 leading-relaxed">Citus distributes tables across worker nodes using a distribution column. When a query filters on that column, Citus routes it to the correct shard. When the query touches multiple shards or must join distributed tables, Citus coordinates parallel execution across workers.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">T-SQL shard-map example:</strong></p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL (with declarative partitioning as a foundation for sharding logic):</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Create a range-partitioned table suitable for per-shard attachment via FDW
-CREATE TABLE orders (
-    order_id     BIGINT NOT NULL,
-    customer_id  BIGINT NOT NULL,
-    order_date   DATE NOT NULL,
-    total_amount NUMERIC(12, 2),
-    status       TEXT
-) PARTITION BY RANGE (order_date);
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Shard map: which key ranges live on which shard database
+CREATE TABLE dbo.ShardMap (
+    ShardID      INT NOT NULL PRIMARY KEY,
+    ShardName    SYSNAME NOT NULL,   -- connection target for this shard
+    KeyRangeLow  BIGINT NOT NULL,
+    KeyRangeHigh BIGINT NOT NULL,
+    IsOnline     BIT NOT NULL DEFAULT (1)
+);
 
--- Create individual partitions (in a sharded setup, each would live on a different node via FDW)
-CREATE TABLE orders_2023 PARTITION OF orders
-    FOR VALUES FROM ('2023-01-01') TO ('2024-01-01');
+-- Resolve the shard for a customer (called by the data-access layer)
+CREATE FUNCTION dbo.GetShardForCustomer(@CustomerID BIGINT)
+RETURNS SYSNAME
+AS BEGIN
+    RETURN (SELECT TOP (1) ShardName
+            FROM dbo.ShardMap
+            WHERE @CustomerID BETWEEN KeyRangeLow AND KeyRangeHigh
+              AND IsOnline = 1);
+END;</code></pre>
 
-CREATE TABLE orders_2024 PARTITION OF orders
-    FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
 
-CREATE TABLE orders_2025 PARTITION OF orders
-    FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
-
--- Verify partition pruning is applied (only relevant partition scanned)
-EXPLAIN ANALYZE
-SELECT * FROM orders
-WHERE order_date BETWEEN '2024-03-01' AND '2024-06-30'
-  AND customer_id = 42;</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server and Sharding</strong></p>
 
@@ -252,12 +232,9 @@ ORDER BY p.partition_number;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">2PC has well-known problems in the presence of failures. If the coordinator crashes after all participants have prepared but before the commit message is sent, participants are left in a blocking state — they hold locks but cannot release them without instruction from the coordinator. This is called the in-doubt transaction problem. It can cause deadlocks and requires manual DBA intervention to resolve.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL Prepared Transactions</strong></p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">In-Doubt Transactions and MSDTC Recovery</strong></p>
 
-<p class="text-gray-300 leading-relaxed">PostgreSQL supports prepared transactions natively via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">PREPARE TRANSACTION</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">COMMIT PREPARED</code> / <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ROLLBACK PREPARED</code>. These are the building blocks for external 2PC coordinators to use.</p>
-
-
-<p class="text-gray-300 leading-relaxed">In-doubt transactions visible in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_prepared_xacts</code> that are hours or days old are a red flag. If the coordinator that created them is permanently gone, the DBA must determine the correct outcome from application logs and manually commit or roll back each one.</p>
+<p class="text-gray-300 leading-relaxed">The failure mode that pages DBAs is the in-doubt transaction: the coordinator crashed after prepare but before the commit decision reached every participant, leaving locks held indefinitely. In <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_tran_active_transactions</code> these show a non-null <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dtc_state</code> that never advances. The MSDTC coordinator normally recovers them on restart by replaying its log — so the first response is to check whether the coordinator host is actually down, not to kill things. If the coordinator is permanently gone, the DBA must determine the correct outcome from application logs and resolve each transaction manually; there is no safe automatic choice between commit and rollback, which is exactly why 2PC is a last resort.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server Distributed Transactions</strong></p>
 
@@ -297,9 +274,9 @@ WHERE is_enlisted = 1;</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Monitoring Replication Lag</strong></p>
 
-<p class="text-gray-300 leading-relaxed">In any replicated system, lag — the delay between a write on the primary and its application on a replica — is the primary operational metric. A replica that has fallen behind by seconds is usually acceptable. A replica that has fallen behind by hours is a disaster waiting for a failover event to expose it. Both PostgreSQL and SQL Server provide views to monitor this, and both should be feeding alerting systems continuously.</p>
+<p class="text-gray-300 leading-relaxed">In any replicated system, lag — the delay between a write on the primary and its application on a replica — is the primary operational metric. A replica that has fallen behind by seconds is usually acceptable. A replica that has fallen behind by hours is a disaster waiting for a failover event to expose it. <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_hadr_database_replica_states</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_hadr_availability_replica_states</code> expose it continuously, and both should be feeding alerting systems.</p>
 
-<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_replication</code> view on PostgreSQL (shown earlier) exposes the LSN positions of every connected standby. The difference between the primary's current WAL position and a standby's replay LSN is the lag, expressed in bytes. Dividing this by the replication rate gives an estimate in time, though replication rate is variable.</p>
+<p class="text-gray-300 leading-relaxed">SQL Server's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_hadr_database_replica_states</code> exposes <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">log_send_queue_size</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">redo_queue_size</code> per database per replica — the lag in bytes. Dividing by <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">log_send_rate</code> / <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">redo_rate</code> estimates the lag in time, though replication rate is variable; alert on the byte counts directly, since they don't lie.</p>
 
 <p class="text-gray-300 leading-relaxed">SQL Server's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_hadr_database_replica_states</code> exposes <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">log_send_queue_size</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">redo_queue_size</code> for AG replicas. These are the backlog of redo waiting to be sent and the backlog waiting to be applied, respectively. Both should be close to zero in a healthy deployment.</p>
 
@@ -309,11 +286,11 @@ WHERE is_enlisted = 1;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Preventing split-brain requires fencing — a mechanism that guarantees the old primary cannot accept writes after a new one has been promoted. Common approaches include:</p>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **STONITH (Shoot The Other Node In The Head)**: Physically power off or network-isolate the old primary before promotion proceeds. Used in Linux Pacemaker clusters with PostgreSQL.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Lease-based fencing**: The primary holds a time-limited lease from a consensus system (like etcd or ZooKeeper). Patroni, the most widely deployed PostgreSQL HA solution, uses this approach. If the primary cannot renew its lease, it fences itself by stopping write acceptance.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Node isolation via WSFC**: the cluster service fences the failed node so it cannot accept writes; a former primary that recovers without quorum stays offline rather than coming back as a rogue primary.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Lease-based fencing**: The primary holds a time-limited lease; if it cannot renew, it fences itself by stopping write acceptance. AGs achieve the same effect through quorum — a primary that loses quorum takes its databases offline rather than accepting writes it can't replicate.</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Quorum-based failover**: SQL Server's Windows Server Failover Cluster (WSFC) uses quorum — a majority of cluster nodes must agree before a failover proceeds. If quorum is lost, the cluster stops operations rather than risk split-brain.</li>
 
-<p class="text-gray-300 leading-relaxed">Patroni's architecture is worth understanding in detail because it represents production-grade PostgreSQL HA. Patroni uses etcd, Consul, or ZooKeeper as a distributed consensus store. The current primary continuously updates a key in that store. If the primary fails to update the key within a configurable TTL, standby nodes race to acquire the leader key. The winner promotes itself to primary. The loser becomes a standby of the new primary. The former primary, if it recovers, finds that it cannot acquire the leader key and fences itself by refusing connections. No human intervention is required for a clean failover, typically completing in 10–30 seconds.</p>
+<p class="text-gray-300 leading-relaxed">AG automatic failover is worth understanding in detail because it represents production-grade SQL Server HA. It requires synchronous commit, automatic failover configured on the replicas, and a healthy WSFC quorum. When the primary's heartbeat fails, the cluster verifies quorum majority, then the chosen synchronous secondary transitions to primary — typically completing in 10–30 seconds with no human intervention. The former primary, if it recovers, cannot accept writes: without quorum it stays offline, which is the fencing.</p>
 
 <p class="text-gray-300 leading-relaxed">SQL Server's Always On AG automatic failover uses WSFC quorum. The replica configured for automatic failover monitors the primary via a lease mechanism. If the primary lease expires and quorum exists, failover is triggered. The listener — a virtual network name that applications connect to — is updated to point to the new primary, and application connections are rerouted automatically.</p>
 
@@ -323,26 +300,9 @@ WHERE is_enlisted = 1;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Quorum resolves this: only the partition with a majority of nodes can elect a new primary. In a three-node cluster, a majority is two nodes. The partition containing two nodes can elect a new primary; the partition with one node cannot. The isolated node fences itself.</p>
 
-<p class="text-gray-300 leading-relaxed">DBAs must design cluster topology with odd numbers of voters to avoid tie-breaking problems. A two-node cluster with no external quorum witness cannot safely achieve automatic failover without split-brain risk, because each partition of one node cannot determine whether it has a majority. Adding a third node — or a lightweight quorum witness (an etcd node, a file share witness in WSFC, or Patroni's third etcd node) — breaks the tie and makes automatic failover safe.</p>
+<p class="text-gray-300 leading-relaxed">DBAs must design cluster topology with odd numbers of voters to avoid tie-breaking problems. A two-node cluster with no external quorum witness cannot safely achieve automatic failover without split-brain risk, because each partition of one node cannot determine whether it has a majority. Adding a third node — or a lightweight quorum witness (a file share witness or cloud witness in WSFC) — breaks the tie and makes automatic failover safe.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL: Checking for Network Partition Effects</strong></p>
-
-<p class="text-gray-300 leading-relaxed">When network instability occurs, replication connections may drop and reconnect repeatedly. The primary's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_replication</code> view will show standbys appearing and disappearing. A standby that is disconnected but not failed may also hold a replication slot open, preventing WAL cleanup.</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify inactive replication slots that may be accumulating WAL
-SELECT slot_name,
-       slot_type,
-       active,
-       active_pid,
-       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS wal_retained,
-       restart_lsn,
-       wal_status
-FROM pg_replication_slots
-WHERE active = FALSE
-ORDER BY pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) DESC;
-
--- Drop a slot that has become dangerously stale (confirm replica is gone first)
--- SELECT pg_drop_replication_slot('stale_slot_name');</code></pre>
+<p class="text-gray-300 leading-relaxed">In SQL Server, the same instability shows up in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_hadr_availability_replica_states</code>: replicas flap between CONNECTED and DISCONNECTED, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">last_connect_error_number</code> records the cause, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">synchronization_health_desc</code> degrades. A replica that can't be reached holds its log send queue — on the primary, watch <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">log_send_queue_size</code> grow as the backpressure signal. The diagnostic query in the SQL Server subsection below surfaces exactly this.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server: Detecting AG Communication Failures</strong></p>
 
@@ -372,17 +332,22 @@ ORDER BY ag.name, ar.replica_server_name;</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Read-Your-Writes (RYW)</strong>: A client that performs a write should always see that write in subsequent reads. This sounds obvious but breaks in distributed systems when reads are routed to a replica that has not yet applied the write. An e-commerce application where a user updates their shipping address and then immediately views their order — and sees the old address — has violated RYW. The fix is either to route reads for that session to the primary temporarily, or to track the write's LSN and ensure the replica has reached that LSN before serving the read.</p>
 
-<p class="text-gray-300 leading-relaxed">PostgreSQL provides <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_current_wal_lsn()</code> on the primary and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_last_wal_replay_lsn()</code> on standbys. Application-level RYW logic can capture the LSN at write time and wait until a chosen replica reaches that LSN before redirecting reads.</p>
+<p class="text-gray-300 leading-relaxed">For application-level read-your-writes, capture the primary's commit time at write time and poll the secondary's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">last_commit_time</code> in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_hadr_database_replica_states</code> until it catches up before redirecting reads there — or simpler, route read-after-write requests to the primary for a short window.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- On standby: wait until the replica has replayed past a given LSN
--- pg_wal_lsn_diff returns 0 or negative when standby has caught up
-SELECT pg_wal_lsn_diff('0/1A3F2C0'::pg_lsn, pg_last_wal_replay_lsn()) AS bytes_behind;</code></pre>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- On a secondary: how far behind is this replica right now?
+SELECT DB_NAME(database_id) AS db_name,
+       log_send_queue_size AS send_queue_kb,
+       redo_queue_size AS redo_queue_kb,
+       last_commit_time
+FROM sys.dm_hadr_database_replica_states
+WHERE is_local = 1
+  AND is_primary_replica = 0;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">SQL Server readable secondaries face the same challenge. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_hadr_database_replica_states</code> view exposes <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">last_received_lsn</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">last_hardened_lsn</code>, which can be used to implement similar application-level RYW logic.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Monotonic Reads</strong>: A client should not observe older data after having observed newer data. If a user refreshes a page and their query is routed to different replicas on each refresh, and one replica is slightly behind the other, the user might see a post appear and then disappear on the next refresh. Sticky session routing — always routing a given user's reads to the same replica — is the simplest mitigation, at the cost of uneven load distribution.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Causal Consistency</strong>: A stronger property than eventual consistency but weaker than strong consistency. If operation B depends causally on operation A, any client that observes B must also observe A. Distributed systems that implement vector clocks or hybrid logical clocks can track causality and ensure that reads never violate causal ordering. CockroachDB and YugabyteDB (both PostgreSQL-compatible distributed databases) implement causal consistency at the engine level. PostgreSQL itself, when used with a single primary, provides full linearizability for transactions on that primary; it is only in the multi-primary or replica-read path that these weaker consistency models become relevant.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Causal Consistency</strong>: A stronger property than eventual consistency but weaker than strong consistency. If operation B depends causally on operation A, any client that observes B must also observe A. Distributed systems that implement vector clocks or hybrid logical clocks can track causality and ensure that reads never violate causal ordering. SQL Server, when used with a single primary, provides full linearizability for transactions on that primary; it is only in the replica-read path that these weaker consistency models become relevant — which is why read-your-writes routing matters for user-facing reads after writes.</p>
 
 <p class="text-gray-300 leading-relaxed">DBAs rarely need to implement causal consistency infrastructure themselves, but they need to understand it well enough to evaluate claims made by middleware vendors and to diagnose application bugs that manifest as "data flickering" or "ghost writes."</p>
 
@@ -402,7 +367,7 @@ SELECT pg_wal_lsn_diff('0/1A3F2C0'::pg_lsn, pg_last_wal_replay_lsn()) AS bytes_b
 
 <p class="text-gray-300 leading-relaxed">The simplest model is a single primary in one region with asynchronous replicas in other regions. Reads from distant regions are served locally; writes always travel to the primary region. This introduces write latency proportional to the round-trip time between the user's region and the primary region. For a user in Singapore writing to a primary in Virginia, that round trip can exceed 200 milliseconds — acceptable for some workloads, unacceptable for others.</p>
 
-<p class="text-gray-300 leading-relaxed">PostgreSQL achieves this with streaming replication across regions. The primary is in one availability zone or data center; standbys in each remote region connect and replay WAL. A connection pooler or load balancer in each region routes read queries to the local standby and write queries to the primary.</p>
+<p class="text-gray-300 leading-relaxed">Tune the tradeoff per replica: synchronous commit within a region for zero data loss, asynchronous across regions for latency — and treat the async replica's send queue as your RPO meter. A listener or traffic manager in each region routes reads to the local secondary and writes to the primary.</p>
 
 <p class="text-gray-300 leading-relaxed">SQL Server achieves the same with AG replicas distributed across Azure regions or on-premises data centers. The readable secondary in each region serves local reads; the primary handles all writes.</p>
 
@@ -410,7 +375,7 @@ SELECT pg_wal_lsn_diff('0/1A3F2C0'::pg_lsn, pg_last_wal_replay_lsn()) AS bytes_b
 
 <p class="text-gray-300 leading-relaxed">The more ambitious architecture is active-active: each region can accept writes. This eliminates write latency for all users but introduces the hardest problem in distributed databases — multi-master conflict resolution. Two users in different regions modifying the same row simultaneously will produce a conflict that the system must detect and resolve.</p>
 
-<p class="text-gray-300 leading-relaxed">PostgreSQL does not natively support active-active multi-master replication. The ecosystem solutions are BDR (Bi-Directional Replication), provided by EDB (EnterpriseDB), and Citus. BDR implements last-write-wins (LWW) conflict resolution by default, with hooks for custom conflict handlers. It uses logical replication extended to propagate changes in both directions between nodes. Conflicts are detected by comparing transaction timestamps from a clock synchronization layer.</p>
+<p class="text-gray-300 leading-relaxed">SQL Server has no native multi-master: the supported patterns are conflict-avoidance designs — shard-per-region (each region owns its writes), or distributed availability groups with a single global primary. True active-active with conflict resolution belongs in the application layer, not the database.</p>
 
 <p class="text-gray-300 leading-relaxed">SQL Server has no native active-active multi-master replication for OLTP workloads either. Merge replication, an older feature, implements a form of it with conflict resolution rules, but it has well-known scalability limitations and is generally not recommended for high-throughput systems. Azure Cosmos DB, Microsoft's globally distributed NoSQL database, was built from the ground up for multi-master with configurable consistency levels, but it is a different product and data model.</p>
 
@@ -428,25 +393,31 @@ SELECT pg_wal_lsn_diff('0/1A3F2C0'::pg_lsn, pg_last_wal_replay_lsn()) AS bytes_b
 
 <p class="text-gray-300 leading-relaxed">In a distributed database, the query planner faces a problem that does not exist in a single-node system: data needed for a join might reside on a different node, and retrieving it requires a network transfer. This transfer — called a data shuffle or broadcast — is often the dominant cost in distributed queries.</p>
 
-<p class="text-gray-300 leading-relaxed">Citus (PostgreSQL) and Azure Synapse Analytics (SQL Server's distributed analytics engine) both implement distributed query planners that optimize this problem. The key insight is co-location: if two tables are distributed by the same column and their shard keys match, a join between them can be executed entirely on individual worker nodes without any data transfer. If they are not co-located, the planner must choose between broadcasting the smaller table to all workers or redistributing one table by the join key.</p>
+<p class="text-gray-300 leading-relaxed">Azure Synapse Analytics (SQL Server's distributed analytics engine) implements a distributed query planner that optimizes this problem. The key insight is co-location: if two tables are distributed by the same column and their shard keys match, a join between them can be executed entirely on individual worker nodes without any data transfer. If they are not co-located, the planner must choose between broadcasting the smaller table to all workers or redistributing one table by the join key.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Citus co-location example:</strong></p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Synapse distribution example:</strong></p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Distribute orders and order_items on customer_id so joins are co-located
-SELECT create_distributed_table('orders', 'customer_id');
-SELECT create_distributed_table('order_items', 'customer_id', colocate_with =&gt; 'orders');
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Hash-distribute both tables on customer_id: joins stay local per distribution
+CREATE TABLE dbo.orders
+WITH (DISTRIBUTION = HASH(customer_id))
+AS SELECT * FROM staging.orders;
 
--- This join executes locally on each shard — no cross-node data movement
-SELECT o.order_id,
-       o.order_date,
+CREATE TABLE dbo.order_items
+WITH (DISTRIBUTION = HASH(customer_id))
+AS SELECT * FROM staging.order_items;
+
+-- This join executes locally on each distribution - no cross-node data movement
+SELECT o.order_id, o.order_date,
        SUM(oi.quantity * oi.unit_price) AS total
-FROM orders o
-JOIN order_items oi ON o.order_id = oi.order_id
-                    AND o.customer_id = oi.customer_id
+FROM dbo.orders o
+JOIN dbo.order_items oi ON o.order_id = oi.order_id
+                       AND o.customer_id = oi.customer_id
 WHERE o.customer_id = 98765
 GROUP BY o.order_id, o.order_date;</code></pre>
 
-<p class="text-gray-300 leading-relaxed">When queries cannot be co-located — for example, a report that aggregates across all customers — Citus parallelizes execution across all workers and merges results on the coordinator. The coordinator becomes the bottleneck for such queries, which is why distributed OLTP systems require careful schema design to ensure the hot path (per-customer or per-tenant operations) is always co-located.</p>
+
+
+<p class="text-gray-300 leading-relaxed">When queries cannot be co-located — for example, a report that aggregates across all customers — Synapse parallelizes execution across all distributions and merges results on the control node. The coordinator becomes the bottleneck for such queries, which is why distributed OLTP systems require careful schema design to ensure the hot path (per-customer or per-tenant operations) is always co-located.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server Distributed Query via Linked Servers and PolyBase</strong></p>
 
@@ -486,7 +457,7 @@ WHERE OrderDate &gt;= '2024-01-01'
 GROUP BY CustomerID
 ORDER BY revenue DESC;</code></pre>
 
-<p class="text-gray-300 leading-relaxed">The consistent theme across both platforms is that distributed query processing requires the DBA and data architect to deeply understand where data lives and to design schemas and query patterns that minimize cross-node data movement. Treating a distributed system as if it were a single node — writing queries without regard to data locality — consistently produces the worst possible performance outcomes.</p>
+<p class="text-gray-300 leading-relaxed">The consistent theme is that distributed query processing requires the DBA and data architect to deeply understand where data lives and to design schemas and query patterns that minimize cross-node data movement. Treating a distributed system as if it were a single node — writing queries without regard to data locality — consistently produces the worst possible performance outcomes.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
@@ -506,22 +477,27 @@ ORDER BY revenue DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Contract</strong>: Once all application code has been updated to write to the new column and all existing rows have been backfilled, add constraints, set defaults, or drop old columns.</p>
 
-<p class="text-gray-300 leading-relaxed">PostgreSQL's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALTER TABLE ... ADD COLUMN</code> with a default value that requires a table rewrite was historically a long-blocking operation. Since PostgreSQL 11, adding a column with a non-volatile default does not require a table rewrite and takes only a brief lock. This makes expand operations much faster. However, adding a NOT NULL constraint without a default still requires scanning the entire table.</p>
+<p class="text-gray-300 leading-relaxed">SQL Server's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALTER TABLE ... ADD COLUMN</code> with a default is a metadata-only operation — the default is stored, not written to every row — which makes expand operations fast. However, adding a NOT NULL constraint without a default still scans the entire table: add the column nullable, backfill in batches, then alter to NOT NULL.</p>
 
-<p class="text-gray-300 leading-relaxed">Tools like <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_repack</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pglogical</code>-based online migrations are commonly used in Citus or manual sharding deployments to apply schema changes with minimal downtime.</p>
+<p class="text-gray-300 leading-relaxed">For large tables, ONLINE index rebuilds and resumable operations apply schema changes with minimal downtime; in sharded deployments, roll the change out shard by shard behind the shard map so a bad migration can be halted before it reaches every shard.</p>
 
 <p class="text-gray-300 leading-relaxed">SQL Server offers <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALTER TABLE ... ADD</code> for new nullable columns as a metadata-only operation, similarly fast. Adding constraints, however, can require full table scans. <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WITH NOCHECK</code> defers constraint validation, allowing the schema change to complete quickly while accepting that existing data has not been validated — a trade-off that must be explicitly acknowledged and managed.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: Add column safely (metadata-only if default is immutable, PG11+)
-ALTER TABLE orders ADD COLUMN shipping_region TEXT DEFAULT 'UNASSIGNED';
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: add a NOT NULL column to a large table without a long blocking scan
+-- Step 1: add as nullable (metadata-only)
+ALTER TABLE dbo.orders ADD priority_level INT NULL;
 
--- Add NOT NULL constraint without full scan by using a check constraint trick
--- Step 1: Add as nullable first
-ALTER TABLE orders ADD COLUMN priority_level INT;
--- Step 2: Set constraint as NOT VALID (applies to new rows only, no full scan)
-ALTER TABLE orders ADD CONSTRAINT chk_priority_not_null CHECK (priority_level IS NOT NULL) NOT VALID;
--- Step 3: Validate existing rows in a separate operation (takes ShareUpdateExclusiveLock, not AccessExclusiveLock)
-ALTER TABLE orders VALIDATE CONSTRAINT chk_priority_not_null;</code></pre>
+-- Step 2: backfill in batches to avoid log explosion
+WHILE (1 = 1)
+BEGIN
+    UPDATE TOP (10000) dbo.orders
+    SET priority_level = 0
+    WHERE priority_level IS NULL;
+    IF @@ROWCOUNT = 0 BREAK;
+END;
+
+-- Step 3: enforce NOT NULL once no nulls remain
+ALTER TABLE dbo.orders ALTER COLUMN priority_level INT NOT NULL;</code></pre>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: Add nullable column (metadata-only, no table rebuild)
 ALTER TABLE dbo.Orders ADD ShippingRegion NVARCHAR(100) NULL DEFAULT 'UNASSIGNED';
@@ -543,27 +519,30 @@ ALTER TABLE dbo.Orders WITH CHECK CHECK CONSTRAINT chk_PriorityNotNull;</code></
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Distributed Tracing</strong></p>
 
-<p class="text-gray-300 leading-relaxed">In a distributed application, a single user request may touch a connection pooler, the coordinator node of a Citus cluster, multiple worker nodes, and then an application server. Understanding the latency breakdown requires distributed tracing — each component emitting spans that can be correlated by a shared trace ID. OpenTelemetry is the emerging standard for this. PostgreSQL itself does not yet emit OpenTelemetry spans natively, but instrumentation can be added at the connection pooler layer (PgBouncer, pgcat) and at the application layer.</p>
+<p class="text-gray-300 leading-relaxed">In a distributed application, a single user request may touch a connection pool, the shard router, multiple shard databases, and then an application server. Understanding the latency breakdown requires distributed tracing — each component emitting spans that can be correlated by a shared trace ID. OpenTelemetry is the emerging standard for this: instrument at the driver/pooler layer and the application layer, and use Extended Events and Query Store for the database-side spans.</p>
 
 <p class="text-gray-300 leading-relaxed">SQL Server in Azure emits distributed tracing telemetry through Azure Monitor and Application Insights. On-premises, SQL Server Extended Events can capture query execution at each node, and correlation can be done by matching session IDs and timestamps, though this is considerably more manual.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Centralized Log Aggregation</strong></p>
 
-<p class="text-gray-300 leading-relaxed">Every node in a distributed database cluster must ship its logs to a central store. Elasticsearch, Loki, or a SIEM platform are common targets. Structured logging — JSON-formatted log lines with consistent field names — makes cross-node correlation possible. PostgreSQL's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">log_line_prefix</code> should include <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">%t</code> (timestamp), <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">%p</code> (PID), <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">%a</code> (application name), and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">%d</code> (database name) at minimum. In a distributed deployment, adding the hostname is essential.</p>
+<p class="text-gray-300 leading-relaxed">Every node in a distributed database cluster must ship its logs to a central store. Elasticsearch, Loki, or a SIEM platform are common targets. Structured logging — JSON-formatted log lines with consistent field names — makes cross-node correlation possible. Ensure every node's Error Log and XEvent output is tagged with timestamp, hostname, and application name at minimum. In a distributed deployment, the hostname tag is essential — without it, cross-node correlation is guesswork.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># postgresql.conf: structured log prefix for distributed environments
-log_line_prefix = '{"time":"%t","pid":%p,"user":"%u","db":"%d","app":"%a","host":"%h"} '</code></pre>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Ship each node's SQL Server Error Log with a host tag (Filebeat example)
+filebeat.inputs:
+- type: log
+  paths: ['C:\Program Files\Microsoft SQL Server\MSSQL*\MSSQL\Log\ERRORLOG*']
+  fields: { host.name: 'sql-node-01', log.type: 'sql-errorlog' }</code></pre>
 
 <p class="text-gray-300 leading-relaxed">SQL Server's default logging to the Windows Event Log is insufficient for distributed deployments. Configuring SQL Server Agent alerts to ship critical events to a centralized SIEM, combined with shipping XEvent trace files to a central repository, provides the necessary visibility.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Metrics and Alerting</strong></p>
 
-<p class="text-gray-300 leading-relaxed">Prometheus with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">postgres_exporter</code> is the standard metrics pipeline for PostgreSQL clusters. In a distributed deployment, each node — primary, standbys, Citus workers — runs its own exporter. Prometheus scrapes all exporters; Grafana provides dashboards that display per-node metrics side by side. Key metrics to alert on:</p>
+<p class="text-gray-300 leading-relaxed">A Prometheus exporter (or Azure Monitor / a third-party agent) is the standard metrics pipeline for SQL Server clusters. In a distributed deployment, each node — primary, secondaries — runs its own collector. Prometheus scrapes all exporters; Grafana provides dashboards that display per-node metrics in one view. Key metrics to alert on:</p>
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Replication lag (bytes and estimated seconds) per standby</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> WAL generation rate on the primary</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Replication slot WAL retention (to catch runaway slots)</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Connection count vs. `max_connections` per node</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Transaction log generation rate on the primary</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Log send queue size per secondary (to catch a replica falling behind)</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Connection count vs. worker-thread pressure per node</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Lock wait events and deadlock rates</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Query percentile latencies (p50, p95, p99) per node and per query fingerprint</li>
 
@@ -575,11 +554,7 @@ log_line_prefix = '{"time":"%t","pid":%p,"user":"%u","db":"%d","app":"%a","host"
 
 <p class="text-gray-300 leading-relaxed">The operational burden of running a distributed database — configuring replication, managing failover, handling schema changes across shards, setting up observability — is substantial. For many organizations, managed cloud database services transfer much of that burden to the cloud provider.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">For PostgreSQL workloads</strong>, the managed options include:</p>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Amazon Aurora for PostgreSQL**: A distributed storage layer that replicates six copies of data across three Availability Zones, with a PostgreSQL-compatible compute layer. Aurora handles storage replication transparently; the DBA manages the compute instances and read replica routing.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Google Cloud Spanner**: A globally distributed, strongly consistent database with a PostgreSQL interface. Spanner uses TrueTime (GPS- and atomic-clock-based time synchronization) to achieve external consistency without sacrificing global write throughput. It abstracts all sharding and replication from the operator.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Azure Database for PostgreSQL – Flexible Server**: Provides HA with zone-redundant standby, automated backups, and read replicas. Less complex than self-managed Citus but less horizontally scalable.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **CockroachDB and YugabyteDB**: PostgreSQL-compatible distributed databases built from the ground up for horizontal scale with strong consistency. They handle sharding, replication, and distributed transaction coordination internally.</li>
+<p class="text-gray-300 leading-relaxed">For SQL Server workloads, the managed options span a spectrum: <strong class="text-white">Azure SQL Database Hyperscale</strong> for storage-compute separation with fast failover, <strong class="text-white">elastic pools</strong> for multi-tenant SaaS scale, and <strong class="text-white">Azure SQL Managed Instance</strong> for near-on-premises parity (including AG-like HA) without managing the cluster. Choose by control needs: Hyperscale for elastic growth, Managed Instance for lift-and-shift with minimal re-architecture.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">For SQL Server workloads</strong>, the primary managed options include:</p>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Azure SQL Database**: Offers built-in HA, geo-redundant backups, active geo-replication, and auto-failover groups. The Business Critical tier replicates across three nodes using an Always On AG under the hood, transparently managed.</li>
@@ -593,18 +568,18 @@ log_line_prefix = '{"time":"%t","pid":%p,"user":"%u","db":"%d","app":"%a","host"
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Distribution is driven by specific pressures** — storage limits, read throughput, write throughput, and availability requirements — and the right architecture depends on which pressure is dominant. Applying full horizontal sharding to solve a read-scale problem is over-engineering; using a simple read replica set when writes exceed single-node capacity is under-engineering.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Replication is the foundation of every distributed PostgreSQL and SQL Server deployment**, but replication type — physical vs. logical in PostgreSQL, transactional vs. AG-based in SQL Server — determines what operations are possible, what consistency guarantees apply, and what the operational overhead looks like. Choosing the wrong replication model creates constraints that are expensive to reverse.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Replication is the foundation of every distributed SQL Server deployment**, but replication type — transactional vs. AG-based — determines what operations are possible, what consistency guarantees apply, and what the operational overhead looks like. Choosing the wrong replication model creates constraints that are expensive to reverse.</li>
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Distributed transactions via two-phase commit carry significant performance costs** and introduce failure modes — in-doubt transactions, coordinator crashes — that require operational procedures beyond normal database administration. Where throughput demands are high, alternative patterns (sagas, event sourcing, compensating transactions) are often preferable to 2PC.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Split-brain prevention through fencing is non-negotiable** in any system with automatic failover. A distributed database architecture that cannot guarantee fencing will eventually experience a split-brain event, and the data divergence that results is among the most costly incidents a database team can face. Quorum-based solutions (Patroni with etcd, WSFC with quorum) are the standard approach.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Split-brain prevention through fencing is non-negotiable** in any system with automatic failover. A distributed database architecture that cannot guarantee fencing will eventually experience a split-brain event, and the data divergence that results is among the most costly incidents a database team can face. Quorum-based solutions (WSFC with quorum) are the standard approach.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Observability in distributed systems requires centralized log aggregation, unified metrics collection across all nodes, and an understanding of per-node health that goes beyond what single-instance monitoring provides.** Replication lag, WAL retention by replication slots, cross-node query latency, and schema migration status across all nodes must be continuously monitored and alerted upon. The invisible failure — a replica quietly falling behind, a stale replication slot slowly filling the disk — is the distributed system's most insidious threat.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Observability in distributed systems requires centralized log aggregation, unified metrics collection across all nodes, and an understanding of per-node health that goes beyond what single-instance monitoring provides.** Replication lag, log send/redo queue growth, cross-node query latency, and schema migration status across all nodes must be continuously monitored and alerted upon. The invisible failure — a replica quietly falling behind, an unconsumed change feed slowly filling the disk — is the distributed system's most insidious threat.</li>
     </div>
     <div class="mt-14 bg-blue-950/40 border border-blue-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
-        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · SQL Server</p>
       </div>
       <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
          class="shrink-0 px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded-xl text-sm transition">
