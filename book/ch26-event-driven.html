@@ -79,24 +79,7 @@
 
 <p class="text-gray-300 leading-relaxed">*Figure: The transactional outbox pattern — the business write and the event write commit atomically in one transaction, and a separate relay process forwards the event to the broker only after commit.*</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL outbox table
-CREATE TABLE event_outbox (
-    id            BIGSERIAL PRIMARY KEY,
-    aggregate_id  TEXT        NOT NULL,
-    aggregate_type TEXT       NOT NULL,
-    event_type    TEXT        NOT NULL,
-    payload       JSONB       NOT NULL,
-    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    processed_at  TIMESTAMPTZ,
-    retry_count   INT         NOT NULL DEFAULT 0
-);
 
-CREATE INDEX idx_outbox_unprocessed
-    ON event_outbox (created_at)
-    WHERE processed_at IS NULL;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server outbox table
 CREATE TABLE event_outbox (
     id             BIGINT IDENTITY(1,1) PRIMARY KEY,
@@ -115,30 +98,7 @@ CREATE INDEX idx_outbox_unprocessed
 
 <p class="text-gray-300 leading-relaxed">Within application code, the business insert and the outbox insert share a transaction:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: atomic business write + event emission
-BEGIN;
 
-INSERT INTO orders (customer_id, total_amount, status)
-VALUES ($1, $2, 'pending')
-RETURNING id INTO TEMP TABLE new_order;
-
-INSERT INTO event_outbox (aggregate_id, aggregate_type, event_type, payload)
-SELECT
-    id::TEXT,
-    'Order',
-    'OrderPlaced',
-    jsonb_build_object(
-        'order_id',     id,
-        'customer_id',  $1,
-        'total_amount', $2,
-        'occurred_at',  NOW()
-    )
-FROM new_order;
-
-COMMIT;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: atomic business write + event emission
 BEGIN TRANSACTION;
 
@@ -184,34 +144,6 @@ COMMIT TRANSACTION;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">To use logical decoding, the server must have <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">wal_level = logical</code> set in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">postgresql.conf</code>. This is now the default in PostgreSQL 15 and above.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: create a logical replication slot using the pgoutput plugin
-SELECT pg_create_logical_replication_slot(
-    'orders_cdc_slot',
-    'pgoutput'
-);
-
--- Peek at changes without advancing the slot (useful for testing)
-SELECT *
-FROM pg_logical_slot_peek_changes(
-    'orders_cdc_slot',
-    NULL,
-    NULL,
-    'proto_version', '1',
-    'publication_names', 'orders_publication'
-);
-
--- Create a publication for specific tables
-CREATE PUBLICATION orders_publication
-FOR TABLE orders, order_items;
-
--- Check slot lag — critical for monitoring
-SELECT
-    slot_name,
-    database,
-    active,
-    pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn) AS lag_bytes
-FROM pg_replication_slots;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Slot lag is the single most important metric in any logical replication setup. When a consumer falls behind, the WAL files it hasn't yet processed cannot be deleted. Unchecked slot lag can fill your disk and crash the primary. Every production deployment using logical replication slots should alert when lag exceeds a threshold — typically a few hundred megabytes in a busy system — and should drop the slot if the consumer has been absent for more than a few hours.</p>
 
@@ -219,7 +151,7 @@ FROM pg_replication_slots;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">SQL Server's CDC feature captures changes to specified tables by reading the transaction log and writing them into a set of system-maintained change tables. It's enabled at the database level and then per table.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: enable CDC on the database
 EXEC sys.sp_cdc_enable_db;
 
@@ -270,26 +202,6 @@ FROM cdc.fn_cdc_get_all_changes_dbo_orders(
 
 <p class="text-gray-300 leading-relaxed">A trigger on the outbox table can fire the notification automatically:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: trigger-based NOTIFY on outbox insert
-CREATE OR REPLACE FUNCTION notify_outbox_insert()
-RETURNS TRIGGER LANGUAGE plpgsql AS $$
-BEGIN
-    PERFORM pg_notify(
-        'outbox_event',
-        json_build_object(
-            'id',          NEW.id,
-            'event_type',  NEW.event_type,
-            'aggregate_id', NEW.aggregate_id
-        )::TEXT
-    );
-    RETURN NEW;
-END;
-$$;
-
-CREATE TRIGGER trg_notify_outbox
-AFTER INSERT ON event_outbox
-FOR EACH ROW EXECUTE FUNCTION notify_outbox_insert();</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The relay subscribes with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">LISTEN outbox_event</code> and blocks until a notification arrives, then immediately polls the outbox for unprocessed rows. This hybrid approach — outbox for durability, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">NOTIFY</code> for low latency — is robust and elegant.</p>
 
@@ -301,7 +213,7 @@ FOR EACH ROW EXECUTE FUNCTION notify_outbox_insert();</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Service Broker models communication as conversations between services, each backed by queues. The setup is verbose by modern standards, but the guarantees are strong.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: minimal Service Broker setup for event notifications
 -- Enable Service Broker on the database
 ALTER DATABASE OrdersDB SET ENABLE_BROKER WITH ROLLBACK IMMEDIATE;
@@ -359,18 +271,7 @@ FROM OrderEventQueue;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Idempotency strategies include: tracking processed event IDs in a table and skipping duplicates; using upsert semantics (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">INSERT ... ON CONFLICT DO UPDATE</code> in PostgreSQL, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">MERGE</code> in SQL Server) so re-processing a create event doesn't fail; or making business logic naturally idempotent (setting a status to "shipped" twice is harmless; incrementing a counter twice is not).</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: idempotent event processing using upsert
-INSERT INTO order_projections (order_id, status, last_event_id, updated_at)
-VALUES ($1, $2, $3, NOW())
-ON CONFLICT (order_id) DO UPDATE
-    SET status        = EXCLUDED.status,
-        last_event_id = EXCLUDED.last_event_id,
-        updated_at    = EXCLUDED.updated_at
-WHERE order_projections.last_event_id &lt; EXCLUDED.last_event_id;
--- The WHERE clause prevents older events from overwriting newer state</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: idempotent event processing using MERGE
 MERGE INTO order_projections AS target
 USING (VALUES (@order_id, @status, @last_event_id, SYSDATETIMEOFFSET()))
@@ -406,23 +307,7 @@ WHEN NOT MATCHED THEN
 
 <p class="text-gray-300 leading-relaxed">The outbox relay should also use <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SELECT ... FOR UPDATE SKIP LOCKED</code> in PostgreSQL or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WITH (UPDLOCK, READPAST)</code> in SQL Server to allow multiple relay instances to run concurrently without contending for the same rows. This is the correct pattern for competing consumers on a database-backed queue.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: batch relay with SKIP LOCKED for concurrent relay workers
-WITH batch AS (
-    SELECT id, aggregate_id, event_type, payload
-    FROM event_outbox
-    WHERE processed_at IS NULL
-    ORDER BY created_at
-    LIMIT 500
-    FOR UPDATE SKIP LOCKED
-)
-UPDATE event_outbox
-SET processed_at = NOW()
-FROM batch
-WHERE event_outbox.id = batch.id
-RETURNING batch.*;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: batch relay with READPAST for concurrent relay workers
 WITH batch AS (
     SELECT TOP 500 id, aggregate_id, event_type, payload
@@ -448,23 +333,14 @@ INNER JOIN batch ON event_outbox.id = batch.id;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The simplest approach is periodic deletion of processed rows older than a configured window — 24 to 72 hours is common, giving a replay window for debugging. Deletion should be done in small batches to avoid long-running locks:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: batched deletion of old processed outbox rows
-DELETE FROM event_outbox
-WHERE id IN (
-    SELECT id FROM event_outbox
-    WHERE processed_at &lt; NOW() - INTERVAL '48 hours'
-    LIMIT 5000
-);</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: batched deletion of old processed outbox rows
 DELETE TOP (5000) FROM event_outbox
 WHERE processed_at &lt; DATEADD(HOUR, -48, SYSDATETIMEOFFSET());</code></pre>
 
 <p class="text-gray-300 leading-relaxed">For SQL Server CDC, the cleanup job retention is configured when enabling CDC:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: configure CDC cleanup retention (in minutes; 4320 = 72 hours)
 EXEC sys.sp_cdc_change_job
     @job_type       = N'cleanup',
@@ -477,17 +353,7 @@ EXEC sys.sp_cdc_change_job
 
 <p class="text-gray-300 leading-relaxed">In PostgreSQL, replication slot lag is visible in<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_replication_slots</code>, as shown earlier. Outbox backlog is trivially queryable:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: monitor outbox backlog depth and oldest unprocessed event
-SELECT
-    COUNT(*)                            AS pending_events,
-    MIN(created_at)                     AS oldest_pending,
-    NOW() - MIN(created_at)             AS max_lag,
-    COUNT(*) FILTER (WHERE retry_count &gt;= 3) AS near_dead_letter
-FROM event_outbox
-WHERE processed_at IS NULL;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: monitor outbox backlog depth and oldest unprocessed event
 SELECT
     COUNT(*)                                        AS pending_events,
@@ -547,24 +413,6 @@ ORDER BY jh.run_date DESC, jh.run_time DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">PostgreSQL is a reasonable event store for low-to-moderate volume event-sourced systems. An append-only events table with good indexing on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">aggregate_id</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sequence_number</code> can handle write throughput that satisfies many applications. Dedicated event store products (EventStoreDB, for instance) offer subscription and snapshot features purpose-built for the pattern, but the operational simplicity of staying in PostgreSQL has real value.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: a simple append-only event store table
-CREATE TABLE domain_events (
-    id              BIGSERIAL PRIMARY KEY,
-    aggregate_id    UUID          NOT NULL,
-    aggregate_type  TEXT          NOT NULL,
-    sequence_number BIGINT        NOT NULL,
-    event_type      TEXT          NOT NULL,
-    payload         JSONB         NOT NULL,
-    metadata        JSONB         NOT NULL DEFAULT '{}',
-    occurred_at     TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
-
-    CONSTRAINT uq_aggregate_sequence
-        UNIQUE (aggregate_id, sequence_number)
-);
-
-CREATE INDEX idx_domain_events_aggregate
-    ON domain_events (aggregate_id, sequence_number);</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">UNIQUE</code> constraint on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">(aggregate_id, sequence_number)</code> enforces optimistic concurrency: if two processes try to append the same sequence number for the same aggregate simultaneously, one will fail with a unique violation. Application code catches this and retries. This is the event sourcing equivalent of an optimistic lock.</p>
 

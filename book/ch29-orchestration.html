@@ -64,7 +64,7 @@
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server Agent</strong> is built into SQL Server (excluding Express Edition) and provides a mature job scheduling framework. A SQL Server Agent job consists of one or more steps, each of which can be a T-SQL batch, an SSIS package execution, a PowerShell script, or a command-line executable. Steps are linked by success and failure outcomes — step two can be configured to run on success, run on failure, or be skipped entirely. Alerts can be attached to jobs based on SQL Server error severity levels, and the job history is stored in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">msdb</code>, queryable through the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sysjobs</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sysjobsteps</code>, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sysjobhistory</code> tables.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Query recent job execution history with duration and outcome
 SELECT
     j.name AS job_name,
@@ -89,23 +89,6 @@ ORDER BY h.run_date DESC, h.run_time DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">pgAgent</strong> is a companion tool for PostgreSQL, installed separately and typically managed through pgAdmin. It supports multi-step jobs with steps written in SQL or shell script, scheduled using cron-style expressions. Job history is stored in the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pgagent</code> schema within a nominated database. pgAgent is functional but less feature-rich than SQL Server Agent — there is no native conditional branching between steps, and alerting capabilities are minimal unless extended externally.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Query pgAgent job run history (requires pgagent schema installed)
-SELECT
-    j.jobname,
-    jl.jlgstart AS started_at,
-    jl.jlgduration AS duration,
-    CASE jl.jlgstatus
-        WHEN 'r' THEN 'Running'
-        WHEN 's' THEN 'Succeeded'
-        WHEN 'f' THEN 'Failed'
-        WHEN 'i' THEN 'Internal Error'
-        ELSE jl.jlgstatus
-    END AS status
-FROM pgagent.pga_joblog jl
-JOIN pgagent.pga_job j ON jl.jlgjobid = j.jobid
-WHERE jl.jlgstart &gt;= NOW() - INTERVAL '7 days'
-ORDER BY jl.jlgstart DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The limits of native schedulers become apparent in several situations. Both SQL Server Agent and pgAgent store their configuration in the same database they are maintaining — a problem when that database is unavailable. Multi-database or multi-host coordination is essentially manual. Retry logic is rudimentary: SQL Server Agent can retry a step a configurable number of times with a fixed delay, but there is no backoff, no dead-letter handling, and no way to inspect the exact condition under which a retry fired. Cross-environment workflows — development to staging to production promotion — cannot be expressed natively.</p>
 
@@ -140,31 +123,12 @@ ORDER BY jl.jlgstart DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">For <strong class="text-white">PostgreSQL</strong>, a production maintenance pipeline typically includes: identifying bloated tables programmatically, running VACUUM ANALYZE on high-priority targets, rebuilding indexes concurrently for the most bloated, and capturing before/after metrics. The programmatic identification step is itself a query that becomes part of the orchestration:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify tables with significant dead tuple bloat, suitable for
--- feeding a VACUUM prioritization step in a pipeline
-SELECT
-    schemaname,
-    relname AS table_name,
-    n_dead_tup,
-    n_live_tup,
-    ROUND(100.0 * n_dead_tup / NULLIF(n_live_tup + n_dead_tup, 0), 2)
-        AS dead_tuple_pct,
-    last_vacuum,
-    last_autovacuum,
-    pg_size_pretty(pg_total_relation_size(schemaname||'.'||relname))
-        AS total_size
-FROM pg_stat_user_tables
-WHERE n_dead_tup &gt; 10000
-  AND (last_vacuum IS NULL OR last_vacuum &lt; NOW() - INTERVAL '24 hours')
-ORDER BY dead_tuple_pct DESC
-LIMIT 20;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">This query is the first task in a pipeline. An orchestration tool runs it, captures the result set, and passes the list of table names to subsequent VACUUM tasks — potentially running several in parallel with a configurable concurrency limit to avoid overwhelming the server. After each VACUUM, a verification task checks that <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">n_dead_tup</code> has decreased and logs the result. This is not possible with a static cron-scheduled script, because the set of tables to process is dynamic.</p>
 
 <p class="text-gray-300 leading-relaxed">For <strong class="text-white">SQL Server</strong>, the equivalent pipeline for index maintenance queries fragmentation data first:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify indexes with significant fragmentation for a maintenance pipeline
 SELECT
     DB_NAME() AS database_name,
@@ -202,27 +166,7 @@ ORDER BY ips.avg_fragmentation_in_percent DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">For SQL Server, the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">MERGE</code> statement or conditional <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">INSERT</code>/<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">UPDATE</code> patterns provide idempotency in data loading steps. For PostgreSQL, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">INSERT ... ON CONFLICT DO UPDATE</code> (upsert) handles the same scenario:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Idempotent upsert into a pipeline audit log table
--- Safe to retry without creating duplicate records
-INSERT INTO pipeline_run_log (
-    pipeline_name,
-    run_date,
-    step_name,
-    status,
-    rows_affected,
-    completed_at
-)
-VALUES (
-    $1, CURRENT_DATE, $2, $3, $4, NOW()
-)
-ON CONFLICT (pipeline_name, run_date, step_name)
-DO UPDATE SET
-    status = EXCLUDED.status,
-    rows_affected = EXCLUDED.rows_affected,
-    completed_at = EXCLUDED.completed_at;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Equivalent idempotent upsert for pipeline audit logging
 MERGE pipeline_run_log AS target
 USING (SELECT @pipeline_name, CAST(GETDATE() AS DATE),
@@ -256,20 +200,7 @@ WHEN NOT MATCHED THEN
 
 <p class="text-gray-300 leading-relaxed">The pre-migration step matters as much as the migration itself. Before applying a migration that adds a NOT NULL column to a large table, an orchestration pipeline should verify estimated table size, check current lock wait times, confirm replication lag is acceptable, and verify that a backup completed successfully within the last window. These checks are straightforward queries:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Pre-migration checks: table size, active connections, replication lag
-SELECT
-    pg_size_pretty(pg_total_relation_size('public.orders')) AS table_size,
-    (SELECT count(*) FROM pg_stat_activity
-     WHERE state = 'active'
-       AND wait_event_type = 'Lock') AS active_lock_waiters,
-    (SELECT CASE
-        WHEN pg_is_in_recovery() THEN
-            EXTRACT(EPOCH FROM (NOW() - pg_last_xact_replay_timestamp()))
-        ELSE 0
-     END) AS replication_lag_seconds;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Pre-migration checks: table size, blocking, AG replica lag
 SELECT
     (8 * SUM(a.total_pages)) / 1024 AS table_size_mb,

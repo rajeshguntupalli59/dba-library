@@ -127,36 +127,7 @@ def ingest_cves_to_catalog(conn, cves: list[dict]):
 
 <p class="text-gray-300 leading-relaxed">Autonomous patching requires authoritative, real-time knowledge of what version every cluster is running. Version drift — where different clusters diverge from the approved baseline — is itself a risk signal and a scheduling input. Without automated inventory, the patch pipeline cannot know which clusters need action.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Stored in a central management database; populated by agents running on each cluster
-CREATE TABLE cluster_version_inventory (
-    cluster_id        TEXT        NOT NULL,
-    environment       TEXT        NOT NULL,  -- 'production', 'staging', 'dev'
-    region            TEXT,
-    pg_version        TEXT        NOT NULL,
-    pg_minor_version  TEXT        NOT NULL,
-    extensions        JSONB,
-    last_seen         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    approved_baseline TEXT,
-    drift_detected    BOOLEAN     GENERATED ALWAYS AS
-                        (pg_minor_version != approved_baseline) STORED,
-    PRIMARY KEY (cluster_id)
-);
 
--- Query to surface clusters lagging more than one minor release behind baseline
-SELECT
-    cluster_id,
-    environment,
-    pg_minor_version        AS current_version,
-    approved_baseline,
-    (string_to_array(approved_baseline, '.'))[3]::int
-        - (string_to_array(pg_minor_version, '.'))[3]::int AS minor_versions_behind,
-    last_seen
-FROM cluster_version_inventory
-WHERE drift_detected = TRUE
-ORDER BY minor_versions_behind DESC, environment DESC;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Central inventory table in a dedicated management database
 CREATE TABLE dbo.SqlInstanceInventory (
     InstanceId          NVARCHAR(200)  NOT NULL PRIMARY KEY,
@@ -341,7 +312,7 @@ class PatchOrchestrator:
 
 <p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">validator.evaluate()</code> call queries Prometheus for a set of pre-defined SLIs: connection error rate, query latency P99, replication lag (for PostgreSQL streaming replication via Patroni), and active connection count relative to max_connections. For SQL Server Always On Availability Groups, the equivalent validator checks the DMV <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_hadr_database_replica_states</code> for synchronization health and redo queue depth.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Validation query run by the patch orchestrator against each SQL Server AG replica
 SELECT
     ag.name                                                AS availability_group,
@@ -420,7 +391,7 @@ def patch_patroni_cluster(cluster_hosts: list[str], patch_fn):
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server Always On:</strong> The equivalent sequence uses PowerShell (or dbatools) to orchestrate the patch across AG replicas. The autonomous patcher calls the SQL Server Management API through <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pyodbc</code> or the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dbatools</code> module via subprocess.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Pre-patch validation: verify AG is fully synchronized before beginning
 SELECT
     ag.name,
@@ -448,24 +419,6 @@ WHERE ars.synchronization_health_desc != 'HEALTHY'
 
 <p class="text-gray-300 leading-relaxed">One non-obvious edge case: PostgreSQL extension upgrades often require <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALTER EXTENSION name UPDATE</code> to be run in each database after the package upgrade, and this must happen before the new binary serves queries that depend on the updated extension functions. The autonomous patcher includes a post-patch SQL execution step that iterates through the extension catalog and applies pending updates:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Run per-database after binary upgrade to apply pending extension updates
-DO $$
-DECLARE
-    ext RECORD;
-BEGIN
-    FOR ext IN
-        SELECT name, installed_version, default_version
-        FROM pg_available_extensions
-        WHERE installed_version IS NOT NULL
-          AND installed_version != default_version
-    LOOP
-        RAISE NOTICE 'Updating extension % from % to %',
-            ext.name, ext.installed_version, ext.default_version;
-        EXECUTE format('ALTER EXTENSION %I UPDATE', ext.name);
-    END LOOP;
-END;
-$$;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">This runs as part of the post-patch validation phase and its output is logged to the patch audit trail.</p>
 
@@ -712,33 +665,7 @@ class RollbackEvaluator:
 
 <p class="text-gray-300 leading-relaxed">The patch audit log is append-only by design. On PostgreSQL, this is enforced using row-level security combined with a privilege structure that grants INSERT but never UPDATE or DELETE to the patch agent role:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE patch_audit_log (
-    log_id          BIGSERIAL       PRIMARY KEY,
-    event_time      TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
-    patch_id        TEXT            NOT NULL,
-    cluster_id      TEXT            NOT NULL,
-    ring_id         INT,
-    event_type      TEXT            NOT NULL,
-    -- e.g. 'ring_started', 'patch_applied', 'validation_passed',
-    --      'trigger_fired', 'rollback_initiated', 'rollback_verified'
-    trigger_type    TEXT,
-    trigger_reason  TEXT,
-    actor           TEXT            NOT NULL DEFAULT current_user,
-    metrics_snapshot JSONB,
-    outcome         TEXT,
-    notes           TEXT
-);
 
--- Enforce append-only: grant INSERT, revoke UPDATE/DELETE from agent role
-GRANT INSERT ON patch_audit_log TO patch_agent;
-REVOKE UPDATE, DELETE ON patch_audit_log FROM patch_agent;
-
--- Optionally use a publication for logical replication to a
--- separate compliance sink that the patch system itself cannot reach
-CREATE PUBLICATION patch_audit_pub FOR TABLE patch_audit_log;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE dbo.PatchAuditLog (
     LogId            BIGINT IDENTITY(1,1) PRIMARY KEY,
     EventTime        DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),

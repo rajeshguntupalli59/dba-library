@@ -53,31 +53,7 @@
 
 <p class="text-gray-300 leading-relaxed">The observability layer must collect at three levels simultaneously: the OS block device level, the database engine level, and the logical object level. Conflating these three creates misleading signals. A table with poor sequential scan performance might be fine at the block device level but suffering from heap fragmentation. A WAL device might show 95% utilization while the data device sits idle — indicating checkpoint tuning as the correct intervention, not storage provisioning.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Capture a point-in-time I/O snapshot per relation, tracking heap vs. index read/hit ratios
-SELECT
-    schemaname,
-    relname,
-    heap_blks_read,
-    heap_blks_hit,
-    ROUND(
-        heap_blks_hit::numeric /
-        NULLIF(heap_blks_hit + heap_blks_read, 0) * 100, 2
-    ) AS heap_hit_ratio,
-    idx_blks_read,
-    idx_blks_hit,
-    ROUND(
-        idx_blks_hit::numeric /
-        NULLIF(idx_blks_hit + idx_blks_read, 0) * 100, 2
-    ) AS idx_hit_ratio,
-    toast_blks_read,
-    tidx_blks_read
-FROM pg_statio_user_tables
-WHERE heap_blks_read + heap_blks_hit &gt; 10000
-ORDER BY heap_blks_read DESC
-LIMIT 50;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Capture I/O stall distribution per file to identify hot files vs. idle files
 SELECT
     DB_NAME(vfs.database_id)         AS database_name,
@@ -173,44 +149,7 @@ if __name__ == "__main__":
 
 <p class="text-gray-300 leading-relaxed">Relations scoring below a configured cold threshold for seven consecutive measurement periods become candidates for demotion. Relations scoring above a hot threshold that currently reside on a slower tablespace become candidates for promotion.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify tables eligible for cold-tier demotion based on statio deltas logged to a metrics table
-WITH recent_io AS (
-    SELECT
-        relation_name,
-        AVG(heap_blks_read_delta)  AS avg_reads,
-        AVG(heap_blks_write_delta) AS avg_writes,
-        MAX(collected_at)          AS last_seen
-    FROM io_metrics_history
-    WHERE collected_at &gt;= NOW() - INTERVAL '7 days'
-    GROUP BY relation_name
-),
-current_placement AS (
-    SELECT
-        c.relname AS relation_name,
-        t.spcname AS tablespace_name,
-        pg_total_relation_size(c.oid) AS total_bytes
-    FROM pg_class c
-    LEFT JOIN pg_tablespace t ON t.oid = c.reltablespace
-    WHERE c.relkind = 'r'
-      AND c.relnamespace NOT IN (
-          SELECT oid FROM pg_namespace WHERE nspname IN ('pg_catalog','information_schema')
-      )
-)
-SELECT
-    cp.relation_name,
-    cp.tablespace_name,
-    cp.total_bytes / (1024*1024) AS size_mb,
-    COALESCE(ri.avg_reads, 0)   AS avg_reads_per_interval,
-    COALESCE(ri.avg_writes, 0)  AS avg_writes_per_interval
-FROM current_placement cp
-LEFT JOIN recent_io ri ON ri.relation_name = cp.relation_name
-WHERE COALESCE(ri.avg_reads, 0) + COALESCE(ri.avg_writes, 0) &lt; 50
-  AND cp.tablespace_name = 'hot_nvme'
-ORDER BY avg_reads_per_interval ASC
-LIMIT 20;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify filegroups with disproportionate I/O load relative to data volume
 SELECT
     fg.name                          AS filegroup_name,
@@ -339,35 +278,7 @@ def apply_adjustment(conn, parameter, direction, current_values):
 
 <p class="text-gray-300 leading-relaxed">Autonomous bloat remediation differs from scheduled VACUUM in a critical way: it is reactive to measured waste, not a calendar. The system continuously estimates bloat using the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pgstattuple</code> extension in PostgreSQL or the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_db_index_physical_stats</code> DMV in SQL Server, and it acts when waste crosses a defined threshold relative to the cost of remediation.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Estimate table bloat using pgstattuple; requires extension installed
-SELECT
-    schemaname,
-    tablename,
-    pg_size_pretty(pg_total_relation_size(schemaname||'.'||tablename)) AS total_size,
-    ROUND((dead_tuple_percent)::numeric, 2) AS dead_pct,
-    ROUND((free_percent)::numeric, 2)       AS free_space_pct,
-    approx_tuple_count,
-    dead_tuple_count
-FROM (
-    SELECT
-        n.nspname                             AS schemaname,
-        c.relname                             AS tablename,
-        (pgstattuple(c.oid)).dead_tuple_percent,
-        (pgstattuple(c.oid)).free_percent,
-        (pgstattuple(c.oid)).approx_tuple_count,
-        (pgstattuple(c.oid)).dead_tuple_count
-    FROM pg_class c
-    JOIN pg_namespace n ON n.oid = c.relnamespace
-    WHERE c.relkind = 'r'
-      AND n.nspname NOT IN ('pg_catalog', 'information_schema')
-      AND pg_total_relation_size(c.oid) &gt; 10 * 1024 * 1024  -- skip tables &lt; 10MB
-) bloat_stats
-WHERE dead_tuple_percent &gt; 20
-   OR free_percent &gt; 30
-ORDER BY dead_tuple_percent DESC;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify indexes with significant fragmentation eligible for autonomous rebuild or reorganize
 SELECT
     OBJECT_NAME(ips.object_id)           AS table_name,
@@ -409,47 +320,7 @@ ORDER BY ips.avg_fragmentation_in_percent DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Autonomous partition creation is the most time-sensitive operation. A system that allows a partition to be missing during a high-write period will route all writes to the default partition (PostgreSQL) or fail (SQL Server with partition scheme exhaustion). The creation agent runs hourly and ensures partitions exist for the current period plus two future periods.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Procedure to autonomously create next-period partitions for time-partitioned tables
-CREATE OR REPLACE PROCEDURE auto_create_partitions(
-    p_parent_table TEXT,
-    p_schema TEXT DEFAULT 'public',
-    p_lookahead_days INT DEFAULT 7
-)
-LANGUAGE plpgsql
-AS $$
-DECLARE
-    v_partition_name TEXT;
-    v_start_date DATE;
-    v_end_date DATE;
-    v_current_date DATE := CURRENT_DATE;
-BEGIN
-    FOR i IN 0..p_lookahead_days LOOP
-        v_start_date := v_current_date + (i || ' days')::INTERVAL;
-        v_end_date   := v_start_date + INTERVAL '1 day';
-        v_partition_name := p_parent_table || '_' || TO_CHAR(v_start_date, 'YYYY_MM_DD');
 
-        -- Only create if partition does not already exist
-        IF NOT EXISTS (
-            SELECT 1 FROM pg_class c
-            JOIN pg_namespace n ON n.oid = c.relnamespace
-            WHERE c.relname = v_partition_name
-              AND n.nspname = p_schema
-        ) THEN
-            EXECUTE FORMAT(
-                'CREATE TABLE %I.%I PARTITION OF %I.%I
-                 FOR VALUES FROM (%L) TO (%L)',
-                p_schema, v_partition_name,
-                p_schema, p_parent_table,
-                v_start_date, v_end_date
-            );
-            RAISE NOTICE 'Created partition: %.%', p_schema, v_partition_name;
-        END IF;
-    END LOOP;
-END;
-$$;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Extend a partition scheme to accommodate future periods
 -- Assumes partition function pfn_daily_range already exists
 DECLARE @next_boundary DATE = CAST(DATEADD(DAY, 7, GETDATE()) AS DATE);
@@ -562,7 +433,7 @@ SELECT pg_prewarm(
 
 <p class="text-gray-300 leading-relaxed">In SQL Server, the buffer pool is managed dynamically by the memory manager (SQLOS), and the autonomous layer can influence it through Resource Governor memory limits, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max server memory</code> adjustments, and Buffer Pool Extension (BPE) configuration on systems with fast SSD tiers. The more powerful lever in SQL Server is identifying which buffer pages are being evicted and why, using <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_os_buffer_descriptors</code>.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify the distribution of buffer pool pages by database and object
 -- to understand what is consuming the working set
 SELECT

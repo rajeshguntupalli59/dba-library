@@ -61,26 +61,6 @@
 <p class="text-gray-300 leading-relaxed">4. <strong class="text-white">Connection rerouting</strong>: Reload HAProxy without dropping existing long-lived connections using <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">haproxy -sf $(cat /var/run/haproxy.pid)</code>.</p>
 <p class="text-gray-300 leading-relaxed">5. <strong class="text-white">Verification</strong>: Run a synthetic write/read probe transaction against the new primary. If it fails within 10 seconds, re-escalate to human.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Heartbeat monitoring table used by trade-sentinel
-CREATE TABLE trading.heartbeat (
-    node_id        TEXT PRIMARY KEY,
-    last_written   TIMESTAMPTZ NOT NULL DEFAULT now(),
-    sequence_num   BIGINT NOT NULL DEFAULT 0
-);
-
--- Application writes every 5 seconds; sentinel reads this view
-CREATE VIEW trading.heartbeat_lag AS
-SELECT
-    node_id,
-    now() - last_written        AS lag_interval,
-    EXTRACT(EPOCH FROM (now() - last_written)) AS lag_seconds
-FROM trading.heartbeat;
-
--- Sentinel alert query: fetch nodes with lag &gt; 8 seconds
-SELECT node_id, lag_seconds
-FROM trading.heartbeat_lag
-WHERE lag_seconds &gt; 8;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">trade-sentinel</code> daemon managed promotion and HAProxy rewrite atomically:</p>
 
@@ -186,7 +166,7 @@ if __name__ == "__main__":
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> If `page_count <= 500`: skip (small table overhead not worth it)</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> If estimated rebuild duration (based on historical stats) would exceed 4 minutes: defer to off-peak window specific to tenant's primary geography</li>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Autonomous index maintenance procedure per tenant schema
 CREATE OR ALTER PROCEDURE dbo.usp_AutoIndexMaintenance
     @TenantSchema  NVARCHAR(128),
@@ -311,46 +291,6 @@ DEALLOCATE tenant_cursor;</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Tier 3 — Autonomous remediation</strong>: The system retrieved the last known good plan, extracted the join type and scan method differences, and automatically injected a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_hint_plan</code> comment into the affected query's scheduled invocation wrapper.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Plan history capture: store normalized plan snapshots
-CREATE TABLE monitoring.query_plan_history (
-    fingerprint       BIGINT       NOT NULL,
-    query_sample      TEXT         NOT NULL,
-    plan_json         JSONB        NOT NULL,
-    p90_exec_ms       NUMERIC(12,3) NOT NULL,
-    captured_at       TIMESTAMPTZ  NOT NULL DEFAULT now(),
-    is_baseline       BOOLEAN      NOT NULL DEFAULT FALSE,
-    PRIMARY KEY (fingerprint, captured_at)
-);
-
--- Regression detection view: compare recent p90 to 7-day baseline
-CREATE OR REPLACE VIEW monitoring.plan_regression_candidates AS
-WITH baseline AS (
-    SELECT
-        fingerprint,
-        AVG(p90_exec_ms)  AS baseline_p90_ms
-    FROM monitoring.query_plan_history
-    WHERE is_baseline = TRUE
-      AND captured_at &gt;= now() - INTERVAL '7 days'
-    GROUP BY fingerprint
-),
-recent AS (
-    SELECT
-        fingerprint,
-        AVG(p90_exec_ms)  AS recent_p90_ms
-    FROM monitoring.query_plan_history
-    WHERE is_baseline = FALSE
-      AND captured_at &gt;= now() - INTERVAL '15 minutes'
-    GROUP BY fingerprint
-)
-SELECT
-    r.fingerprint,
-    b.baseline_p90_ms,
-    r.recent_p90_ms,
-    r.recent_p90_ms / NULLIF(b.baseline_p90_ms, 0) AS regression_ratio
-FROM recent r
-JOIN baseline b USING (fingerprint)
-WHERE r.recent_p90_ms / NULLIF(b.baseline_p90_ms, 0) &gt; 2.5;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The Python remediation agent retrieved the baseline plan, parsed the scan node types from the JSONB, and synthesized a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_hint_plan</code> directive:</p>
 
@@ -450,26 +390,6 @@ def apply_plan_stabilization(conn_str: str, fingerprint: int) -&gt; None:
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> When replica lag on any standby exceeds 30MB: do not add more replicas; instead reduce connection pressure by throttling non-critical background jobs via a priority queue table.</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> When `pg_stat_activity_count{state="active"} / max_connections < 0.35` for 300 seconds: scale down one replica if replica count > 2.</li>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Connection pressure monitoring with replica lag
-SELECT
-    sa.count_active,
-    sa.max_connections,
-    ROUND(sa.count_active::NUMERIC / sa.max_connections * 100, 2) AS utilization_pct,
-    sr.application_name,
-    pg_size_pretty(sr.sent_lsn - sr.replay_lsn)  AS replication_lag_bytes,
-    (sr.sent_lsn - sr.replay_lsn)                AS lag_bytes_raw
-FROM (
-    SELECT
-        COUNT(*) FILTER (WHERE state = 'active')  AS count_active,
-        setting::INT                               AS max_connections
-    FROM pg_stat_activity
-    CROSS JOIN pg_settings
-    WHERE name = 'max_connections'
-    GROUP BY setting
-) sa
-CROSS JOIN pg_stat_replication sr
-ORDER BY lag_bytes_raw DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The Kubernetes controller patched CloudNativePG's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Cluster</code> resource to add replicas dynamically:</p>
 
@@ -602,47 +522,6 @@ def throttle_background_jobs() -&gt; None:
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Tier 2 (Auto-Draft + Human Approve)**: Violations where the fix is known but the blast radius requires sign-off (e.g., modifying RLS policies on tables with active sessions, revoking a role with 50+ dependent objects).</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Tier 3 (Alert Only)**: Violations requiring architectural judgment (e.g., an entire schema missing encryption at rest, a cross-database link to an unapproved external system).</li>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Compliance scan: roles with LOGIN that have SUPERUSER or CREATEROLE without MFA label
-CREATE OR REPLACE VIEW compliance.excessive_privilege_roles AS
-SELECT
-    r.rolname,
-    r.rolsuper,
-    r.rolcreaterole,
-    r.rolcreatedb,
-    r.rolcanlogin,
-    sl.label        AS security_label
-FROM pg_roles r
-LEFT JOIN pg_shseclabel sl
-    ON sl.objoid   = r.oid
-    AND sl.provider = 'mfa_policy'
-WHERE r.rolcanlogin = TRUE
-  AND (r.rolsuper = TRUE OR r.rolcreaterole = TRUE)
-  AND (sl.label IS NULL OR sl.label &lt;&gt; 'mfa_required');
-
--- Compliance scan: tables in regulated schemas without RLS enabled
-CREATE OR REPLACE VIEW compliance.tables_missing_rls AS
-SELECT
-    n.nspname    AS schema_name,
-    c.relname    AS table_name,
-    c.relrowsecurity
-FROM pg_class c
-JOIN pg_namespace n ON c.relnamespace = n.oid
-WHERE n.nspname IN ('customer_data', 'loan_origination', 'transactions')
-  AND c.relkind = 'r'
-  AND c.relrowsecurity = FALSE;
-
--- Compliance scan: PUBLIC schema permissions that should be restricted
-CREATE OR REPLACE VIEW compliance.public_schema_overexposure AS
-SELECT
-    grantee,
-    table_schema,
-    table_name,
-    privilege_type
-FROM information_schema.role_table_grants
-WHERE table_schema = 'public'
-  AND grantee       = 'PUBLIC'
-  AND privilege_type IN ('INSERT', 'UPDATE', 'DELETE', 'TRUNCATE');</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The autonomous remediation function for Tier 1 violations:</p>
 

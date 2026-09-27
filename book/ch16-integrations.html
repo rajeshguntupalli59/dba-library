@@ -54,22 +54,7 @@
 
 <p class="text-gray-300 leading-relaxed">Connection strings carry more information than most developers realize. The hostname, port, database name, and credentials are obvious, but production connection strings often also encode SSL requirements, connection timeouts, application names, and target session attributes (for PostgreSQL read replicas). The application name parameter deserves special attention — it shows up in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_activity</code> and SQL Server's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_sessions</code>, making it far easier to identify which service is responsible for a problematic query.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Check active connections and their application names
-SELECT pid,
-       usename,
-       application_name,
-       client_addr,
-       state,
-       wait_event_type,
-       wait_event,
-       now() - query_start AS query_duration,
-       left(query, 80) AS query_preview
-FROM   pg_stat_activity
-WHERE  state &lt;&gt; 'idle'
-ORDER  BY query_duration DESC;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Check active sessions and their application names
 SELECT s.session_id,
        s.login_name,
@@ -124,18 +109,7 @@ log_disconnections = 0</code></pre>
 
 <p class="text-gray-300 leading-relaxed">For SQL Server, connection pooling is typically handled at the driver/ADO.NET layer rather than through a separate process. The .NET SqlClient driver manages connection pools automatically, keying pools by connection string — identical connection strings share a pool, while any difference in connection string (including a trailing space) creates a separate pool. You can observe pool activity through SQL Server's DMVs:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Monitor PgBouncer-style pool health via pg_stat_activity
-SELECT datname,
-       usename,
-       state,
-       COUNT(*) AS connection_count
-FROM   pg_stat_activity
-WHERE  pid &lt;&gt; pg_backend_pid()
-GROUP  BY datname, usename, state
-ORDER  BY connection_count DESC;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Monitor connection pool usage by program and login
 SELECT s.program_name,
        s.login_name,
@@ -161,36 +135,12 @@ ORDER  BY session_count DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Setting up <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">postgres_fdw</code> involves three steps: creating the foreign server object, creating a user mapping, and then creating foreign tables that map to remote tables.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Step 1: Create the foreign server pointing to the remote PostgreSQL instance
-CREATE SERVER remote_analytics
-    FOREIGN DATA WRAPPER postgres_fdw
-    OPTIONS (host 'analytics-db.internal', port '5432', dbname 'analytics');
-
--- Step 2: Map the local user to a remote credential
-CREATE USER MAPPING FOR reporting_user
-    SERVER remote_analytics
-    OPTIONS (user 'fdw_reader', password 'secure_password_here');
-
--- Step 3: Import the remote schema (auto-creates foreign tables)
-IMPORT FOREIGN SCHEMA public
-    FROM SERVER remote_analytics
-    INTO fdw_schema;
-
--- Now query across databases as if they were local tables
-SELECT o.order_id,
-       o.customer_id,
-       a.customer_lifetime_value
-FROM   orders o
-JOIN   fdw_schema.customer_analytics a
-       ON o.customer_id = a.customer_id
-WHERE  o.order_date &gt;= CURRENT_DATE - INTERVAL '30 days';</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The query planner is aware of FDW tables and will push down WHERE clauses, JOINs, and aggregations to the remote server when the FDW implementation supports it (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">postgres_fdw</code> does). This pushdown behavior is significant — without it, PostgreSQL would fetch entire remote tables over the network and filter locally, which is catastrophically slow for large tables. You can verify what gets pushed down using <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">EXPLAIN VERBOSE</code>, which will show <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Remote SQL</code> clauses in the plan for FDW nodes.</p>
 
 <p class="text-gray-300 leading-relaxed">SQL Server's equivalent is <strong class="text-white">Linked Servers</strong>, which allow T-SQL queries to reference objects on remote SQL Server instances, Oracle databases, or any OLE DB or ODBC data source. A linked server is created using <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sp_addlinkedserver</code> and queried using four-part naming (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">server.database.schema.table</code>).</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Create a linked server to a remote SQL Server instance
 EXEC sp_addlinkedserver
     @server     = N'REMOTE_ANALYTICS',
@@ -225,22 +175,7 @@ WHERE  o.order_date &gt;= DATEADD(DAY, -30, GETDATE());</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Bulk loading</strong> is the most efficient way to get large volumes of data into either database. PostgreSQL's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">COPY</code> command and SQL Server's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">BULK INSERT</code> / <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">bcp</code> utility bypass row-by-row processing and write data in bulk, with significantly lower overhead per row than individual <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">INSERT</code> statements.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Bulk load from a CSV file using COPY
-COPY staging.raw_events (event_id, user_id, event_type, occurred_at)
-FROM '/data/pipeline/events_20240115.csv'
-WITH (FORMAT CSV,
-      HEADER TRUE,
-      DELIMITER ',',
-      NULL '\\N',
-      ENCODING 'UTF8');
 
--- Alternatively, load from a program output (useful for piped decompression)
-COPY staging.raw_events
-FROM PROGRAM 'gunzip -c /data/pipeline/events_20240115.csv.gz'
-WITH (FORMAT CSV, HEADER TRUE);</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Bulk load from a CSV file using BULK INSERT
 BULK INSERT staging.raw_events
 FROM 'D:\pipeline\events_20240115.csv'
@@ -259,22 +194,7 @@ FROM   staging.raw_events;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">MERGE</code> statement (in SQL Server, called <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">MERGE</code>; in PostgreSQL, called <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">INSERT ... ON CONFLICT</code> or the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">MERGE</code> statement available since PostgreSQL 15) handles the common upsert pattern: insert new rows, update existing rows.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Upsert from staging to production using INSERT ... ON CONFLICT
-INSERT INTO public.customers (customer_id, email, full_name, updated_at)
-SELECT customer_id,
-       email,
-       full_name,
-       updated_at
-FROM   staging.customer_updates
-ON CONFLICT (customer_id)
-DO UPDATE SET
-    email      = EXCLUDED.email,
-    full_name  = EXCLUDED.full_name,
-    updated_at = EXCLUDED.updated_at
-WHERE  public.customers.updated_at &lt; EXCLUDED.updated_at;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Upsert from staging to production using MERGE
 MERGE dbo.customers AS target
 USING staging.customer_updates AS source
@@ -302,18 +222,7 @@ WHEN NOT MATCHED BY TARGET THEN
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Cloud-managed databases</strong> — Amazon RDS, Aurora, Azure SQL Database, Google Cloud SQL, Azure Database for PostgreSQL — expose the same SQL interfaces as on-premises instances, but some integration mechanisms change. Direct filesystem access for <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">COPY FROM</code> is unavailable on managed instances, replaced by cloud-native alternatives. On Amazon RDS for PostgreSQL, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">aws_s3</code> extension handles S3-based COPY operations. On Azure SQL Database, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">BULK INSERT</code> can reference Azure Blob Storage. These are not just convenience features — in a serverless or containerized pipeline architecture, there is no shared filesystem, and cloud-native bulk load paths become necessary.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Load from S3 on Amazon RDS for PostgreSQL (requires aws_s3 extension)
-SELECT aws_s3.table_import_from_s3(
-    'staging.raw_events',
-    'event_id, user_id, event_type, occurred_at',
-    '(FORMAT CSV, HEADER true)',
-    'my-data-bucket',
-    'pipeline/events_20240115.csv',
-    'us-east-1'
-);</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Load from Azure Blob Storage using BULK INSERT with external data source
 CREATE EXTERNAL DATA SOURCE azure_pipeline_storage
 WITH (TYPE = BLOB_STORAGE,

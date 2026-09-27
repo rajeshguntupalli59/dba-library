@@ -93,22 +93,7 @@ print(f"Failover candidates by lag: {candidates}")</code></pre>
 
 <p class="text-gray-300 leading-relaxed">For clusters using pg_auto_failover, the monitor node exposes its own state machine. The autonomous controller subscribes to state transitions and enforces policy constraints before allowing promotion to proceed:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Query pg_auto_failover monitor state (run against the monitor node)
-SELECT
-    nodename,
-    nodehost,
-    nodeport,
-    goalstate,
-    reportedstate,
-    reportedlsn,
-    reportedrepstate,
-    health,
-    pg_size_pretty(reportedlsn - '0/0'::pg_lsn) AS lsn_position
-FROM pgautofailover.node
-ORDER BY formation_id, groupid, nodeid;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Equivalent: query AG replica status for autonomous evaluation
 SELECT
     ag.name AS ag_name,
@@ -139,17 +124,7 @@ ORDER BY ag.name, ars.role_desc;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The workload fingerprinting logic queries <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> and derives a workload signature:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Classify current workload: ratio of sequential scans, index scans, sort operations
-SELECT
-    round(100.0 * sum(seq_scan) / nullif(sum(seq_scan) + sum(idx_scan), 0), 2) AS pct_seq_scan,
-    round(100.0 * sum(idx_scan) / nullif(sum(seq_scan) + sum(idx_scan), 0), 2) AS pct_idx_scan,
-    pg_size_pretty(sum(blks_read) * 8192) AS physical_reads,
-    pg_size_pretty(sum(blks_hit) * 8192) AS buffer_hits,
-    round(100.0 * sum(blks_hit) / nullif(sum(blks_hit) + sum(blks_read), 0), 2) AS buffer_hit_ratio
-FROM pg_stat_user_tables;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Equivalent workload classification from DMVs
 SELECT
     SUM(user_seeks + user_scans + user_lookups) AS total_reads,
@@ -220,30 +195,7 @@ if drift:
 
 <p class="text-gray-300 leading-relaxed">The foundation is a continuous dead tuple monitor that queries <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_user_tables</code> and cross-references with actual table sizes to compute a dead tuple ratio and an estimated bloat percentage:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Autonomous vacuum priority queue: tables needing immediate attention
-SELECT
-    schemaname,
-    relname,
-    n_live_tup,
-    n_dead_tup,
-    round(100.0 * n_dead_tup / nullif(n_live_tup + n_dead_tup, 0), 2) AS dead_pct,
-    last_vacuum,
-    last_autovacuum,
-    last_analyze,
-    pg_size_pretty(pg_total_relation_size(schemaname || '.' || relname)) AS total_size,
-    CASE
-        WHEN n_dead_tup &gt; 10000000 THEN 'CRITICAL'
-        WHEN n_dead_tup &gt; 1000000 THEN 'WARNING'
-        WHEN round(100.0 * n_dead_tup / nullif(n_live_tup + n_dead_tup, 0), 2) &gt; 20 THEN 'WARNING'
-        ELSE 'OK'
-    END AS vacuum_status
-FROM pg_stat_user_tables
-WHERE n_live_tup + n_dead_tup &gt; 10000
-ORDER BY n_dead_tup DESC
-LIMIT 25;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server equivalent: index fragmentation as the analog to dead tuple bloat
 SELECT
     OBJECT_SCHEMA_NAME(ips.object_id) AS schema_name,
@@ -287,20 +239,6 @@ ALTER TABLE events SET (
 
 <p class="text-gray-300 leading-relaxed">An autonomous connection management layer continuously monitors pool utilization, client wait times, and backend saturation, and adjusts pgBouncer configuration dynamically. pgBouncer exposes a management interface via a pseudo-database called <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pgbouncer</code> that accepts control commands at runtime:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Connect to pgBouncer admin interface: psql -p 6432 pgbouncer
--- Query current pool state
-SHOW POOLS;
--- Output includes: database, user, cl_active, cl_waiting, sv_active, sv_idle, sv_used, maxwait
-
--- Increase pool size for a specific database dynamically
-SET pool_size=50 for database=orders_db;
-
--- View current client connections and wait times
-SHOW CLIENTS;
-
--- Check server connections to PostgreSQL backend
-SHOW SERVERS;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The autonomous pool controller interprets these metrics and applies the following decision logic: if <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">cl_waiting</code> exceeds 5 percent of <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">cl_active</code> for more than 30 consecutive seconds, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pool_size</code> is incremented by 10 percent, subject to a maximum that is calculated from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_connections</code> minus reserved connections for administrative access and autovacuum workers. If <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sv_idle</code> exceeds 40 percent of <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pool_size</code> for more than 5 minutes, the pool is shrunk by 10 percent to reclaim backend resources. This hysteresis — requiring a sustained condition before acting, and acting conservatively in both directions — prevents the pool from oscillating continuously.</p>
 
@@ -344,27 +282,7 @@ def get_connection(read_only: bool = False) -&gt; psycopg2.extensions.connection
 
 <p class="text-gray-300 leading-relaxed">The missing index signal comes primarily from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> combined with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">EXPLAIN</code> plan analysis. When a query with high <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">total_time</code> shows sequential scans on large tables, the autonomous system generates a candidate index, validates it on a standby using <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">EXPLAIN</code> (not <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">EXPLAIN ANALYZE</code> — we never run the query again just to test), and scores it against the existing index set for redundancy:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify high-cost sequential scans from pg_stat_statements
-SELECT
-    pss.userid::regrole AS username,
-    pss.query,
-    round(pss.total_exec_time::numeric, 2) AS total_exec_ms,
-    pss.calls,
-    round((pss.total_exec_time / pss.calls)::numeric, 2) AS avg_exec_ms,
-    round(pss.rows / pss.calls::numeric, 2) AS avg_rows,
-    pss.shared_blks_read,
-    pss.shared_blks_hit,
-    round(100.0 * pss.shared_blks_read /
-        nullif(pss.shared_blks_read + pss.shared_blks_hit, 0), 2) AS physical_read_pct
-FROM pg_stat_statements pss
-WHERE pss.calls &gt; 100
-  AND pss.total_exec_time &gt; 10000
-  AND pss.shared_blks_read &gt; pss.shared_blks_hit
-ORDER BY pss.total_exec_time DESC
-LIMIT 20;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Missing index recommendations from Query Store and DMVs
 SELECT TOP 20
     migs.avg_total_user_cost * migs.avg_user_impact * (migs.user_seeks + migs.user_scans)
@@ -389,29 +307,7 @@ ORDER BY improvement_measure DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Unused index detection is more straightforward — PostgreSQL tracks index scans, tuple reads, and tuple fetches per index since the last statistics reset. Any index with zero scans since the last reset (which should cover at least one full week of representative workload) is a candidate for elimination:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify unused and low-value indexes
-SELECT
-    schemaname,
-    tablename,
-    indexname,
-    idx_scan,
-    idx_tup_read,
-    idx_tup_fetch,
-    pg_size_pretty(pg_relation_size(indexrelid)) AS index_size,
-    pg_size_pretty(pg_relation_size(indrelid)) AS table_size,
-    CASE
-        WHEN idx_scan = 0 THEN 'UNUSED'
-        WHEN idx_scan &lt; 10 AND pg_relation_size(indexrelid) &gt; 10485760 THEN 'LOW_VALUE'
-        ELSE 'ACTIVE'
-    END AS status
-FROM pg_stat_user_indexes
-JOIN pg_index USING (indexrelid)
-WHERE NOT indisprimary
-  AND NOT indisunique
-ORDER BY pg_relation_size(indexrelid) DESC;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Unused indexes in SQL Server
 SELECT
     OBJECT_SCHEMA_NAME(i.object_id) AS schema_name,

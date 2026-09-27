@@ -56,18 +56,7 @@
 
 <p class="text-gray-300 leading-relaxed">SQL Server on-premises has its own sizing considerations. Unlike PostgreSQL, which relies on the OS page cache as a second layer, SQL Server manages its own buffer pool directly and will aggressively claim available RAM up to the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max server memory</code> limit. Forgetting to set this limit is a classic mistake that starves the OS of memory on a shared machine.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Check current memory-related configuration
-SELECT name, setting, unit, context
-FROM pg_settings
-WHERE name IN (
-    'shared_buffers',
-    'work_mem',
-    'maintenance_work_mem',
-    'effective_cache_size'
-);</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Check current max server memory setting
 SELECT name, value_in_use, description
 FROM sys.configurations
@@ -97,20 +86,7 @@ WHERE name IN (
 
 <p class="text-gray-300 leading-relaxed">Despite these challenges, virtualized databases work well in practice when the environment is properly configured. Reserve CPU and memory resources for database VMs rather than leaving them subject to dynamic contention. Disable memory ballooning for database guests. Ensure VM-level I/O limits are not inadvertently throttling database storage throughput.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Check for evidence of I/O performance pressure
-SELECT schemaname, tablename,
-       heap_blks_read,
-       heap_blks_hit,
-       round(
-           heap_blks_hit::numeric /
-           NULLIF(heap_blks_hit + heap_blks_read, 0) * 100, 2
-       ) AS buffer_hit_ratio
-FROM pg_statio_user_tables
-ORDER BY heap_blks_read DESC
-LIMIT 20;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Check buffer pool hit ratio and I/O stalls
 SELECT
     DB_NAME(vfs.database_id) AS database_name,
@@ -147,19 +123,7 @@ ORDER BY vfs.io_stall_read_ms DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">That said, managed services handle genuinely hard operational problems well. Point-in-time recovery, automated backups with configurable retention, Multi-AZ high availability, automated minor version patching, and built-in monitoring are all provided without you building any of that infrastructure yourself. For a startup or a development team building a new application, a managed service lets you focus on the application instead of the database platform.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- On RDS PostgreSQL, check available extensions
-SELECT name, default_version, installed_version, comment
-FROM pg_available_extensions
-ORDER BY name;
 
--- Check parameter group settings via pg_settings
-SELECT name, setting, source, context
-FROM pg_settings
-WHERE source = 'configuration file'
-ORDER BY name;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- On Azure SQL Database, check available features and service tier
 SELECT
     DATABASEPROPERTYEX(DB_NAME(), 'Edition') AS edition,
@@ -188,17 +152,7 @@ FROM sys.dm_db_persisted_sku_features;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">SQL Server has supported Docker containers since SQL Server 2017, and Microsoft maintains official Linux-based container images for SQL Server. Running SQL Server in a container is operationally similar to PostgreSQL — mount a persistent volume to the data directory, configure via environment variables or startup scripts, and manage the lifecycle through container orchestration. SQL Server containers on Kubernetes are used in production, particularly in development/test environments and for SQL Server instances that need fast provisioning and deprovisioning.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- After starting a PostgreSQL container, verify data directory and configuration
-SHOW data_directory;
-SHOW config_file;
 
--- Check that the data directory is on the expected persistent volume path
-SELECT pg_postmaster_start_time(),
-       version(),
-       pg_size_pretty(pg_database_size(current_database())) AS db_size;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- After starting a SQL Server container, verify instance configuration
 SELECT @@SERVERNAME AS server_name,
        @@VERSION AS version,
@@ -235,31 +189,7 @@ EXEC xp_readerrorlog 0, 1, N'Logging SQL Server messages';</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The fundamental challenge in hybrid architectures is data movement and consistency. If your primary PostgreSQL cluster runs on-premises and your disaster recovery replica runs on AWS RDS, you need logical replication between them, because physical replication (streaming replication) doesn't work across different storage architectures. Logical replication in PostgreSQL replicates data at the row level, crossing version and environment boundaries, but it has limitations — DDL changes are not replicated, sequences don't replicate their current values, and large object operations don't replicate. These gaps require operational procedures to compensate.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Set up logical replication publication on the on-premises primary
--- (This runs on the source — on-premises PostgreSQL)
-CREATE PUBLICATION prod_to_cloud_pub
-FOR ALL TABLES
-WITH (publish = 'insert, update, delete');
 
--- On the cloud replica, create the subscription
--- (This runs on the destination — RDS PostgreSQL)
-CREATE SUBSCRIPTION prod_to_cloud_sub
-CONNECTION 'host=onprem-primary.internal port=5432
-            dbname=appdb user=replicator password=secret
-            sslmode=require'
-PUBLICATION prod_to_cloud_pub;
-
--- Monitor replication lag on the source
-SELECT sub_name,
-       sent_lsn,
-       write_lsn,
-       flush_lsn,
-       replay_lsn,
-       (sent_lsn - replay_lsn) AS replication_lag_bytes
-FROM pg_stat_replication;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Check replication or AG synchronization status in a hybrid setup
 -- On the primary replica
 SELECT

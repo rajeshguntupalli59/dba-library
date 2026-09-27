@@ -66,23 +66,7 @@
 
 <p class="text-gray-300 leading-relaxed">In PostgreSQL, the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_statio_user_tables</code> view tracks buffer hits and disk reads per table. A buffer hit means the requested block was found in shared buffers. A block read means the engine had to go to disk (or the OS file system cache, discussed shortly).</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Cache hit ratio per table
-SELECT
-    schemaname,
-    relname AS table_name,
-    heap_blks_read AS disk_reads,
-    heap_blks_hit  AS buffer_hits,
-    ROUND(
-        heap_blks_hit::numeric /
-        NULLIF(heap_blks_hit + heap_blks_read, 0) * 100,
-        2
-    ) AS hit_ratio_pct
-FROM pg_statio_user_tables
-WHERE heap_blks_hit + heap_blks_read &gt; 0
-ORDER BY disk_reads DESC;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Buffer cache hit ratio from performance counters
 SELECT
     object_name,
@@ -99,23 +83,7 @@ AND object_name LIKE '%Buffer Manager%';</code></pre>
 
 <p class="text-gray-300 leading-relaxed">You can also look at which specific tables are generating the most disk reads, which helps prioritize tuning efforts. In PostgreSQL, tables with a persistently low hit ratio may benefit from either a larger shared_buffers value or investigation into whether large sequential scans are polluting the buffer pool with data that is only needed once.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify tables with poor cache hit ratios
-SELECT
-    relname AS table_name,
-    heap_blks_read,
-    heap_blks_hit,
-    ROUND(
-        100.0 * heap_blks_hit /
-        NULLIF(heap_blks_hit + heap_blks_read, 0),
-        1
-    ) AS hit_pct
-FROM pg_statio_user_tables
-WHERE heap_blks_read &gt; 1000
-ORDER BY hit_pct ASC
-LIMIT 20;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Pages in buffer pool per database
 SELECT
     DB_NAME(database_id) AS database_name,
@@ -159,7 +127,7 @@ ORDER BY pages_in_buffer DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">In SQL Server, the <strong class="text-white">Procedure Cache</strong> (also called the Plan Cache) stores execution plans for ad-hoc queries, stored procedures, and prepared statements. SQL Server uses parameterization to recognize when two queries differ only in their literal values and can share a plan. You can inspect the plan cache through <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_cached_plans</code> and related DMVs.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Top cached plans by execution count and CPU cost
 SELECT TOP 20
     qs.execution_count,
@@ -172,17 +140,6 @@ CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) AS st
 CROSS APPLY sys.dm_exec_query_plan(qs.plan_handle) AS qp
 ORDER BY qs.execution_count DESC;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Cached plan usage via pg_prepared_statements (session-level)
-SELECT
-    name,
-    statement,
-    prepare_time,
-    calls,
-    total_exec_time,
-    mean_exec_time
-FROM pg_prepared_statements
-ORDER BY calls DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">PostgreSQL handles plan caching differently from SQL Server. In PostgreSQL, query plan caching happens primarily through <strong class="text-white">prepared statements</strong>. When a client prepares a statement using <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">PREPARE</code> or a protocol-level prepare (as most connection poolers and ORMs do), PostgreSQL initially uses a generic plan after enough executions convince it that the generic plan is efficient. For the first five executions of a prepared statement, PostgreSQL creates a custom plan for each execution using the actual parameter values. After five executions, it evaluates whether a generic cached plan would be cheaper on average.</p>
 
@@ -204,24 +161,7 @@ ORDER BY calls DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">One pattern that databases themselves support, and that serves as an alternative to external caches for certain workloads, is <strong class="text-white">materialized views</strong>. A materialized view pre-computes the result of a complex query and stores it as a physical table. Queries that would otherwise join several large tables and aggregate millions of rows can instead read from the materialized view in milliseconds.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Create a materialized view for a complex aggregation
-CREATE MATERIALIZED VIEW monthly_sales_summary AS
-SELECT
-    DATE_TRUNC('month', order_date) AS month,
-    product_category,
-    SUM(order_total) AS total_revenue,
-    COUNT(*) AS order_count,
-    AVG(order_total) AS avg_order_value
-FROM orders
-JOIN products USING (product_id)
-GROUP BY 1, 2
-WITH DATA;
 
--- Refresh it on a schedule
-REFRESH MATERIALIZED VIEW CONCURRENTLY monthly_sales_summary;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Indexed view (SQL Server's equivalent of a materialized view)
 CREATE VIEW monthly_sales_summary
 WITH SCHEMABINDING
@@ -259,20 +199,7 @@ ON monthly_sales_summary (month, product_category);</code></pre>
 
 <p class="text-gray-300 leading-relaxed">In SQL Server, connection pooling is typically handled by the client driver (ADO.NET, JDBC), and the plan cache is server-side and query-keyed rather than connection-keyed. Switching pooling modes is less disruptive to plan caching. However, frequent <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DBCC FREEPROCCACHE</code> calls — sometimes used as a troubleshooting step — clear the entire plan cache, forcing recompilation of everything. This is rarely the right production action; targeted eviction using the plan handle is always preferable.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Check for plans that may be causing problems (high planning time)
-SELECT
-    query,
-    calls,
-    ROUND(total_plan_time::numeric / calls, 2) AS avg_plan_ms,
-    ROUND(total_exec_time::numeric / calls, 2) AS avg_exec_ms
-FROM pg_stat_statements
-WHERE calls &gt; 100
-  AND total_plan_time / calls &gt; total_exec_time / calls
-ORDER BY avg_plan_ms DESC
-LIMIT 10;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Find plans with high recompile counts
 SELECT
     qs.sql_handle,

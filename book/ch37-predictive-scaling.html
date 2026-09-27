@@ -66,45 +66,7 @@
 
 <p class="text-gray-300 leading-relaxed">The metrics that matter most for workload prediction fall into several categories: query throughput (transactions per second, queries per second), resource utilization (CPU, memory, I/O), wait events (what queries are waiting for), and connection patterns (how many connections arrive, at what rate, from which application pools). Collecting all of these at one-second granularity into an external time-series store is ideal, but even five-minute samples preserved over several months are enough to reveal weekly and monthly patterns for most OLTP workloads.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Capture a point-in-time workload snapshot for archival
--- Run this periodically via pg_cron or an external scheduler
-INSERT INTO dba_metrics.workload_snapshots (
-    captured_at,
-    db_name,
-    tps_commit,
-    tps_rollback,
-    blks_read,
-    blks_hit,
-    temp_files,
-    temp_bytes,
-    deadlocks,
-    active_connections,
-    idle_connections,
-    waiting_connections
-)
-SELECT
-    NOW()                                           AS captured_at,
-    d.datname                                       AS db_name,
-    s.xact_commit                                   AS tps_commit,
-    s.xact_rollback                                 AS tps_rollback,
-    s.blks_read,
-    s.blks_hit,
-    s.temp_files,
-    s.temp_bytes,
-    s.deadlocks,
-    COUNT(*) FILTER (WHERE a.state = 'active')      AS active_connections,
-    COUNT(*) FILTER (WHERE a.state = 'idle')        AS idle_connections,
-    COUNT(*) FILTER (WHERE a.wait_event IS NOT NULL) AS waiting_connections
-FROM pg_stat_database s
-JOIN pg_database d ON d.oid = s.datid
-LEFT JOIN pg_stat_activity a ON a.datid = s.datid
-WHERE d.datname = current_database()
-GROUP BY d.datname, s.xact_commit, s.xact_rollback,
-         s.blks_read, s.blks_hit, s.temp_files,
-         s.temp_bytes, s.deadlocks;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Capture a point-in-time workload snapshot for archival
 INSERT INTO dba_metrics.workload_snapshots (
     captured_at,
@@ -152,26 +114,7 @@ SELECT
 
 <p class="text-gray-300 leading-relaxed">The simplest and often most useful starting point is decomposing your workload time series into its seasonal components. A weekly seasonal model asks: given the same hour and day of week, what does the historical distribution of TPS, connection count, or CPU look like? This does not require machine learning. It requires grouping your telemetry data by day-of-week and hour-of-day and computing percentiles.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Build a seasonal workload profile from 90 days of history
--- Shows P50, P90, P99 TPS by day-of-week and hour
-SELECT
-    EXTRACT(ISODOW FROM captured_at)::INT          AS day_of_week,  -- 1=Mon, 7=Sun
-    EXTRACT(HOUR  FROM captured_at)::INT           AS hour_of_day,
-    ROUND(PERCENTILE_CONT(0.50) WITHIN GROUP
-          (ORDER BY tps_commit)::NUMERIC, 2)       AS p50_tps,
-    ROUND(PERCENTILE_CONT(0.90) WITHIN GROUP
-          (ORDER BY tps_commit)::NUMERIC, 2)       AS p90_tps,
-    ROUND(PERCENTILE_CONT(0.99) WITHIN GROUP
-          (ORDER BY tps_commit)::NUMERIC, 2)       AS p99_tps,
-    COUNT(*)                                       AS sample_count
-FROM dba_metrics.workload_snapshots
-WHERE captured_at &gt;= NOW() - INTERVAL '90 days'
-  AND db_name = 'production_db'
-GROUP BY 1, 2
-ORDER BY 1, 2;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Build a seasonal workload profile from 90 days of history
 -- Shows P50, P90, P99 batch requests by day-of-week and hour
 SELECT
@@ -212,29 +155,7 @@ ORDER BY day_of_week, hour_of_day;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The general structure of a scaling decision rule looks like this: *if the predicted workload for time T exceeds threshold X, initiate resource action Y at time T minus provisioning_lag*. The provisioning lag is measured empirically for each resource type in your environment. Read replica spin-up on Aurora typically takes three to five minutes. A read replica on standard RDS takes eight to fifteen minutes. Adjusting max_connections via a parameter group change on RDS requires a restart, making it unsuitable for reactive or predictive scaling — better handled by a PgBouncer pool configuration change that takes effect immediately.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify upcoming hours where predicted load exceeds current capacity baseline
--- Assumes dba_metrics.scaling_thresholds holds configured limits
--- and dba_metrics.seasonal_profile holds the precomputed P90 values
-SELECT
-    sp.day_of_week,
-    sp.hour_of_day,
-    sp.p90_tps                                       AS predicted_p90_tps,
-    st.tps_scale_threshold,
-    sp.p90_tps - st.tps_scale_threshold              AS headroom_deficit,
-    CASE
-        WHEN sp.p90_tps &gt; st.tps_scale_threshold * 1.5 THEN 'SCALE_AGGRESSIVELY'
-        WHEN sp.p90_tps &gt; st.tps_scale_threshold        THEN 'SCALE_STANDARD'
-        WHEN sp.p90_tps &gt; st.tps_scale_threshold * 0.8  THEN 'SCALE_WARM'
-        ELSE                                                  'NO_ACTION'
-    END                                              AS recommended_action
-FROM dba_metrics.seasonal_profile sp
-CROSS JOIN dba_metrics.scaling_thresholds st
-WHERE st.db_name = 'production_db'
-  AND sp.p90_tps &gt; st.tps_scale_threshold * 0.8
-ORDER BY sp.day_of_week, sp.hour_of_day;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify upcoming hours where predicted load exceeds capacity thresholds
 SELECT
     sp.day_of_week,
@@ -268,24 +189,7 @@ ORDER BY sp.day_of_week, sp.hour_of_day;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The tables and indexes worth pre-warming are those that appear in the most frequent query plans during peak periods. In PostgreSQL, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_user_tables</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_user_indexes</code> show sequential and index scan counts that identify hot objects. In SQL Server, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_query_stats</code> joined back to execution plans identifies the most frequently executed queries and the objects they access.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify top tables and indexes for pre-warming before a predicted peak
--- Use pg_prewarm extension to load these into shared_buffers
-SELECT
-    schemaname,
-    relname                                     AS table_name,
-    seq_scan + idx_scan                         AS total_access_count,
-    pg_size_pretty(pg_total_relation_size(
-        (schemaname || '.' || relname)::regclass)) AS total_size,
-    -- Pre-warm command to execute ahead of peak
-    'SELECT pg_prewarm(''' || schemaname || '.' || relname || ''');'
-                                                AS prewarm_command
-FROM pg_stat_user_tables
-WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
-ORDER BY total_access_count DESC
-LIMIT 20;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify top objects for buffer pool pre-warming
 -- After identifying, use DBCC DROPCLEANBUFFERS carefully in dev;
 -- in production, pre-warm by running covering queries against the objects
@@ -328,54 +232,7 @@ ORDER BY qs.total_logical_reads DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">A simple but effective approach is to maintain two prediction windows in parallel: a *long-range baseline* built from the full historical retention period, and a *short-range adaptive baseline* built from only the most recent two to three weeks of data. When the two baselines diverge significantly — say, the short-range P90 is more than 30% higher than the long-range P90 for the same day-of-week/hour slot — the system flags a potential trend shift and begins weighting the short-range baseline more heavily in its scaling decisions while also alerting the operations team to investigate.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Detect model drift: compare short-range vs. long-range P90 baselines
-WITH long_range AS (
-    SELECT
-        EXTRACT(ISODOW FROM captured_at)::INT   AS day_of_week,
-        EXTRACT(HOUR  FROM captured_at)::INT    AS hour_of_day,
-        PERCENTILE_CONT(0.90) WITHIN GROUP
-            (ORDER BY tps_commit)               AS p90_tps_long
-    FROM dba_metrics.workload_snapshots
-    WHERE captured_at &gt;= NOW() - INTERVAL '90 days'
-      AND db_name = 'production_db'
-    GROUP BY 1, 2
-),
-short_range AS (
-    SELECT
-        EXTRACT(ISODOW FROM captured_at)::INT   AS day_of_week,
-        EXTRACT(HOUR  FROM captured_at)::INT    AS hour_of_day,
-        PERCENTILE_CONT(0.90) WITHIN GROUP
-            (ORDER BY tps_commit)               AS p90_tps_short
-    FROM dba_metrics.workload_snapshots
-    WHERE captured_at &gt;= NOW() - INTERVAL '21 days'
-      AND db_name = 'production_db'
-    GROUP BY 1, 2
-)
-SELECT
-    l.day_of_week,
-    l.hour_of_day,
-    ROUND(l.p90_tps_long::NUMERIC,  2)          AS p90_long_range,
-    ROUND(s.p90_tps_short::NUMERIC, 2)          AS p90_short_range,
-    ROUND(((s.p90_tps_short - l.p90_tps_long)
-           / NULLIF(l.p90_tps_long, 0) * 100)::NUMERIC, 1)
-                                                AS pct_drift,
-    CASE
-        WHEN s.p90_tps_short &gt; l.p90_tps_long * 1.3 THEN 'TREND_UP_SIGNIFICANT'
-        WHEN s.p90_tps_short &gt; l.p90_tps_long * 1.1 THEN 'TREND_UP_MINOR'
-        WHEN s.p90_tps_short &lt; l.p90_tps_long * 0.7 THEN 'TREND_DOWN_SIGNIFICANT'
-        ELSE                                          'STABLE'
-    END                                         AS drift_classification
-FROM long_range l
-JOIN short_range s
-    ON l.day_of_week = s.day_of_week
-    AND l.hour_of_day = s.hour_of_day
-WHERE ABS((s.p90_tps_short - l.p90_tps_long)
-          / NULLIF(l.p90_tps_long, 0)) &gt; 0.1
-ORDER BY ABS((s.p90_tps_short - l.p90_tps_long)
-             / NULLIF(l.p90_tps_long, 0)) DESC;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Detect model drift: compare short-range vs. long-range P90 baselines
 WITH long_range AS (
     SELECT
@@ -448,77 +305,7 @@ ORDER BY ABS((s.p90_short - l.p90_long) / NULLIF(l.p90_long, 0)) DESC;</code></p
 
 <p class="text-gray-300 leading-relaxed">In PostgreSQL environments, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_cron</code> is a convenient in-database scheduler for the telemetry collection and prediction-evaluation queries, but the actual scaling API calls should still be dispatched outside the database. A common pattern is to have pg_cron write scaling recommendations to a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dba_metrics.scaling_queue</code> table, and have an external lightweight daemon — a Python script, a Go binary, a systemd service — poll that queue and execute the corresponding API calls.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Create the scaling action queue table
-CREATE TABLE IF NOT EXISTS dba_metrics.scaling_queue (
-    id                  BIGSERIAL       PRIMARY KEY,
-    created_at          TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
-    target_time         TIMESTAMPTZ     NOT NULL,
-    action_type         TEXT            NOT NULL,  -- 'ADD_REPLICA','REMOVE_REPLICA','POOL_EXPAND', etc.
-    action_params       JSONB           NOT NULL DEFAULT '{}',
-    status              TEXT            NOT NULL DEFAULT 'PENDING',
-        -- PENDING, DISPATCHED, COMPLETED, FAILED
-    dispatched_at       TIMESTAMPTZ,
-    completed_at        TIMESTAMPTZ,
-    notes               TEXT
-);
 
-CREATE INDEX IF NOT EXISTS ix_scaling_queue_status_target
-    ON dba_metrics.scaling_queue (status, target_time)
-    WHERE status = 'PENDING';
-
--- Populate queue entries based on upcoming predicted peaks
--- This query is run by pg_cron every 15 minutes
-INSERT INTO dba_metrics.scaling_queue (target_time, action_type, action_params)
-SELECT
-    -- Schedule the action to fire (provisioning_lag_minutes) before the predicted peak
-    DATE_TRUNC('hour', NOW()) +
-        MAKE_INTERVAL(hours =&gt; sp.hour_of_day) -
-        MAKE_INTERVAL(mins  =&gt; 15)              AS target_time,
-    CASE rec.recommended_action
-        WHEN 'SCALE_AGGRESSIVELY' THEN 'ADD_REPLICA'
-        WHEN 'SCALE_STANDARD'     THEN 'ADD_REPLICA'
-        WHEN 'SCALE_WARM'         THEN 'POOL_EXPAND'
-    END                                         AS action_type,
-    JSONB_BUILD_OBJECT(
-        'db_name',            'production_db',
-        'recommended_action', rec.recommended_action,
-        'predicted_p90_tps',  sp.p90_tps,
-        'threshold',          st.tps_scale_threshold
-    )                                           AS action_params
-FROM dba_metrics.seasonal_profile    sp
-CROSS JOIN dba_metrics.scaling_thresholds st
-JOIN LATERAL (
-    SELECT
-        CASE
-            WHEN sp.p90_tps &gt; st.tps_scale_threshold * 1.5 THEN 'SCALE_AGGRESSIVELY'
-            WHEN sp.p90_tps &gt; st.tps_scale_threshold        THEN 'SCALE_STANDARD'
-            WHEN sp.p90_tps &gt; st.tps_scale_threshold * 0.8  THEN 'SCALE_WARM'
-            ELSE NULL
-        END AS recommended_action
-) rec ON rec.recommended_action IS NOT NULL
-WHERE st.db_name = 'production_db'
-  -- Only queue for the next 2 hours, avoid duplicates
-  AND sp.hour_of_day IN (
-        EXTRACT(HOUR FROM NOW())::INT + 1,
-        EXTRACT(HOUR FROM NOW())::INT + 2
-  )
-  AND sp.day_of_week = EXTRACT(ISODOW FROM NOW())::INT
-  -- Skip if already queued for this target slot
-  AND NOT EXISTS (
-      SELECT 1 FROM dba_metrics.scaling_queue sq
-      WHERE sq.status IN ('PENDING', 'DISPATCHED')
-        AND sq.action_type = CASE rec.recommended_action
-                                WHEN 'SCALE_AGGRESSIVELY' THEN 'ADD_REPLICA'
-                                WHEN 'SCALE_STANDARD'     THEN 'ADD_REPLICA'
-                                WHEN 'SCALE_WARM'         THEN 'POOL_EXPAND'
-                             END
-        AND sq.target_time = DATE_TRUNC('hour', NOW()) +
-                             MAKE_INTERVAL(hours =&gt; sp.hour_of_day) -
-                             MAKE_INTERVAL(mins  =&gt; 15)
-  );</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Create the scaling action queue table
 IF OBJECT_ID('dba_metrics.scaling_queue', 'U') IS NULL
 BEGIN
@@ -602,39 +389,7 @@ WHERE st.db_name = 'production_db'
 
 <p class="text-gray-300 leading-relaxed">The key metrics to track at the meta level are prediction accuracy, action latency, and action outcome. Prediction accuracy measures how closely the model's P90 estimate matched the actual P90 observed during each hour slot. Action latency measures the time from when the scaling queue entry was created to when the provisioned capacity was actually serving queries. Action outcome tracks whether each scaling action achieved its intended effect — did adding a replica actually reduce query latency and connection wait times, or did the bottleneck turn out to be somewhere else?</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Retrospective prediction accuracy report
--- Compares what the model predicted vs. what actually happened
-SELECT
-    TO_CHAR(w.captured_at, 'YYYY-MM-DD HH24:00')   AS hour_slot,
-    sp.p90_tps                                       AS predicted_p90,
-    PERCENTILE_CONT(0.90) WITHIN GROUP
-        (ORDER BY w.tps_commit)                      AS actual_p90,
-    ROUND(ABS(sp.p90_tps -
-              PERCENTILE_CONT(0.90) WITHIN GROUP
-                  (ORDER BY w.tps_commit)::NUMERIC)
-          / NULLIF(sp.p90_tps, 0) * 100, 1)         AS pct_error,
-    CASE
-        WHEN ABS(sp.p90_tps -
-                 PERCENTILE_CONT(0.90) WITHIN GROUP
-                     (ORDER BY w.tps_commit)::NUMERIC)
-             / NULLIF(sp.p90_tps, 0) &lt; 0.10         THEN 'ACCURATE'
-        WHEN PERCENTILE_CONT(0.90) WITHIN GROUP
-                 (ORDER BY w.tps_commit) &gt; sp.p90_tps THEN 'UNDER_PREDICTED'
-        ELSE                                              'OVER_PREDICTED'
-    END                                              AS prediction_quality
-FROM dba_metrics.workload_snapshots w
-JOIN dba_metrics.seasonal_profile sp
-    ON EXTRACT(ISODOW FROM w.captured_at)::INT = sp.day_of_week
-    AND EXTRACT(HOUR FROM w.captured_at)::INT  = sp.hour_of_day
-WHERE w.captured_at &gt;= NOW() - INTERVAL '30 days'
-  AND w.db_name = 'production_db'
-GROUP BY
-    TO_CHAR(w.captured_at, 'YYYY-MM-DD HH24:00'),
-    sp.p90_tps
-ORDER BY hour_slot;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Retrospective prediction accuracy report
 SELECT
     FORMAT(w.captured_at, 'yyyy-MM-dd HH:00')       AS hour_slot,

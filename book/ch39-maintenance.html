@@ -64,21 +64,6 @@
 
 <p class="text-gray-300 leading-relaxed">The first sign that autovacuum is falling behind is usually bloat. A table that should occupy 2 GB on disk starts using 8 GB. Queries that were fast start doing far more I/O than expected. You can observe this by comparing the live tuple count to the dead tuple count in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_user_tables</code>.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify tables with significant dead tuple accumulation
-SELECT
-    schemaname,
-    relname AS table_name,
-    n_live_tup,
-    n_dead_tup,
-    ROUND(100.0 * n_dead_tup / NULLIF(n_live_tup + n_dead_tup, 0), 2) AS dead_pct,
-    last_vacuum,
-    last_autovacuum,
-    last_analyze,
-    last_autoanalyze
-FROM pg_stat_user_tables
-WHERE n_dead_tup &gt; 10000
-ORDER BY dead_pct DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">When you find a table with a dead tuple percentage above ten or fifteen percent, autovacuum should have already addressed it—if it hasn't, the first question is whether autovacuum is running at all, and the second is whether the table has storage parameters that override the default thresholds. Tables with a very high row velocity sometimes need custom autovacuum settings applied directly to them.</p>
 
@@ -88,15 +73,6 @@ ORDER BY dead_pct DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Transaction ID wraparound deserves its own attention in any PostgreSQL maintenance playbook. Every row in PostgreSQL is stamped with the transaction ID (XID) that inserted it. XIDs are 32-bit unsigned integers, meaning they wrap around after about 4 billion transactions. PostgreSQL tracks how far the oldest unfrozen XID is from the wraparound limit, and if the gap falls below the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">autovacuum_freeze_max_age</code> threshold (default 200 million transactions), it will force an aggressive VACUUM on affected tables. If the gap falls below <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">vacuum_freeze_min_age</code>, PostgreSQL will begin freezing rows during regular vacuums. The DBA's job is to make sure this never becomes an emergency.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Monitor transaction ID wraparound risk by database
-SELECT
-    datname,
-    age(datfrozenxid) AS xid_age,
-    2147483647 - age(datfrozenxid) AS xids_remaining,
-    ROUND(100.0 * age(datfrozenxid) / 2147483647, 2) AS pct_toward_wraparound
-FROM pg_database
-ORDER BY xid_age DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">A <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pct_toward_wraparound</code> above fifteen percent should be a monitored alert. Above thirty percent, you should be scheduling manual VACUUM FREEZE runs during off-peak hours on the oldest tables in each affected database.</p>
 
@@ -112,7 +88,7 @@ ORDER BY xid_age DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The conventional guidance is to use REORGANIZE for fragmentation between fifteen and thirty percent, and REBUILD for fragmentation above thirty percent, though these thresholds should be treated as starting points rather than rules. For very small indexes, fragmentation numbers are statistically meaningless—rebuilding a 10-page index every week wastes more I/O than the fragmentation would ever cost.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify index fragmentation across a database
 SELECT
     OBJECT_SCHEMA_NAME(ips.object_id) AS schema_name,
@@ -135,20 +111,6 @@ ORDER BY ips.avg_fragmentation_in_percent DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">In practice, most PostgreSQL indexes don't need manual reindexing if autovacuum is running properly. The cases where reindexing helps are heavily updated indexes where many deleted entries accumulate faster than vacuum can reclaim them, or indexes that have grown significantly through one-time bulk inserts and now have structural imbalance.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Find bloated indexes using pg_stat_user_indexes and size information
-SELECT
-    schemaname,
-    tablename,
-    indexname,
-    pg_size_pretty(pg_relation_size(indexrelid)) AS index_size,
-    idx_scan AS scans_since_reset,
-    idx_tup_read,
-    idx_tup_fetch
-FROM pg_stat_user_indexes
-WHERE idx_scan &lt; 50
-  AND pg_relation_size(indexrelid) &gt; 10 * 1024 * 1024  -- larger than 10 MB
-ORDER BY pg_relation_size(indexrelid) DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Identifying unused indexes deserves its own place in the maintenance playbook. Both platforms maintain statistics about how frequently each index is accessed, but there's an important caveat: SQL Server's index usage stats reset when the service restarts, and PostgreSQL's reset when <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_reset()</code> is called or the server restarts. Before removing an index based on usage stats, verify that the collection window is long enough to cover all workload patterns—including month-end reports, quarterly batch jobs, and infrequent operational queries that might run only a few times a year. A safe practice is to mark candidate indexes for removal, communicate the intent to application owners, and observe for at least one full business cycle before dropping.</p>
 
@@ -162,7 +124,7 @@ ORDER BY pg_relation_size(indexrelid) DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">SQL Server provides <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DBCC CHECKDB</code> as its primary integrity validation tool. It verifies the structural integrity of all objects in the database: allocation structures, B-tree consistency, row data against index data, and cross-page linkages. A full CHECKDB on a large database can take hours and consumes significant I/O bandwidth, which is why many shops run it during off-peak maintenance windows or use the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">PHYSICAL_ONLY</code> option during frequent checks and reserve full logical consistency checks for weekly runs.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Run a full integrity check with informational output
 DBCC CHECKDB (N'YourDatabaseName')
     WITH NO_INFOMSGS, ALL_ERRORMSGS;
@@ -175,18 +137,6 @@ DBCC CHECKDB (N'YourDatabaseName')
 
 <p class="text-gray-300 leading-relaxed">PostgreSQL doesn't have a built-in equivalent to CHECKDB, which is one of the more significant operational gaps between the two platforms. The closest built-in tool is <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VACUUM VERBOSE</code>, which reports any page-level errors it encounters while scanning tables, but it doesn't actively validate B-tree index consistency. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">amcheck</code> extension, available in PostgreSQL 10 and later, provides functions to check B-tree index structural integrity without any locking.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Use amcheck to verify B-tree index consistency (requires amcheck extension)
-CREATE EXTENSION IF NOT EXISTS amcheck;
-
--- Check a specific index for structural corruption
-SELECT bt_index_check('your_schema.your_index_name'::regclass);
-
--- Check with heap verification (more thorough, checks index-to-heap cross-references)
-SELECT bt_index_parent_check(
-    'your_schema.your_index_name'::regclass,
-    heapalloc =&gt; true
-);</code></pre>
 
 <p class="text-gray-300 leading-relaxed">For table-level data verification in PostgreSQL, the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_filechecksum</code> utility introduced in PostgreSQL 12 (when data checksums are enabled at cluster initialization with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">initdb --data-checksums</code>) detects block-level corruption by verifying stored checksums against computed checksums when pages are read. Data checksums should be enabled on all new PostgreSQL clusters—the performance overhead is typically one to two percent, and the early detection capability is worth far more than that.</p>
 
@@ -211,7 +161,7 @@ SELECT bt_index_parent_check(
 
 <p class="text-gray-300 leading-relaxed">This pattern makes the maintenance log table a first-class operational artifact. When someone asks why a query is suddenly slow, you can check whether the most recent statistics refresh ran on schedule. When a developer asks why index fragmentation is high on a specific table, you can check whether the index maintenance job ran successfully and whether that table has unusually high write volume.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Create a maintenance log table and record job execution
 CREATE TABLE dba_maintenance.maintenance_log (
     log_id          INT IDENTITY(1,1) PRIMARY KEY,
@@ -237,32 +187,6 @@ SET completed_at  = SYSDATETIME(),
     rows_affected = @@ROWCOUNT
 WHERE log_id = @log_id;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Equivalent maintenance log table in PostgreSQL
-CREATE TABLE dba_maintenance.maintenance_log (
-    log_id          BIGSERIAL PRIMARY KEY,
-    job_name        TEXT NOT NULL,
-    target_object   TEXT,
-    started_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    completed_at    TIMESTAMPTZ,
-    rows_affected   BIGINT,
-    status          TEXT NOT NULL DEFAULT 'RUNNING',
-    error_message   TEXT
-);
-
--- Record the start of a job and capture the ID for later update
-WITH ins AS (
-    INSERT INTO dba_maintenance.maintenance_log (job_name, target_object)
-    VALUES ('vacuum_analyze', 'public.orders')
-    RETURNING log_id
-)
-SELECT log_id INTO TEMP TABLE _current_job FROM ins;
-
--- On completion, update the log record
-UPDATE dba_maintenance.maintenance_log
-SET completed_at = now(),
-    status       = 'SUCCESS'
-WHERE log_id = (SELECT log_id FROM _current_job);</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Maintenance windows deserve explicit planning rather than implicit assumptions. The question "when can we run this?" has different answers for different tasks. A VACUUM ANALYZE on a non-critical table might run during business hours with minimal impact. A VACUUM FULL that holds an exclusive lock for forty minutes needs a maintenance window agreement with application owners. CHECKDB on a 2 TB database will saturate I/O for several hours and should run during the deepest off-peak period available.</p>
 

@@ -60,35 +60,7 @@
 
 <p class="text-gray-300 leading-relaxed">PostgreSQL's native table partitioning uses the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE TABLE ... PARTITION BY</code> syntax introduced in version 10 and matured significantly in versions 11–14. SQL Server's equivalent is the partition function and partition scheme model, which maps ranges to filegroups.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Create a range-partitioned table for time-series events
-CREATE TABLE events (
-    event_id    BIGSERIAL,
-    occurred_at TIMESTAMPTZ NOT NULL,
-    user_id     BIGINT,
-    event_type  TEXT,
-    payload     JSONB
-) PARTITION BY RANGE (occurred_at);
 
--- Create monthly partitions
-CREATE TABLE events_2024_01
-    PARTITION OF events
-    FOR VALUES FROM ('2024-01-01') TO ('2024-02-01');
-
-CREATE TABLE events_2024_02
-    PARTITION OF events
-    FOR VALUES FROM ('2024-02-01') TO ('2024-03-01');
-
--- Default partition catches anything outside defined ranges
-CREATE TABLE events_default
-    PARTITION OF events DEFAULT;
-
--- Verify partition pruning is working
-EXPLAIN (ANALYZE, BUFFERS)
-SELECT * FROM events
-WHERE occurred_at BETWEEN '2024-01-15' AND '2024-01-20';</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Create a partition function mapping date ranges to partitions
 CREATE PARTITION FUNCTION pf_events_monthly (DATETIME2)
 AS RANGE RIGHT FOR VALUES (
@@ -146,36 +118,7 @@ WHERE t.name = 'events';</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Deciding where on this spectrum to operate requires understanding your read/write ratio and your read latency tolerance. A system with 95% reads, a few seconds of acceptable lag, and complex aggregate queries is a strong candidate for a replica plus materialized views. A system where every read must reflect the latest write must stay on the primary.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Create a materialized view for dashboard reads
--- The write path stays on the normalized orders and order_items tables
-CREATE MATERIALIZED VIEW mv_daily_sales_summary AS
-SELECT
-    DATE_TRUNC('day', o.created_at)::DATE  AS sale_date,
-    p.category,
-    COUNT(DISTINCT o.order_id)              AS order_count,
-    SUM(oi.quantity)                        AS units_sold,
-    SUM(oi.quantity * oi.unit_price)        AS gross_revenue,
-    SUM(oi.quantity * oi.unit_price * 0.85) AS estimated_margin
-FROM orders o
-JOIN order_items oi ON oi.order_id = o.order_id
-JOIN products p ON p.product_id = oi.product_id
-WHERE o.status = 'completed'
-GROUP BY 1, 2
-WITH DATA;
 
--- Index the materialized view for common query patterns
-CREATE INDEX idx_mv_daily_sales_date
-    ON mv_daily_sales_summary (sale_date DESC);
-
-CREATE INDEX idx_mv_daily_sales_category
-    ON mv_daily_sales_summary (category, sale_date DESC);
-
--- Refresh strategy: use CONCURRENTLY during business hours
--- so reads aren't blocked
-REFRESH MATERIALIZED VIEW CONCURRENTLY mv_daily_sales_summary;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server uses indexed views (schema-bound) for similar functionality
 -- Note: SQL Server indexed views have stricter requirements than pg materialized views
 CREATE VIEW vw_daily_sales_summary
@@ -219,42 +162,7 @@ CREATE NONCLUSTERED INDEX idx_daily_sales_category
 
 <p class="text-gray-300 leading-relaxed">SQL Server's equivalent is SQL Server Change Data Capture, a built-in feature that captures changes into shadow tables within the same database. Downstream systems query these capture tables to read changes since a given LSN (Log Sequence Number).</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Check current replication slots (used by CDC tools like Debezium)
-SELECT
-    slot_name,
-    plugin,
-    slot_type,
-    active,
-    restart_lsn,
-    confirmed_flush_lsn,
-    pg_size_pretty(
-        pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) * 8192 / 8192
-    ) AS approximate_lag
-FROM pg_replication_slots;
 
--- Create a logical replication slot for a CDC consumer
--- 'pgoutput' is the built-in logical decoder in PostgreSQL 10+
-SELECT pg_create_logical_replication_slot(
-    'debezium_orders_slot',
-    'pgoutput'
-);
-
--- Monitor WAL accumulation caused by unconsumed slots
--- (this is critical: inactive slots cause WAL to accumulate indefinitely)
-SELECT
-    slot_name,
-    active,
-    pg_size_pretty(
-        pg_wal_lsn_diff(
-            pg_current_wal_lsn(),
-            restart_lsn
-        ) * current_setting('block_size')::BIGINT / 8192
-    ) AS wal_retained
-FROM pg_replication_slots
-ORDER BY restart_lsn;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Enable CDC on the database
 EXEC sys.sp_cdc_enable_db;
 
@@ -323,35 +231,7 @@ ORDER BY __$seqval;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Monitoring in multi-region setups requires watching replication lag from multiple vantage points. A replica that's 5 seconds behind the primary is fine under normal load. A replica that's 5 minutes behind because network conditions degraded undetected is a problem you want to know about before a failover forces you to discover it.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- On the primary: view current replication state for all standbys
-SELECT
-    application_name,
-    client_addr,
-    state,
-    sent_lsn,
-    write_lsn,
-    flush_lsn,
-    replay_lsn,
-    EXTRACT(EPOCH FROM write_lag)  AS write_lag_seconds,
-    EXTRACT(EPOCH FROM flush_lag)  AS flush_lag_seconds,
-    EXTRACT(EPOCH FROM replay_lag) AS replay_lag_seconds,
-    sync_state
-FROM pg_stat_replication
-ORDER BY application_name;
 
--- On a standby: check how far behind the primary it is
-SELECT
-    CASE
-        WHEN pg_is_in_recovery() THEN
-            EXTRACT(EPOCH FROM (NOW() - pg_last_xact_replay_timestamp()))
-        ELSE 0
-    END AS replication_lag_seconds,
-    pg_last_wal_receive_lsn()  AS received_lsn,
-    pg_last_wal_replay_lsn()   AS replayed_lsn,
-    pg_is_in_recovery()        AS is_standby;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Monitor Always On AG replica synchronization health
 SELECT
     ag.name                             AS availability_group,
@@ -418,69 +298,7 @@ ORDER BY ag.name, ar.replica_server_name;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Wiring these three layers together creates an actionable observability stack. When an alert fires on a metrics threshold (average query latency exceeded 100ms for 5 minutes), you pivot to logs to identify the slow queries responsible, then use traces to understand which application paths are generating those queries and why.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Enable pg_stat_statements for query-level metrics
--- (requires adding pg_stat_statements to shared_preload_libraries in postgresql.conf)
-CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
 
--- Top 20 queries by total execution time since last reset
-SELECT
-    LEFT(query, 100)                        AS query_preview,
-    calls,
-    ROUND(total_exec_time::NUMERIC, 2)      AS total_ms,
-    ROUND(mean_exec_time::NUMERIC, 2)       AS mean_ms,
-    ROUND(stddev_exec_time::NUMERIC, 2)     AS stddev_ms,
-    ROUND(min_exec_time::NUMERIC, 2)        AS min_ms,
-    ROUND(max_exec_time::NUMERIC, 2)        AS max_ms,
-    rows,
-    ROUND(100.0 * shared_blks_hit /
-        NULLIF(shared_blks_hit + shared_blks_read, 0), 2) AS cache_hit_pct
-FROM pg_stat_statements
-WHERE calls &gt; 10
-ORDER BY total_exec_time DESC
-LIMIT 20;
-
--- Identify queries with high variance (occasional spikes)
-SELECT
-    LEFT(query, 100)                        AS query_preview,
-    calls,
-    ROUND(mean_exec_time::NUMERIC, 2)       AS mean_ms,
-    ROUND(stddev_exec_time::NUMERIC, 2)     AS stddev_ms,
-    ROUND(max_exec_time::NUMERIC, 2)        AS max_ms,
-    ROUND(stddev_exec_time / NULLIF(mean_exec_time, 0), 2) AS coefficient_of_variation
-FROM pg_stat_statements
-WHERE calls &gt; 50
-  AND mean_exec_time &gt; 5
-ORDER BY coefficient_of_variation DESC
-LIMIT 20;
-
--- Current blocking chains (useful for trace-level debugging of lock waits)
-WITH RECURSIVE lock_chain AS (
-    SELECT
-        blocked.pid                         AS blocked_pid,
-        blocked.query                       AS blocked_query,
-        blocking.pid                        AS blocking_pid,
-        blocking.query                      AS blocking_query,
-        1                                   AS depth
-    FROM pg_stat_activity blocked
-    JOIN pg_stat_activity blocking
-        ON blocking.pid = ANY(pg_blocking_pids(blocked.pid))
-    WHERE blocked.wait_event_type = 'Lock'
-    UNION ALL
-    SELECT
-        lc.blocked_pid,
-        lc.blocked_query,
-        blocking.pid,
-        blocking.query,
-        lc.depth + 1
-    FROM lock_chain lc
-    JOIN pg_stat_activity blocking
-        ON blocking.pid = ANY(pg_blocking_pids(lc.blocking_pid))
-    WHERE lc.depth &lt; 10
-)
-SELECT * FROM lock_chain ORDER BY depth, blocking_pid;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Top queries by total CPU time using Query Store
 -- (Query Store must be enabled on the database)
 SELECT TOP 20

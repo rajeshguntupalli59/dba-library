@@ -210,40 +210,6 @@ ORIGINAL QUERY:
 
 <p class="text-gray-300 leading-relaxed">Setting up pgvector and loading embeddings requires two pieces: the extension itself and an embedding model. The OpenAI <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-3-small</code> model or the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">all-MiniLM-L6-v2</code> model (runnable locally via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sentence-transformers</code>) are both practical choices.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Install the extension (requires pgvector to be installed on the server)
-CREATE EXTENSION IF NOT EXISTS vector;
-
--- Table to store historical slow query signatures with their embeddings
-CREATE TABLE query_signatures (
-    id              BIGSERIAL PRIMARY KEY,
-    query_hash      TEXT NOT NULL,
-    normalized_sql  TEXT NOT NULL,
-    embedding       vector(1536),          -- OpenAI text-embedding-3-small dimension
-    avg_duration_ms FLOAT,
-    capture_time    TIMESTAMPTZ DEFAULT NOW(),
-    database_name   TEXT,
-    plan_summary    TEXT
-);
-
--- HNSW index for fast approximate nearest-neighbor search
--- m=16 and ef_construction=64 are solid defaults for most DBA workloads
-CREATE INDEX idx_query_signatures_hnsw
-    ON query_signatures
-    USING hnsw (embedding vector_cosine_ops)
-    WITH (m = 16, ef_construction = 64);
-
--- Find the 5 most semantically similar historical queries to a new embedding
--- Replace $1 with the embedding vector of the query you're investigating
-SELECT
-    query_hash,
-    normalized_sql,
-    avg_duration_ms,
-    plan_summary,
-    1 - (embedding &lt;=&gt; $1::vector) AS similarity_score
-FROM query_signatures
-ORDER BY embedding &lt;=&gt; $1::vector
-LIMIT 5;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The Python side generates the embedding and executes the similarity search:</p>
 
@@ -301,18 +267,6 @@ def find_similar_queries(new_query_text: str, conn_string: str, top_k: int = 5) 
 
 <p class="text-gray-300 leading-relaxed">One pgvector operational detail that catches DBAs off guard: HNSW indexes are built entirely in memory during construction. For large embedding tables (millions of rows, 1536 dimensions), you need to set <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">maintenance_work_mem</code> substantially higher than its default before building the index, or the build will either fail or produce a suboptimal graph structure. A working rule: budget approximately <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">(dimensions × 4 bytes × 1.2 overhead × rows) / parallelism</code> in bytes for the build operation.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Increase working memory for the index build session only
-SET maintenance_work_mem = '4GB';
-
--- Then build the HNSW index
-CREATE INDEX idx_query_signatures_hnsw
-    ON query_signatures
-    USING hnsw (embedding vector_cosine_ops)
-    WITH (m = 16, ef_construction = 64);
-
--- Reset for the session
-RESET maintenance_work_mem;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">SQL Server does not have a native equivalent to pgvector as of SQL Server 2022, but Azure SQL Database has introduced native vector support in preview, and the pattern translates closely. For on-premises SQL Server, the typical approach is to store embeddings as <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VARBINARY(MAX)</code> or in a companion Azure Cognitive Search index and handle similarity computation outside the database engine.</p>
 

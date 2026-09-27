@@ -82,20 +82,7 @@
 
 <p class="text-gray-300 leading-relaxed">You can inspect page-level information using the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pageinspect</code> extension:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Enable the pageinspect extension first
-CREATE EXTENSION IF NOT EXISTS pageinspect;
 
--- Inspect the raw header of the first page of a table
-SELECT lower, upper, special, pagesize
-FROM page_header(get_raw_page('orders', 0));
-
--- Examine individual tuple visibility information on page 0
-SELECT lp, lp_off, lp_len, t_xmin, t_xmax, t_ctid
-FROM heap_page_items(get_raw_page('orders', 0))
-LIMIT 20;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server equivalent: examine page internals using DBCC PAGE
 -- First find a page number for the orders table
 SELECT TOP 1
@@ -134,7 +121,7 @@ DBCC PAGE(0, 1, 123, 3) WITH TABLERESULTS;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">You can check whether your tables are heaps or clustered index structures:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Find all tables that are stored as heaps (no clustered index)
 SELECT
     t.name AS table_name,
@@ -148,18 +135,6 @@ WHERE i.type = 0  -- 0 = HEAP
 GROUP BY t.name
 ORDER BY total_space_kb DESC;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- In PostgreSQL, all tables are heaps by default.
--- Check table sizes and their associated indexes:
-SELECT
-    relname AS table_name,
-    pg_size_pretty(pg_relation_size(oid)) AS table_size,
-    pg_size_pretty(pg_indexes_size(oid)) AS indexes_size,
-    pg_size_pretty(pg_total_relation_size(oid)) AS total_size
-FROM pg_class
-WHERE relkind = 'r'
-  AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'public')
-ORDER BY pg_total_relation_size(oid) DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The absence of a clustered index concept in PostgreSQL has one visible benefit: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CLUSTER</code> exists as a one-time physical reorganization command, but it is not self-maintaining. SQL Server's clustered index, by contrast, continuously maintains physical row order as data is inserted, updated, and deleted — at the cost of page splits when rows are inserted in non-sequential key order.</p>
 
@@ -181,7 +156,7 @@ ORDER BY pg_total_relation_size(oid) DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">You can create and inspect a columnstore index in SQL Server:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Create a clustered columnstore index on a fact table
 -- (This replaces the existing clustered B-tree index)
 CREATE CLUSTERED COLUMNSTORE INDEX cci_fact_sales
@@ -201,24 +176,6 @@ FROM sys.column_store_row_groups
 WHERE object_id = OBJECT_ID('fact_sales')
 ORDER BY row_group_id;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL does not have native columnstore.
--- Approximate columnar efficiency with partial indexes and covering indexes
--- for analytical patterns:
-
--- Example: a covering index that avoids heap access for a summary query
-CREATE INDEX idx_orders_covering_revenue
-ON orders (order_date)
-INCLUDE (customer_id, revenue, status)
-WHERE status IN ('completed', 'shipped');
-
--- Check if the planner uses an index-only scan (no heap access)
-EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
-SELECT order_date, SUM(revenue)
-FROM orders
-WHERE status = 'completed'
-  AND order_date &gt;= '2024-01-01'
-GROUP BY order_date;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">For SQL Server environments that mix OLTP and analytics on the same tables — a pattern called HTAP (Hybrid Transactional/Analytical Processing) — a nonclustered columnstore index on a row-store table is a powerful option. The optimizer will automatically choose the columnstore path for aggregation queries and the B-tree path for single-row lookups. In practice, this requires careful testing: the overhead of maintaining the columnstore's delta store during heavy OLTP writes can become noticeable.</p>
 
@@ -238,23 +195,7 @@ GROUP BY order_date;</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Fill factor</strong> is the control knob for proactive free space management. Setting fill factor below 100% instructs the engine to leave a percentage of each page empty during index builds. This reserves space for future inserts and in-place updates, reducing page splits for non-sequential insert patterns.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Set fill factor on a heavily-updated table to reduce HOT update failures
--- HOT (Heap Only Tuple) updates avoid index updates when the indexed columns
--- haven't changed, but only work if there's room on the same page
-ALTER TABLE orders SET (fillfactor = 80);
 
--- Rebuild the table to apply the new fill factor
-VACUUM FULL orders;  -- or use pg_repack in production to avoid lock
-
--- Check current fillfactor settings for tables
-SELECT relname, reloptions
-FROM pg_class
-WHERE relkind = 'r'
-  AND reloptions IS NOT NULL
-  AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'public');</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Rebuild an index with a fill factor of 80% to reduce page splits
 -- on a table with frequent inserts in the middle of the key range
 ALTER INDEX ix_orders_customer_date
@@ -297,22 +238,7 @@ ORDER BY ips.avg_fragmentation_in_percent DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">You can identify tables with significant TOAST usage in PostgreSQL:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Find tables with large TOAST tables relative to the main table
-SELECT
-    c.relname AS main_table,
-    t.relname AS toast_table,
-    pg_size_pretty(pg_relation_size(c.oid)) AS main_size,
-    pg_size_pretty(pg_relation_size(t.oid)) AS toast_size,
-    pg_size_pretty(pg_relation_size(t.oid)) AS toast_overhead
-FROM pg_class c
-JOIN pg_class t ON c.reltoastrelid = t.oid
-WHERE c.relkind = 'r'
-  AND c.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'public')
-  AND pg_relation_size(t.oid) &gt; 1024 * 1024  -- only if TOAST &gt; 1 MB
-ORDER BY pg_relation_size(t.oid) DESC;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Find tables with significant LOB allocation unit usage
 SELECT
     t.name AS table_name,

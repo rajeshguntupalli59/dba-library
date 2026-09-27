@@ -61,7 +61,7 @@
 
 <p class="text-gray-300 leading-relaxed">The autonomous sensor layer collects these at differential intervals — wait stats at 15-second deltas, query store at 60-second intervals, memory clerks at 30-second intervals. Collecting point-in-time snapshots without computing deltas is one of the most common mistakes in SQL Server observability. <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_os_wait_stats</code> is cumulative since the last service restart; what the decision engine needs is the delta over the collection window.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Autonomous wait stats delta collector
 -- Run this via a SQL Agent job or external Python scheduler at 15-second intervals
 
@@ -114,32 +114,6 @@ SELECT wait_type, waiting_tasks_count, wait_time_ms, signal_wait_time_ms, GETUTC
 FROM sys.dm_os_wait_stats
 WHERE wait_type NOT IN (/* same exclusion list */);</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Equivalent wait event sampling for autonomous baseline in PostgreSQL
--- Uses pg_stat_activity for active waits + pg_stat_bgwriter for I/O pressure
-
-SELECT
-    wait_event_type,
-    wait_event,
-    COUNT(*)                        AS session_count,
-    NOW()                           AS sampled_at
-FROM pg_stat_activity
-WHERE state = 'active'
-  AND wait_event IS NOT NULL
-  AND pid &lt;&gt; pg_backend_pid()
-GROUP BY wait_event_type, wait_event
-ORDER BY session_count DESC;
-
--- Checkpoint pressure delta (run at interval, subtract prior snapshot)
-SELECT
-    checkpoints_timed,
-    checkpoints_req,
-    buffers_checkpoint,
-    buffers_clean,
-    maxwritten_clean,
-    buffers_backend,
-    NOW() AS sampled_at
-FROM pg_stat_bgwriter;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Once delta-aware DMV collection is running, the signals feed into a time-series store — typically Prometheus with a custom SQL Server exporter or a purpose-built Python collector writing to InfluxDB or TimescaleDB. The decision engine then operates against a sliding window of 5–15 minutes of signal history rather than instantaneous reads. A single spike in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">PAGEIOLATCH_EX</code> waits means nothing; a sustained 10-minute elevation above a learned baseline triggers an I/O investigation workflow.</p>
 
@@ -220,7 +194,7 @@ class SQLServerWaitBaseline:
 <p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Validation</strong> — before forcing a plan, verify the "best" plan is still valid given current statistics.</p>
 <p class="text-gray-300 leading-relaxed">4. <strong class="text-white">Remediation</strong> — force the plan or escalate to an index-change workflow if no valid plan exists.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Autonomous plan regression detector
 -- Identifies queries where active plan is &gt;2x worse than best known plan
 -- weighted by execution frequency over the last 2 hours
@@ -421,7 +395,7 @@ class AutonomousQueryGovernor:
 
 <p class="text-gray-300 leading-relaxed">Automatic plan correction — introduced in SQL Server 2017 as a Database Compatibility feature — provides a native version of this loop. Enabling it is a prerequisite, but it is not sufficient for full autonomy because its correction logic is binary (force or don't) and does not participate in a broader decision pipeline. The ADE builds on top of it, using <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_db_tuning_recommendations</code> as an additional signal source:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Surface the native engine's own tuning recommendations
 -- Use these as pre-validated signals in the autonomous decision pipeline
 
@@ -453,7 +427,7 @@ ORDER BY score DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">For environments running Always On across Azure VMs or on-premises with Pacemaker on Linux, the autonomous controller monitors redo queue depth as a leading indicator of failover risk. A secondary with a growing redo queue that is not catching up indicates either an I/O-bound secondary or a network partition that will worsen before it improves.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- AG replica health monitor for autonomous controller
 -- Collects redo queue, send queue, and synchronization state per replica
 
@@ -906,7 +880,7 @@ class AutonomousReadRouter:
 
 <p class="text-gray-300 leading-relaxed">The core signal is <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_db_index_physical_stats</code>, but querying it directly in SAMPLED mode at scale has a non-trivial I/O cost. The autonomous collector uses a tiered scan strategy: small tables are scanned nightly in DETAILED mode; large tables use LIMITED mode daily with DETAILED mode deferred to weekly off-peak windows.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Autonomous index fragmentation assessment with tiered scan mode
 -- Returns actionable rows with recommended operation and estimated cost
 
@@ -1129,7 +1103,7 @@ class AutonomousIndexManager:
 
 <p class="text-gray-300 leading-relaxed">Statistics management follows the same pattern. The autonomous stats controller evaluates modification counters from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_db_stats_properties</code> against a density-aware threshold — tables with highly skewed distributions need stats updated at a lower modification threshold than uniform distributions, because the optimizer's cardinality estimates degrade faster on skewed data.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Autonomous statistics staleness assessment
 -- Uses modification counter relative to table size + density proxy
 
@@ -1218,7 +1192,7 @@ ORDER BY n_mod_since_analyze DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The feedback loop works as follows: the wait stats sensor detects sustained <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">RESOURCE_SEMAPHORE</code> waits (query memory grant queuing), which signals that the memory grant pool is exhausted. The controller inspects <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_query_memory_grants</code> to identify which workload groups are consuming grants, and either caps the offending groups or redistributes the MAX_MEMORY_PERCENT between pools.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Memory grant pressure diagnostic for autonomous controller
 SELECT
     mg.session_id,

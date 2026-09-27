@@ -113,60 +113,7 @@ tags: ["pci", "authentication", "credentials"]</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The policy registry itself should live in a table structure that supports efficient querying by framework, scope, and severity — the compliance loop pulls active policies from this registry on each evaluation cycle.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Policy registry table
-CREATE TABLE compliance_policies (
-    policy_id           TEXT PRIMARY KEY,
-    framework           TEXT NOT NULL,
-    control_ref         TEXT NOT NULL,
-    description         TEXT NOT NULL,
-    target_scope        TEXT[] NOT NULL,
-    detection_query     TEXT NOT NULL,
-    detection_platform  TEXT NOT NULL CHECK (detection_platform IN ('postgresql','sqlserver','prometheus')),
-    severity            TEXT NOT NULL CHECK (severity IN ('critical','high','medium','low')),
-    remediation_mode    TEXT NOT NULL CHECK (remediation_mode IN ('auto','approve','alert')),
-    remediation_action  TEXT NOT NULL,
-    evidence_query      TEXT NOT NULL,
-    sla_minutes         INT NOT NULL DEFAULT 60,
-    owner               TEXT NOT NULL,
-    tags                TEXT[],
-    is_active           BOOLEAN NOT NULL DEFAULT TRUE,
-    version             INT NOT NULL DEFAULT 1,
-    last_modified       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    modified_by         TEXT NOT NULL DEFAULT current_user
-);
 
-CREATE INDEX idx_compliance_policies_framework
-    ON compliance_policies (framework)
-    WHERE is_active = TRUE;
-
-CREATE INDEX idx_compliance_policies_scope
-    ON compliance_policies USING GIN (target_scope)
-    WHERE is_active = TRUE;
-
--- Findings table — every detected violation is a row
-CREATE TABLE compliance_findings (
-    finding_id          BIGSERIAL PRIMARY KEY,
-    policy_id           TEXT NOT NULL REFERENCES compliance_policies (policy_id),
-    detected_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    target_database     TEXT NOT NULL,
-    target_host         TEXT NOT NULL,
-    violation_detail    JSONB NOT NULL,
-    severity            TEXT NOT NULL,
-    status              TEXT NOT NULL DEFAULT 'open'
-                        CHECK (status IN ('open','remediating','resolved','suppressed','escalated')),
-    remediation_started TIMESTAMPTZ,
-    remediation_result  JSONB,
-    resolved_at         TIMESTAMPTZ,
-    sla_deadline        TIMESTAMPTZ GENERATED ALWAYS AS
-                        (detected_at + (sla_minutes || ' minutes')::INTERVAL) STORED,
-    sla_minutes         INT NOT NULL
-);
-
-CREATE INDEX idx_findings_status ON compliance_findings (status, detected_at DESC);
-CREATE INDEX idx_findings_sla    ON compliance_findings (sla_deadline) WHERE status = 'open';</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Policy registry table
 CREATE TABLE compliance_policies (
     policy_id           NVARCHAR(200) PRIMARY KEY,
@@ -334,46 +281,7 @@ class ComplianceLoop:
 
 <p class="text-gray-300 leading-relaxed">The finding processor is the component responsible for idempotency — it must not create duplicate findings for a violation that is already open, and it must automatically resolve findings when the detection query no longer returns the violating rows.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Finding processor upsert logic — run inside the Python processor
--- New finding: insert if no open finding exists for this policy+target+detail
-INSERT INTO compliance_findings
-    (policy_id, target_database, target_host,
-     violation_detail, severity, status, sla_minutes)
-SELECT
-    $1::TEXT,                      -- policy_id
-    $2::TEXT,                      -- target_database
-    $3::TEXT,                      -- target_host
-    $4::JSONB,                     -- violation_detail (fingerprint key inside)
-    $5::TEXT,                      -- severity
-    'open',
-    $6::INT                        -- sla_minutes
-WHERE NOT EXISTS (
-    SELECT 1 FROM compliance_findings
-    WHERE policy_id       = $1
-      AND target_database = $2
-      AND target_host     = $3
-      AND violation_detail-&gt;&gt;'fingerprint' = $4::JSONB-&gt;&gt;'fingerprint'
-      AND status IN ('open', 'remediating')
-);
 
--- Auto-resolve findings whose violations are no longer detected
-UPDATE compliance_findings
-SET    status      = 'resolved',
-       resolved_at = NOW(),
-       remediation_result = jsonb_build_object(
-           'resolution', 'auto_resolved',
-           'note', 'Violation no longer detected by detection query'
-       )
-WHERE  policy_id       = $1
-  AND  target_database = $2
-  AND  target_host     = $3
-  AND  status IN ('open', 'remediating')
-  AND  violation_detail-&gt;&gt;'fingerprint' NOT IN (
-      SELECT jsonb_array_elements_text($7::JSONB)  -- current violation fingerprints
-  );</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Finding processor upsert — SQL Server equivalent
 -- Insert new finding if not already open
 INSERT INTO compliance_findings
@@ -458,45 +366,7 @@ WHERE  policy_id       = @policy_id
 
 <p class="text-gray-300 leading-relaxed">The following shows a full remediation action for one of the highest-frequency PCI-DSS violations: an account with excessive login privileges that was provisioned outside the IAM workflow.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Remediation: revoke LOGIN from unauthorized service account
--- Called after human approval (remediation_mode: approve)
-DO $$
-DECLARE
-    v_role    TEXT := $ROLE_NAME$;
-    v_reason  TEXT := 'Compliance auto-remediation: PCI-8.2.1 unauthorized login privilege';
-BEGIN
-    -- Capture current state for audit record before change
-    INSERT INTO compliance_remediation_audit
-        (action, role_name, old_state, new_state, executed_at, policy_id)
-    SELECT
-        'REVOKE_LOGIN',
-        v_role,
-        jsonb_build_object(
-            'rolcanlogin', rolcanlogin,
-            'rolvaliduntil', rolvaliduntil,
-            'rolconfig', rolconfig
-        ),
-        jsonb_build_object('rolcanlogin', false),
-        NOW(),
-        $POLICY_ID$
-    FROM pg_roles WHERE rolname = v_role;
 
-    -- Execute the remediation
-    EXECUTE format('ALTER ROLE %I NOLOGIN', v_role);
-
-    -- Terminate any existing sessions immediately
-    PERFORM pg_terminate_backend(pid)
-    FROM pg_stat_activity
-    WHERE usename = v_role AND pid &lt;&gt; pg_backend_pid();
-
-    RAISE NOTICE 'Login revoked for role % and % sessions terminated',
-        v_role,
-        (SELECT count(*) FROM pg_stat_activity WHERE usename = v_role);
-END;
-$$;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Remediation: disable unauthorized login — SQL Server equivalent
 BEGIN TRANSACTION;
 
@@ -544,28 +414,7 @@ COMMIT TRANSACTION;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">compliance_remediation_audit</code> table schema supports this linkage:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE compliance_remediation_audit (
-    audit_id        BIGSERIAL PRIMARY KEY,
-    finding_id      BIGINT REFERENCES compliance_findings (finding_id),
-    policy_id       TEXT NOT NULL REFERENCES compliance_policies (policy_id),
-    action          TEXT NOT NULL,
-    role_name       TEXT,          -- or login_name, object_name, etc.
-    old_state       JSONB,
-    new_state       JSONB,
-    executed_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    executed_by     TEXT NOT NULL DEFAULT current_user,
-    sql_executed    TEXT,          -- literal SQL sent to the engine
-    success         BOOLEAN NOT NULL DEFAULT TRUE,
-    error_detail    TEXT
-);
 
-CREATE INDEX idx_remediation_audit_finding
-    ON compliance_remediation_audit (finding_id);
-CREATE INDEX idx_remediation_audit_policy
-    ON compliance_remediation_audit (policy_id, executed_at DESC);</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE compliance_remediation_audit (
     audit_id        BIGINT IDENTITY(1,1) PRIMARY KEY,
     finding_id      BIGINT REFERENCES compliance_findings (finding_id),
@@ -726,26 +575,7 @@ async def sample_column_for_pii(
 
 <p class="text-gray-300 leading-relaxed">When the classification policy finds an unlabeled PII column, the remediation action (in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">approve</code> mode for schema-level changes) applies the appropriate sensitivity label and writes a classification record:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Apply PII classification via column comment (portable, no extension required)
--- More complete installations use pg_catalog label providers or custom catalogs
-COMMENT ON COLUMN schema_name.table_name.column_name IS
-    'pii_class:email sensitivity:high gdpr_article:6 classified_at:2024-01-15 classified_by:compliance_engine';
 
--- Also write to classification registry for queryable reporting
-INSERT INTO data_classification_registry
-    (schema_name, table_name, column_name, pii_type,
-     sensitivity, detection_method, classified_at, policy_id)
-VALUES
-    ($1, $2, $3, $4, 'high', $5, NOW(), $6)
-ON CONFLICT (schema_name, table_name, column_name)
-DO UPDATE SET
-    pii_type         = EXCLUDED.pii_type,
-    sensitivity      = EXCLUDED.sensitivity,
-    detection_method = EXCLUDED.detection_method,
-    classified_at    = NOW();</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Apply sensitivity label via built-in Data Classification
 ADD SENSITIVITY CLASSIFICATION TO
     [schema_name].[table_name].[column_name]
@@ -784,60 +614,7 @@ WHEN NOT MATCHED THEN
 
 <p class="text-gray-300 leading-relaxed">The desired state model is encoded in a privilege baseline table: the set of grants that are explicitly authorized for each role on each database object, with the authorization event that approved them.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE privilege_baseline (
-    baseline_id     BIGSERIAL PRIMARY KEY,
-    role_name       TEXT NOT NULL,
-    object_schema   TEXT NOT NULL,
-    object_name     TEXT NOT NULL,
-    object_type     TEXT NOT NULL CHECK (object_type IN
-                    ('table','view','sequence','function','schema','database')),
-    privilege_type  TEXT NOT NULL,   -- SELECT, INSERT, UPDATE, DELETE, EXECUTE, USAGE, etc.
-    granted_by      TEXT NOT NULL,
-    approved_by     TEXT NOT NULL,   -- change ticket or IAM approval ID
-    valid_from      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    valid_until     TIMESTAMPTZ,     -- NULL = indefinite
-    is_active       BOOLEAN NOT NULL DEFAULT TRUE,
-    UNIQUE (role_name, object_schema, object_name, privilege_type)
-);
 
--- Detection query: privileges present in pg_class/pg_namespace ACLs
--- but absent from the baseline
-CREATE OR REPLACE VIEW privilege_drift AS
-WITH actual_table_grants AS (
-    SELECT
-        r.rolname                       AS role_name,
-        n.nspname                       AS object_schema,
-        c.relname                       AS object_name,
-        'table'                         AS object_type,
-        unnest(ARRAY['SELECT','INSERT','UPDATE','DELETE','TRUNCATE',
-                     'REFERENCES','TRIGGER'])  AS privilege_type
-    FROM pg_class c
-    JOIN pg_namespace n ON n.oid = c.relnamespace
-    JOIN pg_roles r ON TRUE
-    WHERE c.relkind IN ('r','v','m','f')
-      AND has_table_privilege(r.rolname, c.oid, 'SELECT')
-        -- (full version checks each privilege type)
-),
-baseline_grants AS (
-    SELECT role_name, object_schema, object_name, privilege_type
-    FROM   privilege_baseline
-    WHERE  is_active = TRUE
-      AND  (valid_until IS NULL OR valid_until &gt; NOW())
-)
-SELECT
-    a.role_name,
-    a.object_schema,
-    a.object_name,
-    a.object_type,
-    a.privilege_type,
-    md5(a.role_name || a.object_schema || a.object_name || a.privilege_type)
-        AS fingerprint
-FROM actual_table_grants  a
-LEFT JOIN baseline_grants b USING (role_name, object_schema, object_name, privilege_type)
-WHERE b.role_name IS NULL;   -- actual grant has no baseline authorization</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE privilege_baseline (
     baseline_id     BIGINT IDENTITY(1,1) PRIMARY KEY,
     role_name       NVARCHAR(200) NOT NULL,
@@ -902,24 +679,7 @@ WHERE dp.state IN ('G', 'W')   -- GRANT or GRANT WITH GRANT OPTION
 
 <p class="text-gray-300 leading-relaxed">The evaluation log table supports items 2 and 6:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE compliance_evaluation_log (
-    log_id          BIGSERIAL PRIMARY KEY,
-    policy_id       TEXT NOT NULL REFERENCES compliance_policies (policy_id),
-    evaluated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    target_database TEXT NOT NULL,
-    target_host     TEXT NOT NULL,
-    rows_returned   INT NOT NULL,
-    violation_count INT NOT NULL,
-    duration_ms     INT NOT NULL,
-    evidence_snapshot JSONB,   -- output of evidence_query at eval time
-    error_detail    TEXT
-);
 
-CREATE INDEX idx_eval_log_policy_time
-    ON compliance_evaluation_log (policy_id, evaluated_at DESC);</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE compliance_evaluation_log (
     log_id          BIGINT IDENTITY(1,1) PRIMARY KEY,
     policy_id       NVARCHAR(200) NOT NULL
@@ -1037,30 +797,7 @@ async def generate_evidence_package(
 
 <p class="text-gray-300 leading-relaxed">The policy inheritance model resolves this by distinguishing between the canonical technical control and the framework citations that reference it. A single canonical policy handles detection and remediation; framework mappings record which controls satisfy which framework requirements.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE policy_framework_mappings (
-    mapping_id      BIGSERIAL PRIMARY KEY,
-    policy_id       TEXT NOT NULL REFERENCES compliance_policies (policy_id),
-    framework       TEXT NOT NULL,
-    control_ref     TEXT NOT NULL,
-    requirement_text TEXT NOT NULL,
-    UNIQUE (policy_id, framework, control_ref)
-);
 
--- A single policy can satisfy multiple framework controls
-INSERT INTO policy_framework_mappings
-    (policy_id, framework, control_ref, requirement_text)
-VALUES
-    ('tls-required-pg', 'PCI-DSS', 'PCI-DSS 4.2.1',
-     'Strong cryptography used to safeguard PAN during transmission'),
-    ('tls-required-pg', 'HIPAA',   'HIPAA 164.312(e)(1)',
-     'Implement technical security measures to guard against unauthorized access'),
-    ('tls-required-pg', 'SOC2',    'CC6.7',
-     'Transmits data using encryption and authenticated protocols'),
-    ('tls-required-pg', 'ISO27001','ISO27001 A.10.1',
-     'Cryptographic controls applied to protect information in transit');</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE policy_framework_mappings (
     mapping_id      BIGINT IDENTITY(1,1) PRIMARY KEY,
     policy_id       NVARCHAR(200) NOT NULL
@@ -1093,35 +830,7 @@ VALUES
 
 <p class="text-gray-300 leading-relaxed">The DDL audit detection query requires that DDL event logging is already active:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Assumes pgaudit is installed and logging DDL to a structured log table
--- or that DDL is captured via event triggers into a ddl_audit_log table
 
--- Detection query: DDL executed outside approved change windows
-SELECT
-    event_time,
-    user_name,
-    object_type,
-    object_identity,
-    command_tag,
-    md5(event_time::TEXT || user_name || object_identity) AS fingerprint
-FROM ddl_audit_log
-WHERE event_time &gt;= NOW() - INTERVAL '1 hour'
-  AND NOT (
-    -- Approved change windows: weekdays 22:00–02:00 UTC
-    EXTRACT(DOW FROM event_time AT TIME ZONE 'UTC') BETWEEN 1 AND 5
-    AND (
-        EXTRACT(HOUR FROM event_time AT TIME ZONE 'UTC') &gt;= 22
-        OR EXTRACT(HOUR FROM event_time AT TIME ZONE 'UTC') &lt; 2
-    )
-  )
-  -- Exclude known automation service accounts
-  AND user_name NOT IN (
-        SELECT service_account FROM approved_automation_accounts
-        WHERE ddl_allowed_anytime = TRUE
-  );</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Detection query: DDL executed outside approved change windows
 -- Assumes SQL Server Audit or an event trigger writes to ddl_audit_log
 SELECT

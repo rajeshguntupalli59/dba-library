@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Flipbook Reader — DBA Library</title>
+<meta name="description" content="Read DBA Library books in a page-flipping reader. Turn pages like a real book." />
+<link rel="icon" type="image/svg+xml" href="favicon.svg" />
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  :root { color-scheme: dark; }
+  body { background: #0B0B12; }
+  .book-stage { perspective: 2200px; }
+  .sheet {
+    background: linear-gradient(105deg, #14141f 0%, #171724 60%, #13131d 100%);
+    transform-origin: left center;
+    backface-visibility: hidden;
+    box-shadow: 0 30px 80px rgba(0,0,0,.55), inset 0 0 120px rgba(0,0,0,.25);
+  }
+  .sheet::before {
+    content: ""; position: absolute; inset: 0; pointer-events: none;
+    background: linear-gradient(90deg, rgba(0,0,0,.35), transparent 8%);
+  }
+  @keyframes turnFwd {
+    0% { transform: rotateY(0deg); opacity: 1; }
+    100% { transform: rotateY(-150deg); opacity: 0; }
+  }
+  @keyframes turnBack {
+    0% { transform: rotateY(0deg); opacity: 1; }
+    100% { transform: rotateY(150deg); opacity: 0; }
+  }
+  .turn-fwd { animation: turnFwd .55s ease-in forwards; }
+  .turn-back { animation: turnBack .55s ease-in forwards; }
+  @keyframes pageIn {
+    from { opacity: 0; transform: translateX(24px); }
+    to { opacity: 1; transform: translateX(0); }
+  }
+  .page-in { animation: pageIn .35s ease-out; }
+  @media (prefers-reduced-motion: reduce) {
+    .turn-fwd, .turn-back, .page-in { animation: none !important; }
+  }
+  .sheet article h2 { color: #fff; font-size: 1.6rem; font-weight: 800; margin-bottom: 1rem; }
+  .sheet article h3 { color: #fff; font-size: 1.15rem; font-weight: 700; margin: 1.75rem 0 .75rem; }
+  .sheet article p { color: #d1d5db; line-height: 1.8; margin-bottom: 1rem; }
+  .sheet article pre {
+    background: #0a0a12; border: 1px solid #26263a; border-radius: .75rem;
+    padding: 1.1rem; font-size: .78rem; color: #d1d5db; overflow-x: auto; margin: 1.25rem 0;
+  }
+  .sheet article code { font-family: ui-monospace, monospace; }
+  .sheet article p code, .sheet article li code {
+    background: #26263a; padding: .1rem .4rem; border-radius: .3rem;
+    font-size: .82em; color: #93c5fd;
+  }
+  .sheet article ul { margin: 0 0 1rem 1.25rem; }
+  .sheet article li { color: #d1d5db; line-height: 1.75; margin-bottom: .4rem; list-style: disc; }
+  .sheet article strong { color: #fff; }
+  .sheet article a { color: #818cf8; }
+  select { background: #171724; }
+</style>
+</head>
+<body class="min-h-screen text-gray-200 antialiased">
+
+<header class="sticky top-0 z-20 border-b border-white/10 bg-[#0B0B12]/90 backdrop-blur">
+  <div class="max-w-5xl mx-auto px-4 py-3 flex flex-wrap items-center gap-3">
+    <a href="index.html" class="text-sm text-indigo-300 hover:text-white font-semibold">← Library</a>
+    <h1 id="bookTitle" class="text-base sm:text-lg font-extrabold text-white tracking-tight">Loading…</h1>
+    <div class="ml-auto flex items-center gap-2">
+      <label class="text-xs text-gray-400 hidden sm:inline" for="chSelect">Chapter</label>
+      <select id="chSelect" class="text-sm rounded-lg border border-white/10 px-2 py-1.5 max-w-[220px]"></select>
+    </div>
+  </div>
+  <div class="h-1 bg-white/5">
+    <div id="progress" class="h-full bg-indigo-500 transition-all" style="width:0%"></div>
+  </div>
+</header>
+
+<main class="max-w-5xl mx-auto px-4 py-6 sm:py-10">
+  <div class="book-stage relative">
+    <div id="sheet" class="sheet relative rounded-2xl border border-white/10 px-5 py-8 sm:px-12 sm:py-12 min-h-[60vh]">
+      <article id="page" class="max-w-3xl mx-auto"></article>
+    </div>
+  </div>
+
+  <div class="flex items-center justify-between mt-6 max-w-3xl mx-auto">
+    <button id="prevBtn" class="px-5 py-2.5 rounded-xl border border-white/15 text-sm font-semibold hover:bg-white/5 disabled:opacity-30 disabled:cursor-not-allowed">← Previous</button>
+    <p id="counter" class="text-sm text-gray-400"></p>
+    <button id="nextBtn" class="px-5 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-sm font-semibold text-white disabled:opacity-30 disabled:cursor-not-allowed">Next →</button>
+  </div>
+  <p class="text-center text-xs text-gray-500 mt-4">Tip: use ← → arrow keys or swipe on mobile to turn pages.</p>
+</main>
+
+<script>
+(function () {
+  "use strict";
+  var BOOK_TITLES = {
+    book:  "The DBA Handbook",
+    book2: "The AI-Powered DBA",
+    book3: "The ADE Handbook",
+    book4: "Vector Databases & AI",
+    book5: "The Cloud Database Engineer",
+    book6: "AI-Native Apps on SQL Server",
+    book7: "Database FinOps"
+  };
+  var params = new URLSearchParams(location.search);
+  var book = params.get("book") || "book";
+  if (!BOOK_TITLES[book]) book = "book";
+
+  var bookTitle = document.getElementById("bookTitle");
+  var chSelect = document.getElementById("chSelect");
+  var page = document.getElementById("page");
+  var sheet = document.getElementById("sheet");
+  var progress = document.getElementById("progress");
+  var counter = document.getElementById("counter");
+  var prevBtn = document.getElementById("prevBtn");
+  var nextBtn = document.getElementById("nextBtn");
+
+  var chapters = [];
+  var idx = 0;
+  var reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  bookTitle.textContent = BOOK_TITLES[book];
+  document.title = BOOK_TITLES[book] + " — Flipbook Reader";
+
+  function showError(msg) {
+    page.innerHTML = '<h2>Could not load the book</h2><p>' + msg + '</p>' +
+      '<p><a href="' + book + '/index.html">Open the chapter list instead →</a></p>';
+  }
+
+  function render(i, dir) {
+    idx = i;
+    var c = chapters[idx];
+    fetch(book + "/" + c.file)
+      .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.text(); })
+      .then(function (html) {
+        var doc = new DOMParser().parseFromString(html, "text/html");
+        var art = doc.querySelector("article");
+        if (!art) throw new Error("no article");
+        art.querySelectorAll("p,div").forEach(function (el) {
+          if (/All Chapters/.test(el.textContent) && el.querySelector("a")) el.remove();
+        });
+        var apply = function () {
+          page.innerHTML = "";
+          page.appendChild(document.importNode(art, true));
+          if (!reduceMotion && dir) page.classList.add("page-in");
+          window.scrollTo({ top: 0, behavior: "auto" });
+        };
+        if (!reduceMotion && dir) {
+          sheet.classList.remove("turn-fwd", "turn-back", "page-in");
+          page.classList.remove("page-in");
+          void sheet.offsetWidth;
+          sheet.classList.add(dir > 0 ? "turn-fwd" : "turn-back");
+          setTimeout(function () {
+            sheet.classList.remove("turn-fwd", "turn-back");
+            apply();
+          }, 480);
+        } else {
+          apply();
+        }
+        chSelect.value = String(idx);
+        counter.textContent = "Chapter " + (idx + 1) + " of " + chapters.length;
+        progress.style.width = ((idx + 1) / chapters.length * 100) + "%";
+        prevBtn.disabled = idx === 0;
+        nextBtn.disabled = idx === chapters.length - 1;
+        nextBtn.textContent = idx === chapters.length - 1 ? "Done ✓" : "Next →";
+      })
+      .catch(function (e) { showError(e.message); });
+  }
+
+  function go(d) {
+    var n = idx + d;
+    if (n < 0 || n >= chapters.length) return;
+    render(n, d);
+  }
+
+  prevBtn.addEventListener("click", function () { go(-1); });
+  nextBtn.addEventListener("click", function () { go(1); });
+  chSelect.addEventListener("change", function () { render(parseInt(chSelect.value, 10), 0); });
+  document.addEventListener("keydown", function (e) {
+    if (e.key === "ArrowRight") go(1);
+    else if (e.key === "ArrowLeft") go(-1);
+  });
+  var tx = null;
+  sheet.addEventListener("touchstart", function (e) { tx = e.touches[0].clientX; }, { passive: true });
+  sheet.addEventListener("touchend", function (e) {
+    if (tx === null) return;
+    var dx = e.changedTouches[0].clientX - tx;
+    tx = null;
+    if (dx < -50) go(1);
+    else if (dx > 50) go(-1);
+  }, { passive: true });
+
+  fetch(book + "/manifest.json")
+    .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+    .then(function (data) {
+      chapters = data;
+      if (!chapters.length) throw new Error("empty manifest");
+      chapters.forEach(function (c, i) {
+        var o = document.createElement("option");
+        o.value = String(i);
+        o.textContent = (i + 1) + ". " + c.title;
+        chSelect.appendChild(o);
+      });
+      var start = parseInt(params.get("ch") || "0", 10);
+      if (isNaN(start) || start < 0 || start >= chapters.length) start = 0;
+      render(start, 0);
+    })
+    .catch(function (e) { showError(e.message); });
+})();
+</script>
+</body>
+</html>

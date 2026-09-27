@@ -66,36 +66,7 @@
 
 <p class="text-gray-300 leading-relaxed">Before a model can detect anomalies, it needs to learn what normal looks like. For database environments, behavioral baselines are built from audit log data — the raw record of who connected, from where, when, what they executed, and against which objects.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Enable comprehensive audit logging in postgresql.conf
--- log_connections = on
--- log_disconnections = on
--- log_statement = 'all'
--- log_min_duration_statement = 0
--- log_line_prefix = '%t [%p]: [%l-1] user=%u,db=%d,app=%a,client=%h '
 
--- Using pgaudit extension for structured audit output
-CREATE EXTENSION IF NOT EXISTS pgaudit;
-
--- Set audit logging at the role level for sensitive accounts
-ALTER ROLE analytics_service SET pgaudit.log = 'read,write';
-ALTER ROLE app_service SET pgaudit.log = 'write,ddl';
-
--- Query to extract behavioral features from pg_stat_statements
--- for baseline construction
-SELECT
-    userid::regrole::text                     AS username,
-    LEFT(query, 100)                          AS query_sample,
-    calls,
-    total_exec_time / calls                   AS avg_exec_ms,
-    rows / calls                              AS avg_rows_returned,
-    shared_blks_read / calls                  AS avg_blks_read,
-    DATE_TRUNC('hour', NOW())                 AS sample_window
-FROM pg_stat_statements
-WHERE calls &gt; 10
-ORDER BY total_exec_time DESC;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Enable SQL Server Audit at the server level
 USE master;
 GO
@@ -384,7 +355,7 @@ def run_detection_pipeline(
 
 <p class="text-gray-300 leading-relaxed">For SQL Server environments, integrating with Azure AI services gives you the additional option of using Azure OpenAI Service within your existing network perimeter, subject to your organization's Azure policies.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Query to extract sample queries for a specific session window
 -- from Extended Events session data stored in a target table
 SELECT TOP 10
@@ -425,50 +396,7 @@ ORDER BY al.timestamp DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The detection approach for these patterns uses graph-based analysis layered on top of the behavioral anomaly detection. You model database access as a bipartite graph: users on one side, database objects on the other, with edges representing access events weighted by frequency and recency. Sudden expansion of a user's neighborhood in this graph — new edges to objects that are topologically distant from their historical access pattern — is a strong signal of reconnaissance or lateral movement.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Build an access graph representation using pg_stat_activity history
--- combined with your audit log table
-WITH user_object_access AS (
-    SELECT
-        al.username,
-        al.schema_name,
-        al.object_name,
-        al.schema_name || '.' || al.object_name     AS full_object_name,
-        COUNT(*)                                      AS access_count,
-        MAX(al.event_time)                            AS last_accessed,
-        MIN(al.event_time)                            AS first_accessed
-    FROM audit_log al
-    WHERE al.event_time &gt;= NOW() - INTERVAL '90 days'
-    GROUP BY al.username, al.schema_name, al.object_name
-),
-recent_new_access AS (
-    -- Objects accessed in the last 24 hours that weren't accessed in prior 89 days
-    SELECT DISTINCT
-        r.username,
-        r.full_object_name                            AS newly_accessed_object,
-        h.full_object_name IS NULL                    AS is_brand_new_for_user
-    FROM (
-        SELECT username, full_object_name
-        FROM user_object_access
-        WHERE last_accessed &gt;= NOW() - INTERVAL '24 hours'
-    ) r
-    LEFT JOIN (
-        SELECT username, full_object_name
-        FROM user_object_access
-        WHERE last_accessed &lt; NOW() - INTERVAL '24 hours'
-    ) h ON r.username = h.username AND r.full_object_name = h.full_object_name
-    WHERE h.full_object_name IS NULL
-)
-SELECT
-    rna.username,
-    rna.newly_accessed_object,
-    COUNT(*) OVER (PARTITION BY rna.username) AS new_object_count_24h,
-    sc.sensitivity_label
-FROM recent_new_access rna
-LEFT JOIN sensitivity_catalog sc ON rna.newly_accessed_object = sc.full_object_name
-ORDER BY new_object_count_24h DESC, rna.username;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Detect lateral movement via new schema access compared to 90-day baseline
 WITH HistoricalAccess AS (
     SELECT DISTINCT

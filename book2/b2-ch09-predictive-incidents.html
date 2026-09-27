@@ -56,54 +56,7 @@
 
 <p class="text-gray-300 leading-relaxed">Before wiring up any ML pipeline, it pays to catalog your actual incident history and tag each incident with the metrics that were moving in the hours before it manifested. This retrospective labeling exercise, done consistently, tends to reveal that a majority of incidents share precursor fingerprints with prior events — most production failure modes recur rather than being novel each time. Those fingerprints become your training signal.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Build a retrospective incident precursor dataset by correlating
--- pg_stat_bgwriter snapshots with known incident timestamps stored
--- in a simple incident log table.
 
-CREATE TABLE incident_log (
-    incident_id     SERIAL PRIMARY KEY,
-    started_at      TIMESTAMPTZ NOT NULL,
-    resolved_at     TIMESTAMPTZ,
-    incident_type   TEXT NOT NULL,          -- 'disk_full','lock_storm','vacuum_bloat', etc.
-    affected_db     TEXT NOT NULL,
-    severity        SMALLINT CHECK (severity BETWEEN 1 AND 5),
-    notes           TEXT
-);
-
--- Pull bgwriter pressure metrics in the 4-hour window before each incident
-WITH incident_windows AS (
-    SELECT
-        i.incident_id,
-        i.incident_type,
-        i.started_at,
-        i.started_at - INTERVAL '4 hours' AS window_start
-    FROM incident_log i
-    WHERE i.started_at &gt;= NOW() - INTERVAL '90 days'
-),
-bgwriter_deltas AS (
-    SELECT
-        s.collected_at,
-        s.buffers_clean,
-        s.maxwritten_clean,
-        s.buffers_alloc,
-        LAG(s.buffers_alloc)  OVER (ORDER BY s.collected_at) AS prev_alloc,
-        LAG(s.maxwritten_clean) OVER (ORDER BY s.collected_at) AS prev_maxwritten
-    FROM pg_stat_bgwriter_history s   -- assumes a custom collection table
-)
-SELECT
-    iw.incident_id,
-    iw.incident_type,
-    AVG(bd.buffers_alloc - COALESCE(bd.prev_alloc, 0))     AS avg_alloc_rate,
-    SUM(bd.maxwritten_clean - COALESCE(bd.prev_maxwritten, 0)) AS total_maxwritten_delta,
-    COUNT(*)                                                AS sample_count
-FROM incident_windows iw
-JOIN bgwriter_deltas bd
-    ON bd.collected_at BETWEEN iw.window_start AND iw.started_at
-GROUP BY iw.incident_id, iw.incident_type
-ORDER BY iw.incident_id;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Equivalent retrospective analysis using SQL Server ring buffer
 -- and a custom incident_log table, pulling wait statistics
 -- in the window preceding each logged incident.
@@ -261,45 +214,7 @@ if __name__ == "__main__":
 
 <p class="text-gray-300 leading-relaxed">The practical implementation uses a <strong class="text-white">gradient-boosted classifier</strong> trained on the retrospective incident dataset you built in the first section. Features are the output anomaly scores from your individual detectors (Isolation Forest scores, Prophet forecast residuals, threshold exceedance flags, rate-of-change features) plus lag features capturing the recent history of each signal. The target variable is binary: did a production incident occur within the next two hours?</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Store per-instance risk scores produced by the scoring engine
--- for trending, alerting threshold evaluation, and audit trail.
 
-CREATE TABLE IF NOT EXISTS db_risk_scores (
-    score_id        BIGSERIAL PRIMARY KEY,
-    scored_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    instance_id     TEXT NOT NULL,          -- hostname:port or cluster alias
-    db_name         TEXT NOT NULL,
-    risk_score      NUMERIC(5,4) NOT NULL,  -- 0.0000 to 1.0000
-    top_signals     JSONB,                  -- contributing feature scores
-    model_version   TEXT NOT NULL,
-    alert_threshold NUMERIC(5,4) NOT NULL DEFAULT 0.75
-);
-
-CREATE INDEX CONCURRENTLY idx_risk_scores_instance_time
-    ON db_risk_scores (instance_id, scored_at DESC);
-
-CREATE INDEX CONCURRENTLY idx_risk_scores_high_risk
-    ON db_risk_scores (scored_at DESC)
-    WHERE risk_score &gt;= 0.60;
-
--- Query: instances that have been continuously elevated for &gt; 30 min
--- (useful for suppressing transient spikes from alert logic)
-SELECT
-    instance_id,
-    db_name,
-    MIN(scored_at)                  AS elevated_since,
-    MAX(risk_score)                 AS peak_risk,
-    AVG(risk_score)                 AS avg_risk,
-    COUNT(*)                        AS elevated_windows
-FROM db_risk_scores
-WHERE scored_at &gt;= NOW() - INTERVAL '2 hours'
-  AND risk_score &gt;= 0.60
-GROUP BY instance_id, db_name
-HAVING MIN(scored_at) &lt;= NOW() - INTERVAL '30 minutes'
-ORDER BY avg_risk DESC;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Equivalent risk score storage and sustained-elevation query for SQL Server
 
 CREATE TABLE dbo.db_risk_scores (
@@ -548,89 +463,7 @@ def get_llm_diagnosis(
 
 <p class="text-gray-300 leading-relaxed">The following implementation demonstrates a Tier 1 remediation — automated cancellation of idle-in-transaction sessions — with full audit trail:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Safe automated cancellation of idle-in-transaction sessions
--- exceeding a threshold, with audit logging.
--- Intended to be called by the remediation engine with appropriate credentials.
 
-CREATE TABLE IF NOT EXISTS remediation_audit (
-    audit_id          BIGSERIAL PRIMARY KEY,
-    executed_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    remediation_type  TEXT NOT NULL,
-    instance_id       TEXT NOT NULL,
-    target_detail     JSONB,
-    action_taken      TEXT NOT NULL,
-    triggered_by      TEXT NOT NULL,  -- 'auto' or operator username
-    risk_score_at_trigger NUMERIC(5,4),
-    outcome           TEXT            -- populated after verification
-);
-
--- Remediation function: cancel sessions idle in transaction &gt; threshold
-CREATE OR REPLACE FUNCTION remediate_idle_in_xact(
-    p_threshold_minutes INT DEFAULT 10,
-    p_instance_id TEXT DEFAULT current_setting('cluster.instance_id', true),
-    p_risk_score NUMERIC DEFAULT NULL,
-    p_dry_run BOOLEAN DEFAULT TRUE     -- always default to dry run
-)
-RETURNS TABLE (
-    pid INT,
-    duration INTERVAL,
-    query_snippet TEXT,
-    action TEXT
-)
-LANGUAGE plpgsql
-SECURITY DEFINER
-AS $$
-DECLARE
-    r RECORD;
-BEGIN
-    FOR r IN
-        SELECT
-            sa.pid,
-            NOW() - sa.xact_start AS duration,
-            LEFT(sa.query, 120)   AS query_snippet,
-            sa.usename,
-            sa.application_name
-        FROM pg_stat_activity sa
-        WHERE sa.state = 'idle in transaction'
-          AND sa.xact_start &lt; NOW() - (p_threshold_minutes || ' minutes')::INTERVAL
-          AND sa.pid &lt;&gt; pg_backend_pid()
-        ORDER BY sa.xact_start
-    LOOP
-        IF NOT p_dry_run THEN
-            PERFORM pg_cancel_backend(r.pid);
-            INSERT INTO remediation_audit
-                (remediation_type, instance_id, target_detail,
-                 action_taken, triggered_by, risk_score_at_trigger)
-            VALUES (
-                'cancel_idle_in_xact',
-                COALESCE(p_instance_id, 'unknown'),
-                jsonb_build_object(
-                    'pid', r.pid,
-                    'duration_seconds', EXTRACT(EPOCH FROM r.duration),
-                    'usename', r.usename,
-                    'application_name', r.application_name
-                ),
-                'pg_cancel_backend(' || r.pid || ')',
-                session_user,
-                p_risk_score
-            );
-        END IF;
-
-        RETURN QUERY SELECT
-            r.pid,
-            r.duration,
-            r.query_snippet,
-            CASE WHEN p_dry_run THEN 'DRY RUN - would cancel' ELSE 'CANCELLED' END;
-    END LOOP;
-END;
-$$;
-
--- Revoke public execute; grant only to the remediation service role
-REVOKE EXECUTE ON FUNCTION remediate_idle_in_xact FROM PUBLIC;
-GRANT  EXECUTE ON FUNCTION remediate_idle_in_xact TO remediation_service;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Equivalent idle-blocking session remediation for SQL Server
 -- with audit trail and dry-run safety.
 
@@ -830,47 +663,7 @@ def forecast_db_growth(
 
 <p class="text-gray-300 leading-relaxed">Store the forecast outputs in the same metrics database that feeds the risk scorer. A database instance whose capacity forecast shows less than 21 days to ceiling should automatically elevate its baseline risk score, even if real-time anomaly detectors show nothing alarming — the risk is future-dated, not present-tense, but it belongs in the same operational picture.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Store capacity forecasts and surface upcoming ceiling risks
 
-CREATE TABLE IF NOT EXISTS capacity_forecasts (
-    forecast_id         BIGSERIAL PRIMARY KEY,
-    generated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    instance_id         TEXT NOT NULL,
-    db_name             TEXT NOT NULL,
-    resource_type       TEXT NOT NULL,   -- 'disk', 'connections', 'tablespace'
-    current_value       NUMERIC,
-    ceiling_value       NUMERIC,
-    forecast_horizon_days INT,
-    projected_ceiling_date DATE,
-    days_to_ceiling     INT,
-    forecast_mape       NUMERIC(6,4),
-    forecast_payload    JSONB           -- full Prophet output for charting
-);
-
-CREATE INDEX CONCURRENTLY idx_capacity_forecasts_upcoming
-    ON capacity_forecasts (projected_ceiling_date)
-    WHERE projected_ceiling_date IS NOT NULL
-      AND projected_ceiling_date &gt;= CURRENT_DATE;
-
--- View: instances approaching capacity within 30 days
-CREATE OR REPLACE VIEW v_capacity_risks AS
-SELECT
-    instance_id,
-    db_name,
-    resource_type,
-    current_value,
-    ceiling_value,
-    ROUND(current_value / NULLIF(ceiling_value, 0) * 100, 1) AS pct_utilized,
-    projected_ceiling_date,
-    days_to_ceiling,
-    forecast_mape,
-    generated_at
-FROM capacity_forecasts
-WHERE projected_ceiling_date BETWEEN CURRENT_DATE AND CURRENT_DATE + 30
-ORDER BY days_to_ceiling;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server equivalent: capacity forecast storage and 30-day risk view
 
 CREATE TABLE dbo.capacity_forecasts (

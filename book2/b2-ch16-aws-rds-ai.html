@@ -239,34 +239,6 @@ for page in pages:
 
 <p class="text-gray-300 leading-relaxed">The extension is available on RDS PostgreSQL 15.2+ and Aurora PostgreSQL 15.2+. Install it once per database:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Install pgvector
-CREATE EXTENSION IF NOT EXISTS vector;
-
--- Create a table that stores document chunks alongside their embeddings
--- This example manages internal runbook content for a DBA assistant
-CREATE TABLE runbook_chunks (
-    chunk_id        UUID DEFAULT gen_random_uuid() PRIMARY KEY,
-    runbook_name    TEXT NOT NULL,
-    section_title   TEXT,
-    chunk_text      TEXT NOT NULL,
-    embedding       VECTOR(1536),           -- OpenAI text-embedding-3-small dimension
-    created_at      TIMESTAMPTZ DEFAULT NOW(),
-    updated_at      TIMESTAMPTZ DEFAULT NOW()
-);
-
--- IVFFlat index for approximate nearest neighbor search
--- lists = sqrt(number_of_rows) is a reasonable starting point
-CREATE INDEX idx_runbook_embedding_ivfflat
-    ON runbook_chunks
-    USING ivfflat (embedding vector_cosine_ops)
-    WITH (lists = 100);
-
--- For production at larger scale, HNSW provides better recall
-CREATE INDEX idx_runbook_embedding_hnsw
-    ON runbook_chunks
-    USING hnsw (embedding vector_cosine_ops)
-    WITH (m = 16, ef_construction = 64);</code></pre>
 
 <p class="text-gray-300 leading-relaxed">With the table and index in place, the ingestion pipeline embeds your text and writes to PostgreSQL:</p>
 
@@ -396,14 +368,6 @@ print(answer)</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The most important operational consideration for pgvector at production scale is index maintenance. HNSW indexes on Aurora PostgreSQL do not require periodic rebuild — the index structure handles updates in-place. IVFFlat indexes, however, need to be rebuilt periodically as your data grows because the cluster centroids become stale. A reasonable practice is to rebuild IVFFlat indexes after a 20–25% growth in row count, using <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">REINDEX INDEX CONCURRENTLY</code> to avoid locking:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Rebuild IVFFlat index without blocking reads
-REINDEX INDEX CONCURRENTLY idx_runbook_embedding_ivfflat;
-
--- After rebuilding, check index size and bloat
-SELECT
-    pg_size_pretty(pg_relation_size('idx_runbook_embedding_ivfflat')) AS index_size,
-    pg_size_pretty(pg_total_relation_size('runbook_chunks'))           AS table_total_size;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
@@ -651,21 +615,6 @@ print(diagnosis)</code></pre>
 <p class="text-gray-300 leading-relaxed">2. For each candidate query, retrieve the execution plan from the database.</p>
 <p class="text-gray-300 leading-relaxed">3. Pass the slow query and its plan to Bedrock with a prompt that requests index recommendations in the form of executable DDL.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Step 1: Retrieve execution plan for a slow query
--- In production, you'd get the query text from Performance Insights or pg_stat_statements
-EXPLAIN (FORMAT JSON, ANALYZE FALSE, BUFFERS FALSE)
-SELECT
-    o.order_id,
-    o.customer_id,
-    o.total_amount,
-    c.email
-FROM orders o
-JOIN customers c ON c.customer_id = o.customer_id
-WHERE o.status = 'pending'
-  AND o.created_at &gt; NOW() - INTERVAL '7 days'
-ORDER BY o.total_amount DESC
-LIMIT 100;</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">T-SQL (SQL Server):</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Step 1: Retrieve execution plan for a slow query
@@ -778,29 +727,6 @@ CREATE INDEX CONCURRENTLY idx_orders_pending_recent
 
 <p class="text-gray-300 leading-relaxed">The AI-assisted approach to autovacuum tuning uses the same pattern as index recommendations: collect the signal (table bloat estimates, autovacuum activity from pg_stat_user_tables, wraparound age from pg_class), pass it to Bedrock, get back recommended storage parameters as executable SQL.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Collect autovacuum health signals for tables at risk
-SELECT
-    schemaname,
-    relname,
-    n_live_tup,
-    n_dead_tup,
-    ROUND(100.0 * n_dead_tup / NULLIF(n_live_tup + n_dead_tup, 0), 2) AS dead_tuple_pct,
-    last_vacuum,
-    last_autovacuum,
-    last_analyze,
-    last_autoanalyze,
-    autovacuum_count,
-    autoanalyze_count,
-    -- Age of the oldest transaction ID in this table's visibility map
-    age(relfrozenxid)                                                   AS xid_age,
-    pg_size_pretty(pg_total_relation_size(schemaname||'.'||relname))    AS total_size
-FROM pg_stat_user_tables
-JOIN pg_class ON pg_class.relname = pg_stat_user_tables.relname
-WHERE n_dead_tup &gt; 10000
-   OR age(relfrozenxid) &gt; 100000000
-ORDER BY n_dead_tup DESC, age(relfrozenxid) DESC
-LIMIT 20;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Feed this output to Bedrock with a prompt that specifies the current autovacuum configuration and asks for per-table storage parameter overrides:</p>
 
@@ -960,21 +886,6 @@ cw_client.put_metric_alarm(
 
 <p class="text-gray-300 leading-relaxed">For pgvector query performance, the risk is a similarity search that bypasses the ANN index and performs an exact scan. This happens when the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">lists</code> parameter in an IVFFlat index is too high relative to your <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ivfflat.probes</code> session variable, or when the index was created after rows were already loaded but before <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VACUUM</code> ran to update the visibility map. Catch this in your slow query log:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify pgvector queries that performed sequential scans (no index used)
--- Requires pg_stat_statements
-SELECT
-    LEFT(query, 300)                    AS query_snippet,
-    calls,
-    mean_exec_time                      AS mean_ms,
-    total_exec_time / 1000.0           AS total_seconds,
-    rows
-FROM pg_stat_statements
-WHERE query ILIKE '%&lt;=&gt;%'              -- cosine distance operator
-   OR query ILIKE '%&lt;-&gt;%'             -- L2 distance operator
-   OR query ILIKE '%&lt;#&gt;%'             -- inner product operator
-ORDER BY mean_exec_time DESC
-LIMIT 20;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">If mean execution time for your vector similarity queries is unexpectedly high, run <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">EXPLAIN ANALYZE</code> on a representative query and look for <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Seq Scan</code> on your embedding table. If you see it, confirm the index exists, that <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SET ivfflat.probes = N</code> is set appropriately in your session, and that <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VACUUM</code> has run on the table since the index was created.</p>
 

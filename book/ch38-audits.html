@@ -91,13 +91,6 @@ pgaudit.log_parameter = on</code></pre>
 
 <p class="text-gray-300 leading-relaxed">For object-level auditing — tracking DML against specific sensitive tables — you create a dedicated audit role and grant it to the objects you want to monitor:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Create the audit role and apply object-level auditing
-CREATE ROLE auditor;
-GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE patients TO auditor;
-
--- Enable object auditing for the current session
-SET pgaudit.role = 'auditor';</code></pre>
 
 <p class="text-gray-300 leading-relaxed">With this configuration, any access to the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">patients</code> table — regardless of which user performed it — will generate an <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">OBJECT</code>-type audit record. This is more targeted and far less voluminous than session-level <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">all</code> auditing.</p>
 
@@ -123,7 +116,7 @@ SET pgaudit.role = 'auditor';</code></pre>
 
 <p class="text-gray-300 leading-relaxed">*Figure: SQL Server Audit's three-layer model — server-level and per-database specifications each define what to capture, but all of them funnel into a single, centrally managed audit destination.*</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Step 1: Create the Server Audit (destination)
 CREATE SERVER AUDIT [ProdAudit]
 TO FILE
@@ -145,7 +138,7 @@ ALTER SERVER AUDIT [ProdAudit] WITH (STATE = ON);</code></pre>
 
 <p class="text-gray-300 leading-relaxed">With the Server Audit in place, you attach specifications:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Step 2: Create a Database Audit Specification
 USE HospitalDB;
 GO
@@ -167,52 +160,10 @@ WITH (STATE = ON);</code></pre>
 
 <p class="text-gray-300 leading-relaxed">In PostgreSQL with pgaudit, audit records live in the PostgreSQL log files. On most Linux deployments using systemd, you can capture logs with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">journalctl</code>, or you can configure PostgreSQL to write to CSV format using <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">log_destination = 'csvlog'</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">logging_collector = on</code>. CSV logging makes the audit records machine-readable without a parsing script:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Create a foreign table to query the CSV log directly (PostgreSQL 14+)
--- Using file_fdw extension
-CREATE EXTENSION IF NOT EXISTS file_fdw;
-
-CREATE SERVER pglog FOREIGN DATA WRAPPER file_fdw;
-
-CREATE FOREIGN TABLE postgres_log
-(
-    log_time             timestamp with time zone,
-    user_name            text,
-    database_name        text,
-    process_id           integer,
-    connection_from      text,
-    session_id           text,
-    session_line_num     bigint,
-    command_tag          text,
-    session_start_time   timestamp with time zone,
-    virtual_transaction_id text,
-    transaction_id       bigint,
-    error_severity       text,
-    sql_state_code       text,
-    message              text,
-    detail               text,
-    hint                 text,
-    internal_query       text,
-    internal_query_pos   integer,
-    context              text,
-    query                text,
-    query_pos            integer,
-    location             text,
-    application_name     text
-)
-SERVER pglog
-OPTIONS (filename '/var/log/postgresql/postgresql-2024-01-15_0000.csv', format 'csv');
-
--- Query for audit events specifically
-SELECT log_time, user_name, database_name, message
-FROM postgres_log
-WHERE message LIKE 'AUDIT:%'
-ORDER BY log_time DESC
-LIMIT 100;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">For SQL Server, audit records written to file are read using the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.fn_get_audit_file</code> function, which presents them as a relational result set:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Read audit records from the audit file path
 SELECT
     event_time,
@@ -244,41 +195,6 @@ ORDER BY event_time DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Another technique in PostgreSQL is using trigger-based auditing for high-value DML rather than relying on pgaudit's session-level write class. Triggers execute within the transaction, can capture old and new row values, and write directly to an audit table with whatever structure you define:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Trigger-based audit table for targeted DML auditing
-CREATE TABLE audit_log (
-    audit_id     bigserial PRIMARY KEY,
-    table_name   text NOT NULL,
-    operation    text NOT NULL,
-    changed_by   text NOT NULL DEFAULT current_user,
-    changed_at   timestamptz NOT NULL DEFAULT now(),
-    old_data     jsonb,
-    new_data     jsonb
-);
-
-CREATE OR REPLACE FUNCTION audit_trigger_func()
-RETURNS trigger AS $$
-BEGIN
-    IF TG_OP = 'DELETE' THEN
-        INSERT INTO audit_log (table_name, operation, old_data)
-        VALUES (TG_TABLE_NAME, TG_OP, to_jsonb(OLD));
-        RETURN OLD;
-    ELSIF TG_OP = 'UPDATE' THEN
-        INSERT INTO audit_log (table_name, operation, old_data, new_data)
-        VALUES (TG_TABLE_NAME, TG_OP, to_jsonb(OLD), to_jsonb(NEW));
-        RETURN NEW;
-    ELSIF TG_OP = 'INSERT' THEN
-        INSERT INTO audit_log (table_name, operation, new_data)
-        VALUES (TG_TABLE_NAME, TG_OP, to_jsonb(NEW));
-        RETURN NEW;
-    END IF;
-END;
-$$ LANGUAGE plpgsql SECURITY DEFINER;
-
--- Apply the trigger to the sensitive table
-CREATE TRIGGER patients_audit
-AFTER INSERT OR UPDATE OR DELETE ON patients
-FOR EACH ROW EXECUTE FUNCTION audit_trigger_func();</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SECURITY DEFINER</code> clause means the function executes with the permissions of its owner (typically a privileged DBA account), not the session user. This prevents a user from bypassing the audit by revoking INSERT on the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">audit_log</code> table from themselves.</p>
 
@@ -294,22 +210,12 @@ FOR EACH ROW EXECUTE FUNCTION audit_trigger_func();</code></pre>
 
 <p class="text-gray-300 leading-relaxed">In PostgreSQL, protect audit integrity through several layers. First, ensure the PostgreSQL server process does not own the log directory with write-modify-delete access for any other OS user. Second, restrict who can reconfigure <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pgaudit</code> settings — only superusers can set <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pgaudit.log</code>, so managing superuser access tightly is directly related to audit integrity. Third, for trigger-based audit tables, deny <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">TRUNCATE</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DELETE</code>, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DROP</code> on the audit table to all application roles:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Revoke destructive permissions on the audit table from application roles
-REVOKE DELETE, TRUNCATE ON TABLE audit_log FROM app_role;
-REVOKE ALL ON TABLE audit_log FROM PUBLIC;
-
--- Grant only INSERT to the audit function's owner
-GRANT INSERT ON TABLE audit_log TO audit_owner;
-
--- Grant SELECT to the auditor role for review purposes
-GRANT SELECT ON TABLE audit_log TO auditor_read_role;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">For trigger-based audit tables, also consider partitioning by month and creating new partitions at the beginning of each period. Once a partition is past its period, it can be set to read-only (by revoking write permissions) and archived off-system before being detached.</p>
 
 <p class="text-gray-300 leading-relaxed">In SQL Server, the native audit file format is binary and tamper-evident — SQL Server can detect if an audit file has been modified externally. However, a member of the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sysadmin</code> role can stop and restart the audit, potentially creating a gap in coverage. To detect this, monitor for <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">AUDIT_CHANGE_GROUP</code> events in the Server Audit Specification — this group fires whenever an audit configuration is modified, started, or stopped. Alerting on this event closes the loop on audit tampering at the configuration level.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Add audit configuration change detection to the Server Audit Specification
 ALTER SERVER AUDIT SPECIFICATION [ServerLevelAudit]
     ADD (AUDIT_CHANGE_GROUP)

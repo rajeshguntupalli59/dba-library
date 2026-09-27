@@ -66,30 +66,7 @@
 
 <p class="text-gray-300 leading-relaxed">Partitioning by time is almost always appropriate for edge telemetry workloads. On PostgreSQL, declarative range partitioning on a timestamp column allows you to drop old partitions instantly — no slow DELETE operations that generate WAL and lock rows. On SQL Server, partitioned tables using a partition function achieve similar results, though the management syntax is more verbose.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Time-partitioned sensor table for edge deployment
-CREATE TABLE sensor_readings (
-    reading_id      BIGSERIAL,
-    sensor_id       SMALLINT        NOT NULL,
-    recorded_at     TIMESTAMPTZ     NOT NULL,
-    temperature     REAL,
-    pressure        REAL,
-    humidity        REAL
-) PARTITION BY RANGE (recorded_at);
 
--- Create monthly partitions
-CREATE TABLE sensor_readings_2024_01
-    PARTITION OF sensor_readings
-    FOR VALUES FROM ('2024-01-01') TO ('2024-02-01');
-
-CREATE TABLE sensor_readings_2024_02
-    PARTITION OF sensor_readings
-    FOR VALUES FROM ('2024-02-01') TO ('2024-03-01');
-
--- Drop old data instantly with no heap bloat
-DROP TABLE sensor_readings_2024_01;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Time-partitioned sensor table for edge deployment
 CREATE PARTITION FUNCTION pf_sensor_monthly (DATETIME2)
 AS RANGE RIGHT FOR VALUES (
@@ -116,30 +93,7 @@ ALTER TABLE sensor_readings
 
 <p class="text-gray-300 leading-relaxed">Compression is another lever. PostgreSQL's TOAST mechanism automatically compresses columns exceeding roughly 2 KB, but for structured numeric data in regular-sized columns, you get no automatic compression. TimescaleDB — a PostgreSQL extension widely used in edge IoT scenarios — provides columnar compression for hypertables that can reduce storage by 90% for typical telemetry data. On SQL Server, row and page compression are available even in the Edge edition and are straightforward to enable:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Enable TimescaleDB compression on a hypertable
--- (requires TimescaleDB extension)
-ALTER TABLE sensor_readings SET (
-    timescaledb.compress,
-    timescaledb.compress_segmentby = 'sensor_id',
-    timescaledb.compress_orderby = 'recorded_at DESC'
-);
 
--- Add a compression policy: compress chunks older than 7 days
-SELECT add_compression_policy('sensor_readings', INTERVAL '7 days');
-
--- Check compression savings
-SELECT
-    chunk_name,
-    pg_size_pretty(before_compression_total_bytes) AS before,
-    pg_size_pretty(after_compression_total_bytes)  AS after,
-    ROUND(
-        (1 - after_compression_total_bytes::NUMERIC
-             / NULLIF(before_compression_total_bytes, 0)) * 100, 1
-    ) AS savings_pct
-FROM chunk_compression_stats('sensor_readings');</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Enable page compression on sensor_readings table
 ALTER TABLE sensor_readings REBUILD
 WITH (DATA_COMPRESSION = PAGE);
@@ -189,26 +143,7 @@ WHERE OBJECT_NAME(p.object_id) = 'sensor_readings';</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The risk here is slot bloat. A replication slot that cannot drain will cause WAL to accumulate indefinitely on the edge node. On a constrained disk, this is fatal. Set <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">wal_keep_size</code> conservatively and monitor <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_replication_slots</code> for <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">restart_lsn</code> lag. If lag exceeds your storage budget, you must either expand storage, reduce the outage tolerance, or switch to a polling-based sync approach that does not use slots.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- On the edge node: create publication for outbound data
-CREATE PUBLICATION edge_sensor_pub
-FOR TABLE sensor_readings, device_events
-WITH (publish = 'insert');  -- edge data is insert-only
 
--- Monitor replication slot health on the edge node
-SELECT
-    slot_name,
-    plugin,
-    active,
-    pg_size_pretty(
-        pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)
-    ) AS lag_size,
-    restart_lsn,
-    confirmed_flush_lsn
-FROM pg_replication_slots
-WHERE slot_type = 'logical';</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Azure SQL Edge uses SQL Server replication or Sync Agent
 -- Check distribution agent status for a subscription
 SELECT
@@ -241,36 +176,7 @@ WHERE subscriber_db = 'EdgeSensorDB';</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Checkpoint-based polling</strong> is an alternative to replication slots that is more robust during extended outages. Instead of relying on WAL retention, each table carries a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">modified_at</code> timestamp column updated by a trigger or application code. The central sync process records the last-synced timestamp per edge node and queries for rows modified after that checkpoint. This approach survives arbitrary outages because it requires no server-side state on the edge — only the checkpoint timestamp stored centrally.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Add a modification timestamp and trigger to track changes
-ALTER TABLE sensor_readings
-    ADD COLUMN synced_at TIMESTAMPTZ DEFAULT NULL,
-    ADD COLUMN modified_at TIMESTAMPTZ DEFAULT NOW() NOT NULL;
 
-CREATE OR REPLACE FUNCTION trg_set_modified_at()
-RETURNS TRIGGER LANGUAGE plpgsql AS $$
-BEGIN
-    NEW.modified_at := NOW();
-    RETURN NEW;
-END;
-$$;
-
-CREATE TRIGGER sensor_readings_modified
-    BEFORE UPDATE ON sensor_readings
-    FOR EACH ROW EXECUTE FUNCTION trg_set_modified_at();
-
--- Central sync query: fetch unsynced rows since last checkpoint
--- Run from central server via dblink or foreign data wrapper
-SELECT
-    reading_id, sensor_id, recorded_at,
-    temperature, pressure, humidity, modified_at
-FROM sensor_readings
-WHERE modified_at &gt; $1          -- $1 = last sync checkpoint
-  AND (synced_at IS NULL OR synced_at &lt; modified_at)
-ORDER BY modified_at
-LIMIT 50000;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Checkpoint-based sync using a rowversion/timestamp column
 ALTER TABLE sensor_readings
     ADD row_version ROWVERSION NOT NULL;
@@ -313,36 +219,7 @@ OFFSET 0 ROWS FETCH NEXT 50000 ROWS ONLY;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Autovacuum behavior in PostgreSQL needs explicit attention on edge deployments. The default autovacuum is calibrated for large servers. On edge hardware, autovacuum running at the wrong time can spike I/O and CPU, causing ingestion latency spikes visible in the telemetry data you are trying to collect. Configure <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">autovacuum_vacuum_cost_delay = 20ms</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">autovacuum_vacuum_cost_limit = 200</code> to throttle autovacuum's I/O consumption. For insert-heavy tables with no updates or deletes (common in sensor ingestion), autovacuum's role is primarily freezing transaction IDs — the default settings cause it to run more aggressively than needed. Set <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">autovacuum_vacuum_scale_factor = 0.2</code> on these tables to reduce unnecessary vacuum runs.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Table-level autovacuum tuning for high-ingestion edge tables
-ALTER TABLE sensor_readings SET (
-    autovacuum_vacuum_scale_factor = 0.2,
-    autovacuum_analyze_scale_factor = 0.1,
-    autovacuum_vacuum_cost_delay = 20,
-    autovacuum_vacuum_cost_limit = 200
-);
 
--- Confirm current table-level settings
-SELECT
-    relname,
-    reloptions
-FROM pg_class
-WHERE relname = 'sensor_readings';
-
--- Check autovacuum activity without disrupting production
-SELECT
-    schemaname,
-    relname,
-    n_dead_tup,
-    n_live_tup,
-    last_vacuum,
-    last_autovacuum,
-    last_analyze,
-    last_autoanalyze
-FROM pg_stat_user_tables
-WHERE relname = 'sensor_readings';</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Set memory ceiling for Azure SQL Edge instance
 EXEC sp_configure 'show advanced options', 1;
 RECONFIGURE;
@@ -378,43 +255,7 @@ WHERE name IN (
 
 <p class="text-gray-300 leading-relaxed">Key metrics to collect locally every minute include: active connection count, longest running query duration, replication slot lag (in bytes), table bloat estimates from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_user_tables</code>, cache hit ratio from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_database</code>, and available disk space. On SQL Server Edge, equivalent metrics come from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_os_performance_counters</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_requests</code>, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_os_sys_info</code>.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Local health metrics table for offline persistence
-CREATE TABLE node_health_metrics (
-    captured_at         TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
-    active_connections  SMALLINT,
-    longest_query_sec   REAL,
-    cache_hit_ratio     REAL,
-    wal_slot_lag_mb     REAL,
-    dead_tuple_count    BIGINT,
-    free_disk_mb        INTEGER,
-    synced_to_central   BOOLEAN         NOT NULL DEFAULT FALSE
-);
 
--- Populate via scheduled job (pg_cron or external cron)
-INSERT INTO node_health_metrics (
-    active_connections,
-    longest_query_sec,
-    cache_hit_ratio,
-    wal_slot_lag_mb,
-    dead_tuple_count
-)
-SELECT
-    (SELECT count(*) FROM pg_stat_activity WHERE state = 'active'),
-    (SELECT COALESCE(MAX(EXTRACT(EPOCH FROM (NOW() - query_start))), 0)
-     FROM pg_stat_activity WHERE state = 'active'),
-    (SELECT ROUND(
-        (blks_hit::NUMERIC / NULLIF(blks_hit + blks_read, 0)) * 100, 2
-     )
-     FROM pg_stat_database WHERE datname = current_database()),
-    (SELECT COALESCE(MAX(
-        pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)
-     ) / 1048576.0, 0)
-     FROM pg_replication_slots),
-    (SELECT COALESCE(SUM(n_dead_tup), 0)
-     FROM pg_stat_user_tables);</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Local health metrics table on SQL Edge node
 CREATE TABLE node_health_metrics (
     captured_at         DATETIME2       NOT NULL DEFAULT GETUTCDATE(),
@@ -471,7 +312,7 @@ SELECT
 
 <p class="text-gray-300 leading-relaxed">SQL Server Edge on Linux supports Transparent Data Encryption (TDE), which encrypts data files and backups at the storage layer without requiring application changes. Enable TDE during initial deployment, not after — enabling it on an existing database requires re-encrypting all data pages, which is I/O intensive and time-consuming on edge hardware.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Enable TDE on an Azure SQL Edge database
 -- Step 1: Create master key in master database
 USE master;
@@ -517,26 +358,7 @@ JOIN sys.databases db ON db.database_id = dek.database_id;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Sequence management deserves specific attention. If both the edge database and the central database use a shared sequence for primary keys, disconnection makes that sequence unavailable. Use UUID primary keys generated locally (PostgreSQL's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">gen_random_uuid()</code>, SQL Server's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">NEWSEQUENTIALID()</code> for index-friendly UUIDs) or allocate sequence ranges to each edge node at deployment time. The range allocation approach — where edge node 47 uses IDs 47000000000 to 47999999999 — is simple and guarantees no collisions without any connectivity.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- UUID primary key for fully offline-capable edge table
-CREATE TABLE device_events (
-    event_id        UUID            NOT NULL DEFAULT gen_random_uuid(),
-    device_id       SMALLINT        NOT NULL,
-    event_type      VARCHAR(50)     NOT NULL,
-    occurred_at     TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
-    payload         JSONB,
-    CONSTRAINT pk_device_events PRIMARY KEY (event_id)
-);
 
--- Pre-allocated BIGINT range approach (alternative)
--- Edge node ID is encoded in the high bits
-CREATE SEQUENCE device_events_seq
-    START WITH 4700000000000  -- node 47, range start
-    INCREMENT BY 1
-    MAXVALUE 4799999999999    -- node 47, range end
-    CYCLE OFF;                -- error rather than wrap</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- UUID primary key using NEWSEQUENTIALID for index efficiency
 CREATE TABLE device_events (
     event_id        UNIQUEIDENTIFIER NOT NULL DEFAULT NEWSEQUENTIALID(),

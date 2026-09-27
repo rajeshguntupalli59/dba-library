@@ -94,19 +94,7 @@
 
 <p class="text-gray-300 leading-relaxed">Let's look at the two most foundational monitoring queries: checking active sessions and connection counts.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Active connections grouped by state and database
-SELECT
-    datname,
-    state,
-    COUNT(*) AS connection_count,
-    MAX(EXTRACT(EPOCH FROM (NOW() - state_change))) AS longest_in_state_seconds
-FROM pg_stat_activity
-WHERE pid &lt;&gt; pg_backend_pid()
-GROUP BY datname, state
-ORDER BY connection_count DESC;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Active connections grouped by status and database
 SELECT
     DB_NAME(s.database_id)      AS database_name,
@@ -122,21 +110,7 @@ ORDER BY connection_count DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Cache hit ratio is another foundational metric. When the buffer cache hit ratio drops significantly, it usually means the working set no longer fits in memory, and you are experiencing increased physical I/O.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Buffer cache hit ratio per database
-SELECT
-    datname,
-    blks_hit,
-    blks_read,
-    ROUND(
-        blks_hit::NUMERIC / NULLIF(blks_hit + blks_read, 0) * 100,
-        2
-    ) AS cache_hit_pct
-FROM pg_stat_database
-WHERE datname NOT IN ('template0', 'template1')
-ORDER BY cache_hit_pct ASC;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Buffer cache hit ratio from performance counters
 SELECT
     object_name,
@@ -156,24 +130,7 @@ WHERE counter_name = 'Buffer cache hit ratio'
 
 <p class="text-gray-300 leading-relaxed">In PostgreSQL, blocking appears through <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_locks</code> joined with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_activity</code>. In SQL Server, blocking is exposed through <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_requests</code> and the dedicated <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_os_waiting_tasks</code> DMV.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Blocking chains: who is blocking whom
-SELECT
-    blocked.pid                    AS blocked_pid,
-    blocked.query                  AS blocked_query,
-    blocked.state                  AS blocked_state,
-    EXTRACT(EPOCH FROM NOW() - blocked.query_start)::INT AS wait_seconds,
-    blocking.pid                   AS blocking_pid,
-    blocking.query                 AS blocking_query,
-    blocking.state                 AS blocking_state
-FROM pg_stat_activity AS blocked
-JOIN pg_locks         AS bl  ON bl.pid = blocked.pid AND NOT bl.granted
-JOIN pg_locks         AS kl  ON kl.transactionid = bl.transactionid AND kl.granted
-JOIN pg_stat_activity AS blocking ON blocking.pid = kl.pid
-WHERE blocked.pid &lt;&gt; blocking.pid
-ORDER BY wait_seconds DESC;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Blocking chains with head blocker and wait type
 SELECT
     r.session_id                        AS blocked_session,
@@ -209,22 +166,6 @@ ORDER BY r.wait_time DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Monitoring dead tuple accumulation and autovacuum activity is therefore not optional in PostgreSQL — it is a core DBA responsibility.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Tables with high dead tuple ratios — bloat candidates
-SELECT
-    schemaname,
-    relname                                              AS table_name,
-    n_live_tup,
-    n_dead_tup,
-    ROUND(n_dead_tup::NUMERIC / NULLIF(n_live_tup + n_dead_tup, 0) * 100, 2)
-                                                         AS dead_tuple_pct,
-    last_autovacuum,
-    last_autoanalyze,
-    autovacuum_count
-FROM pg_stat_user_tables
-WHERE n_live_tup + n_dead_tup &gt; 1000
-ORDER BY dead_tuple_pct DESC
-LIMIT 20;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">A dead tuple percentage above 10–20% on a heavily queried table is a signal that autovacuum is not keeping up. This could be because the table's autovacuum settings need tuning, because the autovacuum daemon is overloaded, or because there is a long-running transaction holding back the xmin horizon and preventing cleanup from proceeding.</p>
 
@@ -294,20 +235,7 @@ ORDER BY fragmentation_pct DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The backup age alert deserves special mention. A backup that has not run in 48 hours is a serious operational risk, but many teams do not monitor this at all until they need to restore something. Build a simple check: query your backup history and alert if the most recent successful backup is older than your defined RPO.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Check age of last successful pg_basebackup or pgBackRest backup
--- In environments using a backup log table:
-SELECT
-    backup_type,
-    MAX(completed_at)                        AS last_success,
-    EXTRACT(EPOCH FROM NOW() - MAX(completed_at)) / 3600
-                                             AS hours_since_last_backup
-FROM dba_backup_log
-WHERE status = 'SUCCESS'
-GROUP BY backup_type
-ORDER BY hours_since_last_backup DESC;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Age of most recent successful backup per database and type
 SELECT
     bs.database_name,

@@ -74,33 +74,7 @@
 
 <p class="text-gray-300 leading-relaxed">Store this taxonomy in your policy engine as structured data, not comments or runbooks:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE autonomous_action_taxonomy (
-    action_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    action_type        TEXT NOT NULL,
-    impact_radius      TEXT NOT NULL CHECK (impact_radius IN ('session','object','service','cross-service')),
-    reversible         BOOLEAN NOT NULL,
-    reversibility_note TEXT,
-    urgent             BOOLEAN NOT NULL,
-    governance_track   TEXT NOT NULL CHECK (governance_track IN ('auto','async_approval','sync_approval','prohibited')),
-    max_auto_per_hour  INT,
-    requires_dry_run   BOOLEAN NOT NULL DEFAULT FALSE,
-    created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at         TIMESTAMPTZ NOT NULL DEFAULT now()
-);
 
--- Seed example entries
-INSERT INTO autonomous_action_taxonomy
-    (action_type, impact_radius, reversible, reversibility_note,
-     urgent, governance_track, max_auto_per_hour, requires_dry_run)
-VALUES
-    ('reindex_concurrent',      'object',   true,  'DROP INDEX to undo',             false, 'auto',         4, false),
-    ('kill_idle_in_transaction','session',  false, 'Session state lost',             true,  'auto',         NULL, false),
-    ('primary_failover',        'service',  false, 'Requires manual topology reset', true,  'auto',         1, false),
-    ('drop_table_ttl',          'object',   false, 'Restore from backup only',       false, 'sync_approval',1, true),
-    ('add_read_replica',        'service',  true,  'Remove replica to undo',         false, 'async_approval',2, false);</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE dbo.AutonomousActionTaxonomy (
     ActionId           UNIQUEIDENTIFIER NOT NULL DEFAULT NEWSEQUENTIALID() PRIMARY KEY,
     ActionType         NVARCHAR(100)    NOT NULL,
@@ -298,50 +272,7 @@ class PolicyEngine:
 
 <p class="text-gray-300 leading-relaxed">Store the approval workflow state in a durable queue table:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE governance_action_queue (
-    queue_id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    action_type         TEXT NOT NULL,
-    target_database     TEXT NOT NULL,
-    environment         TEXT NOT NULL,
-    action_payload      JSONB NOT NULL,
-    rollback_procedure  TEXT,
-    policy_id           TEXT NOT NULL,
-    governance_track    TEXT NOT NULL,
-    status              TEXT NOT NULL DEFAULT 'pending'
-                            CHECK (status IN ('pending','approved','rejected',
-                                              'executing','completed','failed',
-                                              'vetoed','timeout_approved')),
-    proposed_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
-    approval_deadline   TIMESTAMPTZ,
-    decided_at          TIMESTAMPTZ,
-    decided_by          TEXT,         -- 'timeout', 'engineer:jsmith', 'auto:urgent'
-    executed_at         TIMESTAMPTZ,
-    completed_at        TIMESTAMPTZ,
-    outcome_summary     TEXT,
-    error_detail        TEXT
-);
 
-CREATE INDEX ON governance_action_queue (status, approval_deadline)
-    WHERE status = 'pending';
-
--- View: actions awaiting approval with time remaining
-CREATE VIEW pending_approvals AS
-SELECT
-    queue_id,
-    action_type,
-    target_database,
-    environment,
-    governance_track,
-    proposed_at,
-    approval_deadline,
-    EXTRACT(EPOCH FROM (approval_deadline - now()))::INT AS seconds_remaining,
-    action_payload
-FROM governance_action_queue
-WHERE status = 'pending'
-ORDER BY approval_deadline ASC NULLS LAST;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE dbo.GovernanceActionQueue (
     QueueId            UNIQUEIDENTIFIER NOT NULL DEFAULT NEWSEQUENTIALID() PRIMARY KEY,
     ActionType         NVARCHAR(100)    NOT NULL,
@@ -466,39 +397,7 @@ if __name__ == '__main__':
 
 <p class="text-gray-300 leading-relaxed">Immutability must be enforced at the database level, not just by application convention. Use append-only table patterns backed by triggers or row-level security that prohibits updates and deletes:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Immutable audit log table with enforced append-only semantics
-CREATE TABLE autonomous_audit_log (
-    log_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    queue_id        UUID REFERENCES governance_action_queue(queue_id),
-    log_type        TEXT NOT NULL
-                        CHECK (log_type IN ('decision','pre_state','execution',
-                                            'post_state','diff','error')),
-    sequence_num    INT NOT NULL,
-    logged_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
-    actor           TEXT NOT NULL,   -- 'ade:policy_engine', 'ade:executor', 'engineer:jsmith'
-    payload         JSONB NOT NULL,
-    checksum        TEXT NOT NULL    -- SHA-256 of (queue_id || log_type || sequence_num || payload)
-);
 
--- Prevent any UPDATE or DELETE on the audit log
-CREATE RULE audit_log_no_update AS ON UPDATE TO autonomous_audit_log DO INSTEAD NOTHING;
-CREATE RULE audit_log_no_delete AS ON DELETE TO autonomous_audit_log DO INSTEAD NOTHING;
-
--- Additionally enforce via RLS for defense in depth
-ALTER TABLE autonomous_audit_log ENABLE ROW LEVEL SECURITY;
-
-CREATE POLICY audit_log_insert_only
-    ON autonomous_audit_log
-    FOR INSERT
-    TO ade_worker
-    WITH CHECK (TRUE);
-
--- No SELECT policy restriction — all roles can read, none can modify
-REVOKE UPDATE, DELETE ON autonomous_audit_log FROM PUBLIC;
-REVOKE UPDATE, DELETE ON autonomous_audit_log FROM ade_worker;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Immutable audit log using temporal-style append-only enforcement
 CREATE TABLE dbo.AutonomousAuditLog (
     LogId        UNIQUEIDENTIFIER NOT NULL DEFAULT NEWSEQUENTIALID() PRIMARY KEY,
@@ -634,61 +533,7 @@ class AuditWriter:
 
 <p class="text-gray-300 leading-relaxed">Policies inherit downward but can be overridden at any level. A global policy prohibiting <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DROP TABLE</code> outside maintenance windows applies everywhere unless a specific database has a registered TTL archiving exemption that overrides it. Store the scope hierarchy and inheritance rules:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE governance_scope_nodes (
-    node_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    parent_id    UUID REFERENCES governance_scope_nodes(node_id),
-    node_type    TEXT NOT NULL CHECK (node_type IN
-                     ('org','environment','region','cluster','database')),
-    node_name    TEXT NOT NULL,
-    metadata     JSONB NOT NULL DEFAULT '{}',
-    UNIQUE (parent_id, node_name)
-);
 
-CREATE TABLE governance_policy_assignments (
-    assignment_id  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    policy_id      TEXT NOT NULL,
-    node_id        UUID NOT NULL REFERENCES governance_scope_nodes(node_id),
-    override_mode  TEXT NOT NULL CHECK (override_mode IN ('inherit','replace','extend')),
-    active         BOOLEAN NOT NULL DEFAULT TRUE,
-    assigned_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-    assigned_by    TEXT NOT NULL
-);
-
--- Recursive CTE to resolve effective policies for a given database node
--- by walking the scope tree from root to leaf, applying overrides
-CREATE OR REPLACE FUNCTION effective_policies_for_node(p_node_id UUID)
-RETURNS TABLE (policy_id TEXT, source_node_id UUID, override_mode TEXT) AS $$
-WITH RECURSIVE scope_ancestors AS (
-    SELECT node_id, parent_id, 0 AS depth
-    FROM governance_scope_nodes
-    WHERE node_id = p_node_id
-    UNION ALL
-    SELECT n.node_id, n.parent_id, sa.depth + 1
-    FROM governance_scope_nodes n
-    JOIN scope_ancestors sa ON n.node_id = sa.parent_id
-),
-ranked_assignments AS (
-    SELECT
-        pa.policy_id,
-        pa.node_id AS source_node_id,
-        pa.override_mode,
-        sa.depth,
-        ROW_NUMBER() OVER (
-            PARTITION BY pa.policy_id
-            ORDER BY sa.depth ASC   -- lower depth = closer to leaf = higher precedence
-        ) AS rn
-    FROM governance_policy_assignments pa
-    JOIN scope_ancestors sa ON pa.node_id = sa.node_id
-    WHERE pa.active = TRUE
-)
-SELECT policy_id, source_node_id, override_mode
-FROM ranked_assignments
-WHERE rn = 1
-  AND override_mode != 'inherit';  -- 'inherit' means use parent's version
-$$ LANGUAGE sql STABLE;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE dbo.GovernanceScopeNodes (
     NodeId     UNIQUEIDENTIFIER NOT NULL DEFAULT NEWSEQUENTIALID() PRIMARY KEY,
     ParentId   UNIQUEIDENTIFIER NULL REFERENCES dbo.GovernanceScopeNodes(NodeId),
@@ -942,7 +787,7 @@ SELECT
     now()                                                AS metric_timestamp
 FROM governance_action_queue;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE VIEW dbo.GovernanceHealthMetrics AS
 SELECT
     SUM(CASE WHEN Status = 'pending'   THEN 1 ELSE 0 END)  AS QueuePending,

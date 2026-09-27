@@ -132,30 +132,7 @@ print(json.dumps(pg_checks, indent=2))</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Once you have a library of these checks, store them in a structured format and run them on a schedule. The following queries demonstrate how to pull the raw data that feeds those checks:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify all role-to-table grants for tables with PII-sensitive column names
-SELECT 
-    r.rolname AS grantee_role,
-    t.table_schema,
-    t.table_name,
-    rp.privilege_type,
-    -- Flag tables likely to contain sensitive data by column naming patterns
-    EXISTS (
-        SELECT 1 FROM information_schema.columns c
-        WHERE c.table_schema = t.table_schema
-          AND c.table_name = t.table_name
-          AND c.column_name ~* '(ssn|social_security|credit_card|card_number|pan|cvv|dob|date_of_birth|passport)'
-    ) AS contains_likely_pii
-FROM information_schema.role_table_grants rp
-JOIN information_schema.tables t 
-    ON rp.table_name = t.table_name 
-    AND rp.table_schema = t.table_schema
-JOIN pg_roles r ON r.rolname = rp.grantee
-WHERE rp.privilege_type IN ('SELECT', 'UPDATE', 'INSERT', 'DELETE')
-  AND t.table_schema NOT IN ('pg_catalog', 'information_schema')
-ORDER BY contains_likely_pii DESC, r.rolname, t.table_name;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify all role-to-table grants for tables with PII-sensitive column names
 SELECT 
     dp.name AS grantee_role,
@@ -318,44 +295,7 @@ Be concise and specific. Reference the actual numbers in the session data."""
 
 <p class="text-gray-300 leading-relaxed">The approach works as follows: capture a full schema snapshot at the last approved compliance review, convert each object's definition into a text representation, embed it using a sentence embedding model, and store the vectors. When a new snapshot is taken, compute embeddings for all current objects, find the nearest neighbor in the baseline for each object, and flag objects where semantic distance exceeds a threshold or where entirely new high-risk objects (by name or column signature) have appeared.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Capture a full schema snapshot including column-level metadata
--- Store this periodically into a compliance tracking schema
-INSERT INTO compliance_schema.schema_snapshots (
-    snapshot_time,
-    snapshot_label,
-    object_type,
-    schema_name,
-    object_name,
-    full_definition
-)
-SELECT 
-    NOW(),
-    'automated_daily',
-    'TABLE_COLUMN',
-    c.table_schema,
-    c.table_name || '.' || c.column_name,
-    -- Build a text representation suitable for embedding
-    FORMAT(
-        'Table: %s.%s | Column: %s | Type: %s | Nullable: %s | Default: %s',
-        c.table_schema, c.table_name, c.column_name,
-        c.data_type, c.is_nullable,
-        COALESCE(c.column_default, 'none')
-    ) AS full_definition
-FROM information_schema.columns c
-WHERE c.table_schema NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
 
-UNION ALL
-
-SELECT 
-    NOW(), 'automated_daily', 'PRIVILEGE',
-    grantee, table_schema || '.' || table_name,
-    FORMAT('Role: %s | Object: %s.%s | Privilege: %s | Grantable: %s',
-        grantee, table_schema, table_name, privilege_type, is_grantable)
-FROM information_schema.role_table_grants
-WHERE table_schema NOT IN ('pg_catalog', 'information_schema');</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Equivalent schema snapshot for SQL Server
 INSERT INTO compliance_tracking.schema_snapshots (
     snapshot_time,
@@ -760,48 +700,7 @@ evidence_text = generate_audit_evidence_section(
 
 <p class="text-gray-300 leading-relaxed">Detecting privilege escalation requires temporal reasoning across the audit log. The pattern to identify is: cumulative permission grants to a principal over a rolling window that, viewed individually, each seem reasonable but collectively produce an over-privileged state.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Detect roles whose effective permissions have grown significantly
--- in the past 90 days compared to the previous 90-day period
-WITH current_period AS (
-    SELECT 
-        grantee,
-        COUNT(DISTINCT table_schema || '.' || table_name) AS accessible_tables,
-        COUNT(DISTINCT privilege_type) AS distinct_privileges,
-        BOOL_OR(privilege_type = 'DELETE') AS has_delete,
-        BOOL_OR(is_grantable = 'YES') AS can_grant_others
-    FROM information_schema.role_table_grants
-    WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
-    GROUP BY grantee
-),
-historical AS (
-    -- Pull from your schema_snapshots table captured previously
-    SELECT
-        grantee_role AS grantee,
-        COUNT(DISTINCT schema_name || '.' || object_name) AS accessible_tables_hist
-    FROM compliance_schema.schema_snapshots
-    WHERE snapshot_time BETWEEN NOW() - INTERVAL '180 days' AND NOW() - INTERVAL '90 days'
-      AND object_type = 'PRIVILEGE'
-    GROUP BY grantee_role
-)
-SELECT 
-    c.grantee,
-    h.accessible_tables_hist AS tables_90_days_ago,
-    c.accessible_tables AS tables_now,
-    c.accessible_tables - COALESCE(h.accessible_tables_hist, 0) AS net_new_tables,
-    c.has_delete,
-    c.can_grant_others,
-    ROUND(
-        (c.accessible_tables - COALESCE(h.accessible_tables_hist, 0))::numeric 
-        / NULLIF(h.accessible_tables_hist, 0) * 100, 1
-    ) AS pct_increase
-FROM current_period c
-LEFT JOIN historical h ON c.grantee = h.grantee
-WHERE c.accessible_tables &gt; COALESCE(h.accessible_tables_hist, 0)
-  AND (c.accessible_tables - COALESCE(h.accessible_tables_hist, 0)) &gt;= 3
-ORDER BY pct_increase DESC NULLS LAST, net_new_tables DESC;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Equivalent privilege growth detection for SQL Server
 WITH current_period AS (
     SELECT
@@ -903,29 +802,7 @@ Be concise. Use specific values from the data provided."""
 
 <p class="text-gray-300 leading-relaxed">The following query identifies tables that likely contain mixed retention classes — that is, both long-lived operational records and short-lived transactional records in the same table, which creates enforcement complexity:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify tables with high temporal variance in record creation dates,
--- which may indicate mixed retention class data co-located in one table
-SELECT
-    schemaname,
-    tablename,
-    pg_size_pretty(pg_total_relation_size(schemaname||'.'||tablename)) AS table_size,
-    -- Check if a likely timestamp column exists
-    (SELECT column_name 
-     FROM information_schema.columns c 
-     WHERE c.table_schema = schemaname 
-       AND c.table_name = tablename
-       AND c.data_type IN ('timestamp with time zone', 'timestamp without time zone', 'date')
-       AND c.column_name ~* '(created|inserted|recorded|timestamp|date)'
-     LIMIT 1
-    ) AS likely_timestamp_column,
-    n_live_tup AS estimated_row_count
-FROM pg_stat_user_tables
-WHERE n_live_tup &gt; 10000  -- Only tables with meaningful row counts
-ORDER BY pg_total_relation_size(schemaname||'.'||tablename) DESC
-LIMIT 50;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Equivalent mixed retention class detection for SQL Server
 SELECT TOP 50
     SCHEMA_NAME(t.schema_id) AS schemaname,

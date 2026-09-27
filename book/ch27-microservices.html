@@ -83,19 +83,7 @@
 
 <p class="text-gray-300 leading-relaxed">For both databases, the DBA's job in a microservices environment includes setting maximum connection limits per service account, monitoring active versus idle connections, and alerting when connection counts approach the configured maximum.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Check current connection counts by application and state
-SELECT
-    application_name,
-    state,
-    COUNT(*) AS connection_count,
-    MAX(EXTRACT(EPOCH FROM (now() - state_change))) AS max_idle_seconds
-FROM pg_stat_activity
-WHERE datname = 'orders_db'
-GROUP BY application_name, state
-ORDER BY connection_count DESC;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Check current connection counts by program name and status
 SELECT
     s.program_name,
@@ -124,16 +112,7 @@ ORDER BY connection_count DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">SQL Server has similar behavior: adding a nullable column is metadata-only and instant, but adding a NOT NULL column without a default requires a table scan to validate or fill the values.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Expand phase: add new column with a default, no table rewrite in PG 11+
-ALTER TABLE orders ADD COLUMN customer_reference_id UUID DEFAULT NULL;
 
--- Create an index concurrently so the table stays available
-CREATE INDEX CONCURRENTLY idx_orders_customer_reference_id
-    ON orders (customer_reference_id)
-    WHERE customer_reference_id IS NOT NULL;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Expand phase: add new nullable column (metadata-only, instant)
 ALTER TABLE orders ADD customer_reference_id UNIQUEIDENTIFIER NULL;
 
@@ -159,26 +138,7 @@ CREATE INDEX idx_orders_customer_reference_id
 
 <p class="text-gray-300 leading-relaxed">The *Transactional Outbox pattern* solves a specific and insidious problem: how do you guarantee that a database write and a message publication happen atomically? Suppose the order service inserts a row into the orders table and then publishes an <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">order_created</code> event to Kafka. If the application crashes between the insert and the publish, the order exists but the downstream services never hear about it. The outbox pattern solves this by inserting the event into an outbox table in the same local transaction as the business data write. A separate process (a relay or Debezium CDC connector) reads the outbox and publishes to the message broker. The event is only removed from the outbox once publication is confirmed.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Transactional outbox: insert business data and event in one transaction
-BEGIN;
 
-INSERT INTO orders (id, customer_id, total_amount, status, created_at)
-VALUES (gen_random_uuid(), $1, $2, 'pending', NOW());
-
-INSERT INTO outbox_events (id, aggregate_type, aggregate_id, event_type, payload, created_at)
-VALUES (
-    gen_random_uuid(),
-    'Order',
-    $3,
-    'order_created',
-    $4::jsonb,
-    NOW()
-);
-
-COMMIT;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Transactional outbox: insert business data and event in one transaction
 BEGIN TRANSACTION;
 
@@ -211,17 +171,7 @@ COMMIT TRANSACTION;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Beyond that, the standard practice in observability-mature teams is embedding trace context in SQL comments. When a service executes a query, it prepends a comment containing the distributed trace ID to the SQL text. Tools like <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sqlcommenter</code> (supported by most ORMs) automate this. The comment ends up in slow query logs and in query text captured by the database's monitoring interfaces, letting you correlate a slow database query with the upstream HTTP request and service call graph that triggered it.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Query with embedded trace context (automatically added by sqlcommenter or ORMs)
-/* traceparent='00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01',
-   service='order-service',version='1.4.2' */
-SELECT o.id, o.total_amount, o.status
-FROM orders o
-WHERE o.customer_id = $1
-  AND o.created_at &gt; NOW() - INTERVAL '30 days'
-ORDER BY o.created_at DESC;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Query with embedded trace context
 /* traceparent='00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01',
    service='order-service',version='1.4.2' */
@@ -251,24 +201,7 @@ ORDER BY o.created_at DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Resource limits in Kubernetes are another area the DBA must influence. If a container's memory limit is set lower than PostgreSQL's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">shared_buffers</code> plus working memory, the container will be OOM-killed under load. A DBA reviewing Kubernetes manifests for a database container should verify that <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">shared_buffers</code> is set to roughly 25% of the container's memory limit, that <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">work_mem</code> is not set so high that concurrent sort operations exhaust available memory, and that <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_connections</code> is configured in concert with the PgBouncer pool size.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Verify current memory configuration in a containerized instance
-SELECT
-    name,
-    setting,
-    unit,
-    context
-FROM pg_settings
-WHERE name IN (
-    'shared_buffers',
-    'work_mem',
-    'max_connections',
-    'effective_cache_size',
-    'maintenance_work_mem'
-)
-ORDER BY name;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Verify current memory configuration in a containerized SQL Server instance
 SELECT
     name,

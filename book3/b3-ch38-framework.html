@@ -77,44 +77,7 @@
 
 <p class="text-gray-300 leading-relaxed">For PostgreSQL, the primary sources are <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_bgwriter</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_replication</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_activity</code>, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_user_tables</code>. These are extended with a custom collector that computes derived signals:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Autonomous signal collection: combined health snapshot for decision engine
--- Runs every 60 seconds via pg_cron or external scheduler
 
-CREATE OR REPLACE VIEW adf.pg_signal_snapshot AS
-SELECT
-    now()                                                   AS collected_at,
-    -- Query pressure
-    (SELECT count(*) FROM pg_stat_activity
-     WHERE state = 'active' AND wait_event_type = 'Lock')  AS active_lock_waiters,
-    (SELECT count(*) FROM pg_stat_activity
-     WHERE state = 'active'
-       AND now() - query_start &gt; interval '30 seconds')    AS long_running_queries,
-    -- Replication lag (bytes)
-    (SELECT COALESCE(max(write_lag_bytes), 0)
-     FROM (
-         SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), sent_lsn) AS write_lag_bytes
-         FROM pg_stat_replication
-     ) sub)                                                 AS max_replication_lag_bytes,
-    -- Buffer hit ratio
-    (SELECT round(
-        sum(blks_hit) * 100.0 /
-        NULLIF(sum(blks_hit) + sum(blks_read), 0), 2)
-     FROM pg_stat_database)                                 AS buffer_hit_ratio,
-    -- Autovacuum pressure
-    (SELECT count(*) FROM pg_stat_user_tables
-     WHERE n_dead_tup &gt; 10000
-       AND (now() - last_autovacuum) &gt; interval '2 hours') AS vacuum_starved_tables,
-    -- Connection saturation
-    (SELECT round(count(*) * 100.0 /
-        current_setting('max_connections')::int, 2)
-     FROM pg_stat_activity)                                 AS connection_saturation_pct,
-    -- Checkpoint pressure
-    (SELECT checkpoints_req * 100.0 /
-        NULLIF(checkpoints_req + checkpoints_timed, 0)
-     FROM pg_stat_bgwriter)                                 AS forced_checkpoint_ratio;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Autonomous signal collection: combined health snapshot for decision engine
 -- Run via SQL Agent job every 60 seconds or captured by external collector
 
@@ -364,7 +327,7 @@ def route_signal(signal_result: dict, ml_scorer=None, llm_client=None) -&gt; Act
 
 <p class="text-gray-300 leading-relaxed">For SQL Server environments running AG-backed multi-site deployments, the decision engine must include a <strong class="text-white">quorum gate</strong> — before any action that touches replication topology (promoting a secondary, pausing log shipping, changing availability mode), the engine checks that it holds a majority vote across AG nodes. This prevents split-brain decision scenarios where two ADF instances simultaneously propose conflicting topology changes.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Quorum gate check: confirm majority AG nodes are reachable before topology actions
 -- Returns 1 if safe to proceed, 0 if quorum is insufficient
 
@@ -415,90 +378,7 @@ END</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The most operationally important actions for PostgreSQL environments — and the ones where incorrect execution causes the most damage — are index creation, configuration parameter changes, and connection pool resizing. All three must execute through change-controlled wrappers:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- ADF executor wrapper: safe concurrent index creation
--- Never fires without prior EXPLAIN ANALYZE estimate and impact classification
 
-CREATE OR REPLACE PROCEDURE adf.exec_create_index_safe(
-    p_table     TEXT,
-    p_columns   TEXT[],
-    p_index_name TEXT,
-    p_proposal_id UUID
-)
-LANGUAGE plpgsql AS $$
-DECLARE
-    v_index_sql     TEXT;
-    v_start_time    TIMESTAMPTZ := now();
-    v_estimated_rows BIGINT;
-    v_table_size_mb NUMERIC;
-BEGIN
-    -- Blast radius check: refuse if table &gt; 100GB without explicit override
-    SELECT pg_total_relation_size(p_table::regclass) / (1024*1024)
-    INTO v_table_size_mb;
-
-    IF v_table_size_mb &gt; 102400 THEN
-        UPDATE adf.action_proposals
-        SET status = 'BLOCKED',
-            block_reason = 'table_exceeds_blast_radius_100gb',
-            updated_at = now()
-        WHERE proposal_id = p_proposal_id;
-        RAISE EXCEPTION 'ADF: Index build blocked — table % is %.0f MB (&gt;100GB limit)',
-            p_table, v_table_size_mb;
-    END IF;
-
-    -- Cooldown check: no actions on this table in the last 30 minutes
-    IF EXISTS (
-        SELECT 1 FROM adf.action_history
-        WHERE target_object = p_table
-          AND completed_at &gt; now() - interval '30 minutes'
-          AND status IN ('COMPLETED', 'FAILED')
-    ) THEN
-        UPDATE adf.action_proposals
-        SET status = 'DEFERRED', block_reason = 'target_in_cooldown'
-        WHERE proposal_id = p_proposal_id;
-        RAISE EXCEPTION 'ADF: Action deferred — % in cooldown window', p_table;
-    END IF;
-
-    -- Build and execute CONCURRENTLY — never block production traffic
-    v_index_sql := format(
-        'CREATE INDEX CONCURRENTLY IF NOT EXISTS %I ON %s (%s)',
-        p_index_name,
-        p_table,
-        array_to_string(p_columns, ', ')
-    );
-
-    UPDATE adf.action_proposals
-    SET status = 'EXECUTING', started_at = now()
-    WHERE proposal_id = p_proposal_id;
-
-    EXECUTE v_index_sql;
-
-    UPDATE adf.action_proposals
-    SET status = 'COMPLETED', completed_at = now()
-    WHERE proposal_id = p_proposal_id;
-
-    INSERT INTO adf.action_history
-        (proposal_id, target_object, action_type, executed_at, completed_at, status)
-    VALUES
-        (p_proposal_id, p_table, 'CREATE_INDEX_CONCURRENTLY',
-         v_start_time, now(), 'COMPLETED');
-
-EXCEPTION WHEN OTHERS THEN
-    UPDATE adf.action_proposals
-    SET status = 'FAILED', failure_reason = SQLERRM, completed_at = now()
-    WHERE proposal_id = p_proposal_id;
-
-    INSERT INTO adf.action_history
-        (proposal_id, target_object, action_type, executed_at, completed_at, status, failure_reason)
-    VALUES
-        (p_proposal_id, p_table, 'CREATE_INDEX_CONCURRENTLY',
-         v_start_time, now(), 'FAILED', SQLERRM);
-
-    RAISE;
-END;
-$$;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- ADF executor wrapper: safe online index creation with blast radius guard
 -- Uses ONLINE = ON to minimize blocking; defers if table exceeds size threshold
 
@@ -597,27 +477,7 @@ END;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The cooldown and blast radius parameters are not hardcoded constants — they live in an <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">adf.executor_policy</code> table that can be updated without redeploying the framework. Different tables, different schemas, and different environments (production vs. staging) carry different policies. A table tagged <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">tier=critical</code> might have a 4-hour cooldown and a 10 GB blast radius limit. A table tagged <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">tier=archive</code> might have a 5-minute cooldown and no size limit at all.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE adf.executor_policy (
-    policy_id       SERIAL PRIMARY KEY,
-    target_pattern  TEXT NOT NULL,          -- regex matched against target_object
-    tier_tag        TEXT NOT NULL DEFAULT 'standard',
-    cooldown_mins   INT  NOT NULL DEFAULT 30,
-    max_size_gb     INT  NULL,              -- NULL = no limit
-    allow_auto      BOOL NOT NULL DEFAULT TRUE,
-    notes           TEXT,
-    updated_at      TIMESTAMPTZ DEFAULT now()
-);
 
--- Populate base policies
-INSERT INTO adf.executor_policy (target_pattern, tier_tag, cooldown_mins, max_size_gb, allow_auto)
-VALUES
-    ('^orders$',              'critical',  240,  10,   FALSE),
-    ('^inventory_.*',         'critical',  120,  25,   TRUE),
-    ('^archive_.*',           'archive',   5,    NULL, TRUE),
-    ('.*',                    'standard',  30,   100,  TRUE);   -- catch-all</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE adf.ExecutorPolicy (
     PolicyId        INT IDENTITY PRIMARY KEY,
     TargetPattern   NVARCHAR(256) NOT NULL,
@@ -648,58 +508,7 @@ VALUES
 
 <p class="text-gray-300 leading-relaxed">The verification record drives the learning loop. Every verified outcome — whether the action succeeded, failed, or produced an unexpected side effect — is written back to the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">adf.outcome_history</code> table. The statistical scoring model in Tier 2 of the decision engine is retrained weekly against this table.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Verify plane: post-action outcome recorder
-CREATE TABLE adf.outcome_history (
-    outcome_id          BIGSERIAL PRIMARY KEY,
-    proposal_id         UUID        NOT NULL REFERENCES adf.action_proposals(proposal_id),
-    signal_name         TEXT        NOT NULL,
-    signal_value_before NUMERIC,
-    signal_value_after  NUMERIC,
-    collateral_signals  JSONB,      -- snapshot of all signals at verify time
-    action_effective    BOOL,       -- did root signal improve?
-    side_effect_detected BOOL,
-    side_effect_detail  TEXT,
-    verified_at         TIMESTAMPTZ DEFAULT now(),
-    verify_window_secs  INT
-);
 
--- Verification query: did lock waiters drop after kill_blocking_head action?
-CREATE OR REPLACE FUNCTION adf.verify_lock_waiter_action(
-    p_proposal_id UUID,
-    p_value_before NUMERIC
-)
-RETURNS VOID LANGUAGE plpgsql AS $$
-DECLARE
-    v_value_after NUMERIC;
-    v_effective   BOOL;
-BEGIN
-    SELECT count(*) INTO v_value_after
-    FROM pg_stat_activity
-    WHERE state = 'active' AND wait_event_type = 'Lock';
-
-    v_effective := (v_value_after &lt; p_value_before * 0.5);  -- 50% reduction required
-
-    INSERT INTO adf.outcome_history
-        (proposal_id, signal_name, signal_value_before,
-         signal_value_after, action_effective, verified_at, verify_window_secs)
-    VALUES
-        (p_proposal_id, 'active_lock_waiters', p_value_before,
-         v_value_after, v_effective, now(), 30);
-
-    IF NOT v_effective THEN
-        -- Escalate: action did not resolve the signal, promote to HUMAN_REQUIRED
-        UPDATE adf.action_proposals
-        SET status = 'ESCALATED',
-            failure_reason = format(
-                'lock_waiters_not_reduced: before=%s after=%s',
-                p_value_before, v_value_after)
-        WHERE proposal_id = p_proposal_id;
-    END IF;
-END;
-$$;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Verify plane: post-action outcome recorder
 CREATE TABLE adf.OutcomeHistory (
     OutcomeId           BIGINT IDENTITY PRIMARY KEY,
@@ -763,33 +572,7 @@ END;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The central governance object is the <strong class="text-white">autonomy dial</strong>: a per-environment, per-action-class setting that controls whether an action fires automatically, requires same-day human approval, requires change-board approval, or is permanently blocked. It is implemented as a simple lookup table with a well-understood override hierarchy.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE adf.autonomy_policy (
-    policy_id       SERIAL PRIMARY KEY,
-    environment     TEXT NOT NULL,          -- 'production', 'staging', 'dev'
-    action_class    TEXT NOT NULL,          -- 'index_management', 'vacuum', 'config_change',
-                                            -- 'connection_scaling', 'failover', 'query_kill'
-    autonomy_level  TEXT NOT NULL           -- 'full_auto', 'auto_offhours', 'approval_required',
-        CHECK (autonomy_level IN            --  'change_board', 'blocked'
-            ('full_auto','auto_offhours','approval_required','change_board','blocked')),
-    offhours_start  TIME,                   -- only used if autonomy_level = 'auto_offhours'
-    offhours_end    TIME,
-    updated_by      TEXT,
-    updated_at      TIMESTAMPTZ DEFAULT now()
-);
 
--- Example: production environment governance defaults
-INSERT INTO adf.autonomy_policy
-    (environment, action_class, autonomy_level, offhours_start, offhours_end, updated_by)
-VALUES
-    ('production', 'vacuum',             'full_auto',       NULL,    NULL,    'adf_bootstrap'),
-    ('production', 'query_kill',         'full_auto',       NULL,    NULL,    'adf_bootstrap'),
-    ('production', 'index_management',   'auto_offhours',  '22:00', '06:00', 'adf_bootstrap'),
-    ('production', 'config_change',      'approval_required', NULL, NULL,    'adf_bootstrap'),
-    ('production', 'connection_scaling', 'auto_offhours',  '22:00', '06:00', 'adf_bootstrap'),
-    ('production', 'failover',           'change_board',    NULL,    NULL,    'adf_bootstrap');</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE adf.AutonomyPolicy (
     PolicyId        INT IDENTITY PRIMARY KEY,
     Environment     NVARCHAR(64)  NOT NULL,
@@ -817,33 +600,7 @@ VALUES
 
 <p class="text-gray-300 leading-relaxed">Change windows work in conjunction with the autonomy dial. A <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">change_board</code>-level action can only execute if a corresponding approved change record exists in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">adf.change_window</code>:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE adf.change_window (
-    window_id       SERIAL PRIMARY KEY,
-    action_class    TEXT        NOT NULL,
-    environment     TEXT        NOT NULL,
-    approved_by     TEXT        NOT NULL,
-    window_start    TIMESTAMPTZ NOT NULL,
-    window_end      TIMESTAMPTZ NOT NULL,
-    ticket_ref      TEXT,
-    consumed        BOOL        DEFAULT FALSE,
-    created_at      TIMESTAMPTZ DEFAULT now()
-);
 
-CREATE OR REPLACE FUNCTION adf.is_change_window_open(
-    p_action_class TEXT,
-    p_environment  TEXT
-) RETURNS BOOL LANGUAGE sql STABLE AS $$
-    SELECT EXISTS (
-        SELECT 1 FROM adf.change_window
-        WHERE action_class  = p_action_class
-          AND environment   = p_environment
-          AND now() BETWEEN window_start AND window_end
-          AND consumed      = FALSE
-    );
-$$;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE adf.ChangeWindow (
     WindowId        INT IDENTITY PRIMARY KEY,
     ActionClass     NVARCHAR(64)  NOT NULL,
@@ -997,81 +754,7 @@ def reason(
 
 <p class="text-gray-300 leading-relaxed">The complete ADF schema bootstrap creates all required tables, views, and functions in a dedicated <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">adf</code> schema that is owned by a restricted service role. No application user should have write access to the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">adf</code> schema — only the framework's service account and DBAs with explicit grant.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- ADF schema bootstrap (abbreviated — full DDL in companion repository)
-CREATE SCHEMA IF NOT EXISTS adf;
 
-CREATE ROLE adf_service NOLOGIN;
-GRANT USAGE ON SCHEMA adf TO adf_service;
-GRANT SELECT, INSERT, UPDATE ON ALL TABLES IN SCHEMA adf TO adf_service;
-GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA adf TO adf_service;
-ALTER DEFAULT PRIVILEGES IN SCHEMA adf
-    GRANT SELECT, INSERT, UPDATE ON TABLES TO adf_service;
-
--- Core state tables
-CREATE TABLE IF NOT EXISTS adf.action_proposals (
-    proposal_id     UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
-    signal_name     TEXT        NOT NULL,
-    proposed_action TEXT        NOT NULL,
-    action_params   JSONB,
-    confidence      NUMERIC(5,4),
-    tier            TEXT,
-    rollback_procedure TEXT,
-    estimated_impact TEXT,
-    status          TEXT        NOT NULL DEFAULT 'PENDING',
-    approved        BOOL        NOT NULL DEFAULT FALSE,
-    approved_by     TEXT,
-    block_reason    TEXT,
-    failure_reason  TEXT,
-    llm_reasoning   TEXT,
-    started_at      TIMESTAMPTZ,
-    completed_at    TIMESTAMPTZ,
-    updated_at      TIMESTAMPTZ DEFAULT now(),
-    created_at      TIMESTAMPTZ DEFAULT now()
-);
-
-CREATE TABLE IF NOT EXISTS adf.action_history (
-    history_id      BIGSERIAL   PRIMARY KEY,
-    proposal_id     UUID        REFERENCES adf.action_proposals(proposal_id),
-    target_object   TEXT,
-    action_type     TEXT,
-    executed_at     TIMESTAMPTZ,
-    completed_at    TIMESTAMPTZ,
-    status          TEXT,
-    failure_reason  TEXT
-);
-
--- Index for cooldown lookups
-CREATE INDEX IF NOT EXISTS idx_action_history_target_completed
-    ON adf.action_history (target_object, completed_at DESC);
-
--- Partitioned signal history (by day, retained 90 days)
-CREATE TABLE IF NOT EXISTS adf.signal_history (
-    collected_at    TIMESTAMPTZ NOT NULL,
-    signal_name     TEXT        NOT NULL,
-    value           NUMERIC,
-    slope           NUMERIC,
-    confidence      NUMERIC(5,4),
-    raw_snapshot    JSONB
-) PARTITION BY RANGE (collected_at);
-
--- Create rolling partitions via pg_cron
-SELECT cron.schedule(
-    'adf_create_signal_partition',
-    '0 0 * * *',
-    $$
-    EXECUTE format(
-        'CREATE TABLE IF NOT EXISTS adf.signal_history_%s
-         PARTITION OF adf.signal_history
-         FOR VALUES FROM (%L) TO (%L)',
-        to_char(now() + interval '1 day', 'YYYYMMDD'),
-        date_trunc('day', now() + interval '1 day'),
-        date_trunc('day', now() + interval '2 days')
-    )
-    $$
-);</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- ADF schema bootstrap (SQL Server)
 IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = 'adf')
     EXEC('CREATE SCHEMA adf');
@@ -1147,30 +830,7 @@ CREATE TABLE adf.SignalHistory (
 
 <p class="text-gray-300 leading-relaxed">The framework's own health is observable through a dedicated status view that any external monitoring system — Grafana, Datadog, PagerDuty — can scrape:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE OR REPLACE VIEW adf.framework_health AS
-SELECT
-    (SELECT count(*) FROM adf.action_proposals
-     WHERE status = 'PENDING'
-       AND created_at &gt; now() - interval '1 hour')         AS pending_proposals_1h,
-    (SELECT count(*) FROM adf.action_proposals
-     WHERE status = 'EXECUTING')                           AS currently_executing,
-    (SELECT count(*) FROM adf.action_proposals
-     WHERE status = 'FAILED'
-       AND created_at &gt; now() - interval '24 hours')       AS failed_actions_24h,
-    (SELECT count(*) FROM adf.action_proposals
-     WHERE status = 'ESCALATED'
-       AND created_at &gt; now() - interval '24 hours')       AS escalations_24h,
-    (SELECT count(*) FROM adf.outcome_history
-     WHERE action_effective = TRUE
-       AND verified_at &gt; now() - interval '24 hours')      AS effective_actions_24h,
-    (SELECT count(*) FROM adf.outcome_history
-     WHERE side_effect_detected = TRUE
-       AND verified_at &gt; now() - interval '24 hours')      AS side_effects_24h,
-    (SELECT max(collected_at) FROM adf.signal_history)     AS last_signal_collected_at,
-    (SELECT now() - max(collected_at) FROM adf.signal_history) AS signal_staleness;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE OR ALTER VIEW adf.FrameworkHealth AS
 SELECT
     (SELECT COUNT(*) FROM adf.ActionProposals

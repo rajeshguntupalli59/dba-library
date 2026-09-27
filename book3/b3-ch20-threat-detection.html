@@ -78,52 +78,7 @@
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Tables accessed per session</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Average rows examined and returned</li>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Create baseline table for per-user query behavior
-CREATE TABLE security.query_baseline (
-    usename          TEXT NOT NULL,
-    query_id         BIGINT NOT NULL,
-    normalized_query TEXT,
-    calls_per_hour   NUMERIC,
-    avg_rows         NUMERIC,
-    stddev_rows      NUMERIC,
-    avg_exec_ms      NUMERIC,
-    stddev_exec_ms   NUMERIC,
-    first_seen       TIMESTAMPTZ,
-    last_updated     TIMESTAMPTZ DEFAULT now(),
-    PRIMARY KEY (usename, query_id)
-);
 
--- Populate/refresh baseline from pg_stat_statements (run on schedule)
-INSERT INTO security.query_baseline (
-    usename, query_id, normalized_query,
-    calls_per_hour, avg_rows, stddev_rows,
-    avg_exec_ms, stddev_exec_ms, first_seen, last_updated
-)
-SELECT
-    r.rolname                          AS usename,
-    s.queryid,
-    s.query                            AS normalized_query,
-    s.calls / NULLIF(
-        EXTRACT(EPOCH FROM (now() - stats_reset)) / 3600, 0
-    )                                  AS calls_per_hour,
-    s.rows / NULLIF(s.calls, 0)        AS avg_rows,
-    -- stddev approximated from total_exec_time variance proxy
-    sqrt(s.total_exec_time / NULLIF(s.calls, 0)
-         - power(s.mean_exec_time, 2)) AS stddev_exec_ms,
-    s.mean_exec_time                   AS avg_exec_ms,
-    NULL                               AS stddev_exec_ms_placeholder,
-    now()                              AS first_seen,
-    now()                              AS last_updated
-FROM pg_stat_statements s
-JOIN pg_roles r ON r.oid = s.userid
-ON CONFLICT (usename, query_id) DO UPDATE
-    SET calls_per_hour  = EXCLUDED.calls_per_hour,
-        avg_rows        = EXCLUDED.avg_rows,
-        avg_exec_ms     = EXCLUDED.avg_exec_ms,
-        last_updated    = now();</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Baseline table for per-login query behavior
 CREATE TABLE SecurityBaseline.QueryProfile (
     LoginName       NVARCHAR(128) NOT NULL,
@@ -398,46 +353,7 @@ if __name__ == "__main__":
     F -->|no| L3done[Session quarantined]</pre></div>
 <p class="text-gray-300 leading-relaxed">*The containment ladder proportions response to confidence — quorum and protected-principal checks are hard gates that route to a human before Level 3/4 actions fire.*</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Level 1: Rate-limit suspicious session dynamically
--- Executed by the monitoring user with pg_signal_backend privilege
-SELECT pg_cancel_backend(pid)              -- cancel current query
-FROM pg_stat_activity
-WHERE pid = :target_pid;
 
--- Apply restrictive settings to the role
-ALTER ROLE suspicious_user
-    SET statement_timeout    = '5s'
-    SET work_mem             = '4MB'
-    SET idle_in_transaction_session_timeout = '30s';
-
--- Level 3: Terminate session and block new connections
-SELECT pg_terminate_backend(pid)
-FROM pg_stat_activity
-WHERE usename = :target_user
-  AND pid &lt;&gt; pg_backend_pid();
-
--- Revoke login (Level 4)
-REVOKE CONNECT ON DATABASE prod FROM suspicious_user;
-
--- Forensic snapshot: record what tables were accessed in this session
-INSERT INTO security.access_forensics (
-    incident_id, username, query_id,
-    query_text, tables_accessed, captured_at
-)
-SELECT
-    :incident_id,
-    s.usename,
-    st.queryid,
-    st.query,
-    -- pg_stat_statements doesn't expose table-level detail; supplement with audit log
-    NULL,
-    now()
-FROM pg_stat_activity   s
-JOIN pg_stat_statements st ON st.userid = s.usesysid
-WHERE s.usename = :target_user;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Level 1: Move login to restricted Resource Governor pool
 -- (assumes pool 'ThreatContainment' is pre-configured with max CPU 10%)
 ALTER RESOURCE GOVERNOR RECONFIGURE;  -- classifier function re-evaluated on next connection
@@ -693,38 +609,6 @@ END;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Privilege escalation detection extends beyond DDL triggers. The scoring engine also runs a scheduled differential check every 5 minutes comparing current role memberships against the last-known-good snapshot:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Snapshot current role memberships
-CREATE TABLE IF NOT EXISTS security.role_membership_snapshot (
-    snapshot_id     BIGSERIAL,
-    captured_at     TIMESTAMPTZ DEFAULT now(),
-    member_role     TEXT,
-    granted_role    TEXT,
-    granted_by      TEXT,
-    admin_option    BOOLEAN
-);
-
--- Differential: roles granted since last snapshot
-INSERT INTO security.role_membership_snapshot
-    (member_role, granted_role, granted_by, admin_option)
-SELECT
-    r.rolname   AS member_role,
-    g.rolname   AS granted_role,
-    gr.rolname  AS granted_by,
-    m.admin_option
-FROM pg_auth_members m
-JOIN pg_roles r  ON r.oid  = m.member
-JOIN pg_roles g  ON g.oid  = m.roleid
-JOIN pg_roles gr ON gr.oid = m.grantor
-WHERE NOT EXISTS (
-    SELECT 1 FROM security.role_membership_snapshot prev
-    WHERE prev.member_role   = r.rolname
-      AND prev.granted_role  = g.rolname
-      AND prev.captured_at   = (
-          SELECT MAX(captured_at)
-          FROM security.role_membership_snapshot
-      )
-);</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Any newly appeared row in this differential is an unconditional alert. A role granted between scheduled windows without a corresponding change-management ticket in the external ITSM system (validated via an HTTP callback to the ITSM API) is escalated immediately to Level 4 autonomous containment.</p>
 

@@ -53,44 +53,7 @@
 
 <p class="text-gray-300 leading-relaxed">The autonomous control plane maintains this graph in a metadata store — typically a strongly consistent key-value system like etcd or Consul — with updates pushed by health agents running as sidecars to every database node. Each agent emits a heartbeat every five seconds carrying latency samples, replication offset, and a local cluster state hash. The control plane ingests these events and continuously recomputes the topology graph.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Topology registry table in the control plane database (PostgreSQL)
-CREATE TABLE db_topology (
-    node_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    cloud_provider   TEXT NOT NULL CHECK (cloud_provider IN ('aws','azure','gcp')),
-    region           TEXT NOT NULL,
-    availability_zone TEXT,
-    role             TEXT NOT NULL CHECK (role IN ('primary','replica','arbiter')),
-    cluster_id       UUID NOT NULL REFERENCES db_clusters(cluster_id),
-    replication_lag_ms NUMERIC,
-    network_rtt_ms   NUMERIC,
-    data_transfer_cost_per_gb NUMERIC,
-    health_state     TEXT NOT NULL DEFAULT 'healthy'
-                     CHECK (health_state IN ('healthy','degraded','failed','unknown')),
-    last_seen        TIMESTAMPTZ NOT NULL DEFAULT now(),
-    metadata         JSONB
-);
 
--- Index for fast failover candidate selection across clouds
-CREATE INDEX ix_topology_role_health
-    ON db_topology (cluster_id, role, health_state, replication_lag_ms)
-    WHERE health_state = 'healthy' AND role = 'replica';
-
--- View: per-cluster health summary across clouds
-CREATE VIEW cluster_cross_cloud_health AS
-SELECT
-    c.cluster_name,
-    n.cloud_provider,
-    COUNT(*) FILTER (WHERE n.health_state = 'healthy')  AS healthy_nodes,
-    COUNT(*) FILTER (WHERE n.health_state = 'degraded') AS degraded_nodes,
-    COUNT(*) FILTER (WHERE n.health_state = 'failed')   AS failed_nodes,
-    MAX(n.replication_lag_ms)                           AS max_lag_ms,
-    AVG(n.network_rtt_ms)                               AS avg_rtt_ms
-FROM db_topology n
-JOIN db_clusters c USING (cluster_id)
-GROUP BY c.cluster_name, n.cloud_provider;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Topology registry in the control plane SQL Server database
 CREATE TABLE dbo.db_topology (
     node_id               UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWSEQUENTIALID(),
@@ -205,7 +168,7 @@ def diagnose_replication_lag(
 
 <p class="text-gray-300 leading-relaxed">For SQL Server, Always On Availability Groups spanning Azure regions use the asynchronous commit mode for cross-region replicas — a requirement, not an option. The autonomous control plane monitors <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_hadr_database_replica_states</code> continuously and enforces a lag SLO: if the secondary's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">redo_queue_size</code> exceeds 512 MB for more than 90 seconds, the system triggers a workload throttle on the primary, reducing batch sizes in flight from application connection pools.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Autonomous lag monitoring query executed by the control plane every 30s
 SELECT
     ag.name                                              AS ag_name,
@@ -353,35 +316,6 @@ def execute_cross_cloud_failover(
 
 <p class="text-gray-300 leading-relaxed">The ADE implements continuous cost attribution at the workload level, not the infrastructure level. This distinction matters: knowing that an EC2 instance costs $0.48/hour is infrastructure billing. Knowing that the nightly ETL job running on that instance generates 2.3 TB of cross-cloud egress at $0.09/GB — $207 per run — is workload attribution. The autonomous system optimizes the latter.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Workload cost attribution: track per-query cloud egress cost
--- Requires pg_stat_statements and a custom cost annotation mechanism
-CREATE TABLE workload_cost_log (
-    log_id           BIGSERIAL PRIMARY KEY,
-    recorded_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    query_id         BIGINT,          -- from pg_stat_statements.queryid
-    application_name TEXT,
-    source_cloud     TEXT NOT NULL,
-    destination_cloud TEXT NOT NULL,
-    data_transferred_bytes BIGINT,
-    egress_cost_usd  NUMERIC(12,6),
-    execution_count  BIGINT,
-    total_exec_ms    NUMERIC(14,3)
-);
-
--- Daily cost summary by workload and cloud pair
-SELECT
-    DATE_TRUNC('day', recorded_at)  AS day,
-    application_name,
-    source_cloud || '→' || destination_cloud AS cloud_path,
-    SUM(data_transferred_bytes) / 1e9        AS total_gb,
-    SUM(egress_cost_usd)                     AS total_cost_usd,
-    SUM(execution_count)                     AS executions,
-    AVG(total_exec_ms / NULLIF(execution_count,0)) AS avg_exec_ms
-FROM workload_cost_log
-WHERE recorded_at &gt;= now() - INTERVAL '30 days'
-GROUP BY 1, 2, 3
-ORDER BY total_cost_usd DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The autonomous workload placement engine runs a nightly optimization pass over these cost logs and proposes — or directly applies, depending on governance mode — workload migrations. A query pattern generating heavy cross-cloud egress is a candidate for read replica promotion in the destination cloud, eliminating the egress path entirely.</p>
 
@@ -469,7 +403,7 @@ FROM metrics_ingestion_status
 WHERE EXTRACT(EPOCH FROM (now() - last_ingested)) &gt; 120
 ORDER BY ingestion_lag_sec DESC;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Equivalent ingestion tracking for SQL Server control plane
 CREATE TABLE dbo.metrics_ingestion_status (
     provider        NVARCHAR(16) NOT NULL,
@@ -593,31 +527,7 @@ def acquire_cluster_lease(cluster_id: str, agent_id: str, ttl_sec: int = 30):
 
 <p class="text-gray-300 leading-relaxed">Beyond lease management, the autonomous system maintains a global action log — an append-only record of every decision made, the state at the time of the decision, the expected outcome, and the observed outcome after a verification window. This log serves three purposes: it provides an audit trail for compliance review, it feeds the reinforcement-learning layer that adjusts decision weights over time, and it enables rollback analysis when an autonomous action produces an unexpected state.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE autonomous_action_log (
-    action_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    initiated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
-    agent_id           TEXT NOT NULL,
-    cloud_provider     TEXT NOT NULL,
-    cluster_id         UUID NOT NULL,
-    action_type        TEXT NOT NULL,
-    -- e.g. 'promote_replica','reroute_workload','scale_pool','throttle_writes'
-    target_node_id     UUID,
-    decision_inputs    JSONB NOT NULL,  -- snapshot of scoring inputs at decision time
-    expected_outcome   JSONB,
-    observed_outcome   JSONB,           -- populated after verification window
-    outcome_verified_at TIMESTAMPTZ,
-    status             TEXT NOT NULL DEFAULT 'in_progress'
-                       CHECK (status IN ('in_progress','completed','failed','rolled_back')),
-    rollback_action_id UUID REFERENCES autonomous_action_log(action_id)
-);
 
--- Index for learning pipeline: fetch completed actions with observed outcomes
-CREATE INDEX ix_action_log_learning
-    ON autonomous_action_log (action_type, status, initiated_at)
-    WHERE status = 'completed' AND observed_outcome IS NOT NULL;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE dbo.autonomous_action_log (
     action_id           UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWSEQUENTIALID(),
     initiated_at        DATETIMEOFFSET NOT NULL DEFAULT SYSDATETIMEOFFSET(),
@@ -652,39 +562,7 @@ CREATE INDEX IX_action_log_learning
 
 <p class="text-gray-300 leading-relaxed">The autonomous system must encode these constraints as hard guardrails — not soft preferences — that override any cost or latency optimization. A constraint violation is not a sub-optimal outcome; it is a compliance failure with legal consequences. This means residency constraints must be evaluated before the scoring function runs, not as an additional term within it.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Data residency policy registry
-CREATE TABLE residency_policies (
-    policy_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    cluster_id       UUID NOT NULL REFERENCES db_clusters(cluster_id),
-    data_classification TEXT NOT NULL,  -- 'pii_eu', 'phi', 'financial_regulated', etc.
-    allowed_regions  TEXT[] NOT NULL,   -- ARRAY['eu-west-1','eu-central-1','westeurope']
-    allowed_providers TEXT[] NOT NULL,  -- ARRAY['aws','azure']
-    enforce_at_write BOOLEAN NOT NULL DEFAULT TRUE,
-    enforce_at_read  BOOLEAN NOT NULL DEFAULT TRUE,
-    regulation_ref   TEXT,              -- e.g. 'GDPR Art.46', 'HIPAA §164.312'
-    created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
-);
 
--- Policy evaluation function: returns TRUE if a target node is permitted
-CREATE OR REPLACE FUNCTION is_node_residency_compliant(
-    p_cluster_id UUID,
-    p_target_provider TEXT,
-    p_target_region   TEXT
-) RETURNS BOOLEAN
-LANGUAGE sql STABLE AS $$
-    SELECT NOT EXISTS (
-        SELECT 1
-        FROM residency_policies
-        WHERE cluster_id = p_cluster_id
-          AND (
-               p_target_provider != ALL(allowed_providers)
-            OR p_target_region   != ALL(allowed_regions)
-          )
-    );
-$$;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE dbo.residency_policies (
     policy_id           UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWSEQUENTIALID(),
     cluster_id          UNIQUEIDENTIFIER NOT NULL,

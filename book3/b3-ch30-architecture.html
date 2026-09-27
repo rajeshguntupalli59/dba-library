@@ -146,45 +146,7 @@ reconcile()</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The following shows how a PostgreSQL system emits normalized signals that feed the state machine:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Compute normalized deviation signals for the decision engine
--- Run by the autonomous controller every 60 seconds
-WITH baseline AS (
-    SELECT
-        metric_name,
-        AVG(metric_value)  AS baseline_mean,
-        STDDEV(metric_value) AS baseline_stddev
-    FROM db_metrics_hourly
-    WHERE collected_at &gt;= NOW() - INTERVAL '30 days'
-      AND collected_at &lt; NOW() - INTERVAL '1 hour'  -- exclude recent anomalous period
-    GROUP BY metric_name
-),
-current_values AS (
-    SELECT
-        metric_name,
-        AVG(metric_value) AS current_value
-    FROM db_metrics_raw
-    WHERE collected_at &gt;= NOW() - INTERVAL '5 minutes'
-    GROUP BY metric_name
-)
-SELECT
-    c.metric_name,
-    c.current_value,
-    b.baseline_mean,
-    b.baseline_stddev,
-    CASE WHEN b.baseline_stddev = 0 THEN 0
-         ELSE (c.current_value - b.baseline_mean) / b.baseline_stddev
-    END AS z_score,
-    CASE
-        WHEN ABS((c.current_value - b.baseline_mean) / NULLIF(b.baseline_stddev, 0)) &gt; 4 THEN 'CRITICAL'
-        WHEN ABS((c.current_value - b.baseline_mean) / NULLIF(b.baseline_stddev, 0)) &gt; 2.5 THEN 'DEGRADED'
-        ELSE 'NOMINAL'
-    END AS signal_state
-FROM current_values c
-JOIN baseline b USING (metric_name)
-ORDER BY ABS(z_score) DESC NULLS LAST;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Equivalent normalized signal computation for SQL Server
 WITH baseline AS (
     SELECT
@@ -284,30 +246,7 @@ If no safe action exists, set action to "ESCALATE_TO_HUMAN"."""
 
 <p class="text-gray-300 leading-relaxed">The following shows a complete autonomous agent for PostgreSQL index bloat remediation, implemented as a Patroni-aware procedure that respects cluster topology before acting:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Autonomous index bloat detection: feed this into the action decision pipeline
--- Identifies indexes eligible for autonomous REINDEX CONCURRENTLY
-SELECT
-    schemaname,
-    tablename,
-    indexname,
-    pg_size_pretty(pg_relation_size(indexrelid))   AS index_size,
-    ROUND(100.0 * (
-        1 - (pg_stat_get_numscans(indexrelid)::numeric /
-             NULLIF(pg_stat_get_numscans(indexrelid) +
-                    pg_stat_get_idx_tup_read(indexrelid), 0))
-    ), 2)                                           AS estimated_bloat_pct,
-    pg_relation_size(indexrelid)                    AS index_bytes,
-    last_idx_scan
-FROM pg_stat_user_indexes
-JOIN pg_index USING (indexrelid)
-WHERE NOT indisprimary
-  AND pg_relation_size(indexrelid) &gt; 100 * 1024 * 1024   -- indexes &gt; 100MB only
-  AND last_idx_scan &lt; NOW() - INTERVAL '1 day'            -- recently active
-ORDER BY index_bytes DESC
-LIMIT 20;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Equivalent index bloat/fragmentation detection for SQL Server autonomous agent
 SELECT
     DB_NAME()                                    AS database_name,
@@ -748,30 +687,7 @@ ORDER BY regression_ratio DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The action log table is the foundation:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE autonomous_action_log (
-    action_id        BIGSERIAL PRIMARY KEY,
-    action_type      TEXT NOT NULL,
-    target_resource  TEXT NOT NULL,
-    trigger_signals  JSONB NOT NULL,
-    parameters       JSONB NOT NULL,
-    decision_source  TEXT NOT NULL,    -- 'threshold_rule' | 'state_machine' | 'llm_synthesis'
-    confidence       NUMERIC(4,3),
-    executed_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    outcome          TEXT,             -- 'success' | 'failure' | 'partial' | 'escalated'
-    outcome_detail   JSONB,
-    resolved_at      TIMESTAMPTZ,
-    human_reviewed   BOOLEAN DEFAULT FALSE,
-    human_feedback   TEXT,             -- 'correct' | 'incorrect' | 'unnecessary'
-    policy_version   TEXT NOT NULL
-);
 
-CREATE INDEX ON autonomous_action_log (action_type, executed_at DESC);
-CREATE INDEX ON autonomous_action_log USING GIN (trigger_signals);
-CREATE INDEX ON autonomous_action_log (outcome, human_feedback)
-    WHERE human_reviewed = TRUE;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE dbo.autonomous_action_log (
     action_id        BIGINT IDENTITY(1,1) PRIMARY KEY,
     action_type      NVARCHAR(100)  NOT NULL,

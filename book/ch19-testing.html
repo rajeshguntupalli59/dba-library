@@ -68,25 +68,7 @@
 
 <p class="text-gray-300 leading-relaxed">For PostgreSQL, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_dump</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_restore</code> are the standard tools for creating a schema-level copy. For a data subset, you can dump specific tables with row filtering. For SQL Server, database backups with restore, or database snapshots, are the typical approach.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Create a schema-only copy of the production database for test environment setup
--- Run this from the OS shell, not inside psql
--- pg_dump -h prod-server -U postgres -s -F c -f schema_only.dump mydb
 
--- Then restore into a test database
--- pg_restore -h test-server -U postgres -d mydb_test schema_only.dump
-
--- Verify the object count matches production
-SELECT
-    table_schema,
-    COUNT(*) AS table_count
-FROM information_schema.tables
-WHERE table_type = 'BASE TABLE'
-  AND table_schema NOT IN ('pg_catalog', 'information_schema')
-GROUP BY table_schema
-ORDER BY table_schema;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Restore a production backup to a test server with a new database name
 RESTORE DATABASE mydb_test
 FROM DISK = 'D:\Backups\mydb_prod.bak'
@@ -120,39 +102,7 @@ ORDER BY s.name;</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Pre-migration checks</strong> answer questions like: Are there any rows that would violate the new constraint? Are there any dependent objects that will be affected by this change? Is there enough disk space for a table rewrite? Will this operation lock the table?</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Before adding a NOT NULL constraint, check for nulls
-SELECT COUNT(*) AS null_count
-FROM orders
-WHERE customer_id IS NULL;
 
--- Before adding a unique constraint, identify duplicates
-SELECT customer_id, COUNT(*) AS duplicate_count
-FROM orders
-GROUP BY customer_id
-HAVING COUNT(*) &gt; 1
-ORDER BY duplicate_count DESC;
-
--- Check dependent views before dropping or altering a column
-SELECT
-    dependent_ns.nspname AS dependent_schema,
-    dependent_view.relname AS dependent_view,
-    source_ns.nspname AS source_schema,
-    source_table.relname AS source_table,
-    pg_attribute.attname AS column_name
-FROM pg_depend
-JOIN pg_rewrite ON pg_depend.objid = pg_rewrite.oid
-JOIN pg_class AS dependent_view ON pg_rewrite.ev_class = dependent_view.oid
-JOIN pg_class AS source_table ON pg_depend.refobjid = source_table.oid
-JOIN pg_attribute ON pg_depend.refobjid = pg_attribute.attrelid
-    AND pg_depend.refobjsubid = pg_attribute.attnum
-JOIN pg_namespace dependent_ns ON dependent_ns.oid = dependent_view.relnamespace
-JOIN pg_namespace source_ns ON source_ns.oid = source_table.relnamespace
-WHERE source_table.relname = 'orders'
-  AND pg_attribute.attname = 'customer_id'
-  AND source_ns.nspname = 'public';</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Before adding a NOT NULL constraint, check for nulls
 SELECT COUNT(*) AS null_count
 FROM dbo.orders
@@ -177,18 +127,7 @@ ORDER BY referencing_entity_name;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">In PostgreSQL, adding a foreign key constraint with large tables can create an index entry in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_constraint</code> with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">convalidated = false</code> if you used <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">NOT VALID</code> during creation — meaning the constraint was added but hasn't been checked against existing rows yet. You need to explicitly run <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VALIDATE CONSTRAINT</code> afterward, and you should verify this in your post-migration checks.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Post-migration: confirm all constraints on a table are valid
-SELECT
-    conname AS constraint_name,
-    contype AS constraint_type,
-    convalidated AS is_validated
-FROM pg_constraint
-JOIN pg_class ON pg_class.oid = pg_constraint.conrelid
-WHERE pg_class.relname = 'orders'
-ORDER BY contype, conname;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Post-migration: check for untrusted (not-validated) constraints
 SELECT
     t.name AS table_name,
@@ -221,30 +160,7 @@ ORDER BY table_name, constraint_name;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Start with row counts. This catches bulk failures — a truncated load, a filter that accidentally excluded rows, a partition that wasn't included in the migration script. Then move to aggregate checks: sum of key financial columns, count of distinct values in high-cardinality columns, min and max of date ranges. A migration that has the right row count but wrong aggregates almost always indicates a data transformation bug.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Row count reconciliation across source and target tables
-SELECT 'source' AS location, COUNT(*) AS row_count FROM source_schema.orders
-UNION ALL
-SELECT 'target', COUNT(*) FROM target_schema.orders;
 
--- Aggregate reconciliation for financial integrity
-SELECT
-    'source' AS location,
-    SUM(order_total)    AS total_revenue,
-    COUNT(DISTINCT customer_id) AS unique_customers,
-    MIN(order_date)     AS earliest_order,
-    MAX(order_date)     AS latest_order
-FROM source_schema.orders
-UNION ALL
-SELECT
-    'target',
-    SUM(order_total),
-    COUNT(DISTINCT customer_id),
-    MIN(order_date),
-    MAX(order_date)
-FROM target_schema.orders;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Row count reconciliation
 SELECT 'source' AS location, COUNT(*) AS row_count FROM source_schema.dbo.orders
 UNION ALL
@@ -283,21 +199,7 @@ FROM target_schema.dbo.orders;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Before any significant schema or index change, capture the query plans and timing for your top 20–30 queries by frequency and resource consumption. You can identify these from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> in PostgreSQL or from the Query Store in SQL Server. Run each of them explicitly in a controlled test environment before and after the change.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Capture a query's execution plan before a change
--- Use EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT) for full detail
-EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
-SELECT
-    o.order_id,
-    o.customer_id,
-    o.order_total,
-    c.email
-FROM orders o
-JOIN customers c ON o.customer_id = c.customer_id
-WHERE o.order_date &gt;= '2024-01-01'
-  AND o.status = 'PENDING';</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Capture a query's execution plan before a change
 -- Use SET STATISTICS IO and TIME for runtime metrics
 SET STATISTICS IO ON;

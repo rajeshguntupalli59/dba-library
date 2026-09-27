@@ -83,25 +83,7 @@ lock_timeout_seconds: 300</code></pre>
 
 <p class="text-gray-300 leading-relaxed">This file is the source of truth. The autonomous agent checks the zone classification before taking any action. For gated actions, it opens a pull request or calls a webhook — it never acts first.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Autonomous agent records every action with zone classification
-CREATE TABLE autonomous_action_log (
-    action_id        BIGSERIAL PRIMARY KEY,
-    action_type      TEXT NOT NULL,
-    zone             TEXT NOT NULL CHECK (zone IN ('fully_autonomous','coordinated_autonomous','gated')),
-    initiated_at     TIMESTAMPTZ DEFAULT now(),
-    approved_at      TIMESTAMPTZ,
-    approved_by      TEXT,
-    executed_at      TIMESTAMPTZ,
-    rollback_sql     TEXT,
-    outcome          TEXT,
-    conflict_detected BOOLEAN DEFAULT FALSE
-);
 
-CREATE INDEX idx_action_log_zone_initiated
-    ON autonomous_action_log (zone, initiated_at DESC);</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Equivalent action audit table in SQL Server
 CREATE TABLE dbo.AutonomousActionLog (
     ActionId          BIGINT IDENTITY(1,1) PRIMARY KEY,
@@ -256,28 +238,7 @@ resource "postgresql_configuration" "pg_settings" {
 
 <p class="text-gray-300 leading-relaxed">The autonomy API endpoint powering this data source stores ownership records:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Parameter ownership registry — autonomous agent writes here
--- when it takes ownership of a GUC parameter
-CREATE TABLE autonomous_parameter_ownership (
-    parameter_name   TEXT PRIMARY KEY,
-    owned_since      TIMESTAMPTZ DEFAULT now(),
-    owned_by         TEXT NOT NULL,  -- agent identifier
-    last_value       TEXT,
-    iac_baseline     TEXT,           -- value from IaC before agent took over
-    release_ownership_on TEXT        -- condition under which IaC can reclaim
-);
 
--- Autonomous agent claims ownership before modifying a parameter
-INSERT INTO autonomous_parameter_ownership
-    (parameter_name, owned_by, iac_baseline, release_ownership_on)
-VALUES
-    ('autovacuum_vacuum_cost_delay', 'vacuum-agent-v2', '2ms', 'manual_release_only')
-ON CONFLICT (parameter_name) DO UPDATE
-    SET last_value = EXCLUDED.last_value,
-        owned_by   = EXCLUDED.owned_by;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server equivalent: tracks sp_configure ownership
 CREATE TABLE dbo.AutonomousParameterOwnership (
     ParameterName         NVARCHAR(200) PRIMARY KEY,
@@ -628,52 +589,7 @@ def fire_autonomous_event(action_type: str, zone: str, outcome: str,
 
 <p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">autonomous_action_log</code> tables defined earlier carry a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">rollback_sql</code> column for exactly this reason. For parameter changes, the rollback is trivially the prior value. For structural changes — index creation, partition additions, replica configuration changes — the rollback requires more care.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Stored procedure executed by the rollback daemon
-CREATE OR REPLACE PROCEDURE execute_autonomous_rollback(p_action_id BIGINT)
-LANGUAGE plpgsql AS $$
-DECLARE
-    v_rollback_sql  TEXT;
-    v_zone          TEXT;
-    v_executed_at   TIMESTAMPTZ;
-    v_action_type   TEXT;
-BEGIN
-    SELECT rollback_sql, zone, executed_at, action_type
-    INTO v_rollback_sql, v_zone, v_executed_at, v_action_type
-    FROM autonomous_action_log
-    WHERE action_id = p_action_id;
 
-    IF v_rollback_sql IS NULL THEN
-        RAISE EXCEPTION 'No rollback SQL recorded for action_id=%', p_action_id;
-    END IF;
-
-    IF v_executed_at IS NULL THEN
-        RAISE EXCEPTION 'Action % has not been executed — nothing to roll back', p_action_id;
-    END IF;
-
-    -- Execute rollback
-    EXECUTE v_rollback_sql;
-
-    -- Record the rollback in the log
-    UPDATE autonomous_action_log
-    SET outcome        = 'rolled_back',
-        conflict_detected = TRUE
-    WHERE action_id = p_action_id;
-
-    -- Insert a companion rollback record for full traceability
-    INSERT INTO autonomous_action_log
-        (action_type, zone, initiated_at, executed_at, outcome, rollback_sql)
-    VALUES
-        ('rollback_of_' || v_action_type, v_zone,
-         now(), now(),
-         'rollback_executed',
-         '-- rollback of action_id ' || p_action_id);
-
-    RAISE NOTICE 'Rollback of action % completed.', p_action_id;
-END;
-$$;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server rollback procedure
 CREATE OR ALTER PROCEDURE dbo.ExecuteAutonomousRollback
     @ActionId BIGINT
@@ -720,36 +636,6 @@ END;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">For index operations — where rollback means dropping a just-created index or recreating a dropped one — the rollback SQL is generated before execution and stored atomically with the action log record:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Before creating an autonomous index, generate and store rollback SQL
-DO $$
-DECLARE
-    v_action_id BIGINT;
-    v_index_name TEXT := 'idx_orders_customer_autonomous_20240115';
-    v_rollback   TEXT;
-BEGIN
-    -- Generate rollback BEFORE acting
-    v_rollback := format('DROP INDEX CONCURRENTLY IF EXISTS %I', v_index_name);
-
-    INSERT INTO autonomous_action_log
-        (action_type, zone, initiated_at, rollback_sql)
-    VALUES
-        ('index_creation_replica', 'fully_autonomous', now(), v_rollback)
-    RETURNING action_id INTO v_action_id;
-
-    -- Now act
-    EXECUTE format(
-        'CREATE INDEX CONCURRENTLY %I ON orders (customer_id, created_at DESC)',
-        v_index_name
-    );
-
-    UPDATE autonomous_action_log
-    SET executed_at = now(), outcome = 'success'
-    WHERE action_id = v_action_id;
-
-    RAISE NOTICE 'Index created. Rollback stored for action_id=%', v_action_id;
-END;
-$$;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The rollback store is not just a safety net — it becomes the foundation for automated regression detection. If the autonomous system's observability layer detects that a recent action correlated with a performance degradation (query latency increased after index creation, for example, due to increased planner overhead on writes), the rollback daemon can be triggered automatically within the evaluation window, executing the stored rollback SQL without human involvement.</p>
 
@@ -795,23 +681,7 @@ change_freeze_calendar: "pagerduty_schedule_id_xyz"</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Each autonomous agent role should have exactly the permissions required for its specific action set and nothing more. The vacuum optimization agent needs <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_signal_backend</code> and the ability to alter autovacuum storage parameters; it does not need <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SUPERUSER</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATEDB</code>, or access to application schema tables.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Least-privilege role for the vacuum optimization agent
-CREATE ROLE autonomous_vacuum_agent LOGIN PASSWORD 'rotated-by-vault';
 
--- Only what it needs
-GRANT pg_signal_backend TO autonomous_vacuum_agent;
-GRANT UPDATE ON TABLE autonomous_parameter_ownership TO autonomous_vacuum_agent;
-GRANT INSERT, UPDATE ON TABLE autonomous_action_log TO autonomous_vacuum_agent;
-
--- Can read pg_stat_user_tables and pg_stat_bgwriter — nothing else
-GRANT pg_monitor TO autonomous_vacuum_agent;
-
--- Explicit denial of application schema access
-REVOKE ALL ON SCHEMA public FROM autonomous_vacuum_agent;
-GRANT USAGE ON SCHEMA monitoring TO autonomous_vacuum_agent;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Least-privilege login for the index advisor agent
 CREATE LOGIN AutonomousIndexAgent WITH PASSWORD = 'ManagedByVault!1';
 CREATE USER AutonomousIndexAgent FOR LOGIN AutonomousIndexAgent;

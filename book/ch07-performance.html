@@ -64,22 +64,7 @@
 
 <p class="text-gray-300 leading-relaxed">In PostgreSQL, you generate a plan using <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">EXPLAIN</code> for the estimated plan or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">EXPLAIN ANALYZE</code> for the actual execution with runtime statistics. <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">EXPLAIN ANALYZE</code> runs the query, so avoid it on expensive writes unless you wrap them in a transaction you can roll back.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- See the full execution plan with actual timing and row counts
-EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
-SELECT
-    o.order_id,
-    o.order_date,
-    c.customer_name,
-    SUM(oi.unit_price * oi.quantity) AS order_total
-FROM orders o
-JOIN customers c ON c.customer_id = o.customer_id
-JOIN order_items oi ON oi.order_id = o.order_id
-WHERE o.order_date &gt;= '2024-01-01'
-GROUP BY o.order_id, o.order_date, c.customer_name
-ORDER BY order_total DESC;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- See the actual execution plan with I/O and time statistics
 SET STATISTICS IO ON;
 SET STATISTICS TIME ON;
@@ -116,26 +101,7 @@ ORDER BY order_total DESC;
 
 <p class="text-gray-300 leading-relaxed">You can increase the statistics target for specific columns when the default resolution of 100 histogram buckets is not enough to capture the actual distribution. For columns used heavily in WHERE clauses or JOIN conditions with skewed data, bumping the statistics target to 500 or even 1000 gives the optimizer more detail to work with.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Check current statistics and see where estimates diverged recently
-SELECT
-    schemaname,
-    tablename,
-    attname,
-    n_distinct,
-    correlation
-FROM pg_stats
-WHERE tablename = 'orders'
-ORDER BY attname;
 
--- Increase statistics resolution for a skewed column
-ALTER TABLE orders
-    ALTER COLUMN order_status SET STATISTICS 500;
-
--- Force a manual analyze on the table
-ANALYZE VERBOSE orders;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Check statistics health and when they were last updated
 SELECT
     s.name AS stats_name,
@@ -167,24 +133,7 @@ EXEC sp_updatestats;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">PostgreSQL's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> extension is the starting point for workload analysis. Once enabled, it tracks query execution across all connections, aggregating statistics by normalized query text. You can sort by total time, mean time, or I/O reads to find exactly where your database is spending its time.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Find the top 10 slowest queries by total execution time
-SELECT
-    query,
-    calls,
-    total_exec_time / 1000 AS total_seconds,
-    mean_exec_time / 1000 AS mean_seconds,
-    stddev_exec_time / 1000 AS stddev_seconds,
-    rows,
-    shared_blks_hit,
-    shared_blks_read,
-    shared_blks_read::float /
-        NULLIF(shared_blks_hit + shared_blks_read, 0) AS miss_ratio
-FROM pg_stat_statements
-ORDER BY total_exec_time DESC
-LIMIT 10;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Find the top 10 most expensive queries by total CPU time
 SELECT TOP 10
     qs.total_worker_time / qs.execution_count AS avg_cpu_us,
@@ -227,31 +176,7 @@ ORDER BY qs.total_worker_time DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">For schema-level optimizations, partitioning is one of the most powerful tools available. A <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sales</code> table with five years of data and 800 million rows can be partitioned by year or quarter, enabling the optimizer to skip entire partitions when the query filters on the partition key. Both PostgreSQL (declarative partitioning since version 10) and SQL Server (partition functions and schemes) support this pattern. The key insight is that partition pruning only works when the filter condition is on the partition key column and the value is known at planning time — a filter like <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WHERE year_col = EXTRACT(YEAR FROM NOW())</code> may not prune correctly if the planner cannot resolve the expression statically.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Create a partitioned table for sales data by year
-CREATE TABLE sales (
-    sale_id     BIGSERIAL,
-    sale_date   DATE NOT NULL,
-    customer_id INT NOT NULL,
-    amount      NUMERIC(12,2),
-    region      TEXT
-) PARTITION BY RANGE (sale_date);
 
-CREATE TABLE sales_2023
-    PARTITION OF sales
-    FOR VALUES FROM ('2023-01-01') TO ('2024-01-01');
-
-CREATE TABLE sales_2024
-    PARTITION OF sales
-    FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
-
--- Verify partition pruning is happening
-EXPLAIN (ANALYZE, BUFFERS)
-SELECT SUM(amount)
-FROM sales
-WHERE sale_date BETWEEN '2024-01-01' AND '2024-03-31';</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Create a partition function and scheme for sales data
 CREATE PARTITION FUNCTION pf_sales_by_year (DATE)
 AS RANGE RIGHT

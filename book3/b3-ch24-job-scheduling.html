@@ -65,43 +65,7 @@
 
 <p class="text-gray-300 leading-relaxed">This formalization matters because the scheduler needs to make decisions that balance multiple jobs against each other and against live workload — a problem that cron cannot even represent, let alone solve.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Job definition table for intent-based scheduling
-CREATE TABLE autonomous_jobs (
-    job_id          SERIAL PRIMARY KEY,
-    job_name        TEXT NOT NULL UNIQUE,
-    work_unit       TEXT NOT NULL,           -- SQL or function call
-    preconditions   JSONB NOT NULL DEFAULT '[]',
-    constraints     JSONB NOT NULL DEFAULT '[]',
-    priority        INT NOT NULL DEFAULT 50, -- 1 (highest) to 100 (lowest)
-    estimated_io_mb INT,
-    estimated_cpu_pct NUMERIC(5,2),
-    max_duration_sec INT DEFAULT 3600,
-    enabled         BOOLEAN DEFAULT TRUE,
-    created_at      TIMESTAMPTZ DEFAULT NOW(),
-    last_modified   TIMESTAMPTZ DEFAULT NOW()
-);
 
--- Example: index rebuild job with intent-based preconditions
-INSERT INTO autonomous_jobs (
-    job_name, work_unit, preconditions, constraints, priority, estimated_io_mb
-) VALUES (
-    'rebuild_bloated_indexes',
-    'CALL maintenance.rebuild_indexes_auto()',
-    '[
-        {"signal": "active_connections_pct", "operator": "&lt;", "threshold": 40},
-        {"signal": "replication_lag_seconds", "operator": "&lt;", "threshold": 30},
-        {"signal": "bloated_index_count", "operator": "&gt;", "threshold": 5}
-    ]',
-    '[
-        {"signal": "active_connections_pct", "operator": "&lt;", "threshold": 70},
-        {"signal": "longest_txn_seconds", "operator": "&lt;", "threshold": 60}
-    ]',
-    20,
-    2048
-);</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Intent-based job registry in SQL Server
 CREATE TABLE dbo.autonomous_jobs (
     job_id          INT IDENTITY(1,1) PRIMARY KEY,
@@ -148,61 +112,10 @@ INSERT INTO dbo.autonomous_jobs (
 
 <p class="text-gray-300 leading-relaxed">The architecture uses a tiered collection model. High-frequency signals — active connections, CPU utilization, query duration — are sampled every 10–15 seconds and stored in a fixed-size ring buffer. Lower-frequency signals — replication lag, bloat estimates, stale statistics counts — are collected every 1–5 minutes. Expensive signals — actual bloat calculations requiring <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pgstattuple</code>, or SQL Server's fragmentation analysis — are collected on-demand or once per hour and cached.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Signal ring buffer: fixed retention, high-speed insert path
-CREATE TABLE scheduler_signals (
-    signal_id     BIGSERIAL PRIMARY KEY,
-    signal_name   TEXT NOT NULL,
-    signal_value  NUMERIC NOT NULL,
-    collected_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-) PARTITION BY RANGE (collected_at);
-
--- Automatically create partitions (handled by pg_partman or similar)
--- Retain only 24 hours of signal history for scheduling decisions
-CREATE INDEX ON scheduler_signals (signal_name, collected_at DESC);
-
--- Signal collection function — called by pg_cron every 15 seconds
--- (pg_cron is the bootstrap; it runs the collector, not the jobs themselves)
-CREATE OR REPLACE FUNCTION collect_scheduler_signals()
-RETURNS VOID LANGUAGE plpgsql AS $$
-DECLARE
-    v_conn_pct     NUMERIC;
-    v_longest_txn  NUMERIC;
-    v_repl_lag     NUMERIC;
-BEGIN
-    -- Active connection percentage
-    SELECT ROUND(100.0 * count(*) / current_setting('max_connections')::INT, 2)
-    INTO v_conn_pct
-    FROM pg_stat_activity
-    WHERE state != 'idle';
-
-    -- Longest running transaction in seconds
-    SELECT COALESCE(
-        EXTRACT(EPOCH FROM MAX(NOW() - xact_start)), 0
-    )
-    INTO v_longest_txn
-    FROM pg_stat_activity
-    WHERE xact_start IS NOT NULL AND state != 'idle';
-
-    -- Replication lag (max across all standbys)
-    SELECT COALESCE(MAX(EXTRACT(EPOCH FROM write_lag)), 0)
-    INTO v_repl_lag
-    FROM pg_stat_replication;
-
-    INSERT INTO scheduler_signals (signal_name, signal_value) VALUES
-        ('active_connections_pct',  v_conn_pct),
-        ('longest_txn_seconds',     v_longest_txn),
-        ('replication_lag_seconds', v_repl_lag);
-
-    -- Purge signals older than 24 hours
-    DELETE FROM scheduler_signals
-    WHERE collected_at &lt; NOW() - INTERVAL '24 hours';
-END;
-$$;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">For SQL Server, the equivalent pipeline integrates with existing DMV infrastructure and can feed into a dedicated monitoring database or an external time-series store:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Signal collection stored procedure for SQL Server autonomous scheduler
 CREATE OR ALTER PROCEDURE monitoring.CollectSchedulerSignals
 AS
@@ -306,55 +219,6 @@ if __name__ == "__main__":
 
 <p class="text-gray-300 leading-relaxed">The precondition evaluator is a signal-query function that reads the most recent values for each signal referenced in a job's precondition array and applies the operator-threshold comparison:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Evaluate whether all preconditions for a job are satisfied
-CREATE OR REPLACE FUNCTION evaluate_job_preconditions(p_job_id INT)
-RETURNS BOOLEAN LANGUAGE plpgsql AS $$
-DECLARE
-    v_preconditions  JSONB;
-    v_condition      JSONB;
-    v_signal_value   NUMERIC;
-    v_threshold      NUMERIC;
-    v_operator       TEXT;
-    v_satisfied      BOOLEAN := TRUE;
-BEGIN
-    SELECT preconditions INTO v_preconditions
-    FROM autonomous_jobs WHERE job_id = p_job_id;
-
-    FOR v_condition IN SELECT jsonb_array_elements(v_preconditions)
-    LOOP
-        v_operator  := v_condition-&gt;&gt;'operator';
-        v_threshold := (v_condition-&gt;&gt;'threshold')::NUMERIC;
-
-        -- Get most recent signal value (within last 2 minutes)
-        SELECT signal_value INTO v_signal_value
-        FROM scheduler_signals
-        WHERE signal_name = v_condition-&gt;&gt;'signal'
-          AND collected_at &gt; NOW() - INTERVAL '2 minutes'
-        ORDER BY collected_at DESC
-        LIMIT 1;
-
-        IF v_signal_value IS NULL THEN
-            -- Signal too stale or missing: fail safe, do not schedule
-            v_satisfied := FALSE;
-            EXIT;
-        END IF;
-
-        v_satisfied := v_satisfied AND CASE v_operator
-            WHEN '&lt;'  THEN v_signal_value &lt; v_threshold
-            WHEN '&lt;=' THEN v_signal_value &lt;= v_threshold
-            WHEN '&gt;'  THEN v_signal_value &gt; v_threshold
-            WHEN '&gt;=' THEN v_signal_value &gt;= v_threshold
-            WHEN '='  THEN v_signal_value = v_threshold
-            ELSE FALSE
-        END;
-
-        IF NOT v_satisfied THEN EXIT; END IF;
-    END LOOP;
-
-    RETURN v_satisfied;
-END;
-$$;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The conflict resolver handles a scenario the cron model cannot: two jobs are both eligible to run, but running both simultaneously would collectively breach a resource constraint. The resolver calculates the *combined estimated cost* of all eligible jobs sorted by priority, then selects a maximal subset whose aggregate I/O and CPU estimates stay within configurable limits. Lower-priority jobs that cannot fit into the current window are deferred with a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">deferred_reason</code> log entry.</p>
 
@@ -440,78 +304,7 @@ if __name__ == "__main__":
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Logic failures**: division by zero in a statistics query, a missing table — do not retry, alert, suspend the job pending human review</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Partial failures**: a multi-step procedure that committed some batches before failing — resume from checkpoint, not full restart</li>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Job execution log with failure classification
-CREATE TABLE job_runs (
-    run_id          BIGSERIAL PRIMARY KEY,
-    job_id          INT REFERENCES autonomous_jobs(job_id),
-    started_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    finished_at     TIMESTAMPTZ,
-    status          TEXT NOT NULL CHECK (status IN (
-                        'running', 'completed', 'failed_transient',
-                        'failed_resource', 'failed_logic',
-                        'suspended', 'skipped'
-                    )),
-    failure_class   TEXT,
-    error_message   TEXT,
-    rows_processed  BIGINT,
-    retry_count     INT DEFAULT 0,
-    next_retry_at   TIMESTAMPTZ,
-    checkpoint_data JSONB          -- for resumable jobs
-);
 
--- Failure classification function
-CREATE OR REPLACE FUNCTION classify_job_failure(p_sqlerrcode TEXT, p_errmsg TEXT)
-RETURNS TEXT LANGUAGE plpgsql AS $$
-BEGIN
-    -- Transient: lock/deadlock/connection issues
-    IF p_sqlerrcode IN ('40001', '40P01', '53300', '55P03') THEN
-        RETURN 'transient';
-    END IF;
-    -- Resource: disk full, out of memory, statement timeout
-    IF p_sqlerrcode IN ('53100', '53200', '57014', '54000') THEN
-        RETURN 'resource';
-    END IF;
-    -- Logic: undefined table, division by zero, type errors
-    IF p_sqlerrcode IN ('42P01', '22012', '42703', '42883') THEN
-        RETURN 'logic';
-    END IF;
-    -- Default: treat unknown as transient with a cap
-    RETURN 'transient';
-END;
-$$;
-
--- Retry policy table: configurable per failure class and job
-CREATE TABLE job_retry_policies (
-    policy_id           SERIAL PRIMARY KEY,
-    job_id              INT REFERENCES autonomous_jobs(job_id),
-    failure_class       TEXT NOT NULL,
-    max_retries         INT NOT NULL DEFAULT 3,
-    initial_delay_sec   INT NOT NULL DEFAULT 60,
-    backoff_multiplier  NUMERIC(4,2) NOT NULL DEFAULT 2.0,
-    max_delay_sec       INT NOT NULL DEFAULT 3600
-);
-
--- Default retry policies for all jobs
-INSERT INTO job_retry_policies (job_id, failure_class, max_retries, initial_delay_sec, backoff_multiplier)
-SELECT j.job_id, fc.failure_class,
-       CASE fc.failure_class
-           WHEN 'transient'  THEN 5
-           WHEN 'resource'   THEN 3
-           WHEN 'logic'      THEN 0  -- never retry logic failures
-           ELSE 2
-       END,
-       CASE fc.failure_class
-           WHEN 'transient'  THEN 30
-           WHEN 'resource'   THEN 300
-           ELSE 60
-       END,
-       2.0
-FROM autonomous_jobs j
-CROSS JOIN (VALUES ('transient'), ('resource'), ('logic')) AS fc(failure_class)
-ON CONFLICT DO NOTHING;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Equivalent job run tracking for SQL Server
 CREATE TABLE dbo.job_runs (
     run_id          BIGINT IDENTITY(1,1) PRIMARY KEY,
@@ -563,64 +356,7 @@ END;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Job dependency graphs are declared in a separate edge table and enforced by the scheduling engine before dispatch. A partition-rotation job that must complete before the archival job touches the old partition, an index rebuild that should not run in parallel with a statistics update on the same table — these are first-class relationships in the schema, not comments in a runbook:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Job dependency graph
-CREATE TABLE job_dependencies (
-    dependency_id   SERIAL PRIMARY KEY,
-    upstream_job_id INT REFERENCES autonomous_jobs(job_id),
-    downstream_job_id INT REFERENCES autonomous_jobs(job_id),
-    dependency_type TEXT NOT NULL CHECK (dependency_type IN (
-        'sequential',   -- downstream runs after upstream completes
-        'exclusive',    -- downstream cannot run while upstream is running
-        'shared_table'  -- both touch the same table, cannot overlap
-    )),
-    CONSTRAINT no_self_dep CHECK (upstream_job_id != downstream_job_id)
-);
 
--- Function: check whether a job's dependencies allow it to be dispatched now
-CREATE OR REPLACE FUNCTION check_job_dependencies(p_job_id INT)
-RETURNS BOOLEAN LANGUAGE plpgsql AS $$
-DECLARE
-    v_blocking_run_id BIGINT;
-BEGIN
-    -- Check sequential dependencies: upstream must have completed successfully
-    SELECT r.run_id INTO v_blocking_run_id
-    FROM job_dependencies d
-    JOIN job_runs r ON r.job_id = d.upstream_job_id
-    WHERE d.downstream_job_id = p_job_id
-      AND d.dependency_type = 'sequential'
-      AND r.status NOT IN ('completed')
-      AND r.started_at &gt; NOW() - INTERVAL '24 hours'
-    ORDER BY r.started_at DESC
-    LIMIT 1;
-
-    IF FOUND THEN RETURN FALSE; END IF;
-
-    -- Check exclusive dependencies: upstream must not be currently running
-    SELECT r.run_id INTO v_blocking_run_id
-    FROM job_dependencies d
-    JOIN job_runs r ON r.job_id = d.upstream_job_id
-    WHERE d.downstream_job_id = p_job_id
-      AND d.dependency_type IN ('exclusive', 'shared_table')
-      AND r.status = 'running';
-
-    IF FOUND THEN RETURN FALSE; END IF;
-
-    -- Also check the reverse: if this job is upstream to something running
-    SELECT r.run_id INTO v_blocking_run_id
-    FROM job_dependencies d
-    JOIN job_runs r ON r.job_id = d.downstream_job_id
-    WHERE d.upstream_job_id = p_job_id
-      AND d.dependency_type IN ('exclusive', 'shared_table')
-      AND r.status = 'running';
-
-    IF FOUND THEN RETURN FALSE; END IF;
-
-    RETURN TRUE;
-END;
-$$;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server job dependency graph
 CREATE TABLE dbo.job_dependencies (
     dependency_id     INT IDENTITY(1,1) PRIMARY KEY,
@@ -704,107 +440,10 @@ END;</code></pre>
     J --> B</pre></div>
 <p class="text-gray-300 leading-relaxed">*Every job in the priority-ordered queue passes through the same four gates each cycle — nothing runs on a clock, only on cleared preconditions, dependencies, and budget.*</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE OR REPLACE PROCEDURE run_scheduler_cycle()
-LANGUAGE plpgsql AS $$
-DECLARE
-    v_job            RECORD;
-    v_can_run        BOOLEAN;
-    v_pre_ok         BOOLEAN;
-    v_dep_ok         BOOLEAN;
-    v_run_id         BIGINT;
-    v_resource_budget_io   INT := 4096;  -- MB available this cycle
-    v_resource_budget_cpu  NUMERIC := 60.0; -- % available this cycle
-    v_allocated_io   INT := 0;
-    v_allocated_cpu  NUMERIC := 0.0;
-BEGIN
-    -- Step 1: Apply forecast-based budget adjustments
-    -- Tighten budgets during predicted high-load hours
-    SELECT
-        v_resource_budget_io  * CASE WHEN p75_io  &gt; 60 THEN 0.5 ELSE 1.0 END,
-        v_resource_budget_cpu * CASE WHEN p75_cpu &gt; 60 THEN 0.5 ELSE 1.0 END
-    INTO v_resource_budget_io, v_resource_budget_cpu
-    FROM (
-        SELECT
-            MAX(CASE WHEN signal_name = 'active_connections_pct'
-                     THEN p75_value ELSE 0 END) AS p75_io,
-            MAX(CASE WHEN signal_name = 'cpu_utilization_pct'
-                     THEN p75_value ELSE 0 END) AS p75_cpu
-        FROM scheduler_workload_forecast
-        WHERE dow       = EXTRACT(DOW  FROM NOW())::INT
-          AND hour_of_day = EXTRACT(HOUR FROM NOW())::INT
-    ) forecast_values;
-
-    -- Step 2: Evaluate each enabled job in priority order
-    FOR v_job IN
-        SELECT j.*
-        FROM autonomous_jobs j
-        LEFT JOIN LATERAL (
-            SELECT status, next_retry_at
-            FROM job_runs
-            WHERE job_id = j.job_id
-            ORDER BY started_at DESC
-            LIMIT 1
-        ) last_run ON TRUE
-        WHERE j.enabled = TRUE
-          AND (
-              last_run.status IS NULL
-              OR last_run.status NOT IN ('running')
-              AND (last_run.next_retry_at IS NULL OR last_run.next_retry_at &lt;= NOW())
-          )
-        ORDER BY j.priority ASC, j.estimated_io_mb ASC NULLS LAST
-    LOOP
-        -- Step 3: Check preconditions
-        v_pre_ok := evaluate_job_preconditions(v_job.job_id);
-        IF NOT v_pre_ok THEN
-            INSERT INTO job_runs (job_id, status, started_at, finished_at)
-            VALUES (v_job.job_id, 'skipped', NOW(), NOW());
-            CONTINUE;
-        END IF;
-
-        -- Step 4: Check dependencies
-        v_dep_ok := check_job_dependencies(v_job.job_id);
-        IF NOT v_dep_ok THEN CONTINUE; END IF;
-
-        -- Step 5: Check resource budget
-        IF (v_allocated_io  + COALESCE(v_job.estimated_io_mb,  0)) &gt; v_resource_budget_io
-        OR (v_allocated_cpu + COALESCE(v_job.estimated_cpu_pct, 0)) &gt; v_resource_budget_cpu
-        THEN
-            -- Defer this job: budget exhausted for this cycle
-            INSERT INTO job_runs (job_id, status, started_at, finished_at,
-                                  failure_class, error_message)
-            VALUES (v_job.job_id, 'skipped', NOW(), NOW(),
-                    NULL, 'resource_budget_exhausted');
-            CONTINUE;
-        END IF;
-
-        -- Step 6: Dispatch — insert a running record and execute asynchronously
-        INSERT INTO job_runs (job_id, status, started_at)
-        VALUES (v_job.job_id, 'running', NOW())
-        RETURNING run_id INTO v_run_id;
-
-        -- Accumulate resource allocation
-        v_allocated_io  := v_allocated_io  + COALESCE(v_job.estimated_io_mb,  0);
-        v_allocated_cpu := v_allocated_cpu + COALESCE(v_job.estimated_cpu_pct, 0);
-
-        -- Actual execution happens in a background worker process
-        -- The run_id is passed so the worker can update job_runs on completion
-        PERFORM pg_notify(
-            'scheduler_dispatch',
-            json_build_object(
-                'run_id',    v_run_id,
-                'job_id',    v_job.job_id,
-                'work_unit', v_job.work_unit,
-                'max_duration_sec', v_job.max_duration_sec
-            )::text
-        );
-    END LOOP;
-END;
-$$;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_notify</code> call dispatches to a Python worker pool that subscribes to the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">scheduler_dispatch</code> channel. Each worker picks up one dispatch notification, executes the work unit, and updates the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">job_runs</code> record. The scheduler procedure itself never blocks on job execution — the 30-second loop runs cleanly regardless of how long individual jobs take.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server master scheduler cycle using Service Broker for async dispatch
 CREATE OR ALTER PROCEDURE dbo.RunSchedulerCycle
 AS

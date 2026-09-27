@@ -62,29 +62,7 @@
 
 <p class="text-gray-300 leading-relaxed">The following queries represent the kind of baseline telemetry collection that feeds an AI pipeline. They identify query-level performance fingerprints and index utilization patterns — the two most important input signals for automated recommendation systems.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Collect query performance fingerprints from pg_stat_statements
--- Run this on a schedule (e.g., every 5 minutes) and store deltas
-SELECT
-    queryid,
-    query,
-    calls,
-    total_exec_time,
-    mean_exec_time,
-    stddev_exec_time,
-    rows,
-    shared_blks_hit,
-    shared_blks_read,
-    shared_blks_written,
-    blk_read_time,
-    blk_write_time,
-    now() AS collected_at
-FROM pg_stat_statements
-WHERE calls &gt; 10
-ORDER BY total_exec_time DESC
-LIMIT 200;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Collect query performance fingerprints from DMVs
 -- Run this on a schedule and store deltas in a monitoring database
 SELECT TOP 200
@@ -108,21 +86,7 @@ ORDER BY qs.total_elapsed_time DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Index utilization is equally important. Tables with zero seeks on indexes are candidates for dropping; tables with high sequential scans but no matching indexes are candidates for index creation. This data, accumulated over weeks, gives an AI model enough signal to make recommendations with confidence.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Index utilization snapshot for AI training data
-SELECT
-    schemaname,
-    tablename,
-    indexname,
-    idx_scan,
-    idx_tup_read,
-    idx_tup_fetch,
-    pg_size_pretty(pg_relation_size(indexrelid)) AS index_size,
-    now() AS collected_at
-FROM pg_stat_user_indexes
-ORDER BY idx_scan ASC;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Index utilization snapshot for AI training data
 SELECT
     OBJECT_SCHEMA_NAME(i.object_id)           AS schema_name,
@@ -162,43 +126,7 @@ ORDER BY ius.user_seeks ASC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">A simpler starting point that does not require a separate ML infrastructure is statistical process control: track the rolling mean and standard deviation of a metric over a sliding window, and alert when a new value falls outside three standard deviations. This is not machine learning in the strict sense, but it captures the contextual awareness that static thresholds miss. The query below implements this pattern directly in the database, making it a useful building block for a lightweight alerting agent.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Statistical anomaly detection on query mean execution time
--- Uses a 7-day rolling baseline from a stored telemetry table
-WITH baseline AS (
-    SELECT
-        queryid,
-        AVG(mean_exec_time)    AS baseline_mean,
-        STDDEV(mean_exec_time) AS baseline_stddev
-    FROM query_telemetry
-    WHERE collected_at &gt;= NOW() - INTERVAL '7 days'
-      AND collected_at &lt; NOW() - INTERVAL '1 hour'
-    GROUP BY queryid
-),
-current_window AS (
-    SELECT
-        queryid,
-        AVG(mean_exec_time) AS current_mean
-    FROM query_telemetry
-    WHERE collected_at &gt;= NOW() - INTERVAL '1 hour'
-    GROUP BY queryid
-)
-SELECT
-    c.queryid,
-    b.baseline_mean,
-    b.baseline_stddev,
-    c.current_mean,
-    ROUND(((c.current_mean - b.baseline_mean) /
-           NULLIF(b.baseline_stddev, 0))::numeric, 2) AS z_score
-FROM current_window c
-JOIN baseline b ON c.queryid = b.queryid
-WHERE b.baseline_stddev &gt; 0
-  AND ABS((c.current_mean - b.baseline_mean) /
-          NULLIF(b.baseline_stddev, 0)) &gt; 3
-ORDER BY ABS((c.current_mean - b.baseline_mean) /
-             NULLIF(b.baseline_stddev, 0)) DESC;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Statistical anomaly detection on query mean execution time
 -- Uses a 7-day rolling baseline from a stored telemetry table
 WITH baseline AS (
@@ -266,25 +194,7 @@ ORDER BY ABS((c.current_mean - b.baseline_mean) /
 
 <p class="text-gray-300 leading-relaxed">The query below shows how you might identify blocking sessions that an automated agent could act upon — with the important caveat that the agent should log every action it takes, including the query text and execution plan of the killed session, before terminating it.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify long-running blocking queries for automated remediation
--- An agent queries this and kills sessions blocking for &gt; configured threshold
-SELECT
-    blocking.pid                          AS blocking_pid,
-    blocking.usename                      AS blocking_user,
-    blocking.application_name,
-    blocking.query                        AS blocking_query,
-    EXTRACT(EPOCH FROM (NOW() - blocking.query_start)) AS blocking_duration_seconds,
-    blocked.pid                           AS blocked_pid,
-    blocked.query                         AS blocked_query
-FROM pg_stat_activity blocked
-JOIN pg_stat_activity blocking
-    ON blocking.pid = ANY(pg_blocking_pids(blocked.pid))
-WHERE EXTRACT(EPOCH FROM (NOW() - blocking.query_start)) &gt; 300
-  AND blocking.state = 'active'
-ORDER BY blocking_duration_seconds DESC;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify long-running blocking sessions for automated remediation
 -- An agent queries this and can execute KILL &lt;spid&gt; after logging details
 SELECT

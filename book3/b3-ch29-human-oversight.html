@@ -141,38 +141,7 @@ def resolve_tier(base_tier: OversightTier, ctx: ActionContext) -&gt; OversightTi
 
 <p class="text-gray-300 leading-relaxed">The second design principle: differentiated approval channels. Low-urgency proposals queue into a daily digest reviewed during business hours. High-urgency proposals (for example, a Tier 3 action triggered by degraded performance above a defined threshold) push to PagerDuty or Slack with a one-click approval link. Emergency proposals — where delay causes measurable SLA impact — have a pre-approved escalation path that automatically promotes to Tier 2 (execute-and-notify) after a configurable timeout, provided the confidence score exceeds a threshold.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Approval queue schema in a management database
-CREATE TABLE autonomous_action_proposals (
-    proposal_id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    action_class        TEXT NOT NULL,
-    target_database     TEXT NOT NULL,
-    target_environment  TEXT NOT NULL CHECK (target_environment IN ('production','staging','dev')),
-    proposed_sql        TEXT,
-    proposed_config     JSONB,
-    triggering_signal   JSONB NOT NULL,      -- metric name, value, threshold
-    projected_outcome   TEXT NOT NULL,
-    rollback_procedure  TEXT NOT NULL,
-    confidence_score    NUMERIC(4,3) NOT NULL,
-    oversight_tier      SMALLINT NOT NULL,
-    proposed_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
-    expires_at          TIMESTAMPTZ NOT NULL,
-    approved_by         TEXT,
-    approved_at         TIMESTAMPTZ,
-    rejected_by         TEXT,
-    rejected_at         TIMESTAMPTZ,
-    rejection_reason    TEXT,
-    auto_escalated      BOOLEAN DEFAULT FALSE,
-    status              TEXT NOT NULL DEFAULT 'pending'
-                            CHECK (status IN ('pending','approved','rejected','expired','executed','rolled_back'))
-);
 
-CREATE INDEX ON autonomous_action_proposals (status, expires_at)
-    WHERE status = 'pending';
-
-CREATE INDEX ON autonomous_action_proposals (target_database, proposed_at DESC);</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Approval queue schema (T-SQL equivalent)
 CREATE TABLE dbo.AutonomousActionProposals (
     ProposalId          UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWSEQUENTIALID(),
@@ -280,26 +249,6 @@ def process_expired_and_escalate(conn_str: str, slack_webhook: str):
 
 <p class="text-gray-300 leading-relaxed">When an LLM-based reasoning layer is involved in decision-making (a pattern covered in the preceding chapters), the system prompts the model to reason in a structured chain-of-thought format, and that reasoning chain is stored verbatim alongside the action record. Engineers can then read the model's reasoning as a narrative explanation.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Audit trail: decision rationale storage
-CREATE TABLE autonomous_action_audit (
-    audit_id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    proposal_id         UUID REFERENCES autonomous_action_proposals(proposal_id),
-    decision_timestamp  TIMESTAMPTZ NOT NULL DEFAULT now(),
-    signals_observed    JSONB NOT NULL,
-    -- e.g. {"bloat_ratio": 0.42, "table": "orders", "dead_tuples": 8200000}
-    rules_fired         JSONB NOT NULL,
-    -- e.g. [{"rule": "bloat_ratio &gt; 0.35", "weight": 1.0, "fired": true}]
-    alternatives_considered JSONB,
-    -- e.g. [{"action": "VACUUM FULL", "rejected_reason": "requires lock"}]
-    llm_reasoning_chain TEXT,
-    final_action        TEXT NOT NULL,
-    executed_at         TIMESTAMPTZ,
-    execution_result    TEXT,
-    execution_duration_ms INTEGER,
-    outcome_verified    BOOLEAN,
-    outcome_signals     JSONB   -- post-execution metric snapshot
-);</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Post-action narrative generation can be handled by a scheduled job that reads the structured audit record and generates a human-readable summary. For teams using LLM APIs, this is a simple prompt-and-store operation:</p>
 
@@ -364,7 +313,7 @@ the projection. Be specific about metric values. Do not use filler language.
 
 <p class="text-gray-300 leading-relaxed">Structured audit trail queries allow operators to investigate patterns over time — which action classes fire most frequently, which confidence scores correlate with poor outcomes, which databases generate the most auto-escalations. These are operational intelligence queries, not forensic queries. Building a Grafana dashboard on top of the audit tables turns the oversight infrastructure into a continuous improvement signal.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Audit summary: action class outcomes over rolling 30 days
 SELECT
     p.ActionClass,
@@ -446,22 +395,7 @@ def autonomous_action(redis_client: redis.Redis):
 
 <p class="text-gray-300 leading-relaxed">For Scenario 2, the abort mechanism depends on the action type. Long-running queries can be terminated via database-native mechanisms:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Abort an autonomous action by its backend PID
--- The action execution logs its PID in the audit table before starting
-SELECT pg_cancel_backend(pid)
-FROM pg_stat_activity
-WHERE query_start &gt; now() - INTERVAL '10 minutes'
-  AND application_name LIKE 'ade_worker_%'
-  AND state = 'active';
 
--- If cancel is insufficient, use terminate
-SELECT pg_terminate_backend(pid)
-FROM pg_stat_activity
-WHERE application_name LIKE 'ade_worker_%'
-  AND state = 'active';</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Abort an autonomous action session in SQL Server
 -- ADE workers connect with a recognizable application name
 SELECT session_id, login_time, program_name, status, last_request_start_time

@@ -55,34 +55,7 @@
 
 <p class="text-gray-300 leading-relaxed">The architecture looks like this: a time-series feature store (TimescaleDB or InfluxDB) receives raw telemetry from the database; a feature engineering pipeline produces lag features, rolling window statistics, and cross-metric ratios; a retraining pipeline runs weekly; and a prediction service exposes a gRPC endpoint that the database operator consults during routine planning. When the prediction service returns a capacity exhaustion probability above 0.85 for a specific table's index structure within the next 72 hours, the operator doesn't wait for an alert — it queues a migration job.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Query the telemetry feature store to extract index efficiency trends
--- for input to the retraining pipeline
-SELECT
-    schemaname,
-    relname,
-    indexrelname,
-    date_trunc('hour', sample_ts) AS hour_bucket,
-    AVG(idx_scan)                 AS avg_scans,
-    AVG(idx_tup_read)             AS avg_tup_read,
-    AVG(idx_tup_fetch)            AS avg_tup_fetch,
-    -- Efficiency ratio: low values signal index deterioration
-    ROUND(
-        AVG(idx_tup_fetch)::numeric /
-        NULLIF(AVG(idx_tup_read), 0), 4
-    ) AS fetch_read_ratio,
-    -- Selectivity trend: rising read-to-fetch gap predicts future bloat
-    ROUND(
-        (AVG(idx_tup_read) - AVG(idx_tup_fetch))::numeric /
-        NULLIF(AVG(idx_scan), 0), 2
-    ) AS wasted_reads_per_scan
-FROM pg_telemetry.index_snapshots  -- populated by background collector
-WHERE sample_ts &gt;= NOW() - INTERVAL '7 days'
-GROUP BY schemaname, relname, indexrelname, hour_bucket
-ORDER BY wasted_reads_per_scan DESC NULLS LAST
-LIMIT 50;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Extract index efficiency trends from a custom telemetry history table
 -- populated by a scheduled collector job
 SELECT
@@ -261,50 +234,7 @@ print(json.dumps(policy, indent=2))</code></pre>
 
 <p class="text-gray-300 leading-relaxed">*Regional operators act locally without coordination; only global-scope decisions cross through the arbiter, which resolves conflicts against versioned policy rather than heuristics, and regions fall back to local policy if the arbiter misses the expiry window.*</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- On each regional coordinator: register a decision intent before executing
--- a global-scope action. The arbiter table is replicated via pglogical.
-INSERT INTO autonomous_ops.decision_intents (
-    intent_id,
-    originating_region,
-    decision_scope,        -- 'local' or 'global'
-    action_type,
-    target_resource,
-    proposed_parameters,
-    intent_ts,
-    expiry_ts,
-    status
-) VALUES (
-    gen_random_uuid(),
-    current_setting('app.region_id'),
-    'global',
-    'schema_migration',
-    'orders.order_line_items',
-    jsonb_build_object(
-        'migration_type', 'add_index',
-        'index_definition', 'CREATE INDEX CONCURRENTLY ...',
-        'estimated_duration_seconds', 180
-    ),
-    NOW(),
-    NOW() + INTERVAL '10 minutes',  -- arbiter must respond within 10 minutes
-    'pending'
-)
-ON CONFLICT (target_resource, action_type) 
-WHERE status = 'pending'
-DO NOTHING;  -- Another region already registered an intent; defer to arbiter
 
--- Regional operator then polls for arbiter decision
-SELECT
-    intent_id,
-    status,            -- 'approved', 'denied', 'superseded'
-    arbiter_notes,
-    approved_execution_window
-FROM autonomous_ops.decision_intents
-WHERE originating_region = current_setting('app.region_id')
-  AND status != 'pending'
-  AND intent_ts &gt;= NOW() - INTERVAL '15 minutes';</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Register a cross-region decision intent in the distributed ops catalog
 -- replicated via transactional replication or AG readable secondary sync
 INSERT INTO autonomous_ops.DecisionIntents (
@@ -369,78 +299,12 @@ WHERE OriginatingRegion = @@SERVERNAME
 
 <p class="text-gray-300 leading-relaxed">The technical foundation is a governance engine that sits between the connection pool and the database, operating at the query rewrite or row security policy level. When a new GDPR data subject deletion request arrives, the governance engine doesn't queue a ticket — it immediately applies row-level security masks to the identified user's data, queues the hard delete for the next maintenance window, and updates the audit log. When a new data residency requirement activates for a jurisdiction, the governance engine rewrites routing rules in the proxy layer so that queries containing PII for that jurisdiction route only to in-jurisdiction replicas.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Runtime governance: dynamic row security policy updated by the governance engine
--- when a new residency constraint is activated
-
--- The governance engine calls this function, not a human
-CREATE OR REPLACE FUNCTION governance.apply_residency_constraint(
-    p_schema        TEXT,
-    p_table         TEXT,
-    p_jurisdiction  TEXT,  -- e.g., 'EU', 'US', 'BR'
-    p_constraint_id UUID
-)
-RETURNS VOID
-LANGUAGE plpgsql
-SECURITY DEFINER
-AS $$
-DECLARE
-    v_policy_name TEXT;
-    v_using_expr  TEXT;
-BEGIN
-    v_policy_name := format('rls_%s_%s_%s',
-        p_schema, p_table,
-        replace(p_jurisdiction, '-', '_'));
-
-    -- Build the USING expression: rows matching this jurisdiction
-    -- are only visible to roles that have in-jurisdiction access
-    v_using_expr := format(
-        $expr$
-        (data_jurisdiction != %L)
-        OR (
-            data_jurisdiction = %L
-            AND pg_has_role(current_user, 'role_access_' || %L, 'MEMBER')
-        )
-        $expr$,
-        p_jurisdiction, p_jurisdiction, lower(p_jurisdiction)
-    );
-
-    -- Drop existing policy if it exists (idempotent re-application)
-    EXECUTE format(
-        'DROP POLICY IF EXISTS %I ON %I.%I',
-        v_policy_name, p_schema, p_table
-    );
-
-    -- Apply new residency policy
-    EXECUTE format(
-        'CREATE POLICY %I ON %I.%I AS RESTRICTIVE
-         FOR ALL
-         USING (%s)',
-        v_policy_name, p_schema, p_table, v_using_expr
-    );
-
-    -- Ensure RLS is enabled on the table
-    EXECUTE format(
-        'ALTER TABLE %I.%I ENABLE ROW LEVEL SECURITY',
-        p_schema, p_table
-    );
-
-    -- Audit the governance action
-    INSERT INTO governance.policy_audit_log (
-        constraint_id, schema_name, table_name,
-        policy_name, action, applied_ts, applied_by
-    ) VALUES (
-        p_constraint_id, p_schema, p_table,
-        v_policy_name, 'CREATE', NOW(), 'governance_engine'
-    );
-END;
-$$;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The governance engine calling this function receives its signals from a regulatory event stream — a Kafka topic where compliance systems publish events like <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">data_subject_deletion_requested</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">jurisdiction_constraint_activated</code>, or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">retention_policy_updated</code>. The engine subscribes to this stream, maps events to governance actions, and calls the appropriate database-side functions. The human compliance officer interacts with the regulatory system, not the database; the engine handles the translation.</p>
 
 <p class="text-gray-300 leading-relaxed">For SQL Server environments, the equivalent uses row-level security predicates and dynamic data masking, managed through a governance stored procedure layer:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Governance engine stored procedure: apply or refresh a jurisdiction
 -- residency policy on a target table
 CREATE OR ALTER PROCEDURE governance.ApplyResidencyConstraint
@@ -591,23 +455,7 @@ class ResourceEfficiencyProfile:
 
 <p class="text-gray-300 leading-relaxed">The integration with PostgreSQL and SQL Server environments is through instance metadata — the executor calls cloud provider APIs (not database APIs) to resize instances, but it validates the decision against database-level metrics before committing. An instance may show low CPU utilization because it is heavily I/O-bound; the executor checks buffer pool hit rates and I/O wait statistics before concluding that the instance is genuinely oversized.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Collect the resource efficiency inputs from database-level statistics
--- These feed into the Python efficiency model above
-SELECT
-    'pg_buffer_pool' AS resource_type,
-    current_setting('shared_buffers')                     AS provisioned_capacity,
-    ROUND(
-        (1.0 - (sum(blks_read)::numeric /
-                NULLIF(sum(blks_hit) + sum(blks_read), 0))) * 100,
-        2
-    )                                                     AS hit_rate_pct,
-    sum(blks_read)                                        AS physical_reads_total,
-    sum(blks_hit)                                         AS cache_hits_total
-FROM pg_stat_database
-WHERE datname = current_database();</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Equivalent buffer pool efficiency snapshot for the efficiency model
 SELECT
     'sql_buffer_pool'                                           AS resource_type,

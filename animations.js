@@ -1,5 +1,11 @@
+// Honor the OS reduced-motion preference: skip decorative animation,
+// show final states immediately. Applies to particle canvas, reveals,
+// counters, terminal typing, spotlight, tilt and floating particles.
+const REDUCED = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
 // Full-page particle network background
 (function () {
+  if (REDUCED) return;
   const canvas = document.createElement('canvas');
   canvas.style.cssText = 'position:fixed;inset:0;z-index:0;pointer-events:none;';
   document.body.insertBefore(canvas, document.body.firstChild);
@@ -92,7 +98,11 @@ const _obs = new IntersectionObserver(
   entries => entries.forEach(e => { if (e.isIntersecting) e.target.classList.add('visible'); }),
   { threshold: 0.08 }
 );
-document.querySelectorAll('.fade-up').forEach(el => _obs.observe(el));
+if (REDUCED) {
+  document.querySelectorAll('.fade-up').forEach(el => el.classList.add('visible'));
+} else {
+  document.querySelectorAll('.fade-up').forEach(el => _obs.observe(el));
+}
 
 // Hamburger (index.html only)
 const _hamburger = document.getElementById('hamburger');
@@ -114,16 +124,18 @@ window.addEventListener('scroll', () => {
 }, { passive: true });
 
 // Cursor spotlight
-const _spotlight = document.createElement('div');
-_spotlight.className = 'cursor-spotlight';
-document.body.appendChild(_spotlight);
-document.addEventListener('mousemove', e => {
-  _spotlight.style.left = e.clientX + 'px';
-  _spotlight.style.top  = e.clientY + 'px';
-});
+if (!REDUCED) {
+  const _spotlight = document.createElement('div');
+  _spotlight.className = 'cursor-spotlight';
+  document.body.appendChild(_spotlight);
+  document.addEventListener('mousemove', e => {
+    _spotlight.style.left = e.clientX + 'px';
+    _spotlight.style.top  = e.clientY + 'px';
+  });
+}
 
 // Floating upward particles
-(function() {
+if (!REDUCED) (function() {
   for (let i = 0; i < 22; i++) {
     const p = document.createElement('div');
     p.className = 'particle';
@@ -169,10 +181,12 @@ const _counterObs = new IntersectionObserver(entries => {
     if (e.isIntersecting) { _countUp(e.target); _counterObs.unobserve(e.target); }
   });
 }, { threshold: 0.7 });
-document.querySelectorAll('.hero-stat-val, .stat-val').forEach(el => _counterObs.observe(el));
+if (!REDUCED) {
+  document.querySelectorAll('.hero-stat-val, .stat-val').forEach(el => _counterObs.observe(el));
+}
 
 // Terminal typing animation (index.html only)
-(function() {
+if (!REDUCED) (function() {
   const body = document.querySelector('.terminal-body');
   if (!body) return;
   const kids = [...body.children];
@@ -198,7 +212,7 @@ document.querySelectorAll('.hero-stat-val, .stat-val').forEach(el => _counterObs
 })();
 
 // 3D tilt on glass cards
-document.querySelectorAll('.glass').forEach(card => {
+if (!REDUCED) document.querySelectorAll('.glass').forEach(card => {
   card.addEventListener('mousemove', e => {
     const r = card.getBoundingClientRect();
     const x = (e.clientX - r.left) / r.width - 0.5;

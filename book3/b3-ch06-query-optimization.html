@@ -53,35 +53,10 @@
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL</strong> provides <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> as the foundation. It normalizes queries by replacing literals with placeholders, which means <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SELECT * FROM orders WHERE id = 42</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SELECT * FROM orders WHERE id = 99</code> collapse into a single entry. This normalization is essential for pattern-level analysis. The extension must be enabled and the sampling ratio tuned for high-volume systems.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Enable pg_stat_statements with appropriate settings
-ALTER SYSTEM SET shared_preload_libraries = 'pg_stat_statements';
-ALTER SYSTEM SET pg_stat_statements.max = 10000;
-ALTER SYSTEM SET pg_stat_statements.track = 'all';         -- top + nested
-ALTER SYSTEM SET pg_stat_statements.track_io_timing = on;
-ALTER SYSTEM SET pg_stat_statements.track_planning = on;   -- PG 13+
-SELECT pg_reload_conf();
-
--- pg_stat_statements exposes cumulative counters, not a per-query last-executed
--- timestamp, so it cannot answer "what regressed in the last 15 minutes" on its
--- own. Snapshot the view on an interval and diff consecutive snapshots (see the
--- Python exporter later in this section) to get a windowed rate. This query
--- pulls the current cumulative ranking, which the exporter then deltas.
-SELECT
-    queryid,
-    LEFT(query, 120)          AS query_preview,
-    calls,
-    ROUND(mean_exec_time::numeric, 2)    AS mean_ms,
-    ROUND(stddev_exec_time::numeric, 2)  AS stddev_ms,
-    ROUND((shared_blks_read * 8192.0 / 1024 / 1024)::numeric, 2) AS io_mb
-FROM pg_stat_statements
-WHERE calls &gt; 10
-ORDER BY mean_exec_time DESC
-LIMIT 50;</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server</strong> ships <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Query Store</code> — a far richer structure that persists plan history, resource consumption over time, and supports plan forcing directly from T-SQL. It must be enabled per database and configured for appropriate retention.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Enable Query Store with production-appropriate settings
 ALTER DATABASE [YourDatabase] SET QUERY_STORE = ON;
 ALTER DATABASE [YourDatabase] SET QUERY_STORE (
@@ -208,7 +183,7 @@ if __name__ == "__main__":
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server remediation</strong> is the cleaner case because Query Store supports plan forcing — pinning a query to a known-good historical plan with a single T-SQL statement.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Autonomous plan stabilization: force the last known-good plan
 -- Called by the remediation engine when a regression is confirmed
 
@@ -244,40 +219,6 @@ END</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL</strong> lacks native plan forcing, but the ecosystem provides two mechanisms: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_hint_plan</code> (which injects planner hints into normalized query text via a hint table) and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">plan_cache_mode</code> combined with prepared statement management. For the autonomous layer, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_hint_plan</code> is the practical choice because the hint table can be updated without touching application code.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- pg_hint_plan: install the extension and populate the hint table
--- This is executed by the autonomous remediation engine
-
-CREATE EXTENSION IF NOT EXISTS pg_hint_plan;
-
--- When regression is detected, the engine captures the last known-good
--- plan from a stored EXPLAIN output and injects appropriate hints.
--- Example: force an index scan that the planner abandoned after statistics update
-
-INSERT INTO hint_plan.hints (
-    norm_query_string,
-    application_name,
-    hints
-)
-VALUES (
-    -- Normalized form — literals replaced with ? (pg_hint_plan convention)
-    'SELECT o.*, c.email FROM orders o JOIN customers c ON c.id = o.customer_id WHERE o.status = ? AND o.created_at &gt; ?',
-    '',   -- apply to all application connections
-    'IndexScan(o idx_orders_status_created) HashJoin(o c)'
-)
-ON CONFLICT (norm_query_string, application_name)
-DO UPDATE SET hints = EXCLUDED.hints,
-              updated_at = NOW();
-
--- Record in autonomous audit log
-INSERT INTO dba_autonomous_actions
-    (action_type, object_name, reason, acted_at)
-VALUES (
-    'PLAN_HINT_INJECT',
-    'orders JOIN customers',
-    'Plan regression: seq scan chosen after statistics update, index scan forced',
-    NOW()
-);</code></pre>
 
 <p class="text-gray-300 leading-relaxed">For SQL Server, once a plan is forced, the autonomous system must monitor whether the forced plan is still the correct choice after conditions change — for example, after a major data load that legitimately shifts the optimal join order. The system schedules a re-evaluation every 24 hours: it temporarily unforces the plan, observes runtime for one collection window, and forces again if the regression persists, or permanently unforces if the new plan is now stable and comparable in performance. This feedback loop prevents the system from accumulating stale plan forces indefinitely.</p>
 
@@ -289,7 +230,7 @@ VALUES (
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Discovery</strong> starts with execution plan analysis. Both databases expose whether a query performed a sequential or full table scan in a context where an index could have served it. PostgreSQL surfaces this through <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_user_tables</code> (seq_scan count) and through EXPLAIN JSON output; SQL Server exposes it through Dynamic Management Views including <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_db_missing_index_details</code>.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Surface high-impact missing index recommendations from DMVs
 -- The autonomous engine queries this on every 15-minute cycle
 SELECT TOP 30
@@ -325,32 +266,6 @@ ORDER BY estimated_improvement_score DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">For PostgreSQL, the autonomous system uses a combination of <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_user_tables</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_user_indexes</code>, and hypothetical index analysis via the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">HypoPG</code> extension. HypoPG allows the planner to reason about an index that does not yet exist — the system creates a hypothetical index, runs EXPLAIN (not the real query), checks whether the planner would use it, then discards the hypothesis without any write to disk.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- HypoPG: test whether a proposed index would be used by the planner
--- The autonomous engine runs this before committing to CREATE INDEX
-
-CREATE EXTENSION IF NOT EXISTS hypopg;
-
--- Step 1: Create hypothetical index (no disk write, session-scoped)
-SELECT * FROM hypopg_create_index(
-    'CREATE INDEX ON orders (customer_id, status) INCLUDE (total_amount, created_at)'
-);
-
--- Step 2: Check if planner selects the hypothetical index
-EXPLAIN (FORMAT JSON)
-SELECT o.total_amount, o.created_at
-FROM orders o
-WHERE o.customer_id = 12345
-  AND o.status = 'pending';
--- Inspect output: if Index Scan on &lt;hypothetical&gt; appears, the index is useful
-
--- Step 3: Clean up hypothesis
-SELECT hypopg_reset();
-
--- If the planner would use it, emit the real CREATE INDEX
--- (executed by the autonomous engine under change control gates)
--- CREATE INDEX CONCURRENTLY idx_orders_customer_status
---     ON orders (customer_id, status) INCLUDE (total_amount, created_at);</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Validation before deployment</strong> is non-negotiable. The autonomous system must not create indexes on production tables without a safety gate. The gate checks:</p>
 
@@ -370,37 +285,7 @@ SELECT hypopg_reset();
 
 <p class="text-gray-300 leading-relaxed">When cardinality error ratio exceeds a threshold (typically > 10x under-estimate or > 5x over-estimate on a high-frequency query), the autonomous system triggers targeted statistics refresh:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Targeted statistics update for a specific table and column combination
--- Triggered when cardinality error is detected on high-frequency query
 
--- First, increase statistics target for the offending column
-ALTER TABLE orders
-    ALTER COLUMN status SET STATISTICS 500;   -- default is 100
-
-ALTER TABLE orders
-    ALTER COLUMN customer_segment SET STATISTICS 500;
-
--- For multi-column correlations, create extended statistics
-CREATE STATISTICS IF NOT EXISTS stat_orders_status_segment
-    (dependencies, ndistinct, mcv)  -- most-common-values added in PG 12
-    ON status, customer_segment
-    FROM orders;
-
--- Trigger immediate analysis (not waiting for autovacuum schedule)
-ANALYZE VERBOSE orders;
-
--- Log the intervention
-INSERT INTO dba_autonomous_actions
-    (action_type, object_name, reason, acted_at)
-VALUES (
-    'STATISTICS_REFRESH',
-    'orders(status, customer_segment)',
-    'Cardinality error ratio &gt; 10x detected on query_id=5a7f3c9d, estimated=12 actual=134589',
-    NOW()
-);</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Targeted statistics update with full scan for high-variance columns
 -- SQL Server by default samples; FULLSCAN is expensive but accurate
 

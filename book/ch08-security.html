@@ -60,20 +60,10 @@
 
 <p class="text-gray-300 leading-relaxed">You can inspect active authentication configuration in both systems:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- View pg_hba.conf rules as seen by PostgreSQL
-SELECT type, database, user_name, address, auth_method
-FROM pg_hba_file_rules;
-
--- Check whether current sessions are using SSL, and with what cipher
-SELECT s.usename, s.application_name, s.client_addr, ssl.ssl, ssl.cipher
-FROM pg_stat_activity s
-JOIN pg_stat_ssl ssl USING (pid)
-WHERE ssl.ssl = true;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Note that PostgreSQL does not expose the authentication method used by an individual connection through a system view — <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_hba_file_rules</code> shows what the rules *would* allow, but confirming which method a specific session actually used requires enabling <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">log_connections</code> and checking the server log.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Check the server authentication mode (1 = Windows only, 2 = Mixed)
 SELECT SERVERPROPERTY('IsIntegratedSecurityOnly') AS windows_auth_only;
 
@@ -101,25 +91,7 @@ ORDER BY type_desc, name;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The practical implication is that SQL Server requires two steps to give someone database access: create the login, then create the user in the target database and map it to that login. PostgreSQL has one step — create the role with appropriate attributes and grant it permissions.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Create an application role with login (no superuser privileges)
-CREATE ROLE app_user LOGIN PASSWORD 'use_a_strong_password_here';
 
--- Create a functional role that will hold object permissions
-CREATE ROLE app_readonly NOLOGIN;
-
--- Grant the functional role to the application role
-GRANT app_readonly TO app_user;
-
--- Grant specific permissions on a schema and its tables
-GRANT USAGE ON SCHEMA orders TO app_readonly;
-GRANT SELECT ON ALL TABLES IN SCHEMA orders TO app_readonly;
-
--- Ensure future tables in the schema are also covered
-ALTER DEFAULT PRIVILEGES IN SCHEMA orders
-  GRANT SELECT ON TABLES TO app_readonly;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Step 1: Create a server-level login
 CREATE LOGIN app_user WITH PASSWORD = 'use_a_strong_password_here';
 
@@ -140,22 +112,7 @@ GRANT SELECT ON SCHEMA::orders TO app_readonly;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">In PostgreSQL, privilege visibility comes from the system catalog and information schema. In SQL Server, the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.database_permissions</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">fn_my_permissions</code> views are your tools.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- See all privileges on tables in a given schema
-SELECT grantee, table_schema, table_name, privilege_type
-FROM information_schema.role_table_grants
-WHERE table_schema = 'orders'
-ORDER BY table_name, grantee, privilege_type;
 
--- Check effective role memberships
-SELECT r.rolname AS role,
-       m.rolname AS member
-FROM pg_auth_members am
-JOIN pg_roles r ON r.oid = am.roleid
-JOIN pg_roles m ON m.oid = am.member
-ORDER BY role, member;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- List all explicit permissions in the current database
 SELECT dp.name         AS principal,
        dp.type_desc    AS principal_type,
@@ -183,26 +140,7 @@ ORDER BY dp.name, perm.class_desc, object_name;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">A canonical example: a multi-tenant SaaS platform where one table stores orders for all tenants. Each tenant's application authenticates as a dedicated database role, and you want to guarantee at the database level that Tenant A can never read Tenant B's rows.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Enable RLS on the orders table
-ALTER TABLE orders.line_items ENABLE ROW LEVEL SECURITY;
 
--- Create a policy that filters rows by tenant identifier
--- current_user matches the PostgreSQL role name
-CREATE POLICY tenant_isolation ON orders.line_items
-  USING (tenant_id = current_user::text);
-
--- For write operations, also enforce the check on new rows
-CREATE POLICY tenant_isolation_insert ON orders.line_items
-  FOR INSERT
-  WITH CHECK (tenant_id = current_user::text);
-
--- Confirm RLS is enabled on the table
-SELECT tablename, rowsecurity, forcerowsecurity
-FROM pg_tables
-WHERE schemaname = 'orders' AND tablename = 'line_items';</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Create a schema to hold the security predicate function
 CREATE SCHEMA Security;
 GO
@@ -241,24 +179,7 @@ GO</code></pre>
 
 <p class="text-gray-300 leading-relaxed">After installing <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pgaudit</code>, you configure it via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">postgresql.conf</code> (for session-level auditing) or via the role attribute <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pgaudit.role</code> (for object-level auditing of specific tables or columns):</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- In postgresql.conf:
--- shared_preload_libraries = 'pgaudit'
--- pgaudit.log = 'write, ddl'  -- logs INSERT/UPDATE/DELETE/TRUNCATE and DDL
 
--- Enable object-level auditing via a dedicated audit role
-CREATE ROLE auditor NOLOGIN;
-
--- Grant SELECT on tables you want to audit reads on
-GRANT SELECT ON orders.line_items TO auditor;
-
--- Tell pgaudit to use this role as the audit marker role
--- In postgresql.conf: pgaudit.role = 'auditor'
-
--- Confirm extension is installed
-SELECT * FROM pg_extension WHERE extname = 'pgaudit';</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server has a built-in Server Audit mechanism
 
 -- Step 1: Create a server audit (writes to Windows Event Log here,
@@ -309,7 +230,7 @@ ORDER BY event_time DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">SQL Server's Transparent Data Encryption (TDE) encrypts the data files, log files, and backups at the storage level using a database encryption key (DEK) protected by a certificate or asymmetric key stored in the master database (or, in enterprise deployments, in Azure Key Vault or an HSM via Extensible Key Management). The application sees nothing different — all encryption and decryption happens in the buffer pool, transparent to queries.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Check TDE status across all databases
 SELECT db.name,
        dek.encryption_state,
@@ -356,19 +277,7 @@ ALTER DATABASE OrdersDB SET ENCRYPTION ON;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Object ownership is another overlooked surface. In PostgreSQL, the role that owns a schema or table can drop it, alter it, or change its permissions — regardless of what other roles are configured. Application roles should not own production objects. A dedicated <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">schema_owner</code> role (which holds no login attribute) should own production schemas, and that role should be used only when DDL changes are made, not for routine application connections.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Revoke the CREATE privilege from public on the public schema
--- (for PostgreSQL &lt; 15, where this was granted by default)
-REVOKE CREATE ON SCHEMA public FROM PUBLIC;
 
--- Review which roles have superuser privileges
-SELECT rolname, rolsuper, rolinherit, rolcreaterole,
-       rolcreatedb, rolcanlogin, rolbypassrls
-FROM pg_roles
-WHERE rolsuper = true OR rolcreaterole = true OR rolbypassrls = true
-ORDER BY rolname;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify server-level roles and their members
 SELECT r.name AS server_role,
        m.name AS member_name,

@@ -74,29 +74,7 @@
 
 <p class="text-gray-300 leading-relaxed">PostgreSQL exposes most of this through <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_user_tables</code>, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_activity</code>. The challenge is that <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> normalizes queries and loses some instance-level variance. Augmenting it with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">auto_explain</code> for sampling and a custom background worker that snapshots <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_activity</code> at 1-second intervals gives you the full picture.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Extract raw workload signals from pg_stat_statements
--- This query builds the feature vector for classification
-SELECT
-    queryid,
-    query,
-    calls,
-    total_exec_time / NULLIF(calls, 0)                          AS avg_exec_ms,
-    stddev_exec_time / NULLIF(total_exec_time / NULLIF(calls,0), 0) AS exec_time_cv,
-    rows / NULLIF(calls, 0)                                     AS avg_rows_returned,
-    shared_blks_hit / NULLIF(shared_blks_hit + shared_blks_read, 0) AS buffer_hit_ratio,
-    shared_blks_read / NULLIF(calls, 0)                         AS avg_physical_reads,
-    temp_blks_written / NULLIF(calls, 0)                        AS avg_temp_writes,
-    local_blks_hit + local_blks_read                            AS total_local_blks,
-    wal_bytes / NULLIF(calls, 0)                                AS avg_wal_bytes,
-    -- Frequency signal: calls per hour over observation window
-    calls / EXTRACT(EPOCH FROM (now() - stats_since)) * 3600   AS calls_per_hour
-FROM pg_stat_statements
-WHERE calls &gt; 10  -- minimum sample size for stable features
-  AND query NOT LIKE '/* internal */%'
-ORDER BY total_exec_time DESC;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Extract equivalent workload signals from Query Store
 -- Maps to the same feature vector schema used for classification
 SELECT
@@ -384,66 +362,7 @@ def classify_batch(requests: List[ClassificationRequest]):
 
 <p class="text-gray-300 leading-relaxed">pgBouncer does not natively support dynamic pool assignment, but its configuration can be rewritten and reloaded without dropping connections via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">RELOAD</code>. An orchestration agent monitors the classification service and, when it detects that a query pattern has been reclassified (e.g., a formerly OLTP query has migrated to ANALYTICAL due to data growth), it rewrites the pgBouncer pool assignment and issues a reload.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: Resource group assignment using pg_cgroup integration
--- or using custom session parameters that the application layer respects.
--- This procedure is called by the classification agent post-classification.
 
-CREATE OR REPLACE PROCEDURE assign_workload_resource_group(
-    p_query_id      BIGINT,
-    p_workload_class TEXT
-)
-LANGUAGE plpgsql AS $$
-DECLARE
-    v_target_pool TEXT;
-    v_statement_timeout TEXT;
-    v_work_mem TEXT;
-BEGIN
-    -- Map classification to resource parameters
-    CASE p_workload_class
-        WHEN 'OLTP_POINT' THEN
-            v_target_pool       := 'pool_oltp_primary';
-            v_statement_timeout := '5000';    -- 5 seconds
-            v_work_mem          := '4MB';
-        WHEN 'OLTP_MODERATE' THEN
-            v_target_pool       := 'pool_oltp_primary';
-            v_statement_timeout := '30000';   -- 30 seconds
-            v_work_mem          := '16MB';
-        WHEN 'ANALYTICAL' THEN
-            v_target_pool       := 'pool_replica_read';
-            v_statement_timeout := '300000';  -- 5 minutes
-            v_work_mem          := '256MB';
-        WHEN 'BATCH_ETL' THEN
-            v_target_pool       := 'pool_batch';
-            v_statement_timeout := '3600000'; -- 1 hour
-            v_work_mem          := '512MB';
-        WHEN 'MAINTENANCE' THEN
-            v_target_pool       := 'pool_maintenance';
-            v_statement_timeout := '0';       -- no limit
-            v_work_mem          := '1GB';
-        ELSE
-            v_target_pool       := 'pool_oltp_primary';
-            v_statement_timeout := '30000';
-            v_work_mem          := '16MB';
-    END CASE;
-
-    -- Record the mapping for the orchestration agent to pick up
-    INSERT INTO workload_routing_map
-        (query_id, workload_class, target_pool,
-         statement_timeout_ms, work_mem, updated_at)
-    VALUES
-        (p_query_id, p_workload_class, v_target_pool,
-         v_statement_timeout::INT, v_work_mem, now())
-    ON CONFLICT (query_id) DO UPDATE SET
-        workload_class     = EXCLUDED.workload_class,
-        target_pool        = EXCLUDED.target_pool,
-        statement_timeout_ms = EXCLUDED.statement_timeout_ms,
-        work_mem           = EXCLUDED.work_mem,
-        updated_at         = EXCLUDED.updated_at;
-END;
-$$;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: Resource Governor workload group assignment
 -- Classification function called by Resource Governor at connection time
 -- Updated dynamically based on classification service output
@@ -1009,33 +928,7 @@ GO</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Classification explanation table</strong> — a human-readable record of the dominant features that drove each classification decision.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE IF NOT EXISTS classification_explanations (
-    query_id          BIGINT        NOT NULL PRIMARY KEY,
-    workload_class    TEXT          NOT NULL,
-    confidence        FLOAT         NOT NULL,
-    top_features      JSONB         NOT NULL,  -- {feature: importance_contribution}
-    explanation_text  TEXT          NOT NULL,  -- natural language summary
-    classified_at     TIMESTAMPTZ   NOT NULL DEFAULT now()
-);
 
--- Example of what an explanation record looks like
--- (inserted by the classification agent, not generated here as a query)
--- {
---   "query_id": 1234567,
---   "workload_class": "ANALYTICAL",
---   "confidence": 0.91,
---   "top_features": {
---     "avg_parallelism": 0.31,
---     "result_compression": 0.28,
---     "avg_physical_reads": 0.19
---   },
---   "explanation_text": "Classified as ANALYTICAL: high parallelism (avg 6.2 workers),
---     low result compression (0.003 rows returned per row examined),
---     elevated physical reads (1240 pages/execution)."
--- }</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Dashboard view: current classification state for all active queries
 CREATE OR ALTER VIEW dbo.vw_workload_classification_dashboard AS
 SELECT

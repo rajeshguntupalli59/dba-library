@@ -55,27 +55,7 @@
 
 <p class="text-gray-300 leading-relaxed">The following query illustrates a structured observation layer — not a simple metric read, but a contextual snapshot that combines wait events, query age, and lock relationships in a single pull:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Contextual observation: long-running queries with lock dependency graph
-SELECT
-    a.pid,
-    a.usename,
-    a.application_name,
-    a.state,
-    EXTRACT(EPOCH FROM (now() - a.query_start))::INT AS query_age_seconds,
-    a.wait_event_type,
-    a.wait_event,
-    l.granted,
-    l.locktype,
-    l.relation::regclass AS locked_relation,
-    pg_blocking_pids(a.pid) AS blocked_by
-FROM pg_stat_activity a
-LEFT JOIN pg_locks l ON l.pid = a.pid
-WHERE a.state != 'idle'
-  AND a.query_start &lt; now() - INTERVAL '30 seconds'
-ORDER BY query_age_seconds DESC;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Contextual observation: long-running queries with blocking chain
 SELECT
     r.session_id,
@@ -112,34 +92,7 @@ ORDER BY r.total_elapsed_time DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">A well-structured self-configuration engine operates on a scoring model. Parameters like <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">work_mem</code> can be tuned dynamically at the session level for specific query classes without any system-wide impact:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Session-level self-configuration: elevate work_mem for hash-join heavy sessions
--- This runs inside a connection-level hook or pooler middleware
-DO $$
-DECLARE
-    v_hash_joins BIGINT;
-    v_sort_spills BIGINT;
-    v_current_work_mem TEXT;
-BEGIN
-    SELECT sum(hash_batches_original) INTO v_hash_joins
-    FROM pg_stat_statements
-    WHERE query ~ 'ORDER BY|GROUP BY|DISTINCT'
-      AND calls &gt; 50;
 
-    SELECT sum(temp_blks_written) INTO v_sort_spills
-    FROM pg_stat_statements
-    WHERE calls &gt; 10;
-
-    SELECT current_setting('work_mem') INTO v_current_work_mem;
-
-    IF v_sort_spills &gt; 10000 AND v_current_work_mem = '4MB' THEN
-        PERFORM set_config('work_mem', '16MB', false);
-        RAISE NOTICE 'work_mem elevated to 16MB due to % temp block spills', v_sort_spills;
-    END IF;
-END;
-$$;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Self-configuration: adjust max degree of parallelism based on active workload
 DECLARE @active_parallel_queries INT;
 DECLARE @current_maxdop INT;
@@ -300,34 +253,7 @@ def enforce_query_policies(conn, policy: QueryPolicy, audit_conn):
 
 <p class="text-gray-300 leading-relaxed">For PostgreSQL, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_user_tables</code> provide the raw signal. The autonomous optimizer reads these views, identifies queries with high <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">total_exec_time</code> and low selectivity on sequential scans, and proposes index candidates using the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">hypopg</code> extension — which simulates the effect of a hypothetical index without actually creating it:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Self-optimization: identify top candidates for index creation using hypopg
--- Step 1: Create a hypothetical index on the candidate column
-SELECT * FROM hypopg_create_index(
-    'CREATE INDEX ON orders (customer_id, created_at DESC)'
-);
 
--- Step 2: Re-explain a representative query to see if the planner would use it
-EXPLAIN (FORMAT JSON, ANALYZE false)
-SELECT order_id, total_amount
-FROM orders
-WHERE customer_id = 42
-  AND created_at &gt; now() - INTERVAL '90 days'
-ORDER BY created_at DESC
-LIMIT 20;
-
--- Step 3: Check if the hypothetical index appears in the plan
-SELECT * FROM hypopg_list_indexes();
-
--- Step 4: If planner adopts it, materialize the real index CONCURRENTLY
--- (executed by the autonomous engine only after impact validation)
--- CREATE INDEX CONCURRENTLY idx_orders_customer_created 
---     ON orders (customer_id, created_at DESC);
-
--- Step 5: Clean up hypothetical indexes
-SELECT hypopg_reset();</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Self-optimization: surface missing index candidates ranked by improvement potential
 SELECT TOP 20
     mid.database_id,

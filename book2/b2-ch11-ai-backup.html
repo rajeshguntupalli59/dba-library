@@ -84,33 +84,7 @@
 
 <p class="text-gray-300 leading-relaxed">The foundation is a well-structured telemetry store. You need to capture, at minimum, backup start and end times, backup type, duration, compressed size, throughput (MB/sec), database activity during backup (active sessions, I/O wait, CPU), and whether the backup completed without error. In PostgreSQL, you can query <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_bgwriter</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_database</code>, and your backup tool's completion logs. In SQL Server, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">msdb.dbo.backupset</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">msdb.dbo.backupmediafamily</code> combined with DMV snapshots give you the raw material.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Build a backup telemetry view joining pg_stat_database snapshots
--- captured at backup start/end times with your backup log table
-SELECT
-    b.backup_id,
-    b.backup_type,
-    b.started_at,
-    b.completed_at,
-    EXTRACT(EPOCH FROM (b.completed_at - b.started_at)) AS duration_seconds,
-    b.size_bytes,
-    b.size_bytes / NULLIF(
-        EXTRACT(EPOCH FROM (b.completed_at - b.started_at)), 0
-    ) AS throughput_bytes_per_sec,
-    s.blks_read,
-    s.blks_hit,
-    s.tup_fetched,
-    s.conflicts,
-    b.exit_code,
-    EXTRACT(DOW FROM b.started_at) AS day_of_week,
-    EXTRACT(HOUR FROM b.started_at) AS hour_of_day
-FROM dba_backup_log b
-JOIN pg_stat_database_snapshots s
-    ON s.snapshot_time BETWEEN b.started_at AND b.completed_at
-    AND s.datname = b.database_name
-ORDER BY b.started_at DESC;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Extract backup telemetry with workload context from msdb
 SELECT
     bs.backup_set_id,
@@ -257,53 +231,7 @@ def recommend_next_backup_window(
 
 <p class="text-gray-300 leading-relaxed">The third category is cross-environment consistency. AI can compare backup telemetry across replicated environments and flag when primary and standby backup chains diverge in ways that suggest replication lag has gone undetected at the backup layer.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Detect backup size anomalies using statistical baseline
--- Assumes dba_backup_log table with size_bytes column
-WITH baseline AS (
-    SELECT
-        backup_type,
-        EXTRACT(DOW FROM started_at) AS day_of_week,
-        AVG(size_bytes) AS avg_size,
-        STDDEV(size_bytes) AS stddev_size,
-        COUNT(*) AS sample_count
-    FROM dba_backup_log
-    WHERE started_at &gt;= NOW() - INTERVAL '60 days'
-      AND exit_code = 0
-    GROUP BY backup_type, EXTRACT(DOW FROM started_at)
-),
-recent_backups AS (
-    SELECT
-        b.backup_id,
-        b.backup_type,
-        b.started_at,
-        b.size_bytes,
-        EXTRACT(DOW FROM b.started_at) AS day_of_week
-    FROM dba_backup_log b
-    WHERE b.started_at &gt;= NOW() - INTERVAL '7 days'
-      AND b.exit_code = 0
-)
-SELECT
-    rb.backup_id,
-    rb.backup_type,
-    rb.started_at,
-    rb.size_bytes,
-    bl.avg_size,
-    bl.stddev_size,
-    (rb.size_bytes - bl.avg_size) / NULLIF(bl.stddev_size, 0) AS z_score,
-    CASE
-        WHEN ABS((rb.size_bytes - bl.avg_size) / NULLIF(bl.stddev_size, 0)) &gt; 3 THEN 'CRITICAL_ANOMALY'
-        WHEN ABS((rb.size_bytes - bl.avg_size) / NULLIF(bl.stddev_size, 0)) &gt; 2 THEN 'WARNING_ANOMALY'
-        ELSE 'NORMAL'
-    END AS anomaly_classification
-FROM recent_backups rb
-JOIN baseline bl
-    ON bl.backup_type = rb.backup_type
-    AND bl.day_of_week = rb.day_of_week
-WHERE bl.sample_count &gt;= 8
-ORDER BY ABS((rb.size_bytes - bl.avg_size) / NULLIF(bl.stddev_size, 0)) DESC;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Backup size anomaly detection using T-SQL windowed statistics
 WITH backup_history AS (
     SELECT
@@ -430,76 +358,7 @@ Do not explain what backups are or why they matter."""
 
 <p class="text-gray-300 leading-relaxed">The first application is recovery path optimization. Given a target recovery time or point in time, the model evaluates all valid backup chains — considering full backup age, differential or incremental availability, log backup coverage, restore throughput estimates based on backup file sizes, and storage location (local disk vs. object storage vs. cold archive) — and recommends the sequence that minimizes total recovery time while meeting the RPO target.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Map available recovery chains for a target PITR
--- Assumes pg_basebackup metadata table and WAL archive inventory
-WITH base_backups AS (
-    SELECT
-        backup_id,
-        backup_label,
-        backup_start_lsn,
-        backup_stop_lsn,
-        started_at AS backup_time,
-        size_bytes,
-        storage_location,
-        storage_tier,  -- 'hot', 'warm', 'cold'
-        estimated_restore_minutes
-    FROM dba_basebackup_inventory
-    WHERE is_valid = true
-      AND NOT is_expired
-),
-wal_coverage AS (
-    SELECT
-        w.segment_name,
-        w.start_lsn,
-        w.end_lsn,
-        w.archived_at,
-        w.storage_location,
-        w.storage_tier
-    FROM dba_wal_archive_inventory w
-    WHERE w.is_accessible = true
-),
-recovery_chains AS (
-    SELECT
-        b.backup_id,
-        b.backup_time,
-        b.size_bytes,
-        b.storage_tier,
-        b.estimated_restore_minutes,
-        COUNT(w.segment_name) AS wal_segments_available,
-        MAX(w.archived_at) AS wal_coverage_through,
-        SUM(CASE WHEN w.storage_tier = 'cold' THEN 1 ELSE 0 END) AS cold_wal_segments
-    FROM base_backups b
-    JOIN wal_coverage w ON w.start_lsn &gt;= b.backup_stop_lsn
-    GROUP BY
-        b.backup_id, b.backup_time, b.size_bytes,
-        b.storage_tier, b.estimated_restore_minutes
-)
-SELECT
-    backup_id,
-    backup_time,
-    pg_size_pretty(size_bytes) AS backup_size,
-    storage_tier AS base_backup_tier,
-    estimated_restore_minutes AS base_restore_minutes,
-    wal_segments_available,
-    wal_coverage_through,
-    cold_wal_segments,
-    -- Estimated total restore time: base restore + WAL replay estimate
-    estimated_restore_minutes +
-        CEIL(wal_segments_available * 0.5)  -- rough 30s per WAL segment
-        + (cold_wal_segments * 45)          -- cold retrieval penalty in minutes
-    AS estimated_total_rto_minutes,
-    -- Score: lower RTO = better, penalize cold storage heavily
-    RANK() OVER (
-        ORDER BY
-            estimated_restore_minutes +
-            CEIL(wal_segments_available * 0.5) +
-            (cold_wal_segments * 45)
-    ) AS rto_rank
-FROM recovery_chains
-ORDER BY rto_rank;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Map SQL Server restore chains for a target point-in-time recovery
 -- Evaluates full + differential + log sequences
 WITH full_backups AS (
@@ -771,26 +630,7 @@ def compute_rolling_features(backup_telemetry: pd.DataFrame) -&gt; pd.DataFrame:
 
 <p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Which backup types provide recoverable value at each age?</strong> Full backups age out of recovery utility faster than log backups in a continuous WAL archiving environment. The retention policy should reflect the actual shape of the recovery chain, not a single number applied uniformly.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Analyze actual backup usage patterns to inform retention policy
--- Assumes dba_restore_events table capturing every restore operation
-SELECT
-    EXTRACT(DAY FROM (re.restore_initiated_at - bi.backup_finished_at)) AS backup_age_days_at_restore,
-    bi.backup_type,
-    re.restore_reason,
-    COUNT(*) AS restore_count,
-    ROUND(100.0 * COUNT(*) / SUM(COUNT(*)) OVER (PARTITION BY bi.backup_type), 1) AS pct_of_restores
-FROM dba_restore_events re
-JOIN dba_backup_inventory bi
-    ON bi.backup_id = re.source_backup_id
-WHERE re.restore_initiated_at &gt;= NOW() - INTERVAL '2 years'
-GROUP BY
-    EXTRACT(DAY FROM (re.restore_initiated_at - bi.backup_finished_at)),
-    bi.backup_type,
-    re.restore_reason
-ORDER BY bi.backup_type, backup_age_days_at_restore;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Retention policy effectiveness analysis
 -- Uses restore history from msdb combined with a custom restore tracking table
 SELECT

@@ -75,28 +75,7 @@
 
 <p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_activity</code> view is the primary source for real-time workload visibility. For autonomous systems, the critical fields are <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">wait_event_type</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">wait_event</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">state</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">query_start</code>, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">query_id</code> (PostgreSQL 14+). Querying this view every 5–10 seconds and persisting the results gives your decision engine a timeline of what the database was doing at any moment.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Workload snapshot for autonomous ingestion
--- Collect every 5-10 seconds and store in a time-series table or emit to Prometheus
-SELECT
-    now()                           AS collected_at,
-    pid,
-    usename,
-    application_name,
-    client_addr,
-    state,
-    wait_event_type,
-    wait_event,
-    EXTRACT(EPOCH FROM (now() - query_start))::NUMERIC(10,3) AS query_age_seconds,
-    query_id,
-    LEFT(query, 200)                AS query_snippet,
-    backend_type
-FROM pg_stat_activity
-WHERE backend_type = 'client backend'
-  AND state != 'idle'
-ORDER BY query_age_seconds DESC NULLS LAST;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Equivalent workload snapshot using DMVs
 -- Designed for programmatic collection; include in a scheduled job or monitoring agent
 SELECT
@@ -128,30 +107,7 @@ ORDER BY r.total_elapsed_time DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">For workload telemetry at the query level, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> (PostgreSQL) and the Query Store (SQL Server) are the authoritative sources. These surfaces aggregate execution statistics per normalized query, giving you mean execution time, standard deviation, total I/O, and call count — exactly the inputs needed to identify regression candidates for autonomous tuning.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Query-level performance telemetry for regression detection
--- Run this on a schedule (every 1-5 minutes) and delta against prior snapshot
-SELECT
-    queryid,
-    userid::regrole::TEXT                       AS username,
-    dbid::regdatabase::TEXT                     AS database_name,
-    calls,
-    total_exec_time                             AS total_ms,
-    ROUND((total_exec_time / NULLIF(calls, 0))::NUMERIC, 3)  AS avg_ms,
-    ROUND(stddev_exec_time::NUMERIC, 3)         AS stddev_ms,
-    rows,
-    shared_blks_hit,
-    shared_blks_read,
-    shared_blks_dirtied,
-    blk_read_time,
-    blk_write_time,
-    LEFT(query, 300)                            AS query_text
-FROM pg_stat_statements
-WHERE calls &gt; 10
-ORDER BY total_exec_time DESC
-LIMIT 50;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Query Store equivalent for regression detection
 -- Surfaces queries with high average duration and significant variability
 SELECT TOP 50
@@ -314,58 +270,7 @@ receivers:
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **`LWLock` / `WALWrite`**: High WAL write contention. Autonomous action: evaluate whether `wal_writer_delay`, `commit_delay`, or `synchronous_commit` settings can be safely tuned without durability risk given current replication topology.</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **`IPC` / `BgWorkerStartup`**: Background workers are taking too long to start. Autonomous action: check `max_worker_processes` against current utilization; scale if headroom is insufficient.</li>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Wait event aggregation for autonomous pattern matching
--- This query produces a decision-table row: event category, severity, recommended action class
-WITH wait_snapshot AS (
-    SELECT
-        wait_event_type,
-        wait_event,
-        COUNT(*)                                            AS waiter_count,
-        MAX(EXTRACT(EPOCH FROM (now() - query_start)))      AS max_wait_seconds,
-        AVG(EXTRACT(EPOCH FROM (now() - query_start)))      AS avg_wait_seconds
-    FROM pg_stat_activity
-    WHERE state = 'active'
-      AND wait_event IS NOT NULL
-      AND backend_type = 'client backend'
-    GROUP BY wait_event_type, wait_event
-),
-lock_chains AS (
-    SELECT
-        blocked.pid                                         AS blocked_pid,
-        blocking.pid                                        AS blocking_pid,
-        blocking.query_start                                AS blocker_start,
-        EXTRACT(EPOCH FROM (now() - blocking.query_start))  AS blocker_age_seconds
-    FROM pg_stat_activity blocked
-    JOIN pg_stat_activity blocking
-        ON blocking.pid = ANY(pg_blocking_pids(blocked.pid))
-    WHERE cardinality(pg_blocking_pids(blocked.pid)) &gt; 0
-)
-SELECT
-    ws.wait_event_type,
-    ws.wait_event,
-    ws.waiter_count,
-    ROUND(ws.max_wait_seconds::NUMERIC, 2)                  AS max_wait_sec,
-    ROUND(ws.avg_wait_seconds::NUMERIC, 2)                  AS avg_wait_sec,
-    COUNT(lc.blocked_pid)                                   AS blocked_by_lock_chain,
-    MAX(lc.blocker_age_seconds)                             AS oldest_blocker_age_sec,
-    CASE
-        WHEN ws.wait_event_type = 'Lock' AND ws.waiter_count &gt;= 5
-             AND MAX(lc.blocker_age_seconds) &gt; 120          THEN 'TERMINATE_BLOCKER'
-        WHEN ws.wait_event_type = 'IO' AND ws.waiter_count &gt;= 10
-             AND ws.avg_wait_seconds &gt; 5                    THEN 'PREWARM_AND_REVIEW_CACHE'
-        WHEN ws.wait_event_type = 'LWLock'
-             AND ws.wait_event = 'WALWrite'
-             AND ws.waiter_count &gt;= 8                       THEN 'TUNE_WAL_SETTINGS'
-        ELSE 'MONITOR'
-    END                                                     AS recommended_action
-FROM wait_snapshot ws
-LEFT JOIN lock_chains lc ON ws.wait_event_type = 'Lock'
-GROUP BY ws.wait_event_type, ws.wait_event, ws.waiter_count,
-         ws.max_wait_seconds, ws.avg_wait_seconds
-ORDER BY ws.waiter_count DESC;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Wait type aggregation with autonomous action classification
 -- Run on a schedule; compare delta between snapshots for rate-of-change analysis
 WITH wait_stats AS (
@@ -428,17 +333,7 @@ ORDER BY wait_time_ms DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Metrics about query performance and wait events are meaningless without context about the system's current topology and configuration state. An autonomous action that's perfectly correct for a primary with three healthy replicas may be catastrophically wrong during a failover event. The autonomous system must always know the current state of the world before acting — and that state includes cluster topology, current role (primary or replica), schema version, and the effective value of every configuration parameter the decision logic depends on.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Topology and role snapshot, polled alongside performance telemetry
-SELECT
-    pg_is_in_recovery()                          AS is_replica,
-    CASE WHEN pg_is_in_recovery()
-         THEN pg_last_wal_replay_lsn()
-         ELSE pg_current_wal_lsn() END            AS current_lsn,
-    (SELECT count(*) FROM pg_stat_replication)    AS connected_replica_count,
-    current_setting('server_version_num')         AS server_version_num;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Availability Group role and replica-count snapshot
 SELECT
     ars.role_desc,

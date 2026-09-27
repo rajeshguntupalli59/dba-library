@@ -53,40 +53,7 @@
 
 <p class="text-gray-300 leading-relaxed">The core metric is <strong class="text-white">modified page rate</strong> for SQL Server and <strong class="text-white">WAL generation rate</strong> for PostgreSQL. Both serve as proxies for how quickly the database is diverging from its last known-good backup. When the divergence rate is high, the cost of data loss per unit time is proportionally high, and backup frequency should increase. When the database is quiescent, backup frequency can safely decrease to preserve storage and I/O budget.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Track WAL generation rate over rolling 5-minute windows
--- Store in a monitoring schema for the scheduler to query
-CREATE TABLE IF NOT EXISTS backup_monitor.wal_velocity (
-    recorded_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
-    wal_bytes_delta BIGINT,
-    tps_rate        NUMERIC(12, 2),
-    lsn_current     PG_LSN
-);
 
--- Called by the scheduler agent every 5 minutes
-INSERT INTO backup_monitor.wal_velocity (wal_bytes_delta, tps_rate, lsn_current)
-SELECT
-    (pg_current_wal_lsn() - wal_lsn_at_last_checkpoint) AS wal_bytes_delta,
-    xact_commit + xact_rollback AS tps_rate,
-    pg_current_wal_lsn()
-FROM pg_stat_bgwriter, pg_control_checkpoint()
-WHERE pg_stat_bgwriter.stats_reset &lt; now() - INTERVAL '5 minutes';
-
--- Scheduler query: should we trigger an incremental backup?
-SELECT
-    recorded_at,
-    wal_bytes_delta,
-    CASE
-        WHEN wal_bytes_delta &gt; 5368709120  THEN 'HIGH'      -- &gt; 5 GB WAL in 5 min
-        WHEN wal_bytes_delta &gt; 1073741824  THEN 'MEDIUM'    -- &gt; 1 GB
-        WHEN wal_bytes_delta &gt; 104857600   THEN 'LOW'       -- &gt; 100 MB
-        ELSE 'QUIESCENT'
-    END AS velocity_band
-FROM backup_monitor.wal_velocity
-ORDER BY recorded_at DESC
-LIMIT 1;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Track modified extent rate using dm_io_virtual_file_stats
 -- Proxy for change velocity per database
 SELECT
@@ -239,44 +206,7 @@ def run_scheduler(pg_dsn: str, redis_url: str, databases: list[str]):
 
 <p class="text-gray-300 leading-relaxed">*The three-stage validation pipeline: each backup advances through synchronous integrity checking and two asynchronous restore-based checks before it is trusted for use in a restore plan.*</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Immediately after pg_basebackup or pgBackRest backup completes:
--- Record backup catalog entry with initial validation state
-INSERT INTO backup_catalog.backups (
-    backup_id,
-    database_name,
-    backup_type,
-    started_at,
-    completed_at,
-    backup_size_bytes,
-    wal_start_lsn,
-    wal_stop_lsn,
-    storage_path,
-    validation_state,  -- 'PENDING' | 'INTEGRITY_OK' | 'RESTORE_OK' | 'APP_OK' | 'FAILED'
-    validation_message
-)
-VALUES (
-    gen_random_uuid(),
-    $1, $2, $3, $4, $5, $6::pg_lsn, $7::pg_lsn, $8,
-    'PENDING',
-    NULL
-);
 
--- Query the validation pipeline uses to find work
-SELECT
-    backup_id,
-    database_name,
-    backup_type,
-    storage_path,
-    completed_at,
-    validation_state
-FROM backup_catalog.backups
-WHERE validation_state IN ('PENDING', 'INTEGRITY_OK')
-  AND completed_at &gt; now() - INTERVAL '48 hours'
-ORDER BY completed_at ASC
-LIMIT 10;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server backup validation catalog
 -- Track RESTORE VERIFYONLY results and restore smoke test outcomes
 CREATE TABLE backup_catalog.BackupValidations (
@@ -438,62 +368,7 @@ def _update_catalog(dsn: str, backup_id: str, state: str, message: str):
 
 <p class="text-gray-300 leading-relaxed">The storage lifecycle manager evaluates each backup against all four dimensions. A backup is eligible for deletion only when it fails all four retention tests. The tier migration logic runs separately: backups older than 7 days move from NVMe-backed primary storage to object storage (S3, Azure Blob, or GCS); backups older than 30 days move to archive storage classes (Glacier, Archive).</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Retention policy table — per database, per environment
-CREATE TABLE backup_catalog.retention_policies (
-    policy_id           SERIAL PRIMARY KEY,
-    database_name       TEXT NOT NULL,
-    environment         TEXT NOT NULL,  -- prod | staging | dev
-    retain_days         INT  NOT NULL DEFAULT 30,
-    retain_full_count   INT  NOT NULL DEFAULT 4,
-    pitr_window_hours   INT  NOT NULL DEFAULT 72,
-    compliance_anchor   TEXT NULL,      -- '{"day": "last", "month_end": true}'
-    storage_tier_rules  JSONB NOT NULL DEFAULT '{}',
-    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
-);
 
--- Query: identify backups eligible for deletion
--- A backup is NOT deleted if ANY retention rule still covers it
-WITH policy AS (
-    SELECT * FROM backup_catalog.retention_policies
-    WHERE database_name = $1
-      AND environment = $2
-),
-retention_counts AS (
-    SELECT
-        backup_id,
-        completed_at,
-        backup_type,
-        ROW_NUMBER() OVER (
-            PARTITION BY backup_type
-            ORDER BY completed_at DESC
-        ) AS recency_rank
-    FROM backup_catalog.backups
-    WHERE database_name = $1
-      AND validation_state NOT IN ('FAILED', 'PENDING')
-)
-SELECT * FROM (
-    SELECT
-        rc.backup_id,
-        rc.completed_at,
-        rc.backup_type,
-        CASE
-            WHEN rc.completed_at &gt; now() - (p.retain_days || ' days')::INTERVAL
-                THEN 'RETAINED_TIME'
-            WHEN rc.recency_rank &lt;= p.retain_full_count
-                THEN 'RETAINED_COUNT'
-            WHEN rc.backup_type = 'log'
-             AND rc.completed_at &gt; now() - (p.pitr_window_hours || ' hours')::INTERVAL
-                THEN 'RETAINED_PITR'
-            ELSE 'ELIGIBLE_FOR_DELETION'
-        END AS retention_decision
-    FROM retention_counts rc
-    CROSS JOIN policy p
-) scored
-WHERE retention_decision = 'ELIGIBLE_FOR_DELETION';</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: identify backup sets eligible for deletion
 -- Respects time, count, and log chain continuity constraints
 WITH RetentionPolicy AS (
@@ -647,63 +522,7 @@ def run_tier_lifecycle(catalog_dsn: str, bucket: str, aws_region: str):
 
 <p class="text-gray-300 leading-relaxed">The restore orchestrator maintains a <strong class="text-white">restore plan catalog</strong> — pre-computed restore recipes for common scenarios. These plans are re-evaluated every time a new backup completes, so the plan is always current. When a restore is triggered, the orchestrator selects the appropriate plan rather than computing it under pressure.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Restore plan: pre-computed recipe for a given target time and database
-CREATE TABLE backup_catalog.restore_plans (
-    plan_id             UUID        DEFAULT gen_random_uuid() PRIMARY KEY,
-    database_name       TEXT        NOT NULL,
-    plan_type           TEXT        NOT NULL,   -- 'pitr' | 'latest' | 'labeled'
-    target_lsn          PG_LSN      NULL,
-    target_time         TIMESTAMPTZ NULL,
-    base_backup_id      UUID        NOT NULL REFERENCES backup_catalog.backups(backup_id),
-    log_sequence        UUID[]      NOT NULL DEFAULT '{}',  -- ordered list of log backup IDs
-    estimated_restore_seconds INT   NOT NULL DEFAULT 0,
-    computed_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
-    is_current          BOOLEAN     NOT NULL DEFAULT TRUE
-);
 
--- Recompute the 'latest' restore plan after each new log backup
--- Called by the backup worker upon log backup completion
-WITH latest_full AS (
-    SELECT backup_id, completed_at, wal_stop_lsn
-    FROM backup_catalog.backups
-    WHERE database_name = $1
-      AND backup_type = 'full'
-      AND validation_state = 'RESTORE_OK'
-    ORDER BY completed_at DESC
-    LIMIT 1
-),
-covering_logs AS (
-    SELECT
-        b.backup_id,
-        b.wal_start_lsn,
-        b.wal_stop_lsn,
-        b.completed_at
-    FROM backup_catalog.backups b
-    JOIN latest_full lf ON b.wal_start_lsn &gt;= lf.wal_stop_lsn
-    WHERE b.database_name = $1
-      AND b.backup_type = 'log'
-      AND b.validation_state IN ('INTEGRITY_OK', 'RESTORE_OK', 'APP_OK')
-    ORDER BY b.wal_start_lsn ASC
-)
-INSERT INTO backup_catalog.restore_plans (
-    database_name,
-    plan_type,
-    base_backup_id,
-    log_sequence,
-    computed_at
-)
-SELECT
-    $1,
-    'latest',
-    lf.backup_id,
-    ARRAY_AGG(cl.backup_id ORDER BY cl.wal_start_lsn),
-    now()
-FROM latest_full lf
-CROSS JOIN covering_logs cl
-GROUP BY lf.backup_id;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: compute restore sequence for a given target time
 -- Returns ordered list of backup sets to apply
 WITH FullBackups AS (
@@ -925,49 +744,10 @@ def orchestrate_restore(
 
 <p class="text-gray-300 leading-relaxed">At the storage level, every backup object is stored with a SHA-256 checksum recorded in the backup catalog. The integrity monitor re-verifies checksums on a rolling schedule — not just at backup creation time. This catches bit-rot in object storage, failed disk sectors on backup media, and silent data modification by malicious processes.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Checksum manifest stored alongside backup catalog entry
-ALTER TABLE backup_catalog.backups ADD COLUMN IF NOT EXISTS
-    file_manifest JSONB;
--- Format: {"path/to/file.tar.gz": "sha256:abcd1234...", ...}
-
--- Integrity check job: re-verify checksums on schedule
--- Returns any files whose current hash does not match the manifest
-CREATE OR REPLACE FUNCTION backup_catalog.verify_backup_integrity(
-    p_backup_id UUID
-)
-RETURNS TABLE (
-    file_path       TEXT,
-    expected_hash   TEXT,
-    actual_hash     TEXT,
-    is_corrupt      BOOLEAN
-)
-LANGUAGE plpgsql
-AS $$
-DECLARE
-    v_manifest JSONB;
-BEGIN
-    SELECT file_manifest INTO v_manifest
-    FROM backup_catalog.backups
-    WHERE backup_id = p_backup_id;
-
-    -- The actual hash verification is performed by the Python agent;
-    -- this function records and surfaces the results stored by that agent.
-    RETURN QUERY
-    SELECT
-        (entry-&gt;&gt;'path')::TEXT,
-        (entry-&gt;&gt;'expected_hash')::TEXT,
-        (entry-&gt;&gt;'actual_hash')::TEXT,
-        (entry-&gt;&gt;'expected_hash') IS DISTINCT FROM (entry-&gt;&gt;'actual_hash')
-    FROM jsonb_array_elements(
-        v_manifest-&gt;'verification_results'
-    ) AS entry;
-END;
-$$;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">At the application level, the corruption detector watches for anomalies in live database metrics that suggest logical corruption: sudden drops in row counts in critical tables, index-to-table count divergence, and failed constraint checks. These signals arrive faster than backup validation cycles and allow the system to freeze backup activity — preventing a corrupt state from being captured in a fresh backup — while alerting operators and queuing a restore evaluation.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Application-level integrity monitor: detect row count anomalies
 -- Compares current counts against a rolling baseline
 WITH BaselineCounts AS (
@@ -1110,80 +890,7 @@ def assess_recovery_action(
 
 <p class="text-gray-300 leading-relaxed">These five questions map directly to a health dashboard query set. The queries below are designed to run in under one second against the backup catalog, making them suitable for a Grafana dashboard with a 30-second refresh interval.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Dashboard query 1: backup recency and policy compliance
-SELECT
-    b.database_name,
-    b.backup_type,
-    MAX(b.completed_at)                                    AS last_backup_at,
-    now() - MAX(b.completed_at)                            AS age,
-    CASE
-        WHEN b.backup_type = 'log'
-         AND now() - MAX(b.completed_at) &gt; INTERVAL '30 minutes'
-             THEN 'POLICY_BREACH'
-        WHEN b.backup_type = 'incremental'
-         AND now() - MAX(b.completed_at) &gt; INTERVAL '6 hours'
-             THEN 'POLICY_BREACH'
-        WHEN b.backup_type = 'full'
-         AND now() - MAX(b.completed_at) &gt; INTERVAL '7 days'
-             THEN 'POLICY_BREACH'
-        ELSE 'COMPLIANT'
-    END                                                    AS policy_status
-FROM backup_catalog.backups b
-WHERE b.validation_state NOT IN ('FAILED', 'PENDING')
-GROUP BY b.database_name, b.backup_type
-ORDER BY b.database_name, b.backup_type;
 
--- Dashboard query 2: current recovery point (earliest data that would be lost)
-SELECT
-    database_name,
-    MAX(completed_at) AS recovery_point_objective,
-    now() - MAX(completed_at) AS rpo_lag
-FROM backup_catalog.backups
-WHERE backup_type = 'log'
-  AND validation_state IN ('INTEGRITY_OK', 'RESTORE_OK', 'APP_OK')
-GROUP BY database_name
-ORDER BY rpo_lag DESC;
-
--- Dashboard query 3: validation failures requiring attention
-SELECT
-    backup_id,
-    database_name,
-    backup_type,
-    completed_at,
-    validation_state,
-    validation_message
-FROM backup_catalog.backups
-WHERE validation_state = 'FAILED'
-  AND completed_at &gt; now() - INTERVAL '72 hours'
-ORDER BY completed_at DESC;
-
--- Dashboard query 4: storage by tier
-SELECT
-    storage_tier,
-    COUNT(*)                                   AS backup_count,
-    pg_size_pretty(SUM(backup_size_bytes))     AS total_size,
-    SUM(backup_size_bytes)                     AS total_bytes
-FROM backup_catalog.backups
-WHERE validation_state NOT IN ('FAILED', 'DELETION_PENDING')
-GROUP BY storage_tier
-ORDER BY total_bytes DESC;
-
--- Dashboard query 5: recent restore events
-SELECT
-    re.executed_at,
-    re.database_name,
-    re.plan_type,
-    re.target_time,
-    re.success,
-    re.duration_seconds,
-    re.message
-FROM backup_catalog.restore_events re
-WHERE re.executed_at &gt; now() - INTERVAL '7 days'
-ORDER BY re.executed_at DESC
-LIMIT 20;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server equivalent dashboard queries
 -- Query 1: backup recency and policy compliance
 SELECT

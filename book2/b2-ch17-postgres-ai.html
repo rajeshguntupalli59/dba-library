@@ -56,65 +56,14 @@
 
 <p class="text-gray-300 leading-relaxed">Once installed, you can define columns of type <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">vector(n)</code> where <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">n</code> is the dimensionality. OpenAI's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-ada-002</code> produces 1536-dimensional vectors; models from Cohere or local models via Ollama may produce 768 or 384 dimensions. Pick the model first, then define your schema around it.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Schema for storing document embeddings alongside metadata
-CREATE TABLE document_embeddings (
-    id              BIGSERIAL PRIMARY KEY,
-    document_id     UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
-    chunk_index     INT NOT NULL,
-    chunk_text      TEXT NOT NULL,
-    embedding       VECTOR(1536),
-    model_version   TEXT NOT NULL DEFAULT 'text-embedding-ada-002',
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE (document_id, chunk_index)
-);
-
--- IVFFlat index for approximate nearest neighbor search
--- lists = sqrt(row_count) is a reasonable starting heuristic
-CREATE INDEX idx_doc_embeddings_ivfflat
-    ON document_embeddings
-    USING ivfflat (embedding vector_cosine_ops)
-    WITH (lists = 100);
-
--- HNSW index — better recall, higher build memory cost
--- Prefer this for read-heavy similarity workloads in PostgreSQL 15+
-CREATE INDEX idx_doc_embeddings_hnsw
-    ON document_embeddings
-    USING hnsw (embedding vector_cosine_ops)
-    WITH (m = 16, ef_construction = 64);</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The choice between IVFFlat and HNSW deserves attention. IVFFlat is a centroid-based partitioning approach—faster to build, lower memory overhead, but recall degrades if <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">lists</code> is misconfigured relative to dataset size. HNSW (Hierarchical Navigable Small World) is a graph-based structure that delivers consistently higher recall at the cost of more memory during index construction and a larger on-disk footprint. For most production RAG (retrieval-augmented generation) workloads where recall matters, HNSW is the better default once your dataset stabilizes above a few hundred thousand rows.</p>
 
 <p class="text-gray-300 leading-relaxed">Querying for nearest neighbors uses the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs"><=></code> operator for cosine distance, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs"><-></code> for L2, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs"><#></code> for inner product:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Find top-5 semantically similar chunks to a query embedding
--- $1 is the query embedding passed as a parameter from the application
-SELECT
-    d.title,
-    de.chunk_text,
-    de.chunk_index,
-    1 - (de.embedding &lt;=&gt; $1::vector) AS cosine_similarity
-FROM document_embeddings de
-JOIN documents d ON d.id = de.document_id
-WHERE de.model_version = 'text-embedding-ada-002'
-ORDER BY de.embedding &lt;=&gt; $1::vector
-LIMIT 5;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">One production pattern worth implementing immediately is tracking embedding generation failures. When you're populating embeddings asynchronously from an application or pipeline, rows without embeddings create silent retrieval gaps:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Audit query: documents missing embeddings
-SELECT
-    d.id,
-    d.title,
-    d.created_at,
-    COUNT(de.id) AS chunk_count
-FROM documents d
-LEFT JOIN document_embeddings de ON de.document_id = d.id
-GROUP BY d.id, d.title, d.created_at
-HAVING COUNT(de.id) = 0
-ORDER BY d.created_at DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">For SQL Server environments, there is no native equivalent to pgvector as of SQL Server 2022. Teams running hybrid environments typically push embeddings to either Azure AI Search or a sidecar PostgreSQL instance, then join on identifiers at the application layer. SQL Server's JSON support can store raw float arrays for low-volume experimentation, but this is not a production-grade substitute for indexed ANN search.</p>
 
@@ -126,62 +75,15 @@ ORDER BY d.created_at DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Here is a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">plpython3u</code> function that calls the OpenAI API to classify incoming support tickets by urgency:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE OR REPLACE FUNCTION classify_ticket_urgency(ticket_text TEXT)
-RETURNS TEXT
-LANGUAGE plpython3u
-AS $$
-    import openai
-    import json
-    import os
-
-    client = openai.OpenAI(api_key=os.environ.get('OPENAI_API_KEY'))
-
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are a support triage system. Classify the ticket as one of: "
-                    "CRITICAL, HIGH, MEDIUM, LOW. Respond with only the label."
-                )
-            },
-            {"role": "user", "content": ticket_text}
-        ],
-        temperature=0,
-        max_tokens=10
-    )
-
-    label = response.choices[0].message.content.strip().upper()
-    valid_labels = {"CRITICAL", "HIGH", "MEDIUM", "LOW"}
-    return label if label in valid_labels else "UNKNOWN"
-$$;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">This function is intentionally narrow: deterministic prompt, constrained output, validation of the returned value. Those three properties are what make LLM functions inside databases manageable. Never write a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">plpython3u</code> function that accepts free-form LLM output and inserts it directly into a table without validation.</p>
 
 <p class="text-gray-300 leading-relaxed">Using this in a batch context—say, a nightly job that classifies all unscored tickets—looks like this:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Batch classification job, processes up to 500 unclassified tickets
-UPDATE support_tickets
-SET
-    urgency_label     = classify_ticket_urgency(body_text),
-    classified_at     = NOW(),
-    classification_v  = 'gpt-4o-mini-v1'
-WHERE
-    urgency_label IS NULL
-    AND created_at &gt; NOW() - INTERVAL '7 days'
-    AND id IN (
-        SELECT id FROM support_tickets
-        WHERE urgency_label IS NULL
-        ORDER BY created_at DESC
-        LIMIT 500
-    );</code></pre>
 
 <p class="text-gray-300 leading-relaxed">SQL Server does not support Python stored procedures natively in the same way. SQL Server Machine Learning Services (formerly R Services) does enable Python execution inside the engine, but the deployment model differs significantly—it runs through an external launchpad process and is better suited to batch scoring using pre-trained models loaded via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sp_execute_external_script</code> than for making live HTTP API calls.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: Call a Python scoring model via ML Services
 -- This pattern scores rows using a locally-loaded model, not an external API
 EXEC sp_execute_external_script
@@ -215,26 +117,6 @@ WITH RESULT SETS ((id BIGINT, urgency_label NVARCHAR(20)));</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The foundation is a solid workload capture. <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> is the primary source, but alone it loses the execution plan. Pair it with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">auto_explain</code> to capture plans for slow queries into the PostgreSQL log, then parse those logs into a structured table for AI analysis:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Workload summary: candidates for index review
--- Queries with high sequential scan ratios and meaningful call counts
-SELECT
-    left(query, 120)                                          AS query_preview,
-    calls,
-    round(mean_exec_time::numeric, 2)                        AS avg_ms,
-    round(total_exec_time::numeric / 1000, 2)                AS total_sec,
-    rows / NULLIF(calls, 0)                                  AS avg_rows,
-    shared_blks_read,
-    shared_blks_hit,
-    round(
-        100.0 * shared_blks_read /
-        NULLIF(shared_blks_read + shared_blks_hit, 0), 2
-    )                                                        AS cache_miss_pct
-FROM pg_stat_statements
-WHERE calls &gt; 50
-  AND mean_exec_time &gt; 100
-ORDER BY total_exec_time DESC
-LIMIT 30;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Once you have this data, the Python pipeline that feeds it to an LLM for structured recommendations is straightforward. The key discipline is formatting the context precisely—the LLM needs to see table structure, existing indexes, and query patterns together:</p>
 
@@ -332,38 +214,6 @@ if __name__ == "__main__":
 
 <p class="text-gray-300 leading-relaxed">A production retrieval query that combines semantic similarity with metadata filters looks like this:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Hybrid retrieval: semantic similarity + relational filters
--- $1 = query embedding, $2 = tenant_id, $3 = document_type
-WITH candidate_chunks AS (
-    SELECT
-        de.id,
-        de.chunk_text,
-        de.document_id,
-        de.embedding &lt;=&gt; $1::vector AS cosine_distance,
-        d.title,
-        d.document_type,
-        d.published_at
-    FROM document_embeddings de
-    JOIN documents d ON d.id = de.document_id
-    WHERE
-        d.tenant_id = $2
-        AND d.document_type = $3
-        AND d.is_active = TRUE
-        AND d.published_at &gt; NOW() - INTERVAL '2 years'
-    ORDER BY de.embedding &lt;=&gt; $1::vector
-    LIMIT 20
-)
-SELECT
-    chunk_text,
-    title,
-    document_type,
-    published_at,
-    round((1 - cosine_distance)::numeric, 4) AS similarity_score
-FROM candidate_chunks
-WHERE cosine_distance &lt; 0.35   -- discard low-relevance results
-ORDER BY cosine_distance
-LIMIT 5;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">cosine_distance < 0.35</code> threshold deserves attention. Without a minimum similarity cutoff, the query will always return <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">LIMIT</code> rows—even when none of them are actually relevant. Setting this threshold empirically (by sampling queries against your dataset and reviewing results) prevents the LLM from hallucinating answers based on weakly related context.</p>
 
@@ -462,22 +312,6 @@ conn.close()</code></pre>
 
 <p class="text-gray-300 leading-relaxed">One operational concern specific to PostgreSQL RAG deployments: replication slots used by logical replication can accumulate WAL if consumers fall behind. If your embedding pipeline is a logical replication consumer (for near-real-time document indexing), monitor <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_replication_slots</code> carefully:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Monitor replication slot lag — critical for RAG pipelines using logical replication
-SELECT
-    slot_name,
-    plugin,
-    active,
-    pg_size_pretty(
-        pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)
-    )                                   AS wal_lag,
-    pg_wal_lsn_diff(
-        pg_current_wal_lsn(), restart_lsn
-    )                                   AS wal_lag_bytes,
-    catalog_xmin
-FROM pg_replication_slots
-WHERE slot_type = 'logical'
-ORDER BY wal_lag_bytes DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">A slot that accumulates more than a few gigabytes of WAL lag needs immediate attention—it will fill your WAL directory and crash the primary if left unchecked.</p>
 
@@ -489,87 +323,6 @@ ORDER BY wal_lag_bytes DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The architecture has two parts: a metrics collector that assembles PostgreSQL health data into a structured context, and an AI analysis layer that interprets it. Here is a comprehensive health snapshot query that captures the most diagnostically meaningful PostgreSQL internals:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Comprehensive health snapshot for AI analysis
-SELECT json_build_object(
-    'timestamp', NOW(),
-    'database_size', pg_size_pretty(pg_database_size(current_database())),
-    'connection_stats', (
-        SELECT json_agg(row_to_json(t))
-        FROM (
-            SELECT state, count(*) as count, max(now() - query_start) as max_duration
-            FROM pg_stat_activity
-            WHERE datname = current_database()
-            GROUP BY state
-        ) t
-    ),
-    'cache_hit_ratio', (
-        SELECT round(
-            sum(blks_hit)::numeric /
-            NULLIF(sum(blks_hit) + sum(blks_read), 0) * 100, 2
-        )
-        FROM pg_stat_database
-        WHERE datname = current_database()
-    ),
-    'bloat_candidates', (
-        SELECT json_agg(row_to_json(t))
-        FROM (
-            SELECT
-                schemaname,
-                tablename,
-                n_dead_tup,
-                n_live_tup,
-                round(n_dead_tup::numeric / NULLIF(n_live_tup, 0) * 100, 2) AS dead_ratio,
-                last_autovacuum,
-                last_autoanalyze
-            FROM pg_stat_user_tables
-            WHERE n_dead_tup &gt; 10000
-            ORDER BY n_dead_tup DESC
-            LIMIT 10
-        ) t
-    ),
-    'long_running_queries', (
-        SELECT json_agg(row_to_json(t))
-        FROM (
-            SELECT
-                pid,
-                left(query, 200) as query_preview,
-                state,
-                round(extract(epoch from (now() - query_start))) as duration_seconds,
-                wait_event_type,
-                wait_event
-            FROM pg_stat_activity
-            WHERE state != 'idle'
-              AND query_start &lt; NOW() - INTERVAL '30 seconds'
-              AND datname = current_database()
-            ORDER BY query_start
-        ) t
-    ),
-    'replication_lag_bytes', (
-        SELECT COALESCE(
-            max(pg_wal_lsn_diff(pg_current_wal_lsn(), sent_lsn)),
-            0
-        )
-        FROM pg_stat_replication
-    ),
-    'index_usage', (
-        SELECT json_agg(row_to_json(t))
-        FROM (
-            SELECT
-                schemaname,
-                tablename,
-                indexrelname,
-                idx_scan,
-                idx_tup_read,
-                idx_tup_fetch
-            FROM pg_stat_user_indexes
-            WHERE idx_scan = 0
-              AND pg_relation_size(indexrelid) &gt; 1024 * 1024
-            ORDER BY pg_relation_size(indexrelid) DESC
-            LIMIT 10
-        ) t
-    )
-) AS health_snapshot;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Feed this JSON snapshot to an AI model to produce a narrative diagnostic report:</p>
 
@@ -705,7 +458,7 @@ if __name__ == "__main__":
 
 <p class="text-gray-300 leading-relaxed">The equivalent health aggregation for SQL Server draws on different system views but the principle is identical—collect, structure, and submit:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server health snapshot for AI analysis
 SELECT (
     SELECT
@@ -794,24 +547,6 @@ SELECT (
 
 <p class="text-gray-300 leading-relaxed">Before any AI-generated DDL or DML reaches production, log both the input context and the output recommendation to a dedicated audit table:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE ai_recommendations (
-    id              BIGSERIAL PRIMARY KEY,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    recommendation_type  TEXT NOT NULL,     -- 'index', 'vacuum', 'schema', 'query_rewrite'
-    input_context   JSONB NOT NULL,         -- the workload data / query / schema fed to the AI
-    raw_output      TEXT NOT NULL,          -- verbatim AI response
-    extracted_ddl   TEXT,                   -- parsed DDL if applicable
-    reviewed_by     TEXT,                   -- DBA who approved
-    reviewed_at     TIMESTAMPTZ,
-    applied_at      TIMESTAMPTZ,
-    outcome         TEXT,                   -- 'applied', 'rejected', 'deferred'
-    outcome_notes   TEXT
-);
-
--- Index for audit queries
-CREATE INDEX idx_ai_rec_type_created
-    ON ai_recommendations (recommendation_type, created_at DESC);</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">2. Enforce a dry-run / review gate before application.</strong></p>
 
@@ -819,33 +554,6 @@ CREATE INDEX idx_ai_rec_type_created
 
 <p class="text-gray-300 leading-relaxed">A simple gating function that enforces this pattern:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE OR REPLACE FUNCTION record_ai_recommendation(
-    p_type          TEXT,
-    p_context       JSONB,
-    p_raw_output    TEXT,
-    p_extracted_ddl TEXT DEFAULT NULL
-) RETURNS BIGINT
-LANGUAGE plpgsql
-AS $$
-DECLARE
-    v_id BIGINT;
-BEGIN
-    INSERT INTO ai_recommendations (
-        recommendation_type, input_context, raw_output, extracted_ddl, outcome
-    )
-    VALUES (
-        p_type, p_context, p_raw_output, p_extracted_ddl, 'pending'
-    )
-    RETURNING id INTO v_id;
-
-    -- Raise a notice so monitoring systems can pick it up
-    RAISE NOTICE 'AI recommendation recorded: id=%, type=%, requires DBA review',
-        v_id, p_type;
-
-    RETURN v_id;
-END;
-$$;</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">3. Validate AI-generated DDL before review.</strong></p>
 
@@ -910,23 +618,6 @@ def validate_ai_ddl(conn, ddl_statement: str) -&gt; dict:
 
 <p class="text-gray-300 leading-relaxed">After a DBA reviews and applies (or rejects) an AI recommendation, record the outcome. Over months of operation, this data becomes training material for better prompts—you can identify patterns in recommendations that were consistently rejected and tighten the prompt to avoid generating them:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Recommendation effectiveness summary
-SELECT
-    recommendation_type,
-    outcome,
-    COUNT(*)                                        AS count,
-    round(100.0 * COUNT(*) /
-        SUM(COUNT(*)) OVER (PARTITION BY recommendation_type), 1
-    )                                               AS pct_of_type,
-    AVG(
-        EXTRACT(EPOCH FROM (reviewed_at - created_at)) / 3600
-    )                                               AS avg_review_hours
-FROM ai_recommendations
-WHERE created_at &gt; NOW() - INTERVAL '90 days'
-  AND outcome IS DISTINCT FROM 'pending'
-GROUP BY recommendation_type, outcome
-ORDER BY recommendation_type, count DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">This feedback loop is what separates a mature AI operations practice from an experiment. The models are not static; your prompts and filtering logic should evolve as you observe what works in your specific environment.</p>
 

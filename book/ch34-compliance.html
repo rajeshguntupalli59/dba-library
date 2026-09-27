@@ -64,31 +64,7 @@
 
 <p class="text-gray-300 leading-relaxed">PostgreSQL does not have a built-in comprehensive audit facility comparable to SQL Server's native options, but the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pgaudit</code> extension fills that gap cleanly. <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pgaudit</code> integrates with PostgreSQL's standard logging infrastructure and allows you to log session-level activity (everything a session does) or object-level activity (specific operations on specific objects). For compliance purposes, object-level auditing is usually what you want, because session logging tends to produce enormous volumes of noise.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Install pgaudit extension (requires it to be in shared_preload_libraries in postgresql.conf)
--- In postgresql.conf: shared_preload_libraries = 'pgaudit'
 
--- Enable object-level auditing after extension is created
-CREATE EXTENSION IF NOT EXISTS pgaudit;
-
--- Configure pgaudit to log SELECT, INSERT, UPDATE, DELETE on sensitive tables
--- Set in postgresql.conf or via ALTER SYSTEM:
--- pgaudit.log = 'read, write'
--- pgaudit.log_relation = on
-
--- Grant audit role to track specific table access
--- pgaudit uses role-based object auditing:
-CREATE ROLE audited_role;
-GRANT SELECT ON patients TO audited_role;
-
--- Set the audit role
-ALTER SYSTEM SET pgaudit.role = 'audited_role';
-SELECT pg_reload_conf();
-
--- Any SELECT on patients by any user will now be logged
--- because audited_role has SELECT on it</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server has native auditing via SQL Server Audit
 -- Create a server audit that writes to a file
 CREATE SERVER AUDIT PatientDataAudit
@@ -120,7 +96,7 @@ WITH (STATE = ON);</code></pre>
 
 <p class="text-gray-300 leading-relaxed">SQL Server also provides the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.fn_get_audit_file</code> function for querying audit logs programmatically, which lets you build dashboards or feed audit events into monitoring systems without exporting raw log files.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Query audit log files to find all SELECT operations on Patients
 SELECT
     event_time,
@@ -151,35 +127,7 @@ ORDER BY event_time DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">PostgreSQL's permission model is built around roles. Roles can be users (they can log in) or groups (they cannot log in directly but can be granted to other roles). This makes it straightforward to build a layered permission model where you define roles by job function and assign those roles to users.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Create functional roles that represent job functions
-CREATE ROLE app_readonly;
-CREATE ROLE app_readwrite;
-CREATE ROLE reporting_user;
-CREATE ROLE pii_access;  -- special role for columns containing PII
 
--- Grant appropriate permissions to each role
-GRANT CONNECT ON DATABASE healthcare TO app_readonly, app_readwrite, reporting_user;
-GRANT USAGE ON SCHEMA public TO app_readonly, app_readwrite, reporting_user;
-
-GRANT SELECT ON ALL TABLES IN SCHEMA public TO app_readonly;
-GRANT SELECT, INSERT, UPDATE ON ALL TABLES IN SCHEMA public TO app_readwrite;
-GRANT SELECT ON ALL TABLES IN SCHEMA reporting TO reporting_user;
-
--- Assign roles to actual user accounts
-CREATE USER app_service_account WITH PASSWORD 'strong_password_here' NOINHERIT;
-GRANT app_readwrite TO app_service_account;
-
-CREATE USER analyst_jane WITH PASSWORD 'strong_password_here';
-GRANT reporting_user TO analyst_jane;
-
--- Ensure future tables also get the right permissions
-ALTER DEFAULT PRIVILEGES IN SCHEMA public
-    GRANT SELECT ON TABLES TO app_readonly;
-ALTER DEFAULT PRIVILEGES IN SCHEMA public
-    GRANT SELECT, INSERT, UPDATE ON TABLES TO app_readwrite;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Create database roles by job function
 USE HealthcareDB;
 GO
@@ -211,29 +159,7 @@ GRANT SELECT ON dbo.SSNData TO PIIAccess;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">A quarterly access review process should query the database for all users and their effective permissions and compare that list to an authoritative source like an HR system or an access request ticketing system. Any account in the database that is not in the authoritative source should be flagged for review.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Query effective permissions for all non-system users
-SELECT
-    r.rolname AS username,
-    r.rolsuper AS is_superuser,
-    r.rolcreatedb AS can_create_db,
-    r.rolcreaterole AS can_create_roles,
-    r.rolcanlogin AS can_login,
-    array_to_string(
-        ARRAY(
-            SELECT b.rolname
-            FROM pg_catalog.pg_auth_members m
-            JOIN pg_catalog.pg_roles b ON m.roleid = b.oid
-            WHERE m.member = r.oid
-        ),
-        ', '
-    ) AS member_of_roles
-FROM pg_catalog.pg_roles r
-WHERE r.rolcanlogin = true
-  AND r.rolname NOT LIKE 'pg_%'
-ORDER BY r.rolname;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Query all database users and their role memberships
 SELECT
     dp.name AS username,
@@ -262,33 +188,7 @@ ORDER BY dp.name;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Column-level encryption protects specific sensitive values even from database users who can access the table. In PostgreSQL, the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pgcrypto</code> extension provides encryption and decryption functions. In SQL Server, Always Encrypted shifts encryption key management to the client application so that even the DBA cannot read plaintext values.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Using pgcrypto for column-level encryption
-CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
--- Create a table with an encrypted column
-CREATE TABLE patient_ssn (
-    patient_id    UUID DEFAULT gen_random_uuid() PRIMARY KEY,
-    patient_name  TEXT NOT NULL,
-    ssn_encrypted BYTEA  -- store encrypted value as bytes
-);
-
--- Insert with encryption (key should come from a secure vault, not hardcoded)
-INSERT INTO patient_ssn (patient_name, ssn_encrypted)
-VALUES (
-    'Jane Smith',
-    pgp_sym_encrypt('123-45-6789', current_setting('app.encryption_key'))
-);
-
--- Read with decryption (only applications with the key can decrypt)
-SELECT
-    patient_id,
-    patient_name,
-    pgp_sym_decrypt(ssn_encrypted, current_setting('app.encryption_key')) AS ssn
-FROM patient_ssn
-WHERE patient_id = '...';</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server Always Encrypted (column master key stored outside SQL Server)
 -- First, create the column master key and column encryption key in SSMS or via PowerShell
 -- Then define the table with encrypted columns
@@ -309,7 +209,7 @@ CREATE TABLE dbo.PatientSSN (
 
 <p class="text-gray-300 leading-relaxed">Data masking is a different layer: it presents substitute values to unauthorized users while showing real values to authorized ones. SQL Server has built-in Dynamic Data Masking (DDM), which is a policy-based feature that applies masking rules to columns. It is worth noting that DDM does not encrypt data — it only transforms the output seen by certain users. A user with sufficient permissions can bypass masking, so it should not be relied upon as the sole protection mechanism.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Add dynamic data masking to existing columns
 ALTER TABLE dbo.Customers
 ALTER COLUMN CreditCardNumber
@@ -343,29 +243,7 @@ REVERT;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Retention policies typically involve archiving data that is past its active use period but must still be kept for legal reasons, and permanently deleting data that has exceeded its required retention period. In PostgreSQL, declarative partitioning by date makes retention management cleaner: a partition covering a specific month or year can be dropped with a single <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DROP TABLE</code> command on the partition, which is far faster and less disruptive than a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DELETE</code> statement against millions of rows.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Create a partitioned audit log table with monthly partitions
-CREATE TABLE audit_log (
-    log_id      BIGSERIAL,
-    event_time  TIMESTAMPTZ NOT NULL,
-    user_name   TEXT,
-    action      TEXT,
-    table_name  TEXT,
-    row_id      TEXT
-) PARTITION BY RANGE (event_time);
 
--- Create partitions for recent months
-CREATE TABLE audit_log_2024_11 PARTITION OF audit_log
-    FOR VALUES FROM ('2024-11-01') TO ('2024-12-01');
-
-CREATE TABLE audit_log_2024_12 PARTITION OF audit_log
-    FOR VALUES FROM ('2024-12-01') TO ('2025-01-01');
-
--- When a partition exceeds retention period, drop it atomically
--- This is instantaneous compared to DELETE on millions of rows
-DROP TABLE audit_log_2022_01;  -- removes all data from January 2022</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server partition scheme for time-based retention
 -- First create a partition function
 CREATE PARTITION FUNCTION AuditLogPF (DATETIME2)
@@ -514,7 +392,7 @@ WHERE session_id = @@SPID;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">SQL Server provides a useful mechanism for this through database auditing combined with server-level audit specifications that capture DDL changes:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Audit all DDL changes made by DBAs at the server level
 CREATE SERVER AUDIT DDLChangeAudit
 TO FILE (
@@ -541,18 +419,6 @@ WITH (STATE = ON);</code></pre>
 
 <p class="text-gray-300 leading-relaxed">For PostgreSQL environments, DDL auditing through <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pgaudit</code> captures schema object changes when configured at the session or object level with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DDL</code> included in the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pgaudit.log</code> parameter:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- In postgresql.conf, log all DDL:
--- pgaudit.log = 'ddl, role, connection'
-
--- Verify current pgaudit configuration
-SHOW pgaudit.log;
-SHOW pgaudit.log_catalog;
-SHOW pgaudit.log_relation;
-SHOW pgaudit.log_parameter;
-
--- Sample pgaudit log entry for a DDL change looks like:
--- AUDIT: SESSION,1,1,DDL,ALTER TABLE,,,"ALTER TABLE patients ADD COLUMN notes TEXT",&lt;not logged&gt;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Evidence collection should be treated as an ongoing operational task rather than a pre-audit scramble. Establish a governance evidence repository — this can be as simple as a structured shared folder or as formal as a GRC (Governance, Risk, and Compliance) platform — where you store quarterly access reviews, configuration baseline reports, audit log samples, and change control records. When an auditor arrives, you should be able to produce evidence for any control question without running an emergency investigation.</p>
 
@@ -564,30 +430,7 @@ SHOW pgaudit.log_parameter;
 
 <p class="text-gray-300 leading-relaxed">PostgreSQL has native row-level security with a clean policy syntax. SQL Server provides a similar feature also called Row-Level Security, implemented through inline table-valued functions used as security predicates.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Enable RLS on a sensitive table
-ALTER TABLE patients ENABLE ROW LEVEL SECURITY;
-ALTER TABLE patients FORCE ROW LEVEL SECURITY;  -- applies even to table owner
 
--- Create a policy that allows users to see only patients in their assigned ward
-CREATE POLICY ward_isolation ON patients
-    USING (ward_id = current_setting('app.current_ward_id')::INTEGER);
-
--- Create a separate policy for administrators who can see all rows
-CREATE POLICY admin_access ON patients
-    TO clinical_admin
-    USING (true);  -- no restriction for this role
-
--- Application sets the ward context at session start
--- SET app.current_ward_id = '12';
--- Then all queries against patients automatically filter to ward 12
-
--- Verify RLS is active
-SELECT tablename, rowsecurity, forcerowsecurity
-FROM pg_tables
-WHERE tablename = 'patients';</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Create a schema to hold the security predicate function
 CREATE SCHEMA Security;
 GO
@@ -620,13 +463,6 @@ WITH (STATE = ON);</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The BLOCK predicate in SQL Server RLS prevents users from inserting rows that they would not be able to see after insertion, which closes a subtle data integrity gap. PostgreSQL RLS handles this through WITH CHECK clauses on policies when you want write restrictions in addition to read filtering.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Policy with both USING (for reads) and WITH CHECK (for writes)
-CREATE POLICY tenant_isolation ON orders
-    USING (tenant_id = current_setting('app.tenant_id')::INTEGER)
-    WITH CHECK (tenant_id = current_setting('app.tenant_id')::INTEGER);
--- This prevents a tenant from inserting rows with a different tenant_id
--- even if they somehow know another tenant's ID</code></pre>
 
 <p class="text-gray-300 leading-relaxed">RLS is powerful, but it has performance implications that must be tested in your specific environment. Every query against an RLS-protected table carries the overhead of evaluating the security predicate for each row candidate. If the predicate involves a subquery or a join to another table, that join runs for every query. In high-throughput environments, poorly designed RLS predicates can become significant bottlenecks. Always examine the query plan of queries against RLS-protected tables to verify that the predicate is being pushed down efficiently and that appropriate indexes support it.</p>
 

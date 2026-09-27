@@ -53,49 +53,7 @@
 
 <p class="text-gray-300 leading-relaxed">The foundation is <strong class="text-white">dimensional cost attribution</strong>: every resource consumption event (query execution, storage write, network egress, index maintenance job) is tagged with an ownership dimension before it hits the billing system. In practice, this means building a cost metadata layer that maps database objects to cost centers.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Create a cost attribution registry that maps schemas/roles to cost centers
-CREATE TABLE cost_attribution.ownership (
-    id              SERIAL PRIMARY KEY,
-    schema_name     TEXT NOT NULL,
-    role_name       TEXT,
-    application_tag TEXT,
-    cost_center     TEXT NOT NULL,
-    team_name       TEXT NOT NULL,
-    monthly_budget_usd NUMERIC(12,2),
-    alert_threshold_pct NUMERIC(5,2) DEFAULT 80.0,
-    created_at      TIMESTAMPTZ DEFAULT now(),
-    updated_at      TIMESTAMPTZ DEFAULT now()
-);
 
--- View that joins pg_stat_statements with cost attribution
--- Assumes shared_preload_libraries includes pg_stat_statements
-CREATE OR REPLACE VIEW cost_attribution.query_cost_estimate AS
-SELECT
-    pss.queryid,
-    pss.query,
-    ca.cost_center,
-    ca.team_name,
-    pss.calls,
-    pss.total_exec_time,
-    pss.rows,
-    -- Estimate compute cost: $0.048/vCPU-hour on a typical 8-vCPU instance
-    -- total_exec_time is in milliseconds
-    ROUND(
-        (pss.total_exec_time / 1000.0 / 3600.0)  -- convert to hours
-        * 0.048                                    -- cost per vCPU-hour
-        * (SELECT current_setting('max_parallel_workers_per_gather')::int + 1)
-    , 6) AS estimated_compute_cost_usd,
-    pss.shared_blks_read + pss.shared_blks_hit AS total_blocks_accessed,
-    -- I/O cost estimate: $0.10 per 1M block reads (approximate EBS pricing)
-    ROUND((pss.shared_blks_read * 8192.0 / 1e9) * 0.10, 6) AS estimated_io_cost_usd
-FROM pg_stat_statements pss
-LEFT JOIN cost_attribution.ownership ca
-    ON pss.query ILIKE '%' || ca.schema_name || '%'
-WHERE pss.calls &gt; 0
-ORDER BY estimated_compute_cost_usd + estimated_io_cost_usd DESC;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Cost attribution registry
 CREATE TABLE CostAttribution.Ownership (
     OwnershipID        INT IDENTITY(1,1) PRIMARY KEY,
@@ -233,47 +191,7 @@ if __name__ == "__main__":
 
 <p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Replica count</strong> — read replicas are the largest cost lever in most PostgreSQL and SQL Server architectures. Each read replica is a full instance cost. The system tracks replica load in 5-minute windows and decommissions idle replicas using a golden signal model: if a replica's active connections drop below 5 and its CPU stays under 10% for 20 consecutive minutes, it is a candidate for removal.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Autonomous rightsizing evaluation: replica idle detection
--- Runs every 5 minutes via pg_cron or external scheduler
-CREATE OR REPLACE FUNCTION cost_optimization.evaluate_replica_rightsizing()
-RETURNS TABLE (
-    replica_host        TEXT,
-    action_recommended  TEXT,
-    avg_connections     NUMERIC,
-    avg_cpu_pct         NUMERIC,
-    idle_duration_min   INT,
-    estimated_savings_usd_mo NUMERIC
-) AS $$
-BEGIN
-    RETURN QUERY
-    SELECT
-        rm.replica_host,
-        CASE
-            WHEN rm.avg_active_connections &lt; 5
-             AND rm.avg_cpu_pct &lt; 10
-             AND rm.consecutive_idle_windows &gt;= 4   -- 4 × 5min = 20min
-            THEN 'DECOMMISSION'
-            WHEN rm.avg_active_connections &lt; 10
-             AND rm.avg_cpu_pct &lt; 25
-             AND rm.consecutive_idle_windows &gt;= 12  -- 60min
-            THEN 'SCALE_DOWN_TIER'
-            ELSE 'NO_ACTION'
-        END                                          AS action_recommended,
-        rm.avg_active_connections,
-        rm.avg_cpu_pct,
-        rm.consecutive_idle_windows * 5             AS idle_duration_min,
-        -- Approximate: db.r6g.large = $0.24/hr = ~$175/mo
-        CASE WHEN rm.consecutive_idle_windows &gt;= 4
-             THEN 175.00
-             ELSE 0.00
-        END                                          AS estimated_savings_usd_mo
-    FROM cost_optimization.replica_metrics_rollup rm
-    WHERE rm.window_end &gt;= NOW() - INTERVAL '1 hour';
-END;
-$$ LANGUAGE plpgsql;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Autonomous rightsizing evaluation for Always On secondaries
 CREATE OR REPLACE PROCEDURE CostOptimization.EvaluateReplicaRightsizing
 AS
@@ -393,52 +311,7 @@ if __name__ == "__main__":
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Tier 1 — Statement Timeout Enforcement by Cost Center.</strong> Each cost center gets a configurable statement timeout. Data science workloads doing exploratory analysis against production replicas are limited to 30-second queries by default. OLTP application roles get 5-second timeouts. The mapping is maintained in the cost attribution registry and applied dynamically via connection pooler configuration (PgBouncer) or resource governor (SQL Server).</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Apply per-role statement timeouts dynamically
--- Called by PgBouncer connect_query or a session-level initialization function
-CREATE OR REPLACE FUNCTION cost_optimization.apply_role_cost_policy()
-RETURNS void AS $$
-DECLARE
-    v_role          TEXT := current_user;
-    v_timeout_ms    INT;
-    v_work_mem_mb   INT;
-BEGIN
-    SELECT
-        cp.statement_timeout_ms,
-        cp.work_mem_mb
-    INTO v_timeout_ms, v_work_mem_mb
-    FROM cost_optimization.role_cost_policy cp
-    WHERE cp.role_name = v_role
-      AND cp.is_active = TRUE;
 
-    IF FOUND THEN
-        EXECUTE format('SET statement_timeout = %L', v_timeout_ms || 'ms');
-        EXECUTE format('SET work_mem = %L', v_work_mem_mb || 'MB');
-        -- Log policy application for audit trail
-        INSERT INTO cost_optimization.policy_application_log
-            (role_name, timeout_ms, work_mem_mb, applied_at)
-        VALUES (v_role, v_timeout_ms, v_work_mem_mb, NOW());
-    END IF;
-END;
-$$ LANGUAGE plpgsql SECURITY DEFINER;
-
--- Autonomous kill of long-running queries beyond cost threshold
--- Runs every 60 seconds via pg_cron
-SELECT cron.schedule(
-    'autonomous-query-kill',
-    '* * * * *',
-    $$
-    SELECT pg_terminate_backend(pid)
-    FROM pg_stat_activity psa
-    JOIN cost_optimization.role_cost_policy rcp ON rcp.role_name = psa.usename
-    WHERE state = 'active'
-      AND query_start &lt; NOW() - (rcp.hard_kill_timeout_ms || 'milliseconds')::INTERVAL
-      AND query NOT ILIKE '%pg_terminate_backend%'
-      AND pid &lt;&gt; pg_backend_pid();
-    $$
-);</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Resource Governor workload group mapping for cost governance
 -- Each cost center maps to a resource pool with CPU/memory limits
 CREATE RESOURCE POOL DataSciencePool
@@ -693,7 +566,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE OR REPLACE PROCEDURE CostOptimization.ForecastMonthEndSpend
     @CostCenter NVARCHAR(128)
 AS
@@ -839,7 +712,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE OR REPLACE PROCEDURE CostOptimization.ScoreCostActions
     @Alpha DECIMAL(4,2) = 0.5,
     @Beta  DECIMAL(4,2) = 0.3,
@@ -968,7 +841,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE OR REPLACE PROCEDURE CostOptimization.CalibrateCostModel
 AS
 BEGIN

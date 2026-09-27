@@ -55,25 +55,7 @@
 
 <p class="text-gray-300 leading-relaxed">Dynamic analysis examines what the system is doing right now. A change that scores "medium risk" at 3 AM may score "critical risk" at 2 PM when the instance is processing 40,000 transactions per second with 85% buffer cache utilization. The scoring engine must pull live metrics at decision time, not at submission time.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- View to surface real-time load context for risk scoring decisions
-CREATE OR REPLACE VIEW autonomous_change.live_risk_context AS
-SELECT
-    (SELECT count(*) FROM pg_stat_activity WHERE state = 'active' AND wait_event_type = 'Lock') AS active_lock_waiters,
-    (SELECT count(*) FROM pg_stat_activity WHERE state = 'active') AS active_connections,
-    (SELECT sum(blks_hit)::float / nullif(sum(blks_hit) + sum(blks_read), 0)
-     FROM pg_stat_database) AS buffer_cache_hit_ratio,
-    (SELECT max(age(backend_xmin))
-     FROM pg_stat_activity
-     WHERE backend_xmin IS NOT NULL) AS max_xmin_age,
-    (SELECT extract(epoch FROM now() - min(xact_start))
-     FROM pg_stat_activity
-     WHERE xact_start IS NOT NULL AND state = 'active') AS oldest_txn_seconds,
-    (SELECT count(*) FROM pg_replication_slots WHERE active = false) AS inactive_repl_slots,
-    (SELECT max(pg_wal_lsn_diff(sent_lsn, replay_lsn))
-     FROM pg_stat_replication) AS max_replica_lag_bytes;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Equivalent live risk context for SQL Server change scoring
 CREATE OR ALTER VIEW autonomous_change.live_risk_context AS
 SELECT
@@ -204,43 +186,7 @@ def _select_autonomous_action(tier: RiskTier, context: dict) -&gt; str:
 
 <p class="text-gray-300 leading-relaxed">The autonomous execution controller wraps these operations in an instrumented harness:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Execution audit table for autonomous change tracking
-CREATE TABLE autonomous_change.execution_log (
-    execution_id     UUID DEFAULT gen_random_uuid() PRIMARY KEY,
-    change_id        TEXT NOT NULL,
-    statement        TEXT NOT NULL,
-    risk_tier        TEXT NOT NULL,
-    strategy         TEXT NOT NULL,   -- concurrent, online, batched, deferred
-    started_at       TIMESTAMPTZ DEFAULT now(),
-    completed_at     TIMESTAMPTZ,
-    status           TEXT DEFAULT 'running',  -- running, completed, rolled_back, failed
-    pre_metrics      JSONB,
-    post_metrics     JSONB,
-    abort_reason     TEXT,
-    rows_affected    BIGINT
-);
 
--- Function to capture metrics snapshot at execution boundaries
-CREATE OR REPLACE FUNCTION autonomous_change.capture_metrics_snapshot()
-RETURNS JSONB
-LANGUAGE plpgsql AS $$
-DECLARE
-    snap JSONB;
-BEGIN
-    SELECT jsonb_build_object(
-        'timestamp', now(),
-        'tps', (SELECT sum(xact_commit + xact_rollback) FROM pg_stat_database WHERE datname = current_database()),
-        'active_connections', (SELECT count(*) FROM pg_stat_activity WHERE state = 'active'),
-        'cache_hit_ratio', (SELECT round((sum(blks_hit)::numeric / nullif(sum(blks_hit) + sum(blks_read), 0)) * 100, 2) FROM pg_stat_database),
-        'replication_lag_bytes', (SELECT max(pg_wal_lsn_diff(sent_lsn, replay_lsn)) FROM pg_stat_replication),
-        'longest_query_ms', (SELECT round(max(extract(epoch FROM (now() - query_start))) * 1000) FROM pg_stat_activity WHERE state = 'active')
-    ) INTO snap;
-    RETURN snap;
-END;
-$$;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server execution audit equivalent
 CREATE TABLE autonomous_change.execution_log (
     execution_id     UNIQUEIDENTIFIER DEFAULT NEWSEQUENTIALID() PRIMARY KEY,
@@ -491,38 +437,7 @@ def generate_change_plan_from_intent(
 
 <p class="text-gray-300 leading-relaxed">Some changes are trivially reversible: creating an index can be reversed by dropping it; adding a column with a default can be reversed by dropping the column; changing a configuration parameter can be reversed by restoring the previous value. Other changes are not reversible in-place: once a table rewrite via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_repack</code> completes, there is no "un-repack." For those, the rollback strategy is not reversal but rather pre-execution snapshot validation — ensuring a point-in-time restore target exists before the operation begins.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Rollback registry: maps change types to their reversal strategies
-CREATE TABLE autonomous_change.rollback_registry (
-    change_type          TEXT NOT NULL,
-    lock_level           TEXT NOT NULL,
-    reversal_strategy    TEXT NOT NULL,  -- invert_ddl, restore_config, restore_snapshot, none
-    max_rollback_window  INTERVAL,       -- how long after execution rollback is still valid
-    PRIMARY KEY (change_type, lock_level)
-);
 
-INSERT INTO autonomous_change.rollback_registry VALUES
-    ('index',           'table',     'invert_ddl',       INTERVAL '7 days'),
-    ('index',           'row',       'invert_ddl',       INTERVAL '7 days'),
-    ('ddl',             'exclusive', 'invert_ddl',       INTERVAL '1 hour'),
-    ('ddl',             'table',     'invert_ddl',       INTERVAL '1 hour'),
-    ('config',          'none',      'restore_config',   INTERVAL '30 days'),
-    ('data_migration',  'row',       'restore_snapshot', INTERVAL '24 hours');
-
--- Pre-execution baseline capture for rollback signal comparison
-CREATE TABLE autonomous_change.execution_baselines (
-    execution_id         UUID NOT NULL REFERENCES autonomous_change.execution_log(execution_id),
-    captured_at          TIMESTAMPTZ DEFAULT now(),
-    tps_baseline         NUMERIC,
-    p99_latency_ms       NUMERIC,
-    error_rate_per_min   NUMERIC,
-    cache_hit_ratio      NUMERIC,
-    replication_lag_bytes BIGINT,
-    active_connections   INTEGER,
-    PRIMARY KEY (execution_id)
-);</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE autonomous_change.rollback_registry (
     change_type          NVARCHAR(50) NOT NULL,
     lock_level           NVARCHAR(20) NOT NULL,
@@ -727,59 +642,7 @@ def execute_rollback(
 
 <p class="text-gray-300 leading-relaxed">The autonomous system tracks canary deployments as multi-phase change plans with explicit phase gates:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE autonomous_change.canary_deployments (
-    deployment_id        UUID DEFAULT gen_random_uuid() PRIMARY KEY,
-    change_description   TEXT NOT NULL,
-    current_phase        TEXT NOT NULL DEFAULT 'expand',  -- expand, migrate, contract
-    phase_entered_at     TIMESTAMPTZ DEFAULT now(),
-    expand_plan_id       TEXT,
-    migrate_plan_id      TEXT,
-    contract_plan_id     TEXT,
-    canary_traffic_pct   NUMERIC DEFAULT 0,
-    phase_gate_status    TEXT DEFAULT 'pending',  -- pending, passed, failed
-    phase_gate_metrics   JSONB,
-    created_at           TIMESTAMPTZ DEFAULT now()
-);
 
--- Phase gate evaluation: did the canary deployment produce acceptable outcomes?
-CREATE OR REPLACE FUNCTION autonomous_change.evaluate_canary_phase_gate(
-    p_deployment_id UUID,
-    p_error_rate_threshold NUMERIC DEFAULT 0.01,  -- 1% error rate maximum
-    p_latency_increase_threshold NUMERIC DEFAULT 25.0  -- 25% P99 latency increase maximum
-)
-RETURNS TEXT  -- 'passed', 'failed', 'insufficient_data'
-LANGUAGE plpgsql AS $$
-DECLARE
-    v_phase          TEXT;
-    v_entered_at     TIMESTAMPTZ;
-    v_result         TEXT := 'insufficient_data';
-BEGIN
-    SELECT current_phase, phase_entered_at
-    INTO v_phase, v_entered_at
-    FROM autonomous_change.canary_deployments
-    WHERE deployment_id = p_deployment_id;
-
-    -- Require at least 15 minutes of canary data before evaluating
-    IF now() - v_entered_at &lt; INTERVAL '15 minutes' THEN
-        RETURN 'insufficient_data';
-    END IF;
-
-    -- In a real system, this queries the telemetry store for canary cohort metrics.
-    -- Here we illustrate the gate logic structure:
-    -- IF canary_error_rate &gt; p_error_rate_threshold THEN v_result := 'failed'
-    -- ELSIF canary_p99_latency_increase_pct &gt; p_latency_increase_threshold THEN v_result := 'failed'
-    -- ELSE v_result := 'passed'
-
-    UPDATE autonomous_change.canary_deployments
-    SET phase_gate_status = v_result
-    WHERE deployment_id = p_deployment_id;
-
-    RETURN v_result;
-END;
-$$;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE autonomous_change.canary_deployments (
     deployment_id        UNIQUEIDENTIFIER DEFAULT NEWSEQUENTIALID() PRIMARY KEY,
     change_description   NVARCHAR(500) NOT NULL,

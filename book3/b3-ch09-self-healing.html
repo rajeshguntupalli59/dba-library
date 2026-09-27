@@ -175,63 +175,7 @@ class RemediationLoop:
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Detecting and killing blockers</strong> requires more than identifying the longest-running query. The system must identify the root blocker in a blocking chain — the session holding the lock that all others are waiting on — and evaluate whether terminating it is safe given the current workload context.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify root blockers with full chain context
-WITH RECURSIVE blocking_chain AS (
-    -- Anchor: sessions blocked by nothing (root blockers)
-    SELECT
-        pid,
-        usename,
-        application_name,
-        state,
-        wait_event_type,
-        wait_event,
-        query_start,
-        state_change,
-        query,
-        0 AS depth,
-        ARRAY[pid] AS chain
-    FROM pg_stat_activity
-    WHERE cardinality(pg_blocking_pids(pid)) = 0
-      AND pid IN (
-          SELECT UNNEST(pg_blocking_pids(pid))
-          FROM pg_stat_activity
-          WHERE wait_event_type = 'Lock'
-      )
 
-    UNION ALL
-
-    -- Recursive: sessions blocked by a member of the chain
-    SELECT
-        sa.pid,
-        sa.usename,
-        sa.application_name,
-        sa.state,
-        sa.wait_event_type,
-        sa.wait_event,
-        sa.query_start,
-        sa.state_change,
-        sa.query,
-        bc.depth + 1,
-        bc.chain || sa.pid
-    FROM pg_stat_activity sa
-    JOIN blocking_chain bc
-        ON bc.pid = ANY(pg_blocking_pids(sa.pid))
-    WHERE NOT sa.pid = ANY(bc.chain)  -- prevent cycles
-)
-SELECT
-    pid,
-    depth,
-    usename,
-    application_name,
-    state,
-    EXTRACT(EPOCH FROM (now() - query_start))::int AS blocked_seconds,
-    LEFT(query, 120) AS query_snippet,
-    chain
-FROM blocking_chain
-ORDER BY depth, blocked_seconds DESC;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify root blockers with wait chain and resource details
 WITH BlockingChain AS (
     SELECT
@@ -293,17 +237,7 @@ ORDER BY depth, wait_seconds DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Connection pool exhaustion</strong> — pgBouncer pools full, SQL Server connection counts at max — requires a different healing path. The system first checks whether the exhaustion is caused by a blocker (which is handled above) or by a genuine connection leak. A leak manifests as a large number of idle connections with increasing age and no active transaction. The healing action is to terminate idle connections beyond a configurable age, then recycle the pool.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Terminate idle connections exceeding age threshold (safe to automate)
-SELECT pg_terminate_backend(pid)
-FROM pg_stat_activity
-WHERE state = 'idle'
-  AND query_start &lt; now() - interval '10 minutes'
-  AND pid &lt;&gt; pg_backend_pid()
-  AND usename NOT IN ('replication', 'pgbouncer', 'monitoring')
-  AND application_name NOT LIKE 'pgAgent%';</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Kill idle sessions exceeding age threshold
 DECLARE @session_id INT;
 DECLARE @kill_sql NVARCHAR(50);
@@ -448,31 +382,6 @@ def reconcile_ag(ag_name: str, primary_conn: str, replica_conns: dict):
 
 <p class="text-gray-300 leading-relaxed">The detection query identifies tables where autovacuum is losing the race:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Tables where bloat is growing faster than autovacuum can process
-SELECT
-    schemaname,
-    relname,
-    n_dead_tup,
-    n_live_tup,
-    ROUND(n_dead_tup::numeric / NULLIF(n_live_tup + n_dead_tup, 0) * 100, 2)
-        AS dead_tuple_pct,
-    last_autovacuum,
-    last_autoanalyze,
-    autovacuum_count,
-    EXTRACT(EPOCH FROM (now() - last_autovacuum))::int / 60 AS minutes_since_vacuum,
-    -- Estimated pages requiring vacuum
-    CEIL(n_dead_tup / 100.0)::int AS estimated_vacuum_pages,
-    pg_size_pretty(pg_total_relation_size(schemaname || '.' || relname)) AS total_size
-FROM pg_stat_user_tables
-WHERE n_dead_tup &gt; 10000
-  AND (
-      n_dead_tup::float / NULLIF(n_live_tup + n_dead_tup, 0) &gt; 0.10
-      OR last_autovacuum &lt; now() - interval '2 hours'
-      OR last_autovacuum IS NULL
-  )
-ORDER BY dead_tuple_pct DESC, n_dead_tup DESC
-LIMIT 20;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">When this query identifies candidates, the self-healing system applies a graduated response. If dead tuple percentage is between 10% and 25%, it increases the autovacuum aggressiveness for that specific table using <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALTER TABLE ... SET (autovacuum_vacuum_scale_factor = 0.01, autovacuum_vacuum_cost_delay = 2)</code>. If it exceeds 25%, it schedules an explicit <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VACUUM ANALYZE</code> during the next maintenance window. If it exceeds 40% and the table is a high-traffic table with degraded query performance, it schedules <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VACUUM ANALYZE</code> immediately with a coordinated reduction in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">vacuum_cost_delay</code> at the session level to allow it to run faster.</p>
 
@@ -480,7 +389,7 @@ LIMIT 20;</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server space management</strong> operates differently. Filegroup capacity management, index fragmentation, and log file growth are the primary targets. The autonomous system monitors filegroup utilization and pre-emptively extends data files before they hit autogrowth events — because autogrowth during peak traffic causes latency spikes:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Monitor filegroup utilization and project time-to-full based on recent growth rate
 SELECT
     DB_NAME(mf.database_id)                         AS database_name,

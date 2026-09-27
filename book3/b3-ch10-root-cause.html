@@ -67,32 +67,7 @@
 
 <p class="text-gray-300 leading-relaxed">The collection architecture for PostgreSQL uses a combination of <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_activity</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_bgwriter</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_user_tables</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_locks</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_replication</code>, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_wait_sampling</code> (the extension, not the base view) for sub-second wait event sampling. SQL Server relies on DMVs: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_requests</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_os_wait_stats</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_query_stats</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_db_index_usage_stats</code>, and Extended Events sessions for high-resolution capture.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Unified Layer 2 snapshot: captures wait events, lock chains, and blocking topology
--- Run every 10 seconds by the ARCA collector agent
 
-SELECT
-    a.pid,
-    a.usename,
-    a.application_name,
-    a.state,
-    a.wait_event_type,
-    a.wait_event,
-    a.query_start,
-    EXTRACT(EPOCH FROM (now() - a.query_start))::numeric(10,2) AS duration_sec,
-    a.query,
-    b.pid                  AS blocking_pid,
-    b.usename              AS blocking_user,
-    b.query                AS blocking_query,
-    pg_blocking_pids(a.pid) AS full_blocking_chain
-FROM pg_stat_activity a
-LEFT JOIN pg_stat_activity b
-    ON b.pid = ANY(pg_blocking_pids(a.pid))
-WHERE a.state != 'idle'
-  AND a.pid != pg_backend_pid()
-ORDER BY duration_sec DESC;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Equivalent Layer 2 snapshot for SQL Server: active requests with blocking chain
 -- Deployed as a SQL Agent job step running every 10 seconds
 
@@ -285,42 +260,7 @@ class CausalGraphBuilder:
 
 <p class="text-gray-300 leading-relaxed">For example, the "missing index causing full table scan under load" failure mode in PostgreSQL shows a characteristic distribution: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Lock:relation</code> waits decrease, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">IO:DataFileRead</code> waits increase, autovacuum-related waits remain stable, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CPU</code> becomes the dominant non-wait state. SQL Server's equivalent shows <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">PAGEIOLATCH_SH</code> climbing while <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CXPACKET</code> (parallelism) waits either spike (if the planner attempts a parallel scan) or remain flat (if DOP is forced down by memory pressure).</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Capture wait event distribution snapshot for signature matching
--- The ARCA engine calls this every 30 seconds during elevated latency
 
-WITH wait_snapshot AS (
-    SELECT
-        wait_event_type,
-        wait_event,
-        COUNT(*)                                        AS session_count,
-        AVG(EXTRACT(EPOCH FROM (now() - query_start))) AS avg_wait_sec,
-        SUM(EXTRACT(EPOCH FROM (now() - query_start))) AS total_wait_sec
-    FROM pg_stat_activity
-    WHERE state = 'active'
-      AND wait_event IS NOT NULL
-      AND pid != pg_backend_pid()
-    GROUP BY wait_event_type, wait_event
-),
-total_sessions AS (
-    SELECT COUNT(*) AS active_count
-    FROM pg_stat_activity
-    WHERE state = 'active'
-      AND pid != pg_backend_pid()
-)
-SELECT
-    w.wait_event_type,
-    w.wait_event,
-    w.session_count,
-    w.avg_wait_sec,
-    w.total_wait_sec,
-    ROUND((w.session_count::numeric / NULLIF(t.active_count, 0)) * 100, 2)
-        AS pct_of_active_sessions
-FROM wait_snapshot w
-CROSS JOIN total_sessions t
-ORDER BY w.total_wait_sec DESC;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Wait event distribution snapshot for SQL Server signature matching
 -- Captures delta from baseline (cleared at analysis window start)
 

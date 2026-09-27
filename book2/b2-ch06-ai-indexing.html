@@ -54,33 +54,7 @@
 
 <p class="text-gray-300 leading-relaxed">Traditional tooling sees this problem partially. System catalog views tell you which indexes have been scanned zero times since the last service restart. What they cannot tell you is whether that zero-scan index is critical for a quarterly batch job, whether removing it will increase write throughput by 12% or 2%, or whether a different covering index already subsumes it.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify index usage patterns with write cost context
-SELECT
-    s.schemaname,
-    s.relname                          AS table_name,
-    s.indexrelname                     AS index_name,
-    s.idx_scan                         AS scans,
-    s.idx_tup_read,
-    s.idx_tup_fetch,
-    pg_size_pretty(pg_relation_size(s.indexrelid)) AS index_size,
-    t.n_tup_ins + t.n_tup_upd + t.n_tup_del        AS table_writes,
-    ROUND(
-        (t.n_tup_ins + t.n_tup_upd + t.n_tup_del)::numeric /
-        NULLIF(s.idx_scan, 0), 2
-    )                                   AS writes_per_scan
-FROM
-    pg_stat_user_indexes s
-    JOIN pg_stat_user_tables t
-        ON s.relname = t.relname
-        AND s.schemaname = t.schemaname
-WHERE
-    s.idx_scan &lt; 50
-    AND pg_relation_size(s.indexrelid) &gt; 10 * 1024 * 1024  -- &gt; 10 MB
-ORDER BY
-    pg_relation_size(s.indexrelid) DESC;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify low-usage indexes with write overhead context
 SELECT
     OBJECT_SCHEMA_NAME(i.object_id)      AS schema_name,
@@ -280,67 +254,7 @@ print(recommendation)</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Language models can perform schema audits that previously required a consulting engagement. The key is building a systematic context-extraction pipeline rather than dumping a raw schema at the model and hoping for insight.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Extract rich schema context for AI analysis
-WITH column_stats AS (
-    SELECT
-        c.table_schema,
-        c.table_name,
-        c.column_name,
-        c.data_type,
-        c.character_maximum_length,
-        c.is_nullable,
-        c.column_default,
-        s.null_frac,
-        s.avg_width,
-        s.n_distinct,
-        s.correlation
-    FROM
-        information_schema.columns c
-        LEFT JOIN pg_stats s
-            ON s.schemaname = c.table_schema
-            AND s.tablename = c.table_name
-            AND s.attname = c.column_name
-    WHERE
-        c.table_schema NOT IN ('pg_catalog', 'information_schema')
-),
-fk_coverage AS (
-    SELECT
-        tc.table_schema,
-        tc.table_name,
-        kcu.column_name,
-        ccu.table_name AS referenced_table
-    FROM
-        information_schema.table_constraints tc
-        JOIN information_schema.key_column_usage kcu
-            ON tc.constraint_name = kcu.constraint_name
-        JOIN information_schema.constraint_column_usage ccu
-            ON tc.constraint_name = ccu.constraint_name
-    WHERE
-        tc.constraint_type = 'FOREIGN KEY'
-)
-SELECT
-    cs.*,
-    fk.referenced_table  AS fk_target,
-    CASE
-        WHEN cs.n_distinct BETWEEN -0.01 AND 0.01
-            THEN 'extremely_low_cardinality'
-        WHEN cs.n_distinct &gt; 0 AND cs.n_distinct &lt; 20
-            THEN 'low_cardinality'
-        WHEN cs.n_distinct &lt; 0
-            THEN 'high_cardinality_estimated'
-        ELSE 'numeric_distinct_count'
-    END                  AS cardinality_class
-FROM
-    column_stats cs
-    LEFT JOIN fk_coverage fk
-        ON cs.table_schema = fk.table_schema
-        AND cs.table_name = fk.table_name
-        AND cs.column_name = fk.column_name
-ORDER BY
-    cs.table_schema, cs.table_name, cs.column_name;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Extract schema context with cardinality and FK coverage for AI analysis
 SELECT
     s.name                        AS schema_name,

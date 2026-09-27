@@ -63,38 +63,7 @@
 
 <p class="text-gray-300 leading-relaxed">On PostgreSQL, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> is the foundation. It records normalized query text, execution count, total and mean planning and execution time, shared block reads and hits, and row estimates vs. actuals. However, raw <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> is insufficient on its own. For index inference, you need predicate-level visibility — which columns appear in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WHERE</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">JOIN ON</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ORDER BY</code>, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">GROUP BY</code> clauses — and that requires either query log parsing or the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">auto_explain</code> extension with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">log_analyze</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">log_buffers</code> enabled.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Enable pg_stat_statements and auto_explain for signal collection
--- In postgresql.conf:
--- shared_preload_libraries = 'pg_stat_statements,auto_explain'
--- auto_explain.log_min_duration = 500   -- capture plans for queries &gt; 500ms
--- auto_explain.log_analyze = on
--- auto_explain.log_buffers = on
--- auto_explain.log_format = json
 
--- Query the statement store for high-cost sequential scan candidates
-SELECT
-    queryid,
-    query,
-    calls,
-    mean_exec_time,
-    total_exec_time,
-    rows,
-    shared_blks_read,
-    shared_blks_hit,
-    round(
-        100.0 * shared_blks_read /
-        NULLIF(shared_blks_read + shared_blks_hit, 0), 2
-    ) AS cache_miss_pct
-FROM pg_stat_statements
-WHERE
-    mean_exec_time &gt; 100          -- queries averaging over 100ms
-    AND calls &gt; 50                 -- called frequently enough to matter
-    AND shared_blks_read &gt; 1000   -- reading significant data from disk
-ORDER BY total_exec_time DESC
-LIMIT 50;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Query the plan cache DMVs for sequential scan and high-cost query signals
 SELECT TOP 50
     qs.total_elapsed_time / qs.execution_count        AS avg_elapsed_us,
@@ -199,7 +168,7 @@ def score_index_proposal(
 
 <p class="text-gray-300 leading-relaxed">SQL Server, unlike PostgreSQL with HypoPG, has no supported, native mechanism for testing a hypothetical index against the optimizer without actually building it. The Database Engine Tuning Advisor performs a related workload analysis internally, but it is a separate tool, not an API the autonomous layer calls inline. In practice, teams get most of the same signal from the missing-index DMVs' pre-computed cost and impact estimates (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_db_missing_index_group_stats</code>), combined with creating updated column statistics to sharpen cardinality estimates before deciding whether a proposal is worth a real, concurrently-built index. Creating a statistics object alone does not make the optimizer generate a plan against an index that doesn't exist — it only improves the estimates the optimizer uses for the indexes and access paths that are actually present. Genuine validation of a candidate index on SQL Server means building it, typically first in a staging environment or during a low-traffic window, and measuring the real effect.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Refresh statistics to sharpen cardinality estimates before deciding
 -- whether a proposed index is worth building for real
 UPDATE STATISTICS dbo.orders WITH FULLSCAN;
@@ -223,41 +192,7 @@ SET STATISTICS IO OFF;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">PostgreSQL's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE INDEX CONCURRENTLY</code> is the mechanism. It performs two full sequential scans of the table with only brief ShareUpdateExclusiveLock acquisitions, allowing reads and writes to continue throughout the build. The cost is a longer build time and the possibility of a failed build (which leaves an invalid index behind that must be cleaned up). The autonomous apply layer handles both.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Autonomous index apply with concurrent build and validity check
--- This pattern should be wrapped in the orchestration layer,
--- not run interactively
 
--- Step 1: Create concurrently (non-blocking)
-CREATE INDEX CONCURRENTLY IF NOT EXISTS
-    idx_orders_customer_created_active
-ON public.orders (customer_id, created_at DESC)
-WHERE status = 'active';
-
--- Step 2: Immediately verify the index is valid (not left in broken state)
-SELECT
-    indexname,
-    indexdef,
-    pg_size_pretty(pg_relation_size(indexrelid)) AS index_size
-FROM pg_indexes
-JOIN pg_class ON pg_class.relname = pg_indexes.indexname
-WHERE
-    tablename = 'orders'
-    AND indexname = 'idx_orders_customer_created_active';
-
--- Step 3: Check pg_index for validity — invalid indexes must be dropped
-SELECT
-    i.relname              AS index_name,
-    ix.indisvalid          AS is_valid,
-    ix.indisready          AS is_ready
-FROM pg_index ix
-JOIN pg_class i ON i.oid = ix.indexrelid
-JOIN pg_class t ON t.oid = ix.indrelid
-WHERE
-    t.relname = 'orders'
-    AND i.relname = 'idx_orders_customer_created_active';</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Non-blocking index creation with ONLINE = ON
 -- Requires Enterprise or Developer edition; validate edition before attempting
 
@@ -289,29 +224,7 @@ WITH (
 
 <p class="text-gray-300 leading-relaxed">Unused index detection relies on usage statistics reset cycles. PostgreSQL accumulates index scan counts in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_user_indexes</code> but resets them on server restart. SQL Server's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_db_index_usage_stats</code> resets on service restart. For reliable detection, usage data must be persisted externally across restarts — another function of the observation fact store.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify unused indexes with size and write overhead context
--- Cross-reference with external retention store to confirm zero usage
--- across multiple observation periods, not just since last reset
 
-SELECT
-    schemaname,
-    tablename,
-    indexname,
-    pg_size_pretty(pg_relation_size(indexrelid))        AS index_size,
-    idx_scan                                             AS scan_count,
-    idx_tup_read,
-    idx_tup_fetch,
-    n_tup_ins + n_tup_upd + n_tup_del                  AS write_ops_on_table
-FROM pg_stat_user_indexes
-JOIN pg_stat_user_tables USING (schemaname, relname)
-WHERE
-    idx_scan = 0
-    AND pg_relation_size(indexrelid) &gt; 10 * 1024 * 1024  -- larger than 10MB
-    AND schemaname NOT IN ('pg_catalog', 'information_schema')
-ORDER BY pg_relation_size(indexrelid) DESC;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify unused indexes with write cost visibility
 -- Note: usage stats are per-instance, reset on SQL Server restart
 SELECT
@@ -368,34 +281,6 @@ ORDER BY index_size_mb DESC;</code></pre>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Compress or archive cold partitions automatically (PostgreSQL tablespace reassignment; SQL Server partition switching to a compressed filegroup)</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Pre-create future partitions on a rolling schedule without DBA intervention</li>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Autonomous partition maintenance: pre-create next month's partition
--- and migrate data from the cold partition to an archive tablespace
-
--- Pre-create the next partition (run from a scheduled autonomous job)
-DO $$
-DECLARE
-    next_month_start DATE := DATE_TRUNC('month', CURRENT_DATE + INTERVAL '1 month');
-    next_month_end   DATE := DATE_TRUNC('month', CURRENT_DATE + INTERVAL '2 months');
-    partition_name   TEXT := 'events_' || TO_CHAR(next_month_start, 'YYYY_MM');
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_class
-        WHERE relname = partition_name
-    ) THEN
-        EXECUTE FORMAT(
-            'CREATE TABLE %I PARTITION OF events
-             FOR VALUES FROM (%L) TO (%L)
-             TABLESPACE pg_default',
-            partition_name,
-            next_month_start,
-            next_month_end
-        );
-        RAISE NOTICE 'Created partition: %', partition_name;
-    ELSE
-        RAISE NOTICE 'Partition already exists: %', partition_name;
-    END IF;
-END $$;</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Column-level type evolution</strong> is riskier but actionable. When the observation layer detects consistent implicit casts in query plans — for example, a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WHERE user_id = $1</code> where <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">user_id</code> is <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VARCHAR(36)</code> storing UUIDs and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">$1</code> is always bound as a proper UUID — the system can flag a type migration proposal. The actual migration follows the expand/contract pattern:</p>
 

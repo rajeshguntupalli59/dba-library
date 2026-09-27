@@ -61,45 +61,7 @@
 
 <p class="text-gray-300 leading-relaxed">A decision engine fed only state signals will be reactive and frequently wrong. Fed trend and causal signals, it can act preemptively and precisely.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Structured state + causal signal view for autonomous consumption
--- Returns active blocking chains with full context
-CREATE OR REPLACE VIEW autonomous.blocking_signal AS
-SELECT
-    blocked.pid                          AS blocked_pid,
-    blocked.usename                      AS blocked_user,
-    blocked.application_name             AS blocked_app,
-    blocked.wait_event_type              AS wait_type,
-    blocked.wait_event                   AS wait_event,
-    blocking.pid                         AS blocking_pid,
-    blocking.usename                     AS blocking_user,
-    blocking.application_name           AS blocking_app,
-    blocking.state                       AS blocking_state,
-    EXTRACT(EPOCH FROM (now() - blocked.query_start))::INT AS blocked_seconds,
-    EXTRACT(EPOCH FROM (now() - blocking.query_start))::INT AS blocker_age_seconds,
-    blocked.query                        AS blocked_query,
-    blocking.query                       AS blocking_query,
-    pg_blocking_pids(blocked.pid)        AS full_blocking_chain
-FROM pg_stat_activity blocked
-JOIN pg_stat_activity blocking
-    ON blocking.pid = ANY(pg_blocking_pids(blocked.pid))
-WHERE cardinality(pg_blocking_pids(blocked.pid)) &gt; 0;
 
--- Trend signal: connection saturation rate over sliding 5-minute window
-CREATE OR REPLACE VIEW autonomous.connection_trend AS
-SELECT
-    extract(epoch from now())::bigint AS ts,
-    count(*)                          AS active_connections,
-    (SELECT setting::int FROM pg_settings WHERE name = 'max_connections') AS max_connections,
-    round(count(*) * 100.0 /
-        (SELECT setting::int FROM pg_settings WHERE name = 'max_connections'), 2) AS pct_used,
-    count(*) FILTER (WHERE state = 'idle in transaction') AS idle_in_txn,
-    count(*) FILTER (WHERE state = 'active')              AS active,
-    count(*) FILTER (WHERE wait_event_type = 'Lock')      AS lock_waiters
-FROM pg_stat_activity
-WHERE pid &lt;&gt; pg_backend_pid();</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Structured blocking signal for autonomous consumption
 CREATE OR ALTER VIEW autonomous.blocking_signal AS
 SELECT
@@ -321,57 +283,7 @@ def run_collector(dsn: str, instance_id: str, decision_engine_url: str, interval
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Query fingerprinting</strong> normalizes SQL text by replacing literals with placeholders, producing a stable identifier that survives parameter changes. PostgreSQL's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> does this natively. SQL Server requires explicit fingerprinting via query store plan hashes or custom normalization. The fingerprint becomes the key for correlating current symptoms with historical remediation outcomes — if fingerprint <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">0x8f3a2c</code> caused a sequential scan storm last Tuesday and the fix was to create an index on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">(tenant_id, created_at)</code>, the decision engine should recognize that fingerprint immediately the next time it surfaces.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Query fingerprint performance baseline with trend detection
--- The decision engine queries this every 5 minutes to detect regression
-WITH current_stats AS (
-    SELECT
-        queryid,
-        query,
-        calls,
-        mean_exec_time,
-        stddev_exec_time,
-        rows / NULLIF(calls, 0)     AS rows_per_call,
-        shared_blks_hit,
-        shared_blks_read,
-        shared_blks_hit * 100.0 /
-            NULLIF(shared_blks_hit + shared_blks_read, 0) AS cache_hit_pct,
-        temp_blks_written
-    FROM pg_stat_statements
-    WHERE calls &gt; 100
-),
-baseline AS (
-    -- Stored baselines from autonomous.query_baselines table
-    -- populated by the decision engine during stable periods
-    SELECT queryid, baseline_mean_ms, baseline_cache_hit_pct
-    FROM autonomous.query_baselines
-)
-SELECT
-    c.queryid,
-    LEFT(c.query, 120)                                  AS query_sample,
-    c.calls,
-    ROUND(c.mean_exec_time::numeric, 2)                 AS mean_ms,
-    ROUND(b.baseline_mean_ms::numeric, 2)               AS baseline_ms,
-    ROUND(
-        (c.mean_exec_time - b.baseline_mean_ms)
-        / NULLIF(b.baseline_mean_ms, 0) * 100, 1
-    )                                                   AS pct_regression,
-    ROUND(c.cache_hit_pct::numeric, 1)                  AS cache_hit_pct,
-    ROUND(b.baseline_cache_hit_pct::numeric, 1)         AS baseline_cache_hit_pct,
-    c.temp_blks_written                                 AS temp_blocks,
-    CASE
-        WHEN c.mean_exec_time &gt; b.baseline_mean_ms * 3   THEN 'critical_regression'
-        WHEN c.mean_exec_time &gt; b.baseline_mean_ms * 1.5 THEN 'moderate_regression'
-        WHEN c.cache_hit_pct &lt; b.baseline_cache_hit_pct - 20 THEN 'cache_degradation'
-        ELSE 'nominal'
-    END                                                 AS classification
-FROM current_stats c
-JOIN baseline b USING (queryid)
-WHERE c.mean_exec_time &gt; b.baseline_mean_ms * 1.3   -- only show regressions
-ORDER BY pct_regression DESC
-LIMIT 50;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Query regression detection against stored baselines using Query Store
 WITH current_stats AS (
     SELECT
@@ -715,7 +627,7 @@ CREATE INDEX ON autonomous.action_log (action_type, executed_at DESC);
 CREATE INDEX ON autonomous.action_log USING GIN (trigger_signals);
 CREATE INDEX ON autonomous.action_log USING GIN (action_params);</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: autonomous action audit store
 CREATE TABLE autonomous.action_log (
     action_id        BIGINT IDENTITY(1,1) PRIMARY KEY,

@@ -64,24 +64,7 @@
 
 <p class="text-gray-300 leading-relaxed">In PostgreSQL, the COPY command is the workhorse of bulk loading. It reads data from a file or from standard input (including pipe input from another process) and loads it directly into a table with much less overhead than row-by-row INSERT statements from a client, mainly by avoiding per-statement parsing, planning, and network round-trip costs. Row-level triggers and per-row constraint checks (NOT NULL, CHECK, foreign keys) still fire the same way they do for INSERT. One genuine WAL optimization does apply: when the target table was created or truncated earlier in the same transaction and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">wal_level</code> is <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">minimal</code>, PostgreSQL can skip most WAL logging for the load, because a crash would simply discard the whole transaction rather than needing to replay it.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Load a CSV file directly into a table
-COPY orders (order_id, customer_id, order_date, total_amount)
-FROM '/data/exports/orders_2024.csv'
-WITH (
-    FORMAT csv,
-    HEADER true,
-    DELIMITER ',',
-    NULL 'NULL',
-    ENCODING 'UTF8'
-);
 
--- Load from a program's output (useful for streaming from another system)
-COPY orders (order_id, customer_id, order_date, total_amount)
-FROM PROGRAM 'gunzip -c /data/exports/orders_2024.csv.gz'
-WITH (FORMAT csv, HEADER true);</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- BULK INSERT from a CSV file
 BULK INSERT dbo.orders
 FROM 'D:\data\exports\orders_2024.csv'
@@ -129,26 +112,7 @@ FROM OPENROWSET(
 
 <p class="text-gray-300 leading-relaxed">A typical ELT pattern in PostgreSQL might look like this:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Step 1: Raw data lands in staging table (loaded via COPY)
--- Step 2: Transform and insert into production table with deduplication
 
-INSERT INTO orders (order_id, customer_id, order_date, total_amount, created_at)
-SELECT DISTINCT ON (order_id)
-    order_id::bigint,
-    customer_id::bigint,
-    order_date::date,
-    total_amount::numeric(12, 2),
-    now()
-FROM staging_orders
-WHERE order_id IS NOT NULL
-  AND total_amount::numeric &gt; 0
-ON CONFLICT (order_id) DO UPDATE
-    SET total_amount = EXCLUDED.total_amount,
-        updated_at   = now()
-WHERE orders.total_amount IS DISTINCT FROM EXCLUDED.total_amount;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Step 2: Transform and merge into production table with deduplication
 MERGE INTO dbo.orders AS target
 USING (
@@ -187,28 +151,7 @@ WHEN NOT MATCHED BY TARGET THEN
 
 <p class="text-gray-300 leading-relaxed">To enable and inspect logical replication in PostgreSQL:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Verify logical replication is enabled
-SHOW wal_level;  -- must be 'logical'
 
--- Create a publication for specific tables
-CREATE PUBLICATION orders_pipeline
-FOR TABLE orders, order_items, customers
-WITH (publish = 'insert, update, delete');
-
--- Check existing publications
-SELECT pubname, pubtables, pubinsert, pubupdate, pubdelete
-FROM pg_publication
-JOIN pg_publication_tables ON pubname = pubname
-WHERE pubname = 'orders_pipeline';
-
--- Monitor replication slot lag (critical for production)
-SELECT slot_name,
-       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)) AS lag,
-       active
-FROM pg_replication_slots;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Enable CDC on the database
 EXEC sys.sp_cdc_enable_db;
 
@@ -248,26 +191,7 @@ ORDER BY __$start_lsn;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">For more complex transformation pipelines, tracking pipeline state in a control table is a mature pattern:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Control table for tracking pipeline runs
-CREATE TABLE pipeline_runs (
-    run_id          bigserial PRIMARY KEY,
-    pipeline_name   text NOT NULL,
-    started_at      timestamptz NOT NULL DEFAULT now(),
-    completed_at    timestamptz,
-    rows_processed  bigint,
-    status          text NOT NULL DEFAULT 'running',  -- running, success, failed
-    error_message   text
-);
 
--- At pipeline end, mark success
-UPDATE pipeline_runs
-SET completed_at   = now(),
-    rows_processed = 847293,
-    status         = 'success'
-WHERE run_id = $1;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Control table for tracking pipeline runs
 CREATE TABLE dbo.pipeline_runs (
     run_id          bigint IDENTITY(1,1) PRIMARY KEY,
@@ -303,25 +227,7 @@ WHERE run_id = @run_id;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">In PostgreSQL, partition elimination applies automatically when your load targets rows that fall into a single partition range. You can verify this with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">EXPLAIN ANALYZE</code>:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Verify partition pruning is happening during an insert
-EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
-INSERT INTO orders_partitioned (order_id, customer_id, order_date, total_amount)
-SELECT order_id, customer_id, order_date, total_amount
-FROM staging_orders
-WHERE order_date &gt;= '2024-01-01' AND order_date &lt; '2024-02-01';
 
--- Check which partitions exist and their sizes
-SELECT
-    c.relname                          AS partition_name,
-    pg_size_pretty(pg_relation_size(c.oid)) AS size,
-    pg_stat_get_live_tuples(c.oid)     AS live_rows
-FROM pg_class c
-JOIN pg_inherits i ON c.oid = i.inhrelid
-WHERE i.inhparent = 'orders_partitioned'::regclass
-ORDER BY c.relname;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Check partition statistics before a load
 SELECT
     p.partition_number,

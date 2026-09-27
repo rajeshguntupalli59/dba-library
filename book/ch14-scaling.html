@@ -54,21 +54,7 @@
 
 <p class="text-gray-300 leading-relaxed">Identifying the actual bottleneck requires looking at the right signals. In PostgreSQL, the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_activity</code> view tells you what sessions are doing right now, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_bgwriter</code> exposes how aggressively the background writer is flushing dirty pages — a useful proxy for write I/O pressure. In SQL Server, the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_requests</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_os_wait_stats</code> DMVs are the starting point for almost every performance investigation.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify the top wait events and session states right now
-SELECT
-    state,
-    wait_event_type,
-    wait_event,
-    COUNT(*) AS session_count,
-    MAX(EXTRACT(EPOCH FROM (now() - query_start))) AS longest_seconds
-FROM pg_stat_activity
-WHERE pid &lt;&gt; pg_backend_pid()
-  AND state &lt;&gt; 'idle'
-GROUP BY state, wait_event_type, wait_event
-ORDER BY session_count DESC;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify the top wait types accumulated since last restart
 SELECT TOP 20
     wait_type,
@@ -113,33 +99,7 @@ ORDER BY wait_time_ms DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Range partitioning</strong> is the most common approach for time-series data, logs, events, and any table where rows have a natural chronological ordering. You define ranges on a date or timestamp column, and each partition holds rows for a specific period. The query planner can then skip entire partitions based on the predicate — a technique called partition pruning — which dramatically reduces the data scanned for queries that filter on the partition key.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Create a range-partitioned table on PostgreSQL
-CREATE TABLE orders (
-    order_id     BIGINT NOT NULL,
-    customer_id  INT NOT NULL,
-    order_date   DATE NOT NULL,
-    total_amount NUMERIC(12,2)
-) PARTITION BY RANGE (order_date);
 
--- Create individual partitions
-CREATE TABLE orders_2023
-    PARTITION OF orders
-    FOR VALUES FROM ('2023-01-01') TO ('2024-01-01');
-
-CREATE TABLE orders_2024
-    PARTITION OF orders
-    FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
-
--- A default partition catches rows that don't match any defined range
-CREATE TABLE orders_default
-    PARTITION OF orders DEFAULT;
-
--- Verify partition pruning is happening
-EXPLAIN (ANALYZE, BUFFERS)
-SELECT * FROM orders WHERE order_date BETWEEN '2024-03-01' AND '2024-03-31';</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Create a partition function defining the boundary points
 CREATE PARTITION FUNCTION pf_orders_date (DATE)
 AS RANGE RIGHT FOR VALUES (
@@ -196,23 +156,7 @@ SELECT $PARTITION.pf_orders_date('2024-03-15') AS partition_number;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">SQL Server offers Always On Availability Groups as its primary high-availability and read-scale mechanism. An Availability Group maintains synchronous or asynchronous replicas. Synchronous replicas guarantee no data loss but add latency to commits because the primary waits for the secondary to harden the log before acknowledging. Asynchronous replicas have a potential data loss window but impose no commit latency. Secondary replicas configured with the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALLOW_CONNECTIONS = READ_ONLY</code> option and an appropriate <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">APPLICATION_INTENT = ReadOnly</code> connection string setting will route read workloads to the replica.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- On the primary: check current replication status and lag
-SELECT
-    client_addr,
-    application_name,
-    state,
-    sent_lsn,
-    write_lsn,
-    flush_lsn,
-    replay_lsn,
-    (sent_lsn - replay_lsn) AS replication_lag_bytes,
-    write_lag,
-    flush_lag,
-    replay_lag
-FROM pg_stat_replication;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- On the primary: check AG replica sync state and estimated data loss
 SELECT
     ar.replica_server_name,
@@ -249,31 +193,7 @@ ORDER BY ar.replica_server_name;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The standard solution is a connection pooler that sits between the application and the database. Applications connect to the pooler, which maintains a smaller set of long-lived connections to the database. The pooler multiplexes many short-lived application connections onto fewer database connections. For PostgreSQL, <strong class="text-white">PgBouncer</strong> is the dominant choice, operating in one of three modes: session pooling (one database connection per application session, held for the session's lifetime), transaction pooling (a database connection is checked out only for the duration of a transaction, then returned to the pool), and statement pooling (a connection is held only for a single statement). Transaction pooling is the most effective at reducing connection count but is incompatible with features that depend on session-level state — prepared statements in their native form, advisory locks held between transactions, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SET</code> commands that modify session parameters.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Check current connection counts by state and application
-SELECT
-    application_name,
-    state,
-    COUNT(*) AS connections,
-    MAX(EXTRACT(EPOCH FROM (now() - state_change))) AS longest_idle_seconds
-FROM pg_stat_activity
-WHERE pid &lt;&gt; pg_backend_pid()
-GROUP BY application_name, state
-ORDER BY connections DESC;
 
--- Check the configured maximum
-SHOW max_connections;
-
--- Check how close you are to the limit
-SELECT
-    MAX(pg_settings.setting)::INT AS max_connections,
-    COUNT(pg_stat_activity.pid) AS current_connections,
-    ROUND(COUNT(pg_stat_activity.pid) * 100.0 /
-          MAX(pg_settings.setting)::INT, 1) AS pct_used
-FROM pg_stat_activity, pg_settings
-WHERE pg_settings.name = 'max_connections';</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Check current connections by login and status
 SELECT
     login_name,
@@ -306,27 +226,7 @@ WHERE name IN ('max worker threads', 'max connections');</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">CQRS (Command Query Responsibility Segregation)</strong> is an architectural pattern that formalizes the separation between writes and reads at the application layer. The write path updates the primary database and publishes events. The read path consumes those events and maintains read-optimized projections in separate stores — potentially denormalized tables, materialized views, or entirely different storage systems optimized for specific query shapes. In PostgreSQL, materialized views serve a similar purpose within the database itself and can be refreshed on a schedule or triggered by data changes.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Create a materialized view for an expensive aggregation
-CREATE MATERIALIZED VIEW monthly_revenue_summary AS
-SELECT
-    DATE_TRUNC('month', order_date) AS month,
-    region,
-    SUM(total_amount)               AS total_revenue,
-    COUNT(*)                        AS order_count,
-    AVG(total_amount)               AS avg_order_value
-FROM orders
-GROUP BY DATE_TRUNC('month', order_date), region
-WITH DATA;
 
--- Create an index on the materialized view for fast lookup
-CREATE INDEX idx_mrs_month_region
-    ON monthly_revenue_summary (month, region);
-
--- Refresh it on a schedule (typically called from pg_cron or a job)
-REFRESH MATERIALIZED VIEW CONCURRENTLY monthly_revenue_summary;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Create an indexed view (SQL Server's equivalent of a materialized view)
 CREATE VIEW dbo.monthly_revenue_summary
 WITH SCHEMABINDING

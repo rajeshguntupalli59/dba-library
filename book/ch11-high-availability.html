@@ -74,25 +74,7 @@
 
 <p class="text-gray-300 leading-relaxed">You can monitor replication lag in both systems to understand your actual exposure at any moment.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Check replication lag on the primary
-SELECT
-    client_addr,
-    application_name,
-    state,
-    sent_lsn,
-    write_lsn,
-    flush_lsn,
-    replay_lsn,
-    (sent_lsn - replay_lsn) AS replication_lag_bytes,
-    write_lag,
-    flush_lag,
-    replay_lag,
-    sync_state
-FROM pg_stat_replication
-ORDER BY replay_lag DESC NULLS LAST;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Check replication lag on the primary replica
 SELECT
     ag.name AS ag_name,
@@ -126,18 +108,6 @@ ORDER BY lag_seconds DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">To understand how the automation works, you first need to understand the manual process. A standby server runs in <strong class="text-white">recovery mode</strong> — it is continuously applying WAL from the primary and is read-accessible (with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">hot_standby = on</code>) but cannot accept writes. If you need to promote it to primary, you call <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_promote()</code> in PostgreSQL 12+ or create a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">recovery.signal</code> promotion trigger file in older versions. After promotion, the server exits recovery mode, becomes writable, and begins generating its own WAL.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- On the standby: check if this server is in recovery (standby) mode
-SELECT pg_is_in_recovery();
-
--- On the primary: see the current WAL insert position
-SELECT pg_current_wal_lsn();
-
--- On the standby: see the last WAL location received and replayed
-SELECT
-    pg_last_wal_receive_lsn() AS received,
-    pg_last_wal_replay_lsn()  AS replayed,
-    pg_is_in_recovery()       AS is_standby;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The problem with manual promotion is split-brain: if the primary is actually alive but temporarily unreachable (a network partition rather than a hardware failure), and you promote a standby, you now have two nodes that both believe they are the primary and both accepting writes. Reconciling that state is painful and potentially involves data loss. This is why automated HA systems use a <strong class="text-white">distributed consensus mechanism</strong> to avoid split-brain.</p>
 
@@ -176,7 +146,7 @@ SELECT
 
 <p class="text-gray-300 leading-relaxed">You can query the AG state from any replica to understand the health of the system.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- View the overall health of all availability groups on this instance
 SELECT
     ag.name                          AS availability_group,
@@ -199,20 +169,6 @@ JOIN sys.dm_hadr_database_replica_states drs
 WHERE drs.is_local = 0
 ORDER BY ag.name, ar.replica_server_name;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Equivalent view of replication state in PostgreSQL
--- Run on the primary to see all connected standbys
-SELECT
-    application_name,
-    client_addr,
-    state,
-    sync_state,
-    sent_lsn,
-    replay_lsn,
-    (sent_lsn - replay_lsn)  AS lag_bytes,
-    replay_lag
-FROM pg_stat_replication
-ORDER BY replay_lag DESC NULLS LAST;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Always On AGs support three failover modes: <strong class="text-white">automatic failover</strong>, <strong class="text-white">manual failover</strong>, and <strong class="text-white">forced failover with potential data loss</strong>. Automatic failover requires synchronous-commit mode on the target secondary and is the configuration you want for maximum HA. Manual failover is used for planned maintenance — you initiate it deliberately, and SQL Server ensures the secondary is fully synchronized before the failover completes. Forced failover is the emergency option when the primary is truly gone and you need to bring a secondary online even if it means acknowledging potential data loss.</p>
 
@@ -252,19 +208,7 @@ ORDER BY replay_lag DESC NULLS LAST;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">In PostgreSQL, you can check whether a session is running on a replica and what the current replication lag is from inside application queries.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Application can call this to check if it is connected to a primary or replica
--- and estimate data freshness before running a lag-sensitive query
-SELECT
-    pg_is_in_recovery()                                AS is_replica,
-    pg_last_wal_replay_lsn()                           AS last_applied_lsn,
-    now() - pg_last_xact_replay_timestamp()            AS replay_lag,
-    CASE
-        WHEN pg_is_in_recovery() THEN 'replica'
-        ELSE 'primary'
-    END AS role;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Check replica role and lag from within a session on a secondary
 SELECT
     DATABASEPROPERTYEX(DB_NAME(), 'Updateability') AS db_updateability,

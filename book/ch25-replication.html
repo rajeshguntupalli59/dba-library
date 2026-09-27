@@ -91,22 +91,7 @@ CREATE ROLE replicator WITH REPLICATION LOGIN PASSWORD 'strongpassword';</code><
 
 <p class="text-gray-300 leading-relaxed">You can monitor the state of all connected standbys from the primary using the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_replication</code> view. This view is one of the most valuable tools in day-to-day replication management.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Check replication status from the primary
-SELECT
-    client_addr,
-    usename,
-    application_name,
-    state,
-    sent_lsn,
-    write_lsn,
-    flush_lsn,
-    replay_lsn,
-    (sent_lsn - replay_lsn) AS replication_lag_bytes,
-    sync_state
-FROM pg_stat_replication;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Check Always On AG replica synchronization state
 SELECT
     ar.replica_server_name,
@@ -128,21 +113,7 @@ JOIN sys.availability_databases_cluster adc
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Replication slots</strong> are a significant feature introduced in PostgreSQL 9.4. Without a replication slot, if a standby falls behind or disconnects, the primary is free to recycle WAL segments that the standby has not yet consumed. When the standby reconnects, it may find that the WAL it needs is gone, forcing a full re-sync. A replication slot causes the primary to retain WAL until the slot consumer acknowledges it. This solves the "standby missed WAL" problem but introduces a new one: if a standby with a slot goes offline indefinitely, the primary's pg_wal directory will grow without bound, potentially filling the disk. In production, always monitor slot lag with an alert, and consider whether an unmonitored slot is worth the risk.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Check replication slot status and retained WAL
-SELECT
-    slot_name,
-    slot_type,
-    active,
-    active_pid,
-    confirmed_flush_lsn,
-    pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn) AS lag_bytes,
-    pg_size_pretty(
-        pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)
-    ) AS lag_pretty
-FROM pg_replication_slots;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- No direct equivalent to slots; check log send queue in AG DMV
 SELECT
     ar.replica_server_name,
@@ -217,18 +188,7 @@ ORDER BY application_name;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">PostgreSQL logical replication uses a <strong class="text-white">publisher/subscriber</strong> model. The publisher defines a <strong class="text-white">publication</strong> — a named collection of tables (or all tables in a schema) whose changes should be broadcast. The subscriber creates a <strong class="text-white">subscription</strong> pointing at a publisher's publication and begins consuming those changes.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- On the publisher: create a publication for specific tables
-CREATE PUBLICATION sales_pub
-    FOR TABLE orders, order_items, customers
-    WITH (publish = 'insert, update, delete');
 
--- On the subscriber: create a subscription
-CREATE SUBSCRIPTION sales_sub
-    CONNECTION 'host=primary-db port=5432 dbname=sales user=replicator password=strongpassword'
-    PUBLICATION sales_pub;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: Create a transactional publication (via T-SQL)
 USE [sales];
 EXEC sp_replicationdboption
@@ -266,26 +226,7 @@ EXEC sp_addarticle
 
 <p class="text-gray-300 leading-relaxed">The fundamental metric to watch is replication lag. In PostgreSQL, time-based lag (more meaningful than byte-based lag for most alerting purposes) became directly available in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_replication</code> starting with PostgreSQL 10, in the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">write_lag</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">flush_lag</code>, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">replay_lag</code> columns. These report how long ago the primary wrote data that the standby has yet to write, flush, or replay, respectively.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Monitor replication lag with time-based metrics
-SELECT
-    application_name,
-    client_addr,
-    sync_state,
-    state,
-    pg_size_pretty(pg_wal_lsn_diff(sent_lsn, replay_lsn)) AS byte_lag,
-    write_lag,
-    flush_lag,
-    replay_lag,
-    CASE
-        WHEN replay_lag &gt; interval '30 seconds' THEN 'WARNING'
-        WHEN replay_lag &gt; interval '5 minutes' THEN 'CRITICAL'
-        ELSE 'OK'
-    END AS lag_status
-FROM pg_stat_replication
-ORDER BY replay_lag DESC NULLS LAST;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Monitor AG lag and estimated data loss window
 SELECT
     ar.replica_server_name,
@@ -461,30 +402,6 @@ LIMIT 1;</code></pre>
 <p class="text-gray-300 leading-relaxed">6. Monitor replication lag until it is near zero.</p>
 <p class="text-gray-300 leading-relaxed">7. During a brief maintenance window, stop writes to the old instance, verify the new instance has consumed all remaining changes, advance sequences on the new instance, and redirect application traffic.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- On old primary (v14): create migration publication
-CREATE PUBLICATION upgrade_pub FOR ALL TABLES;
-
--- On new instance (v16): create subscription
-CREATE SUBSCRIPTION upgrade_sub
-    CONNECTION 'host=old-primary port=5432 dbname=mydb user=replicator password=strongpassword'
-    PUBLICATION upgrade_pub;
-
--- Monitor sync progress on the new instance
-SELECT
-    subname,
-    received_lsn,
-    last_msg_receipt_time,
-    latest_end_lsn,
-    latest_end_time
-FROM pg_stat_subscription;
-
--- After cutover: advance sequences on new primary
--- (Run for each sequence; adjust start values based on old primary's sequence state)
-SELECT 'SELECT setval(' || quote_literal(sequence_schema || '.' || sequence_name) ||
-       ', (SELECT last_value FROM ' || sequence_schema || '.' || sequence_name || ') + 10000);'
-FROM information_schema.sequences
-WHERE sequence_schema NOT IN ('pg_catalog', 'information_schema');</code></pre>
 
 <p class="text-gray-300 leading-relaxed">SQL Server handles major version upgrades differently, using <strong class="text-white">rolling upgrades</strong> within an AG. The procedure involves upgrading secondary replicas to the new SQL Server version first (while the primary remains on the old version), then failing over to an upgraded secondary, and finally upgrading the former primary. This is supported because SQL Server AG replication is backward-compatible for one major version during the upgrade window. The online documentation for each SQL Server release specifies the exact supported rolling upgrade path.</p>
 

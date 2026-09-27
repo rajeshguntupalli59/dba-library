@@ -94,13 +94,7 @@ host    all             all             0.0.0.0/0               reject</code></p
 
 <p class="text-gray-300 leading-relaxed">You can verify which authentication mode is active:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Check pg_hba.conf rules in effect (PostgreSQL 10+)
-SELECT type, database, user_name, address, auth_method
-FROM pg_hba_file_rules
-ORDER BY line_number;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Check server authentication mode (1 = Windows only, 2 = Mixed)
 SELECT SERVERPROPERTY('IsIntegratedSecurityOnly') AS windows_auth_only,
        name,
@@ -125,33 +119,7 @@ ORDER BY type_desc, name;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">In PostgreSQL, roles and users are unified concepts. A well-structured role model for an application database looks like this:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Create functional roles
-CREATE ROLE app_readonly NOLOGIN;
-CREATE ROLE app_readwrite NOLOGIN;
-CREATE ROLE app_admin NOLOGIN;
 
--- Grant schema usage
-GRANT USAGE ON SCHEMA public TO app_readonly, app_readwrite, app_admin;
-
--- Read-only: SELECT only on all current tables
-GRANT SELECT ON ALL TABLES IN SCHEMA public TO app_readonly;
-
--- Read-write: SELECT, INSERT, UPDATE, DELETE
-GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app_readwrite;
-GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO app_readwrite;
-
--- Ensure future tables inherit the same grants
-ALTER DEFAULT PRIVILEGES IN SCHEMA public
-  GRANT SELECT ON TABLES TO app_readonly;
-
-ALTER DEFAULT PRIVILEGES IN SCHEMA public
-  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_readwrite;
-
--- Assign the application login to the appropriate role
-GRANT app_readwrite TO appuser;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Create database roles
 CREATE ROLE db_app_readonly;
 CREATE ROLE db_app_readwrite;
@@ -175,23 +143,7 @@ REVERT;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">PostgreSQL's Row-Level Security (RLS) allows you to define policies that filter rows based on the current user context. This is particularly powerful for multi-tenant SaaS applications where a single table holds data for multiple customers:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Enable RLS on the orders table
-ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
 
--- Policy: users can only see their own tenant's orders
-CREATE POLICY tenant_isolation ON orders
-  USING (tenant_id = current_setting('app.current_tenant_id')::integer);
-
--- The application sets the tenant context on each connection
--- SET LOCAL app.current_tenant_id = '42';
-
--- Verify RLS is active
-SELECT tablename, rowsecurity, forcerowsecurity
-FROM pg_tables
-WHERE tablename = 'orders';</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server Row-Level Security
 CREATE SCHEMA Security;
 GO
@@ -219,21 +171,7 @@ GO
 
 <p class="text-gray-300 leading-relaxed">Privileges accumulate silently. A developer is given temporary access to diagnose a production issue and the access is never revoked. An application role picks up permissions from a shared schema that expanded over time. A service account created three years ago still has DBA rights that made sense in development but were never trimmed for production. Regular privilege audits are a core operational practice in zero-trust environments.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify superusers and roles with elevated privileges
-SELECT rolname,
-       rolsuper,
-       rolcreaterole,
-       rolcreatedb,
-       rolbypassrls,
-       rolconnlimit
-FROM pg_roles
-WHERE rolsuper = true
-   OR rolcreaterole = true
-   OR rolbypassrls = true
-ORDER BY rolname;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify server-level elevated principals
 SELECT sp.name AS principal_name,
        sp.type_desc,
@@ -298,25 +236,7 @@ ORDER BY sp.name;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">On the PostgreSQL side, Vault's management role needs permission to create and drop roles:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Create a Vault management role
-CREATE ROLE vault_manager LOGIN PASSWORD 'STRONG_MANAGED_PASSWORD';
 
--- Grant the ability to create roles and manage them
-GRANT CREATEROLE TO vault_manager;
-
--- Vault will use a template like this to create dynamic credentials:
--- CREATE ROLE "v-app-XYZ123" LOGIN PASSWORD '...' 
---   VALID UNTIL '2024-01-01 12:30:00';
--- GRANT app_readwrite TO "v-app-XYZ123";
-
--- Verify active dynamic credentials (identify Vault-managed accounts)
-SELECT rolname, rolvaliduntil, rolcanlogin
-FROM pg_roles
-WHERE rolname LIKE 'v-%'
-ORDER BY rolvaliduntil;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Create the Vault management login at the server level
 CREATE LOGIN vault_manager WITH PASSWORD = 'StrongManagedPassword!';
 
@@ -392,7 +312,7 @@ log_line_prefix = '%t [%p]: [%l-1] user=%u,db=%d,app=%a,client=%h '</code></pre>
 
 <p class="text-gray-300 leading-relaxed">SQL Server provides native audit capabilities through SQL Server Audit, which is configured through the SQL Server Audit object at the server level and Audit Specifications at both the server and database level.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Create a server audit writing to a file
 CREATE SERVER AUDIT ZeroTrustAudit
 TO FILE (

@@ -60,30 +60,7 @@
 
 <p class="text-gray-300 leading-relaxed">The diagnostic starting point is measuring what you currently have — not what was provisioned. Both PostgreSQL and SQL Server expose usage statistics that let you see actual consumption versus available capacity.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Check database size, table bloat, and index sizes to understand storage consumption
-SELECT
-    pg_database.datname AS database_name,
-    pg_size_pretty(pg_database_size(pg_database.datname)) AS total_size
-FROM pg_database
-ORDER BY pg_database_size(pg_database.datname) DESC;
 
--- Identify the largest tables and their indexes
-SELECT
-    schemaname,
-    tablename,
-    pg_size_pretty(pg_total_relation_size(schemaname || '.' || tablename)) AS total_size,
-    pg_size_pretty(pg_relation_size(schemaname || '.' || tablename)) AS table_size,
-    pg_size_pretty(
-        pg_total_relation_size(schemaname || '.' || tablename)
-        - pg_relation_size(schemaname || '.' || tablename)
-    ) AS index_size
-FROM pg_tables
-WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
-ORDER BY pg_total_relation_size(schemaname || '.' || tablename) DESC
-LIMIT 20;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Check database size and available space
 SELECT
     name AS database_name,
@@ -122,29 +99,7 @@ ORDER BY total_mb DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">In PostgreSQL, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_activity</code> shows you what's running right now, but for historical utilization you typically rely on external monitoring (pg_activity, pgBadger, or cloud-native tools). What you *can* measure internally is memory pressure through shared buffer hit rates — a low buffer hit rate suggests you need more memory, while a consistently high rate with unused headroom suggests you can scale down.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Measure shared buffer hit rate (should be above 99% for OLTP workloads)
-SELECT
-    sum(heap_blks_read) AS heap_read,
-    sum(heap_blks_hit) AS heap_hit,
-    ROUND(
-        100.0 * sum(heap_blks_hit)
-        / NULLIF(sum(heap_blks_hit) + sum(heap_blks_read), 0),
-        2
-    ) AS hit_rate_pct
-FROM pg_statio_user_tables;
 
--- Check for idle connections consuming memory
-SELECT
-    state,
-    COUNT(*) AS connection_count,
-    MAX(EXTRACT(EPOCH FROM (now() - state_change))) AS max_idle_seconds
-FROM pg_stat_activity
-WHERE pid &lt;&gt; pg_backend_pid()
-GROUP BY state
-ORDER BY connection_count DESC;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Measure buffer pool hit rate
 SELECT
     ROUND(
@@ -189,34 +144,7 @@ ORDER BY idle_minutes DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Dead tuple reclamation in PostgreSQL</strong> is handled by VACUUM. Every UPDATE and DELETE in PostgreSQL leaves behind dead tuples that occupy space until VACUUM runs. Autovacuum handles most of this automatically, but heavily updated tables can accumulate bloat faster than autovacuum keeps up, especially if autovacuum cost delay parameters are tuned too conservatively. Checking bloat proactively is a production habit worth building.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify tables with significant dead tuple bloat
-SELECT
-    schemaname,
-    relname AS table_name,
-    n_live_tup AS live_rows,
-    n_dead_tup AS dead_rows,
-    ROUND(100.0 * n_dead_tup / NULLIF(n_live_tup + n_dead_tup, 0), 2) AS dead_pct,
-    last_vacuum,
-    last_autovacuum,
-    pg_size_pretty(pg_total_relation_size(schemaname || '.' || relname)) AS total_size
-FROM pg_stat_user_tables
-WHERE n_dead_tup &gt; 10000
-ORDER BY dead_pct DESC;
 
--- Find unused indexes that consume storage and maintenance overhead
-SELECT
-    schemaname,
-    relname AS table_name,
-    indexrelname AS index_name,
-    idx_scan AS scans,
-    pg_size_pretty(pg_relation_size(indexrelid)) AS index_size
-FROM pg_stat_user_indexes
-WHERE idx_scan = 0
-  AND schemaname NOT IN ('pg_catalog', 'information_schema')
-ORDER BY pg_relation_size(indexrelid) DESC;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify fragmented indexes consuming excess space
 SELECT
     OBJECT_SCHEMA_NAME(i.object_id) AS schema_name,
@@ -276,30 +204,7 @@ ORDER BY size_mb DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Both PostgreSQL and SQL Server have built-in views that expose cumulative execution statistics, making it straightforward to rank queries by total resource consumption rather than individual execution time.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Enable pg_stat_statements first: shared_preload_libraries = 'pg_stat_statements'
--- Then find the top resource-consuming queries
-SELECT
-    LEFT(query, 100) AS query_snippet,
-    calls,
-    ROUND(total_exec_time::numeric, 2) AS total_ms,
-    ROUND(mean_exec_time::numeric, 2) AS avg_ms,
-    ROUND(stddev_exec_time::numeric, 2) AS stddev_ms,
-    rows,
-    shared_blks_hit,
-    shared_blks_read,
-    ROUND(
-        100.0 * shared_blks_hit
-        / NULLIF(shared_blks_hit + shared_blks_read, 0),
-        2
-    ) AS cache_hit_pct,
-    shared_blks_read * 8 / 1024.0 AS physical_read_mb
-FROM pg_stat_statements
-WHERE calls &gt; 100
-ORDER BY total_exec_time DESC
-LIMIT 20;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Top resource-consuming queries by total CPU time
 SELECT TOP 20
     qs.total_worker_time / 1000 AS total_cpu_ms,
@@ -397,43 +302,7 @@ ORDER BY qs.total_worker_time DESC;</code></pre>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Establish a monthly cost review cadence with defined owners.</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Incorporate schema review into the development process with explicit cost evaluation criteria.</li>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Quick diagnostic: storage, bloat, and index efficiency in one pass
-WITH table_stats AS (
-    SELECT
-        schemaname,
-        relname,
-        n_live_tup,
-        n_dead_tup,
-        ROUND(100.0 * n_dead_tup / NULLIF(n_live_tup + n_dead_tup, 0), 2) AS dead_pct,
-        last_autovacuum,
-        pg_total_relation_size(schemaname || '.' || relname) AS total_bytes
-    FROM pg_stat_user_tables
-),
-index_stats AS (
-    SELECT
-        relid,
-        SUM(idx_scan) AS total_index_scans,
-        COUNT(*) AS index_count
-    FROM pg_stat_user_indexes
-    GROUP BY relid
-)
-SELECT
-    ts.schemaname,
-    ts.relname AS table_name,
-    pg_size_pretty(ts.total_bytes) AS total_size,
-    ts.n_live_tup AS live_rows,
-    ts.dead_pct AS dead_row_pct,
-    ts.last_autovacuum,
-    is2.index_count,
-    is2.total_index_scans
-FROM table_stats ts
-LEFT JOIN index_stats is2 ON is2.relid = (ts.schemaname || '.' || ts.relname)::regclass
-WHERE ts.total_bytes &gt; 10 * 1024 * 1024  -- tables larger than 10MB
-ORDER BY ts.total_bytes DESC
-LIMIT 30;</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Quick diagnostic: storage, index efficiency, and query cost summary
 SELECT
     OBJECT_SCHEMA_NAME(t.object_id) AS schema_name,
