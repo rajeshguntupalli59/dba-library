@@ -185,7 +185,7 @@ CREATE INDEX IX_findings_sla    ON compliance_findings (sla_deadline)
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># compliance_loop.py — core detection loop
 import asyncio
-import asyncpg
+import aioodbc  # async ODBC pool for SQL Server targets
 import logging
 from datetime import datetime, timezone
 from typing import Dict, List, Any
@@ -472,7 +472,7 @@ AND NOT EXISTS (
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># pii_content_sampler.py
 import re
-import asyncpg
+import aioodbc
 from typing import List, Dict, Any
 
 PII_PATTERNS = {
@@ -485,7 +485,7 @@ PII_PATTERNS = {
 }
 
 async def sample_column_for_pii(
-    conn: asyncpg.Connection,
+    pool,  # aioodbc.Pool
     schema: str,
     table: str,
     column: str,
@@ -496,13 +496,16 @@ async def sample_column_for_pii(
     Returns empty list if no PII patterns found.
     """
     try:
-        rows = await conn.fetch(
-            f'SELECT {column}::TEXT FROM {schema}.{table} '
-            f'TABLESAMPLE SYSTEM(5) LIMIT $1',
-            sample_size
-        )
+        async with pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    f"SELECT TOP (?) CAST([{column}] AS NVARCHAR(MAX)) "
+                    f"FROM [{schema}].[{table}] TABLESAMPLE SYSTEM (5)",
+                    sample_size
+                )
+                rows = await cur.fetchall()
     except Exception:
-        # Column may not be castable to TEXT or table may be empty
+        # Column may not be castable to NVARCHAR(MAX) or table may be empty
         return []
 
     values = [r[0] for r in rows if r[0] is not None]
@@ -641,70 +644,82 @@ CREATE INDEX IX_eval_log_policy_time
 <p class="text-gray-300 leading-relaxed">The evidence package generator queries these tables and assembles a structured report. For a typical SOC 2 audit covering a ninety-day period, this function produces a JSON document that maps directly onto the auditor's control testing worksheet:</p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># evidence_package_generator.py
-import asyncpg
+import aioodbc
 import json
 from datetime import datetime, timezone
 from typing import Dict, Any
 
+def _dicts(cur, rows):
+    cols = [c[0] for c in cur.description]
+    return [dict(zip(cols, r)) for r in rows]
+
 async def generate_evidence_package(
-    pool: asyncpg.Pool,
+    pool,  # aioodbc.Pool
     policy_id: str,
     period_start: datetime,
     period_end: datetime
 ) -&gt; Dict[str, Any]:
     async with pool.acquire() as conn:
-        # 1. Policy definition (latest version in effect during period)
-        policy = await conn.fetchrow("""
-            SELECT * FROM compliance_policies WHERE policy_id = $1
-        """, policy_id)
+        async with conn.cursor() as cur:
+            # 1. Policy definition (latest version in effect during period)
+            await cur.execute(
+                "SELECT * FROM compliance_policies WHERE policy_id = ?",
+                policy_id)
+            policy_rows = _dicts(cur, await cur.fetchall())
+            policy = policy_rows[0] if policy_rows else None
 
-        # 2. Evaluation timeline
-        evaluations = await conn.fetch("""
-            SELECT evaluated_at, target_host, rows_returned,
-                   violation_count, duration_ms, evidence_snapshot, error_detail
-            FROM compliance_evaluation_log
-            WHERE policy_id   = $1
-              AND evaluated_at BETWEEN $2 AND $3
-            ORDER BY evaluated_at
-        """, policy_id, period_start, period_end)
+            # 2. Evaluation timeline
+            await cur.execute("""
+                SELECT evaluated_at, target_host, rows_returned,
+                       violation_count, duration_ms, evidence_snapshot, error_detail
+                FROM compliance_evaluation_log
+                WHERE policy_id   = ?
+                  AND evaluated_at BETWEEN ? AND ?
+                ORDER BY evaluated_at
+            """, policy_id, period_start, period_end)
+            evaluations = _dicts(cur, await cur.fetchall())
 
-        # 3. Findings during the period
-        findings = await conn.fetch("""
-            SELECT finding_id, detected_at, target_host, violation_detail,
-                   status, remediation_started, resolved_at,
-                   sla_deadline, remediation_result
-            FROM compliance_findings
-            WHERE policy_id   = $1
-              AND detected_at BETWEEN $2 AND $3
-            ORDER BY detected_at
-        """, policy_id, period_start, period_end)
+            # 3. Findings during the period
+            await cur.execute("""
+                SELECT finding_id, detected_at, target_host, violation_detail,
+                       status, remediation_started, resolved_at,
+                       sla_deadline, remediation_result
+                FROM compliance_findings
+                WHERE policy_id   = ?
+                  AND detected_at BETWEEN ? AND ?
+                ORDER BY detected_at
+            """, policy_id, period_start, period_end)
+            findings = _dicts(cur, await cur.fetchall())
 
-        # 4. Remediation actions
-        remediations = await conn.fetch("""
-            SELECT ra.audit_id, ra.finding_id, ra.action,
-                   ra.old_state, ra.new_state, ra.executed_at,
-                   ra.executed_by, ra.success, ra.error_detail
-            FROM compliance_remediation_audit ra
-            JOIN compliance_findings f ON f.finding_id = ra.finding_id
-            WHERE f.policy_id   = $1
-              AND ra.executed_at BETWEEN $2 AND $3
-            ORDER BY ra.executed_at
-        """, policy_id, period_start, period_end)
+            # 4. Remediation actions
+            await cur.execute("""
+                SELECT ra.audit_id, ra.finding_id, ra.action,
+                       ra.old_state, ra.new_state, ra.executed_at,
+                       ra.executed_by, ra.success, ra.error_detail
+                FROM compliance_remediation_audit ra
+                JOIN compliance_findings f ON f.finding_id = ra.finding_id
+                WHERE f.policy_id   = ?
+                  AND ra.executed_at BETWEEN ? AND ?
+                ORDER BY ra.executed_at
+            """, policy_id, period_start, period_end)
+            remediations = _dicts(cur, await cur.fetchall())
 
-        # 5. SLA summary
-        sla_stats = await conn.fetchrow("""
-            SELECT
-                COUNT(*)                                        AS total_findings,
-                SUM(CASE WHEN status = 'resolved' THEN 1 END)  AS resolved,
-                SUM(CASE WHEN status = 'escalated' THEN 1 END) AS escalated,
-                AVG(EXTRACT(EPOCH FROM (resolved_at - detected_at))/60)
-                                                               AS avg_resolution_minutes,
-                MAX(EXTRACT(EPOCH FROM (resolved_at - detected_at))/60)
-                                                               AS max_resolution_minutes
-            FROM compliance_findings
-            WHERE policy_id   = $1
-              AND detected_at BETWEEN $2 AND $3
-        """, policy_id, period_start, period_end)
+            # 5. SLA summary
+            await cur.execute("""
+                SELECT
+                    COUNT(*)                                       AS total_findings,
+                    SUM(CASE WHEN status = 'resolved' THEN 1 END) AS resolved,
+                    SUM(CASE WHEN status = 'escalated' THEN 1 END) AS escalated,
+                    AVG(CAST(DATEDIFF(MINUTE, detected_at, resolved_at)
+                        AS FLOAT))                               AS avg_resolution_minutes,
+                    MAX(DATEDIFF(MINUTE, detected_at, resolved_at))
+                                                                 AS max_resolution_minutes
+                FROM compliance_findings
+                WHERE policy_id   = ?
+                  AND detected_at BETWEEN ? AND ?
+            """, policy_id, period_start, period_end)
+            sla_rows = _dicts(cur, await cur.fetchall())
+            sla_stats = sla_rows[0] if sla_rows else {}
 
     return {
         "package_generated_at": datetime.now(timezone.utc).isoformat(),
@@ -712,7 +727,7 @@ async def generate_evidence_package(
             "start": period_start.isoformat(),
             "end":   period_end.isoformat()
         },
-        "policy": dict(policy) if policy else None,
+        "policy": policy,
         "evaluation_summary": {
             "total_evaluations": len(evaluations),
             "evaluations_with_violations": sum(
@@ -722,10 +737,10 @@ async def generate_evidence_package(
                 1 for e in evaluations if e["error_detail"]
             ),
         },
-        "evaluations":   [dict(e) for e in evaluations],
-        "findings":      [dict(f) for f in findings],
-        "remediations":  [dict(r) for r in remediations],
-        "sla_summary":   dict(sla_stats) if sla_stats else {},
+        "evaluations":   evaluations,
+        "findings":      findings,
+        "remediations":  remediations,
+        "sla_summary":   sla_stats,
     }</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The output of <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">generate_evidence_package</code> can be signed with a platform key and stored in immutable object storage (S3 Object Lock, Azure Blob immutability policies) the moment it is generated. This produces a tamper-evident audit trail that can be presented to auditors without involving any engineer in the evidence collection process — which itself satisfies an independence requirement in several audit frameworks.</p>
@@ -819,8 +834,10 @@ WHERE event_time &gt;= DATEADD(HOUR, -1, SYSDATETIMEOFFSET())
         Learn More →
       </a>
     </div>
-    <div class="mt-8 text-xs">
+    <div class="mt-8 flex justify-between text-xs">
+      <a href="b3-ch20-threat-detection.html" class="text-gray-500 hover:text-gray-300 transition">← Previous Chapter</a>
       <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a>
+      <a href="b3-ch22-patch-management.html" class="text-violet-400 hover:text-violet-300 transition">Next Chapter →</a>
     </div>
   </article>
   <footer class="border-t border-gray-800/50 px-6 py-8">

@@ -542,8 +542,8 @@ import json
 import os
 from datetime import datetime
 
+import aioodbc
 import anthropic
-import asyncpg
 import httpx
 import openai
 from fastapi import FastAPI, Request, HTTPException
@@ -553,11 +553,11 @@ app = FastAPI(title="DBA AI Enrichment Service")
 # Clients initialized once at startup
 anthropic_client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 openai_client = openai.OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-DB_CONN_STRING = os.environ["KNOWLEDGE_STORE_CONN"]
+DB_CONN_STRING = os.environ["KNOWLEDGE_STORE_CONN"]  # ODBC DSN for SQL Server
 
 
 async def get_db_pool():
-    return await asyncpg.create_pool(DB_CONN_STRING, min_size=2, max_size=10)
+    return await aioodbc.create_pool(dsn=DB_CONN_STRING, minsize=2, maxsize=10)
 
 db_pool = None
 
@@ -565,6 +565,12 @@ db_pool = None
 async def startup():
     global db_pool
     db_pool = await get_db_pool()
+
+
+def rows_to_dicts(cur, rows):
+    """Convert pyodbc rows to dicts using cursor description."""
+    cols = [c[0] for c in cur.description]
+    return [dict(zip(cols, r)) for r in rows]
 
 
 def embed_text(text: str) -&gt; list[float]:
@@ -580,19 +586,20 @@ async def find_similar_incidents(embedding: list[float], limit: int = 3) -&gt; l
     """Retrieve the most similar past incidents from the knowledge store."""
     embedding_str = "[" + ",".join(str(v) for v in embedding) + "]"
     async with db_pool.acquire() as conn:
-        rows = await conn.fetch("""
-            SELECT
-                incident_id,
-                error_summary,
-                resolution_notes,
-                resolved_at,
-                1 - (embedding &lt;=&gt; $1::vector) AS similarity
-            FROM incident_history
-            WHERE 1 - (embedding &lt;=&gt; $1::vector) &gt; 0.75
-            ORDER BY embedding &lt;=&gt; $1::vector
-            LIMIT $2
-        """, embedding_str, limit)
-    return [dict(r) for r in rows]
+        async with conn.cursor() as cur:
+            await cur.execute("""
+                SELECT TOP (?)
+                    incident_id,
+                    error_summary,
+                    resolution_notes,
+                    resolved_at,
+                    VECTOR_DISTANCE('cosine', embedding, CAST(? AS VECTOR(1536))) AS distance
+                FROM incident_history
+                WHERE VECTOR_DISTANCE('cosine', embedding, CAST(? AS VECTOR(1536))) &lt; 0.25
+                ORDER BY VECTOR_DISTANCE('cosine', embedding, CAST(? AS VECTOR(1536)))
+            """, limit, embedding_str, embedding_str, embedding_str)
+            rows = await cur.fetchall()
+            return rows_to_dicts(cur, rows)
 
 
 async def store_analysis(
@@ -604,23 +611,28 @@ async def store_analysis(
 ):
     """Persist a query analysis and its embedding to the knowledge store."""
     embedding_str = "[" + ",".join(str(v) for v in embedding) + "]"
+    now = datetime.utcnow()
     async with db_pool.acquire() as conn:
-        await conn.execute("""
-            INSERT INTO query_signatures
-                (query_hash, normalized_sql, embedding, avg_duration_ms, plan_summary, capture_time)
-            VALUES ($1, $2, $3::vector, $4, $5, $6)
-            ON CONFLICT (query_hash) DO UPDATE
-                SET avg_duration_ms = EXCLUDED.avg_duration_ms,
-                    plan_summary = EXCLUDED.plan_summary,
-                    capture_time = EXCLUDED.capture_time
-        """,
-            query_hash,
-            normalized_sql,
-            embedding_str,
-            avg_duration_ms,
-            json.dumps(analysis),
-            datetime.utcnow()
-        )
+        async with conn.cursor() as cur:
+            await cur.execute("""
+                MERGE INTO query_signatures AS tgt
+                USING (SELECT ? AS query_hash) AS src
+                    ON tgt.query_hash = src.query_hash
+                WHEN MATCHED THEN
+                    UPDATE SET avg_duration_ms = ?,
+                               plan_summary = ?,
+                               capture_time = ?
+                WHEN NOT MATCHED THEN
+                    INSERT (query_hash, normalized_sql, embedding,
+                            avg_duration_ms, plan_summary, capture_time)
+                    VALUES (?, ?, CAST(? AS VECTOR(1536)), ?, ?, ?);
+            """,
+                query_hash,
+                avg_duration_ms, json.dumps(analysis), now,
+                query_hash, normalized_sql, embedding_str,
+                avg_duration_ms, json.dumps(analysis), now
+            )
+            await conn.commit()
 
 
 @app.post("/analyze-slow-query")
@@ -655,7 +667,7 @@ async def analyze_slow_query(request: Request):
 You are a senior {database_type.upper()} performance engineer.
 Analyze the slow query below and return a JSON object with these keys:
 - "root_cause": concise description of the primary performance issue
-- "bottlenecks": list of specific plan nodes or operators causing the problem  
+- "bottlenecks": list of specific plan nodes or operators causing the problem
 - "index_recommendation": CREATE INDEX statement if applicable, else null
 - "rewrite_suggestion": improved SQL if a rewrite would help, else null
 - "severity": "critical" | "warning" | "acceptable"
@@ -703,26 +715,30 @@ EXECUTION PLAN:
 async def get_similar_queries(query_hash: str, limit: int = 5):
     """Retrieve queries semantically similar to a known query by its hash."""
     async with db_pool.acquire() as conn:
-        source_row = await conn.fetchrow(
-            "SELECT embedding FROM query_signatures WHERE query_hash = $1",
-            query_hash
-        )
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT CAST(embedding AS NVARCHAR(MAX)) AS embedding "
+                "FROM query_signatures WHERE query_hash = ?",
+                query_hash
+            )
+            source_row = await cur.fetchone()
     if not source_row:
         raise HTTPException(status_code=404, detail="Query hash not found")
 
-    embedding = source_row["embedding"]
+    embedding_str = source_row[0]
     async with db_pool.acquire() as conn:
-        rows = await conn.fetch("""
-            SELECT query_hash, normalized_sql, avg_duration_ms,
-                   1 - (embedding &lt;=&gt; $1::vector) AS similarity
-            FROM query_signatures
-            WHERE query_hash != $2
-              AND 1 - (embedding &lt;=&gt; $1::vector) &gt; 0.80
-            ORDER BY embedding &lt;=&gt; $1::vector
-            LIMIT $3
-        """, embedding, query_hash, limit)
-
-    return [dict(r) for r in rows]</code></pre>
+        async with conn.cursor() as cur:
+            await cur.execute("""
+                SELECT TOP (?)
+                    query_hash, normalized_sql, avg_duration_ms,
+                    VECTOR_DISTANCE('cosine', embedding, CAST(? AS VECTOR(1536))) AS distance
+                FROM query_signatures
+                WHERE query_hash != ?
+                  AND VECTOR_DISTANCE('cosine', embedding, CAST(? AS VECTOR(1536))) &lt; 0.20
+                ORDER BY VECTOR_DISTANCE('cosine', embedding, CAST(? AS VECTOR(1536)))
+            """, limit, embedding_str, query_hash, embedding_str, embedding_str)
+            rows = await cur.fetchall()
+            return rows_to_dicts(cur, rows)</code></pre>
 
 <p class="text-gray-300 leading-relaxed">This service, deployed as a container alongside your Prometheus alertmanager, gives you a persistent, searchable intelligence layer over your database environment. Every slow query you analyze makes the next analysis better by building out the similarity index. Every incident you record becomes a retrievable case study for future on-call engineers.</p>
 
@@ -758,8 +774,10 @@ async def get_similar_queries(query_hash: str, limit: int = 5):
         Download Free
       </a>
     </div>
-    <div class="mt-8 text-xs">
+    <div class="mt-8 flex justify-between text-xs">
+      <a href="b2-ch02-aiops-fundamentals.html" class="text-gray-500 hover:text-gray-300 transition">← Previous Chapter</a>
       <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a>
+      <a href="b2-ch04-ai-query-tuning.html" class="text-violet-400 hover:text-violet-300 transition">Next Chapter →</a>
     </div>
   </article>
   <footer class="border-t border-gray-800/50 px-6 py-8">
