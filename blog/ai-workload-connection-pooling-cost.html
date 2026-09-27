@@ -58,22 +58,30 @@ GROUP BY status;
 
 <h2 class="text-xl font-bold text-white mt-10 mb-4">The fix: pool at the transaction level, not the session level</h2>
 
-<p class="text-gray-300 leading-relaxed">PgBouncer in transaction pooling mode is the single highest-leverage change here. Instead of one database connection per agent session, you get a small pool of real connections shared across every agent worker, checked out only for the duration of an actual transaction — not held across the model inference call in between.</p>
+<p class="text-gray-300 leading-relaxed">Client-side pooling with aggressive connection lifetime management is the single highest-leverage change here. SQL Server drivers pool connections in the client (ADO.NET, ODBC, JDBC all do this by default), so the fix is to make every agent worker check a connection out only for the milliseconds it is actually running a query — open late, close early — and never hold one across the model inference call in between.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># pgbouncer.ini
-[databases]
-app_production = host=db.internal port=5432 dbname=app_production
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>// Connection string: small, bounded pool shared by all agent workers
+"Server=db.internal;Database=app_production;Integrated Security=true;"
++ "Max Pool Size=25;Min Pool Size=0;Connection Lifetime=30;"
++ "Connect Timeout=5;"
 
-[pgbouncer]
-pool_mode = transaction
-max_client_conn = 2000
-default_pool_size = 25
-reserve_pool_size = 5
-server_idle_timeout = 30</code></pre>
+// The pattern that matters: open late, close early —
+// never hold the connection across the inference call
+async Task&lt;string&gt; AgentTurnAsync(string prompt)
+{
+    var answer = await model.GenerateAsync(prompt);   // no connection held here
+    await using var conn = new SqlConnection(connString);
+    await conn.OpenAsync();                            // checked out of the pool
+    await using var cmd = new SqlCommand(
+        "INSERT INTO agent_turns (prompt, answer) VALUES (@p, @a);", conn);
+    cmd.Parameters.AddWithValue("@p", prompt);
+    cmd.Parameters.AddWithValue("@a", answer);
+    await cmd.ExecuteNonQueryAsync();
+} // disposed here → returned to the pool immediately</code></pre>
 
 <p class="text-gray-300 leading-relaxed">2,000 agent workers can now share 25 real backend connections, because each one only holds a connection for the milliseconds it's actually running a query — not for the seconds it's waiting on the model. This is the same pattern serverless applications have used for years; AI agent frameworks just haven't caught up to it yet, so most teams are shipping the naive version by default.</p>
 
-<p class="text-gray-300 leading-relaxed">One real constraint: transaction pooling mode doesn't support session-level features like <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SET</code> statements that need to persist, prepared statements outside a single transaction, or advisory locks held across transactions. If your agent tooling relies on any of these, audit that before flipping the switch — it's a config change, but it's not a zero-risk one.</p>
+<p class="text-gray-300 leading-relaxed">Two real constraints to audit before you rely on this. First, pooling is per distinct connection string and security context — if each agent worker connects as a different login or with a slightly different connection string, you get one pool per variation and the math above falls apart; use a single service login for agent database access. Second, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sp_reset_connection</code> runs every time a connection is reused, so session-level <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SET</code> options, temp tables, and transaction state do not survive a trip back to the pool — design agent tooling to be stateless across queries.</p>
 
 <h2 class="text-xl font-bold text-white mt-10 mb-4">Measure the actual saving, not the theoretical one</h2>
 
