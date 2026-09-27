@@ -41,34 +41,41 @@
 
 <p class="text-gray-300 leading-relaxed">The most common mistake in incident response, AI-assisted or not, is investigating live instead of capturing a snapshot first. Locks clear, queries finish, and the exact state that caused the page often looks completely different two minutes later when you finally start looking. My incident script runs first, before I do anything else, and captures everything in one shot:</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/bin/bash
-# incident_snapshot.sh — run this before touching anything else
-OUT=/tmp/incident_$(date +%s).txt
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- incident_snapshot.sql — run this before touching anything else
+-- sqlcmd -S $server -d master -E -i incident_snapshot.sql -o incident.txt
 
-psql -h $DB_HOST -U $DB_USER -d $DB_NAME <<SQL >> $OUT
-\echo '=== Active queries (>5s) ==='
-SELECT pid, now() - query_start AS duration, wait_event_type, wait_event,
-       left(query, 200) AS query
-FROM pg_stat_activity
-WHERE state != 'idle' AND query_start < now() - interval '5 seconds'
-ORDER BY duration DESC;
+-- === Active requests running longer than 5 seconds ===
+SELECT r.session_id, s.login_name, r.status, r.command,
+       DATEDIFF(SECOND, r.start_time, SYSUTCDATETIME()) AS duration_s,
+       r.wait_type, r.wait_time,
+       SUBSTRING(t.text, 1, 200) AS query_text
+FROM sys.dm_exec_requests AS r
+JOIN sys.dm_exec_sessions AS s ON s.session_id = r.session_id
+CROSS APPLY sys.dm_exec_sql_text(r.sql_handle) AS t
+WHERE r.session_id &gt; 50
+  AND r.start_time &lt; DATEADD(SECOND, -5, SYSUTCDATETIME())
+ORDER BY duration_s DESC;
+GO
 
-\echo '=== Lock waits ==='
-SELECT blocked.pid AS blocked_pid, blocking.pid AS blocking_pid,
-       blocked.query AS blocked_query, blocking.query AS blocking_query
-FROM pg_locks blocked
-JOIN pg_locks blocking ON blocking.locktype = blocked.locktype
-  AND blocking.database IS NOT DISTINCT FROM blocked.database
-  AND blocking.relation IS NOT DISTINCT FROM blocked.relation
-  AND blocking.pid != blocked.pid
-JOIN pg_stat_activity blocked ON blocked.pid = blocked.pid
-WHERE NOT blocked.granted;
+-- === Lock waits: who is waiting, and who is holding the lock ===
+SELECT l.request_session_id AS waiting_session,
+       wt.blocking_session_id,
+       l.resource_type, l.resource_database_id,
+       l.request_mode, l.request_status,
+       SUBSTRING(t.text, 1, 200) AS waiting_query
+FROM sys.dm_tran_locks AS l
+LEFT JOIN sys.dm_os_waiting_tasks AS wt
+  ON wt.session_id = l.request_session_id
+OUTER APPLY (
+    SELECT sql_handle FROM sys.dm_exec_requests
+    WHERE session_id = l.request_session_id
+) AS rh
+OUTER APPLY sys.dm_exec_sql_text(rh.sql_handle) AS t
+WHERE l.request_status = 'WAIT';
+GO
 
-\echo '=== Recent errors ==='
-SELECT * FROM pg_stat_database WHERE datname = current_database();
-SQL
-
-echo "Snapshot saved to $OUT"</code></pre>
+-- === Recent errors from the SQL error log ===
+EXEC xp_readerrorlog 0, 1, N'error', NULL, NULL, NULL, N'desc';</code></pre>
 
 <p class="text-gray-300 leading-relaxed">This takes under ten seconds to run and gives you a frozen record of exactly what the database was doing when the alert fired — which matters twice: once for diagnosis, and again afterward when you write the postmortem and can't remember exactly what you saw.</p>
 
@@ -81,7 +88,7 @@ Deploys in the last 2 hours: none.
 Recent schema changes: none in the last 7 days.
 Traffic: normal, matches yesterday's pattern at this time.
 
-Here is a pg_stat_activity + lock snapshot taken 90 seconds after the alert:
+Here is a dm_exec_requests + lock snapshot taken 90 seconds after the alert:
 [paste snapshot]
 
 What's the most likely root cause, ranked by probability, and what

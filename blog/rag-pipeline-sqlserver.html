@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>RAG on your own PostgreSQL data: a production-ready pipeline — Rajesh Guntupalli</title>
-  <meta name="description" content="A complete, production-minded RAG pipeline built entirely on PostgreSQL — chunking strategy, hybrid retrieval, and the freshness problem nobody's demo accounts for." />
+  <title>RAG on your own SQL Server data: a production-ready pipeline — Rajesh Guntupalli</title>
+  <meta name="description" content="A complete, production-minded RAG pipeline built entirely on SQL Server — chunking strategy, hybrid retrieval with native vectors, and the freshness problem nobody's demo accounts for." />
   <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
@@ -28,60 +28,71 @@
     </div>
   </nav>
   <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
-    <div class="flex gap-2 mb-5"><span class="px-2 py-0.5 bg-blue-900/40 border border-blue-800/40 text-blue-300 text-xs rounded-full">AI + Databases</span><span class="px-2 py-0.5 bg-blue-900/40 border border-blue-800/40 text-blue-300 text-xs rounded-full">PostgreSQL</span></div>
-    <h1 class="text-4xl font-extrabold mb-4 leading-tight">RAG on your own PostgreSQL data: a production-ready pipeline</h1>
+    <div class="flex gap-2 mb-5"><span class="px-2 py-0.5 bg-blue-900/40 border border-blue-800/40 text-blue-300 text-xs rounded-full">AI + Databases</span><span class="px-2 py-0.5 bg-blue-900/40 border border-blue-800/40 text-blue-300 text-xs rounded-full">SQL Server</span></div>
+    <h1 class="text-4xl font-extrabold mb-4 leading-tight">RAG on your own SQL Server data: a production-ready pipeline</h1>
     <div class="flex items-center gap-3 text-xs text-gray-500 mb-10 pb-8 border-b border-gray-800/60">
       <span>Rajesh Guntupalli</span><span>·</span><span>August 2026</span><span>·</span><span>6 min read</span>
     </div>
     <div class="space-y-4 text-sm">
 
-<p class="text-gray-300 leading-relaxed">Most RAG tutorials show you embeddings, a similarity search, and a prompt template, then stop right before the part that actually determines whether the system is useful: what happens when the underlying data changes. I've shipped three RAG systems entirely on PostgreSQL, and the pipeline that survives contact with production looks different from the demo in three specific ways.</p>
+<p class="text-gray-300 leading-relaxed">Most RAG tutorials show you embeddings, a similarity search, and a prompt template, then stop right before the part that actually determines whether the system is useful: what happens when the underlying data changes. I've shipped three RAG systems entirely on SQL Server, and the pipeline that survives contact with production looks different from the demo in three specific ways.</p>
 
 <h2 class="text-xl font-bold text-white mt-10 mb-4">Chunking: boring beats clever</h2>
 
 <p class="text-gray-300 leading-relaxed">I started with semantic chunking — using a model to decide chunk boundaries based on topic shifts — and it produced noticeably better-feeling demo results and noticeably worse production reliability, because chunk boundaries became nondeterministic across re-ingestion runs. What actually shipped: fixed-size chunks with overlap, respecting paragraph and heading boundaries where they exist, with metadata that preserves the document structure the chunk came from.</p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE document_chunks (
-  id BIGSERIAL PRIMARY KEY,
-  document_id BIGINT REFERENCES documents(id),
+  id BIGINT IDENTITY(1,1)
+    CONSTRAINT PK_document_chunks PRIMARY KEY,
+  document_id BIGINT NOT NULL REFERENCES documents(id),
   chunk_index INT NOT NULL,
-  heading_path TEXT,          -- "Chapter 3 > Indexing > B-tree structure"
-  content TEXT NOT NULL,
-  content_tsv TSVECTOR GENERATED ALWAYS AS (to_tsvector('english', content)) STORED,
-  embedding VECTOR(1536),
-  source_updated_at TIMESTAMPTZ NOT NULL,
-  UNIQUE (document_id, chunk_index)
+  heading_path NVARCHAR(500),          -- "Chapter 3 > Indexing > B-tree structure"
+  content NVARCHAR(MAX) NOT NULL,
+  embedding VECTOR(1536) NOT NULL,     -- native vector type (SQL Server 2025)
+  source_updated_at DATETIME2 NOT NULL,
+  CONSTRAINT UQ_document_chunks UNIQUE (document_id, chunk_index)
 );
 
-CREATE INDEX ON document_chunks USING gin (content_tsv);
-CREATE INDEX ON document_chunks USING hnsw (embedding vector_cosine_ops);</code></pre>
+-- DiskANN-backed vector index for fast similarity search
+CREATE VECTOR INDEX IX_document_chunks_embedding
+  ON document_chunks (embedding);</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">heading_path</code> column is the detail most tutorials skip, and it's the one that makes retrieved chunks actually usable — when the model cites "Chapter 3 > Indexing > B-tree structure" instead of an anonymous paragraph, both the model's reasoning and the user's trust improve measurably.</p>
 
 <h2 class="text-xl font-bold text-white mt-10 mb-4">Retrieval: hybrid, not just vector</h2>
 
-<p class="text-gray-300 leading-relaxed">Pure vector similarity misses exact-match queries embarrassingly often — someone searching for an error code, a specific function name, or a SKU wants keyword precision, not semantic similarity, and a vector-only pipeline will confidently return something topically related but wrong. Combining full-text search with vector similarity, using reciprocal rank fusion, fixes this without needing a separate system:</p>
+<p class="text-gray-300 leading-relaxed">Pure vector similarity misses exact-match queries embarrassingly often — someone searching for an error code, a specific function name, or a SKU wants keyword precision, not semantic similarity, and a vector-only pipeline will confidently return something topically related but wrong. Combining SQL Server full-text search with vector similarity, using reciprocal rank fusion, fixes this without needing a separate system:</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>WITH vector_results AS (
-  SELECT id, RANK() OVER (ORDER BY embedding <=> $1) AS rank
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Full-text index for the keyword half of hybrid search
+CREATE FULLTEXT CATALOG ft_catalog;
+CREATE FULLTEXT INDEX ON document_chunks(content)
+  KEY INDEX PK_document_chunks;
+GO
+
+DECLARE @q VECTOR(1536) = ...;      -- the query embedding
+DECLARE @keywords NVARCHAR(4000) = N'...';  -- the raw query text
+
+WITH vector_results AS (
+  SELECT TOP (20) id,
+         RANK() OVER (ORDER BY VECTOR_DISTANCE('cosine', embedding, @q)) AS rnk
   FROM document_chunks
-  ORDER BY embedding <=> $1
-  LIMIT 20
+  ORDER BY VECTOR_DISTANCE('cosine', embedding, @q)
 ),
 text_results AS (
-  SELECT id, RANK() OVER (ORDER BY ts_rank(content_tsv, query) DESC) AS rank
-  FROM document_chunks, plainto_tsquery('english', $2) query
-  WHERE content_tsv @@ query
-  LIMIT 20
+  SELECT TOP (20) c.id,
+         RANK() OVER (ORDER BY ft.[RANK] DESC) AS rnk
+  FROM document_chunks AS c
+  INNER JOIN FREETEXTTABLE(document_chunks, content, @keywords) AS ft
+    ON ft.[KEY] = c.id
 )
 SELECT c.id, c.content, c.heading_path,
-       COALESCE(1.0 / (60 + v.rank), 0) + COALESCE(1.0 / (60 + t.rank), 0) AS score
-FROM document_chunks c
-LEFT JOIN vector_results v ON v.id = c.id
-LEFT JOIN text_results t ON t.id = c.id
+       COALESCE(1.0 / (60 + v.rnk), 0) + COALESCE(1.0 / (60 + t.rnk), 0) AS score
+FROM document_chunks AS c
+LEFT JOIN vector_results AS v ON v.id = c.id
+LEFT JOIN text_results AS t ON t.id = c.id
 WHERE v.id IS NOT NULL OR t.id IS NOT NULL
 ORDER BY score DESC
-LIMIT 8;</code></pre>
+OFFSET 0 ROWS FETCH NEXT 8 ROWS ONLY;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">This single query does what two separate systems and an application-layer merge step would otherwise need to do, and it stays inside one transactional boundary with the rest of your data.</p>
 
@@ -93,21 +104,27 @@ LIMIT 8;</code></pre>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE embedding_refresh_queue (
   chunk_id BIGINT PRIMARY KEY REFERENCES document_chunks(id),
-  queued_at TIMESTAMPTZ DEFAULT now()
+  queued_at DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
 );
+GO
 
-CREATE OR REPLACE FUNCTION queue_embedding_refresh() RETURNS TRIGGER AS $$
+CREATE TRIGGER trg_document_chunks_dirty
+ON document_chunks
+AFTER UPDATE
+AS
 BEGIN
-  INSERT INTO embedding_refresh_queue (chunk_id)
-  VALUES (NEW.id)
-  ON CONFLICT (chunk_id) DO NOTHING;
-  RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
-CREATE TRIGGER document_chunks_dirty
-  AFTER UPDATE OF content ON document_chunks
-  FOR EACH ROW EXECUTE FUNCTION queue_embedding_refresh();</code></pre>
+  SET NOCOUNT ON;
+  IF UPDATE(content)
+  BEGIN
+    INSERT INTO embedding_refresh_queue (chunk_id)
+    SELECT i.id
+    FROM inserted AS i
+    WHERE NOT EXISTS (
+      SELECT 1 FROM embedding_refresh_queue AS q
+      WHERE q.chunk_id = i.id
+    );
+  END
+END;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">A worker drains that queue, calls the embedding API, and updates the row. Simple, observable (queue depth tells you exactly how stale your worst-case chunk is), and it turns "did we remember to re-embed this" from a hope into a measured SLA.</p>
 
