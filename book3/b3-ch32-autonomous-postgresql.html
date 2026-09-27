@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Chapter 32: Autonomous PostgreSQL Systems — The ADE Handbook</title>
-  <meta name="description" content="The ADE Handbook Chapter 32: Autonomous PostgreSQL Systems. Autonomous database engineering for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
+  <title>Chapter 32: Azure SQL Autonomous Services — The ADE Handbook</title>
+  <meta name="description" content="The ADE Handbook Chapter 32: Azure SQL Autonomous Services: serverless, Managed Instance, and control-plane operations. Autonomous database engineering for SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
   <script type="module">
     import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
@@ -41,582 +41,346 @@
       <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">The ADE Handbook</span>
     </div>
     <div class="space-y-4 text-sm">
-<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 32: Autonomous PostgreSQL Systems</h2>
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 32: Azure SQL Autonomous Services: Serverless, Managed Instance, and Control-Plane Operations</h2>
 
-<p class="text-gray-300 leading-relaxed">PostgreSQL was never designed to manage itself — but the ecosystem that has grown around it over the past decade has quietly assembled every component necessary to build a fully autonomous system. Patroni handles HA decisions. pg_auto_failover handles topology changes. pgBouncer manages connection routing. Prometheus and Alertmanager observe and react. Kubernetes operators orchestrate lifecycle events. What most teams lack is not the tooling but the architecture that ties these components into a coherent decision-making system: one that observes its own state, reasons about degradation, and takes corrective action without a human in the loop. This chapter builds that architecture from the ground up, covering autonomous topology management, self-tuning memory and parallelism, automated vacuum and bloat remediation, connection intelligence, and the control-plane patterns that make human intervention the exception rather than the rule.</p>
+<p class="text-gray-300 leading-relaxed">Every autonomous system you build on SQL Server operates inside a platform that is already making autonomous decisions. Azure SQL Database pauses compute when it is idle, scales vCores up and down under load, applies automatic plan corrections when regressions appear, and creates or drops indexes on its own authority. Azure SQL Managed Instance moves your database between service tiers, patches the underlying host without your involvement, and fails over to a secondary when hardware degrades. If your autonomous database engine does not understand what the platform is doing — and, more importantly, does not coordinate with it — the two layers will fight. This chapter maps the autonomous services Azure SQL provides, shows how to observe and configure each one, and builds the coordination layer that lets your ADE and the platform's control plane share responsibility without conflicting.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
+<p class="text-gray-300 leading-relaxed">The distinction matters because the previous chapters built autonomy from scratch: agents, policy engines, DMV-driven sensors. That model fits SQL Server running on virtual machines or on-premises, where you own every decision. On Azure SQL, roughly half of those decisions are already handled by the control plane. The DBA's job shifts from building every autonomous behavior to curating the platform's autonomous behaviors — enabling what helps, bounding what risks, and filling the gaps the platform deliberately leaves open.</p>
 
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">Autonomous Topology Management with Patroni and pg_auto_failover</h3>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">The Platform Autonomy Layer: What Azure SQL Decides for You</h3>
 
-<p class="text-gray-300 leading-relaxed">The first requirement of any autonomous PostgreSQL system is that it knows, at all times, exactly what its topology looks like — and can reshape that topology without human involvement when conditions demand it. Two tools dominate this space: Patroni, which uses a distributed consensus store (etcd, Consul, or ZooKeeper) to manage leader election and replication state, and pg_auto_failover, which embeds topology logic directly into a monitor process that coordinates a simpler two- or three-node architecture. Each has its place.</p>
+<p class="text-gray-300 leading-relaxed">Before coordinating with the platform, you need an accurate inventory of what it does autonomously. The Azure SQL control plane operates at a different layer than your database engine agents: it manages the compute, storage, and availability substrate. Your agents manage the workload inside the database. The boundary between the two is the service tier contract — and every conflict between your ADE and the platform can be traced to an action that crossed that boundary in the wrong direction.</p>
 
-<p class="text-gray-300 leading-relaxed">Patroni is appropriate for clusters where topology complexity is high: multiple standbys, cascading replication, geographic distribution across availability zones, or integration with Kubernetes operators like the Zalando postgres-operator or CloudNativePG. pg_auto_failover is better suited for smaller, high-velocity deployments where simplicity and determinism matter more than flexibility.</p>
+<p class="text-gray-300 leading-relaxed">The platform's autonomous decisions fall into five categories:</p>
 
-<p class="text-gray-300 leading-relaxed">The autonomous pattern requires not just failover capability but *policy-driven* failover — the system must decide when to fail over based on observable signals, not just a timeout. A naive timeout-based failover system will promote a standby that has fallen behind due to network partition, producing a split-brain scenario or data loss. An autonomous system checks replication lag, WAL streaming state, and synchronous commit configuration before making a promotion decision.</p>
+<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Compute lifecycle</strong>: serverless auto-pause and auto-resume, automatic vCore scaling in the serverless and Hyperscale tiers, and elastic pool resource balancing across member databases.</p>
+<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Performance tuning</strong>: automatic plan correction (plan forcing through the Query Store interface), automatic index management (create and drop), and adaptive query processing features that are enabled by default.</p>
+<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Availability</strong>: automatic failover within the availability zone or region, failover groups with automatic geo-failover policies, and zone-redundant configurations that the control plane maintains without operator input.</p>
+<p class="text-gray-300 leading-relaxed">4. <strong class="text-white">Maintenance</strong>: patching of the underlying host and SQL Server build, driven by maintenance window policies you configure but do not execute.</p>
+<p class="text-gray-300 leading-relaxed">5. <strong class="text-white">Backup and retention</strong>: automated full, differential, and log backups on a platform schedule, with long-term retention policies that run as background control-plane operations.</p>
 
-<p class="text-gray-300 leading-relaxed">In a Patroni-managed cluster, the DCS (distributed configuration store) is the source of truth. The following illustrates how to query the current cluster state programmatically, which forms the basis for any autonomous control plane decision:</p>
+<p class="text-gray-300 leading-relaxed">Your ADE owns everything inside the database that the platform explicitly does not: workload classification, custom index strategies beyond the platform's conservative heuristics, query governance, capacity forecasting tied to business events, and any decision that requires knowledge of your application's intent. The coordination rule is simple to state and difficult to enforce: <strong class="text-white">never let both layers tune the same knob.</strong> If automatic index management is enabled, your index-creation agent must not create indexes on the same tables. If the platform owns plan forcing, your plan-forcing agent must defer. The rest of this chapter builds the mechanisms that enforce that rule.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import requests
-import json
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Serverless: Auto-Pause, Auto-Scaling, and the DBA's New Job</h3>
 
-PATRONI_API = "http://patroni-primary:8008"
+<p class="text-gray-300 leading-relaxed">The serverless compute tier is the most visibly autonomous surface in Azure SQL. A serverless database pauses itself after a configurable period of inactivity — typically one hour — and resumes automatically when a new connection arrives. While running, it scales compute between a configured minimum and maximum vCore count based on demand. The DBA configures the envelope; the platform makes every decision inside it.</p>
 
-def get_cluster_state():
-    response = requests.get(f"{PATRONI_API}/cluster", timeout=5)
-    state = response.json()
-    members = state.get("members", [])
-    topology = {}
-    for member in members:
-        topology[member["name"]] = {
-            "role": member["role"],
-            "state": member["state"],
-            "lag": member.get("lag", 0),
-            "timeline": member.get("timeline"),
-            "host": member["host"],
-        }
-    return topology
+<p class="text-gray-300 leading-relaxed">For the ADE, serverless introduces a new operational reality: the database can be absent. Any agent that polls DMVs on a schedule must handle the paused state gracefully — a connection attempt to a paused database triggers auto-resume, which takes 30–60 seconds, and a naive health check will report the database as down during that window. The correct pattern is to query the control plane's view of database state before attempting a data-plane connection:</p>
 
-def evaluate_failover_eligibility(topology):
-    eligible = []
-    for name, info in topology.items():
-        if info["role"] == "replica" and info["state"] == "running":
-            if info["lag"] is not None and info["lag"] &lt; 10485760:  # 10 MB lag threshold
-                eligible.append((name, info["lag"]))
-    return sorted(eligible, key=lambda x: x[1])
-
-topology = get_cluster_state()
-candidates = evaluate_failover_eligibility(topology)
-print(f"Failover candidates by lag: {candidates}")</code></pre>
-
-<p class="text-gray-300 leading-relaxed">This decision logic — promote the replica with the lowest lag that is below an acceptable threshold — replaces the human judgment call that most teams make manually during an incident. The autonomous system runs this evaluation continuously and can trigger a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">patronictl switchover</code> or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">patronictl failover</code> via the REST API when the primary health check fails.</p>
-
-<p class="text-gray-300 leading-relaxed">For clusters using pg_auto_failover, the monitor node exposes its own state machine. The autonomous controller subscribes to state transitions and enforces policy constraints before allowing promotion to proceed:</p>
-
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Equivalent: query AG replica status for autonomous evaluation
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Check whether a serverless database is paused before connecting
+-- Runs against the master database of the logical server
 SELECT
-    ag.name AS ag_name,
-    ar.replica_server_name,
-    ars.role_desc,
-    ars.operational_state_desc,
-    ars.connected_state_desc,
-    ars.synchronization_health_desc,
-    ars.last_commit_time,
-    drs.synchronization_state_desc,
-    drs.log_send_queue_size,
-    drs.redo_queue_size
-FROM sys.availability_groups ag
-JOIN sys.availability_replicas ar ON ag.group_id = ar.group_id
-JOIN sys.dm_hadr_availability_replica_states ars ON ar.replica_id = ars.replica_id
-LEFT JOIN sys.dm_hadr_database_replica_states drs ON ar.replica_id = drs.replica_id
-ORDER BY ag.name, ars.role_desc;</code></pre>
-
-<p class="text-gray-300 leading-relaxed">A mature autonomous topology system also enforces a *failover budget* — a maximum number of automated failovers permitted within a rolling time window. This prevents cascading failures caused by a flapping primary from triggering repeated promotions, each of which carries its own risk. The control plane should record every topology change in an immutable audit log, decrement from the budget, and escalate to human on-call if the budget is exhausted. Autonomy does not mean recklessness; it means that routine, well-understood failures are resolved without human latency.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
-
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">Self-Tuning Memory, Parallelism, and Configuration Drift Correction</h3>
-
-<p class="text-gray-300 leading-relaxed">PostgreSQL's performance is governed by a relatively small set of configuration parameters — <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">shared_buffers</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">work_mem</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">effective_cache_size</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_parallel_workers_per_gather</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">wal_buffers</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">checkpoint_completion_target</code> — but the optimal values for these parameters shift as workloads change. A database serving an OLTP workload at 09:00 may be processing large analytical aggregations by 23:00. A static <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">postgresql.conf</code> will be wrong for both.</p>
-
-<p class="text-gray-300 leading-relaxed">Autonomous configuration management addresses this through *workload fingerprinting* and *parameter policy enforcement*. The system continuously profiles the running workload, classifies it against known archetypes, and adjusts parameters within defined safety bounds using <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALTER SYSTEM</code> — which writes to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">postgresql.auto.conf</code> and survives restarts without touching the managed configuration baseline.</p>
-
-<p class="text-gray-300 leading-relaxed">The workload fingerprinting logic queries <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> and derives a workload signature:</p>
-
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Equivalent workload classification from DMVs
-SELECT
-    SUM(user_seeks + user_scans + user_lookups) AS total_reads,
-    SUM(user_scans) AS full_scans,
-    SUM(user_seeks) AS index_seeks,
-    ROUND(100.0 * SUM(user_scans) /
-        NULLIF(SUM(user_seeks + user_scans + user_lookups), 0), 2) AS pct_full_scans,
-    SUM(range_scan_count) AS range_scans,
-    SUM(singleton_lookup_count) AS point_lookups
-FROM sys.dm_db_index_usage_stats
-WHERE database_id = DB_ID();</code></pre>
-
-<p class="text-gray-300 leading-relaxed">When <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pct_seq_scan</code> exceeds 60 percent combined with a buffer hit ratio below 85 percent, the system classifies the workload as analytically dominated and triggers a parameter adjustment pass. The automation increases <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">effective_cache_size</code> to reflect available OS page cache, raises <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">work_mem</code> for sort-heavy operations, and increases <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_parallel_workers_per_gather</code> toward the defined ceiling.</p>
-
-<p class="text-gray-300 leading-relaxed">The critical discipline here is *bounded autonomy*: the system may never set <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">shared_buffers</code> above 40 percent of total system RAM, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">work_mem</code> beyond a per-session ceiling that would exhaust memory under maximum connection count, or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_parallel_workers</code> beyond the number of available CPU cores minus two (reserved for maintenance tasks). These bounds are encoded as policy, not as hardcoded values, so they can be updated through the configuration management plane without touching the automation code.</p>
-
-<p class="text-gray-300 leading-relaxed">Configuration drift — the condition where <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">postgresql.conf</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">postgresql.auto.conf</code>, and runtime <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SHOW</code> values have diverged from the declared policy baseline — must be detected and remediated automatically. The following illustrates an autonomous drift detection pass:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import subprocess
-import psycopg2
-
-POLICY_BASELINE = {
-    "shared_buffers": "4GB",
-    "work_mem": "64MB",
-    "checkpoint_completion_target": "0.9",
-    "wal_compression": "on",
-    "max_parallel_workers_per_gather": "4",
-}
-
-def check_config_drift(conn_str: str) -&gt; dict:
-    conn = psycopg2.connect(conn_str)
-    cur = conn.cursor()
-    drift = {}
-    for param, expected in POLICY_BASELINE.items():
-        cur.execute("SHOW %s" % param)
-        actual = cur.fetchone()[0]
-        if actual != expected:
-            drift[param] = {"expected": expected, "actual": actual}
-    cur.close()
-    conn.close()
-    return drift
-
-def remediate_drift(conn_str: str, drift: dict):
-    conn = psycopg2.connect(conn_str)
-    cur = conn.cursor()
-    for param, values in drift.items():
-        print(f"Correcting {param}: {values['actual']} -&gt; {values['expected']}")
-        cur.execute(f"ALTER SYSTEM SET {param} = %s", (values["expected"],))
-    conn.commit()
-    cur.execute("SELECT pg_reload_conf()")
-    conn.commit()
-    cur.close()
-    conn.close()
-
-drift = check_config_drift("host=pg-primary dbname=postgres user=automation")
-if drift:
-    remediate_drift("host=pg-primary dbname=postgres user=automation", drift)</code></pre>
-
-<p class="text-gray-300 leading-relaxed">This pattern runs as a scheduled job — every 15 minutes in production environments — and reports any remediations to the audit log with before/after values and timestamps. Parameters that require a restart rather than a reload are flagged but not automatically applied; they are queued for execution during the next maintenance window, which the autonomous scheduler determines based on traffic patterns derived from connection pool metrics.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
-
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">Autonomous Vacuum Management and Bloat Remediation</h3>
-
-<p class="text-gray-300 leading-relaxed">Autovacuum is PostgreSQL's built-in mechanism for reclaiming dead tuples and maintaining planner statistics, but its default configuration is conservative. Left unmanaged, high-write OLTP tables will accumulate dead tuple bloat that degrades query performance, inflates table sizes, and — in the most severe case involving transaction ID wraparound — causes the database to enter read-only mode and refuse new connections. An autonomous system cannot tolerate any of these outcomes.</p>
-
-<p class="text-gray-300 leading-relaxed">The autonomous vacuum controller operates on two tiers: reactive (responding to tables that have already exceeded bloat or dead tuple thresholds) and proactive (adjusting autovacuum parameters per-table based on observed write velocity before problems develop). Most teams only implement the reactive tier. The proactive tier is what distinguishes a truly autonomous system.</p>
-
-<p class="text-gray-300 leading-relaxed">The foundation is a continuous dead tuple monitor that queries <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_user_tables</code> and cross-references with actual table sizes to compute a dead tuple ratio and an estimated bloat percentage:</p>
-
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server equivalent: index fragmentation as the analog to dead tuple bloat
-SELECT
-    OBJECT_SCHEMA_NAME(ips.object_id) AS schema_name,
-    OBJECT_NAME(ips.object_id) AS table_name,
-    i.name AS index_name,
-    ips.index_type_desc,
-    ROUND(ips.avg_fragmentation_in_percent, 2) AS fragmentation_pct,
-    ips.page_count,
-    ips.record_count,
-    CASE
-        WHEN ips.avg_fragmentation_in_percent &gt; 30 THEN 'REBUILD'
-        WHEN ips.avg_fragmentation_in_percent &gt; 10 THEN 'REORGANIZE'
-        ELSE 'OK'
-    END AS recommended_action
-FROM sys.dm_db_index_physical_stats(DB_ID(), NULL, NULL, NULL, 'LIMITED') ips
-JOIN sys.indexes i ON ips.object_id = i.object_id AND ips.index_id = i.index_id
-WHERE ips.page_count &gt; 1000
-ORDER BY ips.avg_fragmentation_in_percent DESC;</code></pre>
-
-<p class="text-gray-300 leading-relaxed">When a table enters CRITICAL status, the autonomous controller evaluates whether to issue a manual <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VACUUM</code> (non-blocking, reclaims dead tuples), <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VACUUM ANALYZE</code> (reclaim plus statistics refresh), or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VACUUM FULL</code> (full rewrite, takes an exclusive lock — almost never appropriate in a live system). For tables where bloat has reached a structural level — the actual physical size has diverged significantly from the expected live-data size — the system invokes <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_repack</code> via a background job, which performs the equivalent of <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VACUUM FULL</code> without taking an exclusive lock.</p>
-
-<p class="text-gray-300 leading-relaxed">The proactive tier is more subtle. For each high-write table, the system sets storage parameters directly to override autovacuum defaults:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Autonomous per-table autovacuum tuning for a high-write events table
-ALTER TABLE events SET (
-    autovacuum_vacuum_scale_factor = 0.01,    -- vacuum at 1% dead tuples (vs default 20%)
-    autovacuum_analyze_scale_factor = 0.005,  -- analyze at 0.5% changes
-    autovacuum_vacuum_cost_delay = 2,         -- ms; more aggressive than default 20ms
-    autovacuum_vacuum_insert_scale_factor = 0.05
-);</code></pre>
-
-<p class="text-gray-300 leading-relaxed">The automation derives these values dynamically: for a table receiving more than 50,000 writes per hour, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">autovacuum_vacuum_scale_factor</code> is set to 0.01; above 500,000 writes per hour, it is set to 0.001. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">autovacuum_vacuum_cost_delay</code> is inversely proportional to available I/O headroom as measured from the storage layer metrics. If the system is under I/O pressure, cost delay increases to reduce autovacuum's I/O footprint; when I/O is available, it decreases to allow faster cleanup.</p>
-
-<p class="text-gray-300 leading-relaxed">Transaction ID wraparound — where a database approaches the 2-billion transaction ID limit and PostgreSQL begins emitting "database is not accepting commands" errors — is a failure that should never reach production in an autonomous system. The controller monitors <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">age(datfrozenxid)</code> against a tiered alert schedule: at 500 million transactions of age, it increases autovacuum aggressiveness; at 1 billion, it triggers a forced <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VACUUM FREEZE</code> on the affected tables; at 1.5 billion, it pages the on-call team regardless of the failover budget because this condition requires human decision-making about maintenance windows.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
-
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">Connection Intelligence: pgBouncer Autonomous Routing and Pool Sizing</h3>
-
-<p class="text-gray-300 leading-relaxed">Connection management is one of the most visible failure modes in PostgreSQL under load. Each PostgreSQL backend is an OS process consuming memory; at hundreds or thousands of direct connections, the overhead of context switching and memory pressure degrades performance for everyone. pgBouncer sits in front of PostgreSQL and multiplexes application connections onto a smaller pool of actual database connections — but a static pgBouncer configuration becomes a bottleneck as workloads evolve.</p>
-
-<p class="text-gray-300 leading-relaxed">An autonomous connection management layer continuously monitors pool utilization, client wait times, and backend saturation, and adjusts pgBouncer configuration dynamically. pgBouncer exposes a management interface via a pseudo-database called <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pgbouncer</code> that accepts control commands at runtime:</p>
-
-
-<p class="text-gray-300 leading-relaxed">The autonomous pool controller interprets these metrics and applies the following decision logic: if <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">cl_waiting</code> exceeds 5 percent of <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">cl_active</code> for more than 30 consecutive seconds, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pool_size</code> is incremented by 10 percent, subject to a maximum that is calculated from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_connections</code> minus reserved connections for administrative access and autovacuum workers. If <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sv_idle</code> exceeds 40 percent of <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pool_size</code> for more than 5 minutes, the pool is shrunk by 10 percent to reclaim backend resources. This hysteresis — requiring a sustained condition before acting, and acting conservatively in both directions — prevents the pool from oscillating continuously.</p>
-
-<p class="text-gray-300 leading-relaxed">Autonomous routing adds another dimension: the connection layer should direct read-only queries to standby replicas when replication lag is below an acceptable threshold, and fall back to the primary when standbys are lagging or unavailable. HAProxy or Nginx can perform this routing based on health check endpoints exposed by Patroni (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">/master</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">/replica</code>), but a more intelligent implementation uses a connection proxy that is aware of the query intent and the current replication state:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import psycopg2
-import requests
-
-PATRONI_PRIMARY = "http://pg-node-1:8008"
-PATRONI_REPLICA_1 = "http://pg-node-2:8008"
-
-PRIMARY_DSN = "host=pg-node-1 port=5432 dbname=app user=app_user"
-REPLICA_DSN = "host=pg-node-2 port=5432 dbname=app user=app_user options=-c default_transaction_read_only=on"
-MAX_ACCEPTABLE_LAG_BYTES = 5 * 1024 * 1024  # 5 MB
-
-def get_replica_lag_bytes(patroni_url: str) -&gt; int:
-    try:
-        resp = requests.get(f"{patroni_url}/patroni", timeout=2)
-        data = resp.json()
-        return data.get("replication", [{}])[0].get("sent_lsn", 0)
-    except Exception:
-        return float("inf")
-
-def get_connection(read_only: bool = False) -&gt; psycopg2.extensions.connection:
-    if read_only:
-        lag = get_replica_lag_bytes(PATRONI_REPLICA_1)
-        if lag &lt; MAX_ACCEPTABLE_LAG_BYTES:
-            try:
-                return psycopg2.connect(REPLICA_DSN)
-            except Exception:
-                pass  # fall through to primary
-    return psycopg2.connect(PRIMARY_DSN)</code></pre>
-
-<p class="text-gray-300 leading-relaxed">This routing logic is the foundation of a connection intelligence layer. In production, it runs inside a pgBouncer-adjacent sidecar or a lightweight connection routing service, and the lag threshold itself is tunable per application tier: analytics applications can tolerate 60 seconds of replica lag; payment processing applications must use the primary exclusively.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
-
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">Autonomous Index Management: Creation, Elimination, and Consolidation</h3>
-
-<p class="text-gray-300 leading-relaxed">Index sprawl is one of the most common performance debt patterns in mature PostgreSQL installations. Tables accumulate indexes added reactively during incidents, never revisited afterward. Write performance degrades as every index must be maintained on INSERT and UPDATE. Query plans become unpredictable as the optimizer weighs an expanding set of options. An autonomous index management system approaches this problem from both ends: identifying missing indexes that would improve query performance, and identifying existing indexes that are unused, duplicated, or partially redundant.</p>
-
-<p class="text-gray-300 leading-relaxed">The missing index signal comes primarily from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> combined with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">EXPLAIN</code> plan analysis. When a query with high <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">total_time</code> shows sequential scans on large tables, the autonomous system generates a candidate index, validates it on a standby using <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">EXPLAIN</code> (not <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">EXPLAIN ANALYZE</code> — we never run the query again just to test), and scores it against the existing index set for redundancy:</p>
-
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Missing index recommendations from Query Store and DMVs
-SELECT TOP 20
-    migs.avg_total_user_cost * migs.avg_user_impact * (migs.user_seeks + migs.user_scans)
-        AS improvement_measure,
-    mid.statement AS table_name,
-    mid.equality_columns,
-    mid.inequality_columns,
-    mid.included_columns,
-    migs.user_seeks,
-    migs.user_scans,
-    migs.last_user_seek,
-    ROUND(migs.avg_total_user_cost, 2) AS avg_query_cost,
-    ROUND(migs.avg_user_impact, 2) AS avg_impact_pct,
-    'CREATE INDEX IX_auto_' +
-        REPLACE(REPLACE(mid.statement, '[', ''), ']', '') +
-        '_' + CONVERT(varchar, mig.index_handle) AS suggested_index_ddl
-FROM sys.dm_db_missing_index_groups mig
-JOIN sys.dm_db_missing_index_group_stats migs ON mig.index_group_handle = migs.group_handle
-JOIN sys.dm_db_missing_index_details mid ON mig.index_handle = mid.index_handle
-WHERE migs.avg_total_user_cost * migs.avg_user_impact * (migs.user_seeks + migs.user_scans) &gt; 1000
-ORDER BY improvement_measure DESC;</code></pre>
-
-<p class="text-gray-300 leading-relaxed">Unused index detection is more straightforward — PostgreSQL tracks index scans, tuple reads, and tuple fetches per index since the last statistics reset. Any index with zero scans since the last reset (which should cover at least one full week of representative workload) is a candidate for elimination:</p>
-
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Unused indexes in SQL Server
-SELECT
-    OBJECT_SCHEMA_NAME(i.object_id) AS schema_name,
-    OBJECT_NAME(i.object_id) AS table_name,
-    i.name AS index_name,
-    i.type_desc,
-    ISNULL(us.user_seeks, 0) AS user_seeks,
-    ISNULL(us.user_scans, 0) AS user_scans,
-    ISNULL(us.user_lookups, 0) AS user_lookups,
-    ISNULL(us.user_seeks + us.user_scans + us.user_lookups, 0) AS total_reads,
-    ISNULL(us.user_updates, 0) AS user_updates,
-    ps.used_page_count * 8 / 1024 AS index_size_mb
-FROM sys.indexes i
-LEFT JOIN sys.dm_db_index_usage_stats us
-    ON i.object_id = us.object_id
-    AND i.index_id = us.index_id
-    AND us.database_id = DB_ID()
-JOIN sys.dm_db_partition_stats ps
-    ON i.object_id = ps.object_id
-    AND i.index_id = ps.index_id
-WHERE i.type_desc NOT IN ('HEAP', 'CLUSTERED')
-  AND i.is_primary_key = 0
-  AND i.is_unique_constraint = 0
-  AND ISNULL(us.user_seeks + us.user_scans + us.user_lookups, 0) &lt; 10
-  AND ps.used_page_count * 8 / 1024 &gt; 10
-ORDER BY user_updates DESC, index_size_mb DESC;</code></pre>
-
-<p class="text-gray-300 leading-relaxed">The autonomous index manager never drops an index immediately. The workflow follows a three-phase safety protocol:</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Phase 1 — Marking.</strong> The index is renamed with an <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">_autonomous_drop_candidate_YYYYMMDD</code> suffix. This change is visible to the DBA team, is logged, and does not affect query execution.</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Phase 2 — Observation.</strong> The system waits for a configurable dwell period — typically 7 to 14 days — while monitoring whether any query plan in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> shows a regression in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">mean_exec_time</code> or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">total_exec_time</code>. If a regression is detected that correlates temporally with the marking, the index is automatically unmarked and restored to its original name, and the incident is recorded.</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Phase 3 — Removal.</strong> After the dwell period with no regression, the index is dropped during a low-traffic window. The DDL is preserved in the audit log so it can be recreated manually if needed.</p>
-
-<p class="text-gray-300 leading-relaxed">For duplicate index detection — where two indexes cover the same leading columns — the system queries <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_index</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_attribute</code> to compare column lists:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Detect duplicate and prefix-duplicate indexes in PostgreSQL
-WITH index_columns AS (
-    SELECT
-        i.indrelid::regclass AS table_name,
-        c.relname AS index_name,
-        i.indisunique,
-        i.indisprimary,
-        array_agg(a.attname ORDER BY pos.ord) AS columns
-    FROM pg_index i
-    JOIN pg_class c ON c.oid = i.indexrelid
-    JOIN pg_class t ON t.oid = i.indrelid
-    JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS pos(attnum, ord) ON TRUE
-    JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = pos.attnum
-    WHERE t.relkind = 'r'
-      AND NOT i.indisprimary
-    GROUP BY i.indrelid, c.relname, i.indisunique, i.indisprimary
-),
-duplicates AS (
-    SELECT
-        a.table_name,
-        a.index_name AS index_a,
-        b.index_name AS index_b,
-        a.columns AS columns_a,
-        b.columns AS columns_b
-    FROM index_columns a
-    JOIN index_columns b
-        ON a.table_name = b.table_name
-        AND a.index_name &lt; b.index_name
-        AND (
-            a.columns = b.columns
-            OR a.columns[1:array_length(b.columns, 1)] = b.columns
-            OR b.columns[1:array_length(a.columns, 1)] = a.columns
-        )
-)
-SELECT * FROM duplicates ORDER BY table_name;</code></pre>
-
-<p class="text-gray-300 leading-relaxed">When duplicates are found, the system keeps the more selective index (or the one with more recent scan activity) and queues the other for the three-phase elimination workflow described above.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
-
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">Query Plan Stability and Autonomous Plan Management</h3>
-
-<p class="text-gray-300 leading-relaxed">Query plan regression is one of the most disruptive events in a production PostgreSQL environment. A statistics refresh, a new index, an autovacuum run on a recently modified table, or a PostgreSQL minor version upgrade can all cause the planner to choose a different execution plan — one that may be dramatically slower than the previous one. An autonomous system needs to detect plan regressions as they occur and respond before they cascade into user-visible latency.</p>
-
-<p class="text-gray-300 leading-relaxed">PostgreSQL does not natively support plan freezing (SQL Server's Query Store plan forcing is the closest analog), but <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_hint_plan</code> provides a mechanism to inject planner hints at query execution time, effectively overriding the optimizer's decisions. The autonomous plan manager uses this as a corrective tool, not a permanent configuration: when a regression is detected, a hint is applied; when the underlying statistics issue is resolved (by a targeted <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ANALYZE</code>), the hint is removed and the system verifies the planner chooses the correct plan natively.</p>
-
-<p class="text-gray-300 leading-relaxed">The regression detection logic operates on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code>, comparing rolling average execution times against a historical baseline:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>from dataclasses import dataclass
-from datetime import datetime, timedelta
-from typing import Optional
-import psycopg2
-
-@dataclass
-class QueryBaseline:
-    queryid: int
-    query_fingerprint: str
-    baseline_mean_ms: float
-    baseline_stddev_ms: float
-    recorded_at: datetime
-
-REGRESSION_THRESHOLD_MULTIPLIER = 3.0  # flag if mean &gt; 3x baseline
-
-def detect_plan_regressions(conn_str: str, baselines: list[QueryBaseline]) -&gt; list[dict]:
-    conn = psycopg2.connect(conn_str)
-    cur = conn.cursor()
-    regressions = []
-
-    for baseline in baselines:
+    d.name                                AS database_name,
+    d.state_desc,
+    DATABASEPROPERTYEX(d.name, 'Status')   AS detailed_status
+FROM sys.databases d
+WHERE d.name = N'OrdersDB';</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The auto-pause delay itself is an autonomous policy decision the DBA configures. Setting it too short means frequent pause/resume cycles — each resume incurs latency and the first queries after resume face a cold buffer pool. Setting it too long wastes the cost advantage that justifies serverless. The ADE can manage this setting as a control-plane action, adjusting the pause delay based on observed connection patterns:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Adjust serverless auto-pause delay from observed idle patterns
+import pyodbc
+import subprocess
+
+def recommend_pause_delay(conn_str: str, database: str) -&gt; int:
+    """Analyze connection gaps; return recommended auto-pause delay in minutes."""
+    with pyodbc.connect(conn_str) as conn:
+        cur = conn.cursor()
         cur.execute("""
-            SELECT
-                mean_exec_time,
-                stddev_exec_time,
-                calls
-            FROM pg_stat_statements
-            WHERE queryid = %s
-        """, (baseline.queryid,))
+            SELECT DATEDIFF(MINUTE, MAX(login_time), SYSUTCDATETIME())
+            FROM sys.dm_exec_sessions
+            WHERE database_id = DB_ID(?)
+              AND is_user_process = 1
+        """, (database,))
         row = cur.fetchone()
-        if row is None:
-            continue
-        current_mean, current_stddev, calls = row
-        if calls &lt; 50:
-            continue  # insufficient sample
-        threshold = baseline.baseline_mean_ms * REGRESSION_THRESHOLD_MULTIPLIER
-        if current_mean &gt; threshold:
-            regressions.append({
-                "queryid": baseline.queryid,
-                "baseline_mean_ms": baseline.baseline_mean_ms,
-                "current_mean_ms": current_mean,
-                "degradation_factor": round(current_mean / baseline.baseline_mean_ms, 2),
-                "calls": calls,
-            })
+        longest_recent_idle_min = row[0] if row and row[0] else 0
 
-    cur.close()
-    conn.close()
-    return regressions</code></pre>
+    # If the longest recent idle gap is well under the current delay,
+    # the delay can be shortened without causing resume storms.
+    if longest_recent_idle_min &lt; 30:
+        return 60     # keep default: workload is bursty, avoid resume latency
+    elif longest_recent_idle_min &gt; 240:
+        return 120    # long idle stretches: pause sooner, save cost
+    return 60
 
-<p class="text-gray-300 leading-relaxed">When a regression is detected, the autonomous system performs three immediate actions:</p>
+def apply_pause_delay(server: str, resource_group: str, database: str, delay_min: int):
+    subprocess.run([
+        "az", "sql", "db", "update",
+        "--resource-group", resource_group,
+        "--server", server,
+        "--name", database,
+        "--auto-pause-delay", str(delay_min),
+    ], check=True)</code></pre>
 
-<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Targeted ANALYZE.</strong> Run <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ANALYZE</code> on the tables involved in the regressed query's most recently observed plan. Fresh statistics frequently resolve planner regressions caused by stale row-count estimates.</p>
+<p class="text-gray-300 leading-relaxed">The deeper lesson of serverless is that the DBA's autonomous agents must become <strong class="text-white">state-aware of the platform</strong>. Every agent in your ADE should check database state before acting, back off during resume, and distinguish "database is paused" from "database is down." That check is a few lines of code, but without it, the autonomous system will page you at 3 AM because a dev database did exactly what you configured it to do.</p>
 
-<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Plan capture.</strong> Use <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">EXPLAIN (FORMAT JSON)</code> to capture the current plan and compare it structurally to the last known good plan stored in the baseline catalog. If the plan structure has changed (for example, a nested loop replaced a hash join), the change is recorded as the probable cause.</p>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Elastic Pools: Autonomous Resource Sharing Across Databases</h3>
 
-<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Hint injection.</strong> If the targeted ANALYZE does not resolve the regression within two evaluation cycles (typically 10 minutes), <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_hint_plan</code> is used to enforce the last-known-good join order and scan method. The hint is stored in the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">hint_plan.hints</code> management table that the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_hint_plan</code> extension reads at parse time.</p>
+<p class="text-gray-300 leading-relaxed">Elastic pools are the platform's answer to the multi-tenant resource problem: instead of provisioning peak capacity for every database, you provision a shared pool of eDTUs or vCores and let the platform distribute them. The pool's resource governor is itself an autonomous system — it throttles individual databases that exceed their per-database max, borrows idle capacity for databases under load, and enforces the pool's aggregate limits.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL (pg_hint_plan table insertion):</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Inject a stabilizing hint for a regressed query
-INSERT INTO hint_plan.hints (norm_query_string, application_name, hints)
-VALUES (
-    'SELECT * FROM orders o JOIN customers c ON o.customer_id = c.id WHERE o.status = $1',
-    '',  -- apply to all application connections
-    'HashJoin(o c) SeqScan(o) IndexScan(c)'
-);</code></pre>
+<p class="text-gray-300 leading-relaxed">The coordination question for the ADE is placement: which databases belong in which pool, and when should a database graduate from a pool to a single database (or vice versa)? The platform will never make that decision for you — it manages resources within the pool, not membership of the pool. Your ADE fills the gap by monitoring per-database resource consumption against pool limits:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server (Query Store plan forcing — native capability):</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Force a specific plan in SQL Server Query Store
-USE app_database;
-
--- Find the last known good plan for a query
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Elastic pool pressure: which databases are consistently consuming
+-- a disproportionate share of the pool?
 SELECT
-    qsq.query_id,
-    qsp.plan_id,
-    qsp.last_execution_time,
-    qsp.avg_duration / 1000.0 AS avg_duration_ms,
-    qsp.count_executions
-FROM sys.query_store_query qsq
-JOIN sys.query_store_plan qsp ON qsq.query_id = qsp.query_id
-JOIN sys.query_store_runtime_stats qsrs ON qsp.plan_id = qsrs.plan_id
-WHERE qsq.query_hash = 0x &lt;your_query_hash&gt;
-ORDER BY qsp.last_execution_time DESC;
+    DB_NAME(r.database_id)                       AS database_name,
+    AVG(r.avg_cpu_percent)                       AS avg_cpu_pct,
+    MAX(r.avg_cpu_percent)                       AS max_cpu_pct,
+    AVG(r.avg_data_io_percent)                   AS avg_data_io_pct,
+    AVG(r.avg_log_write_percent)                 AS avg_log_write_pct,
+    COUNT(*)                                     AS samples
+FROM sys.elastic_pool_resource_stats r
+WHERE r.end_time &gt;= DATEADD(DAY, -7, GETUTCDATE())
+GROUP BY r.database_id
+HAVING AVG(r.avg_cpu_percent) &gt; 40
+ORDER BY avg_cpu_pct DESC;</code></pre>
 
--- Force the last known good plan
-EXEC sys.sp_query_store_force_plan
-    @query_id = &lt;query_id&gt;,
-    @plan_id = &lt;last_known_good_plan_id&gt;;</code></pre>
+<p class="text-gray-300 leading-relaxed">The policy that consumes this data is straightforward: a database that averages above 40% of the pool's CPU for a week is a candidate for graduation to a single database, because it is both paying for capacity it could use alone and starving its pool neighbors of burst headroom. Conversely, a single database averaging under 10% CPU is a candidate for pool membership. These are control-plane actions — executed through the Azure CLI or ARM templates, not through T-SQL — which is exactly why they belong in your ADE's control-plane action layer rather than in any database-internal agent.</p>
 
-<p class="text-gray-300 leading-relaxed">The autonomous plan manager maintains a plan stability catalog — a table recording every queryid, its baseline execution profile, the last forced hint (if any), and the timestamp of the last regression event. This catalog is the input to a weekly plan health report that surfaces queries that have required intervention, allowing the DBA team to address root causes (missing statistics targets, poor histogram column coverage, correlation statistics) rather than relying on hints indefinitely.</p>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Automatic Tuning: The Platform's Query Governor</h3>
 
-<p class="text-gray-300 leading-relaxed">---</p>
+<p class="text-gray-300 leading-relaxed">Automatic tuning is where platform autonomy most directly overlaps with the agents built in earlier chapters — and where the "never tune the same knob twice" rule is most important. Azure SQL offers three automatic tuning options: automatic plan correction, automatic index management (create and drop), and the legacy automatic plan-choice correction. Each can be enabled independently per database.</p>
 
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">The Autonomous Control Plane: Event Loop, Audit, and Human Escalation</h3>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Inspect and configure automatic tuning per database
+SELECT
+    name,
+    desired_state_desc   AS plan_correction,
+    actual_state_desc    AS actual_state,
+    reason_desc
+FROM sys.database_automatic_tuning_options;
 
-<p class="text-gray-300 leading-relaxed">All of the autonomous behaviors described in the preceding sections — topology management, configuration tuning, vacuum remediation, connection routing, index management, plan stability enforcement — must be coordinated through a unified control plane. Without coordination, autonomous subsystems can conflict: the connection pool scaler may increase pool size at the same moment the configuration tuner is reducing <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_connections</code>, for example. The control plane is the arbitration layer that prevents such conflicts, enforces action budgets, and determines when autonomy must give way to human judgment.</p>
+-- Enable plan correction only; leave index management to the ADE
+ALTER DATABASE [OrdersDB]
+    SET AUTOMATIC_TUNING (
+        FORCE_LAST_GOOD_PLAN = ON,
+        CREATE_INDEX = OFF,
+        DROP_INDEX = OFF
+    );</code></pre>
 
-<p class="text-gray-300 leading-relaxed">The control plane architecture has five components:</p>
+<p class="text-gray-300 leading-relaxed">The recommended division of labor: let the platform own <strong class="text-white">automatic plan correction</strong> and let your ADE own <strong class="text-white">index management</strong>, or vice versa — but document the choice and enforce it. The platform's plan correction is conservative, well-tested, and operates through the same Query Store plan-forcing mechanism your agents would use. There is no value in duplicating it. The platform's index management is similarly conservative — it creates indexes only for clear-cut missing-index cases and drops only indexes it created itself after a dwell period. If your ADE has a richer index strategy (workload-aware consolidation, columnstore evaluation, partitioning-aware placement), disable the platform's and let yours own the knob.</p>
 
-<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">The Observation Bus.</strong> A continuous stream of metric events ingested from Prometheus, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_*</code> views, Patroni API, pgBouncer admin, and OS-level metrics (CPU, memory, I/O wait). Events are normalized into a common schema and written to a time-series buffer.</p>
+<p class="text-gray-300 leading-relaxed">Whatever the division, your ADE must observe what the platform did. The tuning recommendations DMV is the observation surface:</p>
 
-<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">The Rule Engine.</strong> A set of declarative rules — encoded as YAML or in a domain-specific policy language — that map observation patterns to candidate actions. Rules are versioned and auditable.</p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- What has automatic tuning done lately? Feed this into the ADE audit log.
+SELECT
+    r.reason,
+    r.score,
+    JSON_VALUE(CAST(r.details AS NVARCHAR(MAX)), '$.implementationDetails.script')
+        AS implementation_script,
+    r.state                                 AS recommendation_state,
+    r.created                               AS recommended_at,
+    r.last_refresh                          AS last_evaluated
+FROM sys.dm_db_tuning_recommendations r
+ORDER BY r.last_refresh DESC;</code></pre>
 
-<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">The Action Queue.</strong> A prioritized queue of candidate actions. Before any action is dequeued and executed, it is evaluated for conflicts against currently executing actions, checked against the relevant budget (failover budget, vacuum budget, DDL budget), and logged with a pre-execution fingerprint.</p>
+<p class="text-gray-300 leading-relaxed">Ingesting the platform's tuning history into your ADE's action log closes the loop: when your index agent proposes a new index, it can check whether the platform already created, evaluated, and dropped a similar index — and learn from that outcome instead of repeating the experiment. Platform actions are not noise in your telemetry. They are the most authoritative signal available about what has already been tried.</p>
 
-<p class="text-gray-300 leading-relaxed">4. <strong class="text-white">The Executor.</strong> The component that actually runs actions: calling Patroni APIs, issuing <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALTER SYSTEM</code>, invoking <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_repack</code>, updating pgBouncer configuration, inserting into <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">hint_plan.hints</code>. The executor is the only component with write access to the database infrastructure.</p>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Managed Instance: Service Tiers and Control-Plane Operations</h3>
 
-<p class="text-gray-300 leading-relaxed">5. <strong class="text-white">The Escalation Manager.</strong> When budgets are exhausted, when actions fail, when contradictory signals make autonomous decision-making unsafe, or when a pre-defined confidence threshold is not met, the escalation manager creates an incident in the team's alerting system (PagerDuty, Opsgenie, or equivalent) with a structured context payload that tells the on-call engineer exactly what the system observed, what it tried, and why it stopped.</p>
+<p class="text-gray-300 leading-relaxed">Azure SQL Managed Instance is the platform surface closest to the self-managed SQL Server of the earlier chapters — you get SQL Agent, cross-database queries, CLR, and Service Broker — but the control plane still owns the host. Patching, failover, storage management, and high-availability topology are platform decisions. The DBA's autonomous agents run inside the instance exactly as they would on a VM, with two critical differences: some DMVs and configuration options are restricted, and the instance can be stopped and started as a control-plane operation.</p>
 
-<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph LR
-    A[Observation Bus\nPrometheus, pg_stat_*, Patroni, pgBouncer, OS metrics] --> B[Rule Engine\nversioned policy]
-    B --> C[Action Queue\nconflict + budget checks]
-    C --> D[Executor\nPatroni API, ALTER SYSTEM, pg_repack, pgBouncer, hint_plan.hints]
-    D --> E[(Audit Log)]
-    C -->|Budget exhausted / low confidence| F[Escalation Manager]
-    F --> G[PagerDuty / Opsgenie Incident]
-    H[(Inhibit Table)] -.blocks.-> D</pre></div>
+<p class="text-gray-300 leading-relaxed">The stop/start capability is the Managed Instance equivalent of serverless auto-pause, and it creates the same state-awareness requirement for your agents. A stopped instance refuses connections with a control-plane error, not a database error — your ADE's health checks must distinguish the two, because "stopped by policy" is not an incident.</p>
 
-<p class="text-gray-300 leading-relaxed">*The five-component control plane: every candidate action passes through budget and conflict checks before execution, and the inhibit table can halt the executor at any time regardless of what the rule engine proposes.*</p>
+<p class="text-gray-300 leading-relaxed">The more strategically interesting autonomy in Managed Instance is the <strong class="text-white">service tier update</strong>: scaling vCores, moving between General Purpose and Business Critical, or enabling zone redundancy. These are online operations in most cases, but they are not free — a tier change restarts the SQL Server process, dropping the buffer pool and plan cache. Your ADE should treat a tier change the way it treats a failover: schedule it in a maintenance window, warm the cache afterward, and verify query performance against baseline before declaring success:</p>
 
-<p class="text-gray-300 leading-relaxed">The escalation context payload is important enough to design carefully. An on-call engineer receiving an alert at 02:00 needs to be able to understand the system's reasoning within 30 seconds:</p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Coordinated Managed Instance tier change with post-change verification
+import subprocess
+import pyodbc
+import time
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>{
-  "incident_id": "auto-20240315-0214-0032",
-  "severity": "P2",
-  "component": "vacuum_controller",
-  "cluster": "prod-pg-cluster-1",
-  "summary": "Transaction ID age approaching safety threshold on table public.events",
-  "observations": {
-    "table": "public.events",
-    "age_datfrozenxid": 1420000000,
-    "age_threshold_for_escalation": 1500000000,
-    "last_vacuum_freeze": "2024-02-28T04:12:00Z",
-    "autovacuum_running": false,
-    "estimated_time_to_threshold_hours": 18
-  },
-  "actions_taken": [
-    {
-      "action": "set_autovacuum_freeze_max_age",
-      "parameter": "autovacuum_freeze_max_age",
-      "new_value": "500000000",
-      "timestamp": "2024-03-15T02:10:00Z",
-      "result": "success"
-    },
-    {
-      "action": "trigger_manual_vacuum_freeze",
-      "table": "public.events",
-      "timestamp": "2024-03-15T02:11:00Z",
-      "result": "failed",
-      "error": "autovacuum launcher not responding"
-    }
-  ],
-  "recommended_action": "Manually execute VACUUM FREEZE public.events from a psql session. Verify autovacuum launcher process is alive.",
-  "runbook_url": "https://internal-wiki/runbooks/txid-wraparound-response"
-}</code></pre>
+def scale_managed_instance(server: str, resource_group: str,
+                           vcore: int, tier: str, conn_str: str):
+    # 1. Capture pre-change baseline
+    with pyodbc.connect(conn_str) as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT AVG(avg_cpu_percent) FROM sys.dm_db_resource_stats
+            WHERE end_time &gt;= DATEADD(HOUR, -1, GETUTCDATE())
+        """)
+        baseline_cpu = cur.fetchone()[0]
 
-<p class="text-gray-300 leading-relaxed">This structured escalation context means the on-call engineer arrives at the problem with full situational awareness. They do not need to diagnose what the system already diagnosed — they need to take the specific action that the system could not safely take autonomously.</p>
+    # 2. Execute the control-plane scaling operation
+    subprocess.run([
+        "az", "sql", "mi", "update",
+        "--resource-group", resource_group,
+        "--name", server,
+        "--vcore", str(vcore),
+        "--tier", tier,
+    ], check=True)
 
-<p class="text-gray-300 leading-relaxed">The audit log is equally critical. Every action taken by the autonomous system — whether successful or not — is written to an append-only audit table:</p>
+    # 3. Wait for the instance to come back online
+    for _ in range(60):
+        try:
+            with pyodbc.connect(conn_str, timeout=10) as conn:
+                conn.cursor().execute("SELECT 1")
+            break
+        except Exception:
+            time.sleep(30)
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Autonomous action audit log schema
-CREATE TABLE autonomous_actions (
-    action_id       BIGSERIAL PRIMARY KEY,
-    action_time     TIMESTAMPTZ NOT NULL DEFAULT now(),
-    component       TEXT NOT NULL,
-    cluster_name    TEXT NOT NULL,
-    action_type     TEXT NOT NULL,
-    target_object   TEXT,
-    parameters      JSONB,
-    pre_state       JSONB,
-    post_state      JSONB,
-    result          TEXT NOT NULL CHECK (result IN ('success', 'failed', 'skipped', 'escalated')),
-    error_detail    TEXT,
-    triggered_by    TEXT NOT NULL  -- 'rule:vacuum_critical', 'rule:config_drift', etc.
-);
+    # 4. Warm the buffer pool and plan cache with the top workload queries
+    with pyodbc.connect(conn_str) as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT TOP 20 query_sql_text
+            FROM sys.query_store_query
+            ORDER BY last_execution_time DESC
+        """)
+        for (sql_text,) in cur.fetchall():
+            try:
+                cur.execute("SET ROWCOUNT 1")
+                cur.execute(sql_text)
+                cur.execute("SET ROWCOUNT 0")
+            except Exception:
+                pass  # best-effort warming; individual failures are fine</code></pre>
 
-CREATE INDEX ON autonomous_actions (action_time DESC);
-CREATE INDEX ON autonomous_actions (component, action_time DESC);
-CREATE INDEX ON autonomous_actions (cluster_name, result, action_time DESC);</code></pre>
+<p class="text-gray-300 leading-relaxed">Note what this script does not do: it does not decide <em>whether</em> to scale. That decision belongs to the capacity-planning policy from Chapter 14, running in your ADE. The script is the execution arm — the control-plane action that the policy invokes. Keeping the decision layer (your ADE) separate from the execution layer (platform APIs) is what makes the system auditable: every scaling event traces back to a policy evaluation with a recorded rationale.</p>
 
-<p class="text-gray-300 leading-relaxed">This table serves two purposes beyond auditability: it is the input to the budget enforcement calculation (counting actions of each type within a rolling window), and it feeds the weekly operational review that should be part of every team running an autonomous system. That review asks not only "what did the system fix?" but "what should the system have fixed but didn't, and why?"</p>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Failover Groups: Autonomous Geo-Failover Policy</h3>
 
-<p class="text-gray-300 leading-relaxed">The question of human override is non-negotiable. Every autonomous action type must have a corresponding inhibit mechanism: a flag in a control table, a Patroni tag, a pgBouncer PAUSE command, or an environment variable read at action evaluation time. When an operator sets an inhibit flag, the relevant subsystem stops acting autonomously and escalates all decisions immediately. This is the emergency brake, and it must be reliable, fast, and well-documented.</p>
+<p class="text-gray-300 leading-relaxed">Failover groups are the clearest example of platform autonomy done well. You define a primary and a secondary in different regions, configure a failover policy — automatic or manual — and a grace period. If the primary becomes unreachable, the control plane evaluates the outage against the grace period and fails over automatically. Read-write and read-only listeners follow the role change without application reconfiguration.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Autonomous control inhibit table
-CREATE TABLE autonomous_inhibits (
-    inhibit_id      SERIAL PRIMARY KEY,
-    component       TEXT NOT NULL,   -- 'vacuum_controller', 'topology_manager', 'ALL'
-    cluster_name    TEXT NOT NULL,
-    inhibited_by    TEXT NOT NULL,
-    inhibit_reason  TEXT NOT NULL,
-    inhibit_start   TIMESTAMPTZ NOT NULL DEFAULT now(),
-    inhibit_until   TIMESTAMPTZ,     -- NULL means indefinite
-    released_at     TIMESTAMPTZ
-);
+<p class="text-gray-300 leading-relaxed">The grace period is the autonomy knob, and it deserves the same policy treatment as any threshold in your ADE. The default of one hour is conservative: it prevents flapping during transient outages but accepts up to an hour of downtime before failing over. For a payment database, that is far too long; for a dev database, it is appropriately cautious. Your ADE can manage grace periods as policy, tightening them for databases whose RTO demands it:</p>
 
--- Check function used by all autonomous components before taking action
-CREATE OR REPLACE FUNCTION is_autonomous_action_inhibited(
-    p_component TEXT,
-    p_cluster   TEXT
-) RETURNS BOOLEAN AS $$
-    SELECT EXISTS (
-        SELECT 1 FROM autonomous_inhibits
-        WHERE (component = p_component OR component = 'ALL')
-          AND cluster_name = p_cluster
-          AND released_at IS NULL
-          AND (inhibit_until IS NULL OR inhibit_until &gt; now())
-    );
-$$ LANGUAGE sql STABLE;</code></pre>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Set failover group policy from RTO requirements
+import subprocess
 
-<p class="text-gray-300 leading-relaxed">Every autonomous component calls <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">is_autonomous_action_inhibited()</code> before executing any action. If it returns true, the action is logged with result <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">skipped</code> and the escalation manager is notified. This single check is the integration point between human judgment and automated execution — simple, auditable, and reliable under all conditions.</p>
+def configure_failover_group(server: str, resource_group: str,
+                             group_name: str, rto_minutes: int):
+    # Grace period must cover transient blips but respect the RTO.
+    # Policy: grace = RTO minus expected failover time, capped at 60 min.
+    grace_minutes = max(60, min(3600, (rto_minutes - 5) * 60))
+    grace_hours = max(1, grace_minutes // 60)
+    mode = "Automatic" if rto_minutes &lt;= 30 else "Manual"
 
-<p class="text-gray-300 leading-relaxed">---</p>
+    subprocess.run([
+        "az", "sql", "failover-group", "update",
+        "--resource-group", resource_group,
+        "--server", server,
+        "--name", group_name,
+        "--failover-policy", mode,
+        "--grace-period", str(grace_hours),
+    ], check=True)
+    print(f"{group_name}: policy={mode}, grace-period={grace_hours}h for RTO {rto_minutes}min")</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The critical coordination point: your ADE's own failover agents must be <strong class="text-white">disabled for any database in an automatic failover group</strong>. Two failover authorities — your agent and the platform — will eventually disagree about whether a failover is warranted, and the result is a failover war: the platform fails over to the secondary, your agent detects the old primary as "unhealthy primary" and tries to fail back, and the database ping-pongs between regions. The ADE's topology inventory must mark failover-group members as platform-managed for availability, and the failover policy engine must refuse to evaluate them. This is the single most important coordination rule in the chapter, and it is worth enforcing in code rather than in documentation.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">sequenceDiagram
+    participant App as Application
+    participant Listener as Failover Group Listener
+    participant Primary as Primary Region
+    participant Platform as Control Plane
+    participant Secondary as Secondary Region
+
+    App->>Listener: Read-write traffic
+    Listener->>Primary: Route to current primary
+    Primary-->>Platform: Health signal lost
+    Platform->>Platform: Grace period evaluation
+    Platform->>Secondary: Initiate geo-failover
+    Secondary-->>Platform: Role change complete
+    Platform->>Listener: Update listener DNS
+    Listener->>App: Traffic now routes to new primary
+    Note over Platform: ADE failover agents stay idle:<br/>availability is platform-managed</pre></div>
+
+<p class="text-gray-300 leading-relaxed"><em>The platform-owned failover path: the control plane evaluates the outage against the grace period and fails over without ADE involvement. Your agents observe and log; they do not act.</em></p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Maintenance Windows and Update Policies</h3>
+
+<p class="text-gray-300 leading-relaxed">Platform patching is autonomous by design — you cannot log into the host and run Windows Update — but the <em>schedule</em> is yours to configure. Maintenance windows let you declare when the platform is allowed to patch: a day of the week and a time range, aligned with your own maintenance windows from Chapter 23. The coordination value is obvious: if your ADE schedules index rebuilds for Saturday 02:00 and the platform patches at Saturday 02:00, the two will contend for I/O and the rebuild will run against a cold cache after the host restarts.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Align platform maintenance windows with the ADE's own maintenance schedule
+import subprocess
+
+WEEKDAYS = ["", "Monday", "Tuesday", "Wednesday",
+            "Thursday", "Friday", "Saturday", "Sunday"]
+
+def set_maintenance_window(server: str, resource_group: str,
+                           db_name: str, day: int, start_hour: int):
+    # day: 1=Monday .. 7=Sunday; start_hour: 0-23
+    # Keep the platform window OUTSIDE the ADE's Saturday 02:00 rebuild window
+    subprocess.run([
+        "az", "sql", "db", "update",
+        "--resource-group", resource_group,
+        "--server", server,
+        "--name", db_name,
+        "--maint-config-id",
+        "SQL_{}_{}".format(WEEKDAYS[day], start_hour),
+    ], check=True)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The update policy for Managed Instance deserves separate attention: instances can be pinned to a specific SQL Server build or follow the platform's rolling update train. For production instances under ADE management, the policy should be explicit and version-controlled — the ADE's change-management integration from Chapter 25 should record every platform build change the way it records every schema change, because a build change can alter query plans just as surely as a statistics update can.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Azure Arc: Extending Control-Plane Autonomy to Your Own Infrastructure</h3>
+
+<p class="text-gray-300 leading-relaxed">Azure Arc-enabled SQL Server brings a subset of the platform's control-plane autonomy to SQL Server running on your own VMs or on-premises: centralized inventory, automated patch assessment, and policy-driven configuration through Azure Policy. For the ADE, Arc is the bridge that lets one autonomous system manage a hybrid fleet with one set of policies.</p>
+
+<p class="text-gray-300 leading-relaxed">The practical value is inventory and compliance rather than deep autonomy: Arc tells your ADE which instances exist, what versions they run, and whether they comply with the policies you declare — password rotation, TLS configuration, audit enablement. Your ADE's agents then enforce the database-internal state, while Arc enforces the host-level state. The division mirrors the cloud division: platform owns the substrate, ADE owns the workload.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Arc-enabled instances report into the same inventory the ADE already uses.
+-- Reconcile Arc inventory against the ADE's known fleet weekly:
+-- any instance in Arc but missing from the ADE is unmanaged autonomy debt.
+SELECT
+    arc.instance_name,
+    arc.version,
+    arc.last_seen_utc,
+    ade.last_checkin_utc,
+    CASE
+        WHEN ade.instance_name IS NULL THEN 'UNMANAGED_BY_ADE'
+        WHEN arc.last_seen_utc &lt; DATEADD(DAY, -1, SYSUTCDATETIME()) THEN 'STALE_ARC_DATA'
+        ELSE 'COVERED'
+    END AS coverage_state
+FROM arc_inventory arc
+LEFT JOIN ade_fleet_inventory ade
+    ON ade.instance_name = arc.instance_name;</code></pre>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">The Shared-Responsibility Contract: Encoding It in Policy</h3>
+
+<p class="text-gray-300 leading-relaxed">Every coordination rule in this chapter — who owns plan forcing, who owns failover, who owns index management — is a candidate for encoding in the ADE's policy engine rather than living in runbooks. The shared-responsibility contract is a policy document that the ADE loads at startup and enforces on every action:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># shared_responsibility.yaml — who owns what, enforced by the ADE policy engine
+platform_managed:
+  availability:
+    - "databases in automatic failover groups"
+    - "zone-redundant Business Critical databases"
+  performance:
+    - "automatic plan correction (FORCE_LAST_GOOD_PLAN = ON)"
+  compute:
+    - "serverless auto-pause and auto-scale"
+    - "elastic pool resource distribution"
+  maintenance:
+    - "host patching within configured maintenance windows"
+
+ade_managed:
+  availability:
+    - "AG failover for self-managed SQL Server (VMs, on-premises)"
+    - "failover-group grace period and policy configuration"
+  performance:
+    - "index lifecycle management (platform CREATE_INDEX = OFF)"
+    - "statistics maintenance and custom plan forcing"
+  compute:
+    - "elastic pool membership and graduation decisions"
+    - "serverless auto-pause delay tuning"
+  maintenance:
+    - "maintenance window alignment and build-change tracking"
+
+conflict_rules:
+  - rule: "If platform owns plan correction, ADE plan-forcing agent is disabled for that database."
+  - rule: "If database is in an automatic failover group, ADE failover evaluation is refused."
+  - rule: "Platform tuning recommendations are ingested into the ADE action log before any ADE index action on the same table."</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The enforcement mechanism is a pre-action check in the ADE's action dispatcher — the same pattern as the deployment-window guard from Chapter 28. Before any autonomous action executes, the dispatcher evaluates it against the shared-responsibility contract. An index-creation action on a database where the platform owns index management is refused with a structured log entry, not executed and hoped for the best.</p>
+
+<p class="text-gray-300 leading-relaxed">This contract is also the document you show an auditor. When the auditor asks "who decided to drop that index," the answer is either a platform tuning record with a timestamp and a score, or an ADE action log entry with a policy evaluation and a human approval — never "we don't know, both layers can do that." Shared responsibility without a written contract is just shared blame.</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Autonomous topology management requires policy-driven failover**, not timeout-based failover. Evaluating replication lag, synchronous commit state, and WAL streaming continuity before promoting a replica prevents the data loss and split-brain scenarios that naive automation produces. Failover budgets — maximum automated promotions within a rolling window — prevent cascading failures from spiraling beyond recovery.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Never let both layers tune the same knob.</strong> The platform's autonomous services and your ADE must have a written, policy-enforced division of labor. Every overlap — plan forcing, index management, failover, compute scaling — is a future incident. Encode the division in the shared-responsibility contract and enforce it in the action dispatcher.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Self-tuning configuration requires bounded autonomy with workload fingerprinting.** `ALTER SYSTEM` allows parameter changes that survive restart without touching managed configuration baselines, but every parameter must be bounded by policy — memory fractions, CPU counts, and connection limits — that the automation enforces without exception. Configuration drift detection closes the loop, ensuring that actual runtime values converge on declared policy rather than drifting silently.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Your agents must be platform-state-aware.</strong> Serverless pause, Managed Instance stop/start, and failover-group transitions are not failures. Agents that treat them as failures will page you for correct platform behavior. Check database state through the control plane's view before acting through the data plane.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Vacuum management operates on two tiers: reactive remediation and proactive per-table tuning.** The reactive tier responds to accumulated dead tuples and bloat; the proactive tier adjusts `autovacuum_vacuum_scale_factor` and cost delay parameters per table based on observed write velocity, preventing problems before they require intervention. Transaction ID wraparound monitoring with tiered alert thresholds ensures this failure mode is addressed with days of runway rather than minutes.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Ingest platform actions into your action log.</strong> Automatic tuning recommendations, tier changes, and failover events are the most authoritative signal available about what has already been tried. An ADE that ignores the platform's history will repeat its experiments and contradict its decisions.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Index management in an autonomous system follows a three-phase safety protocol**: mark, observe, remove. Immediate index drops — even for provably unused indexes — carry operational risk. The dwell period with regression monitoring converts a high-risk manual operation into a low-risk automated one. Duplicate index detection and the missing index signal from `pg_stat_statements` combined with execution plan analysis complete the index lifecycle management loop.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Availability in a failover group is platform-managed — keep your failover agents idle.</strong> Two failover authorities will eventually disagree, and the result is a failover war between regions. Mark platform-managed databases in the topology inventory and refuse failover evaluation for them in code, not just in documentation.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The autonomous control plane is the architecture that makes individual autonomous subsystems safe to operate together.** The observation bus, rule engine, action queue, executor, and escalation manager form a coherent decision-making system. The audit log and inhibit mechanism are not optional add-ons — they are the foundation of operator trust in the system. Autonomy earns its place in production by making human intervention the exception and by being completely transparent about every decision it makes.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Align maintenance windows across both layers.</strong> Platform patching and ADE maintenance contend for the same I/O and the same cold caches. Configure the platform's maintenance windows to avoid your ADE's maintenance windows, and track platform build changes with the same rigor as schema changes.</li>
     </div>
     <div class="mt-14 bg-emerald-950/40 border border-emerald-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
@@ -624,7 +388,7 @@ $$ LANGUAGE sql STABLE;</code></pre>
         <p class="text-xs text-gray-400">8 modules · Schema browser · AI assistant · Query optimizer · PostgreSQL, SQL Server, MySQL</p>
       </div>
       <a href="../products.html"
-         class="shrink-0 px-6 py-3 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-xl text-sm transition">
+         class="shrink-0 px-6 py-3 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-lg transition">
         Learn More →
       </a>
     </div>

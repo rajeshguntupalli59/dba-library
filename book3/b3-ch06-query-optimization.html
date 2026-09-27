@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Chapter 6: Autonomous Query Optimization — The ADE Handbook</title>
-  <meta name="description" content="The ADE Handbook Chapter 6: Autonomous Query Optimization. Autonomous database engineering for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
+  <meta name="description" content="The ADE Handbook Chapter 6: Autonomous Query Optimization. Autonomous database engineering for SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
   <script type="module">
     import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
@@ -45,13 +45,11 @@
 
 <p class="text-gray-300 leading-relaxed">Query performance is the most visible surface area of database operations — slow queries surface as customer complaints, SLA breaches, and on-call pages. Yet in most organizations, query tuning remains a manual, reactive, expert-dependent process: a DBA receives an alert, opens a query plan, adds an index, and deploys a fix hours later. Autonomous query optimization replaces this loop entirely. The system continuously observes execution plans, detects regressions and anti-patterns, tests optimization candidates, and deploys changes — without waiting for a human to notice something is wrong. This chapter covers the full architecture of an autonomous query optimization layer: how queries are captured and classified, how the system reasons about plan stability and index opportunities, how candidate optimizations are validated safely before deployment, and how a feedback loop ensures that changes persist only when they demonstrably improve production workloads.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Continuous Query Telemetry: Building the Observation Layer</h3>
 
 <p class="text-gray-300 leading-relaxed">Autonomous optimization is only as good as its observability. Before any decision can be made, the system needs a continuous, structured feed of query behavior — not sampled logs, not manual EXPLAIN runs, but a persistent, queryable record of every workload pattern the database encounters.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL</strong> provides <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> as the foundation. It normalizes queries by replacing literals with placeholders, which means <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SELECT * FROM orders WHERE id = 42</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SELECT * FROM orders WHERE id = 99</code> collapse into a single entry. This normalization is essential for pattern-level analysis. The extension must be enabled and the sampling ratio tuned for high-volume systems.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server</strong> provides Query Store as the foundation. It captures query text, plans, and runtime statistics per query, normalizing parameterized variants into a single query entry — so <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SELECT * FROM orders WHERE id = 42</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SELECT * FROM orders WHERE id = 99</code> collapse into one entry. This normalization is essential for pattern-level analysis. Query Store must be enabled on each database, with capture mode and retention tuned for high-volume systems.</p>
 
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server</strong> ships <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Query Store</code> — a far richer structure that persists plan history, resource consumption over time, and supports plan forcing directly from T-SQL. It must be enabled per database and configured for appropriate retention.</p>
@@ -99,39 +97,34 @@ WHERE rs_recent.last_execution_time &gt; DATEADD(HOUR, -1, GETUTCDATE())
   AND rs_recent.avg_duration &gt; rs_hist.avg_duration * 1.5
 ORDER BY pct_regression DESC;</code></pre>
 
-<p class="text-gray-300 leading-relaxed">Beyond these built-in views, the autonomous system needs a time-series telemetry store — not just a point-in-time snapshot. The practical architecture uses a Prometheus scraper that exports pg_stat_statements metrics on a 30-second interval and writes them to a time-series database (Victoria Metrics, Thanos, or Prometheus itself with long retention). A Python collector handles the normalization and emission.</p>
+<p class="text-gray-300 leading-relaxed">Beyond these built-in views, the autonomous system needs a time-series telemetry store — not just a point-in-time snapshot. The practical architecture uses a Prometheus scraper that exports Query Store and DMV metrics on a 30-second interval and writes them to a time-series database (Victoria Metrics, Thanos, or Prometheus itself with long retention). A Python collector handles the normalization and emission.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># query_telemetry_exporter.py
-# Runs as a Kubernetes CronJob or sidecar process
-import psycopg2
-import json
-import hashlib
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import pyodbc
 import time
 import requests
 from datetime import datetime
 
 PUSHGATEWAY_URL = "http://prometheus-pushgateway:9091"
-DB_DSN = "host=pg-primary dbname=appdb user=monitor password=secret"
+DB_CONN = ("DRIVER={ODBC Driver 18 for SQL Server};"
+           "SERVER=sql-prod-01;DATABASE=appdb;UID=monitor;PWD=secret")
 
 def collect_query_stats():
-    conn = psycopg2.connect(DB_DSN)
+    conn = pyodbc.connect(DB_CONN)
     cur  = conn.cursor()
     cur.execute("""
-        SELECT
-            queryid::text,
-            LEFT(query, 200)    AS query_preview,
-            calls,
-            mean_exec_time,
-            stddev_exec_time,
-            rows,
-            shared_blks_hit,
-            shared_blks_read,
-            temp_blks_written,
-            blk_read_time + blk_write_time AS total_io_time_ms
-        FROM pg_stat_statements
-        WHERE calls &gt; 10
-        ORDER BY mean_exec_time DESC
-        LIMIT 500
+        SELECT TOP 500
+            CONVERT(VARCHAR(64), qs.query_hash, 1) AS query_hash,
+            LEFT(qt.text, 200)    AS query_preview,
+            qs.execution_count    AS calls,
+            qs.total_elapsed_time / 1000.0 / NULLIF(qs.execution_count, 0)
+                                  AS mean_exec_ms,
+            qs.total_logical_reads  AS logical_reads,
+            qs.total_logical_writes AS logical_writes,
+            qs.total_worker_time / 1000.0 AS total_cpu_ms
+        FROM sys.dm_exec_query_stats qs
+        CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) qt
+        WHERE qs.execution_count &gt; 10
+        ORDER BY mean_exec_ms DESC
     """)
     rows = cur.fetchall()
     cols = [d[0] for d in cur.description]
@@ -143,13 +136,13 @@ def collect_query_stats():
 
     for row in rows:
         record = dict(zip(cols, row))
-        qid    = record["queryid"]
-        label  = f'queryid="{qid}"'
-        for metric in ["mean_exec_time", "stddev_exec_time", "calls",
-                        "shared_blks_read", "temp_blks_written", "total_io_time_ms"]:
+        qid    = record["query_hash"]
+        label  = f'query_hash="{qid}"'
+        for metric in ["mean_exec_ms", "calls",
+                       "logical_reads", "logical_writes", "total_cpu_ms"]:
             val = record.get(metric) or 0
             metrics.append(
-                f'pg_query_{metric}{{{label}}} {val} {ts}'
+                f'mssql_query_{metric}{{{label}}} {val} {ts}'
             )
 
     payload = "\n".join(metrics) + "\n"
@@ -171,11 +164,9 @@ if __name__ == "__main__":
 
 <p class="text-gray-300 leading-relaxed">With this telemetry layer operational, the system has the raw material it needs to make decisions. The next step is classifying what kind of problem each query signature represents.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Plan Regression Detection and Automatic Plan Stabilization</h3>
 
-<p class="text-gray-300 leading-relaxed">Plan regression is one of the most insidious database failure modes. A query that ran in 12 ms for months suddenly takes 4.2 seconds — not because the query changed, but because a statistics update, a new index, or a PostgreSQL autovacuum operation shifted the planner's cost estimates enough to select a different join strategy or access path. In a manually operated system, this surfaces as a P2 incident. In an autonomous system, it is detected within one collection interval and remediated before most users notice.</p>
+<p class="text-gray-300 leading-relaxed">Plan regression is one of the most insidious database failure modes. A query that ran in 12 ms for months suddenly takes 4.2 seconds — not because the query changed, but because a statistics update, a new index, or an automatic statistics update shifted the optimizer's cost estimates enough to select a different join strategy or access path. In a manually operated system, this surfaces as a P2 incident. In an autonomous system, it is detected within one collection interval and remediated before most users notice.</p>
 
 <p class="text-gray-300 leading-relaxed">The detection model is straightforward: for each normalized query ID, maintain a rolling baseline of <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">mean_exec_time</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">stddev_exec_time</code>. When the observed mean exceeds <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">baseline_mean + N * baseline_stddev</code> (where N is a tunable sensitivity, typically 3), flag the query as a regression candidate. But raw statistical deviation is not sufficient — call volume matters. A query called twice is not a meaningful regression signal. The autonomous rule is:</p>
 
@@ -217,18 +208,16 @@ BEGIN
          GETUTCDATE());
 END</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL</strong> lacks native plan forcing, but the ecosystem provides two mechanisms: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_hint_plan</code> (which injects planner hints into normalized query text via a hint table) and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">plan_cache_mode</code> combined with prepared statement management. For the autonomous layer, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_hint_plan</code> is the practical choice because the hint table can be updated without touching application code.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server</strong> provides native plan forcing through Query Store (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sp_query_store_force_plan</code>) and plan guides. For the autonomous layer, Query Store plan forcing is the practical choice: the system identifies the last known good plan from Query Store history and forces it without touching application code — the same mechanism behind Automatic Tuning's automatic plan correction.</p>
 
 
 <p class="text-gray-300 leading-relaxed">For SQL Server, once a plan is forced, the autonomous system must monitor whether the forced plan is still the correct choice after conditions change — for example, after a major data load that legitimately shifts the optimal join order. The system schedules a re-evaluation every 24 hours: it temporarily unforces the plan, observes runtime for one collection window, and forces again if the regression persists, or permanently unforces if the new plan is now stable and comparable in performance. This feedback loop prevents the system from accumulating stale plan forces indefinitely.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Autonomous Index Management: Discovery, Validation, and Lifecycle</h3>
 
 <p class="text-gray-300 leading-relaxed">Indexes are the highest-leverage knob in query optimization, and they are also the easiest source of configuration drift — redundant indexes consuming write overhead, missing indexes causing sequential scans at scale, and bloated indexes that were once useful but now serve dead workloads. An autonomous index management system handles all three dimensions continuously.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Discovery</strong> starts with execution plan analysis. Both databases expose whether a query performed a sequential or full table scan in a context where an index could have served it. PostgreSQL surfaces this through <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_user_tables</code> (seq_scan count) and through EXPLAIN JSON output; SQL Server exposes it through Dynamic Management Views including <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_db_missing_index_details</code>.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Discovery</strong> starts with execution plan analysis. SQL Server exposes whether a query performed a full table scan in a context where an index could have served it through <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_db_index_usage_stats</code> (user_scans against heaps and clustered indexes), actual execution plans, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_db_missing_index_details</code>.</p>
 
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Surface high-impact missing index recommendations from DMVs
@@ -264,24 +253,22 @@ WHERE migs.avg_total_user_cost * migs.avg_user_impact
   AND migs.last_user_seek                           &gt; DATEADD(HOUR, -4, GETUTCDATE())
 ORDER BY estimated_improvement_score DESC;</code></pre>
 
-<p class="text-gray-300 leading-relaxed">For PostgreSQL, the autonomous system uses a combination of <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_user_tables</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_user_indexes</code>, and hypothetical index analysis via the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">HypoPG</code> extension. HypoPG allows the planner to reason about an index that does not yet exist — the system creates a hypothetical index, runs EXPLAIN (not the real query), checks whether the planner would use it, then discards the hypothesis without any write to disk.</p>
+<p class="text-gray-300 leading-relaxed">For SQL Server, the autonomous system uses a combination of <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_db_index_usage_stats</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_db_missing_index_details</code>, and hypothetical index analysis via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">AUTOPILOT</code>. AUTOPILOT lets the optimizer reason about an index that does not yet exist — the system defines a hypothetical index, requests the estimated plan (the query is never executed), checks whether the optimizer would use it, then rolls back the hypothesis without any write to disk.</p>
 
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Validation before deployment</strong> is non-negotiable. The autonomous system must not create indexes on production tables without a safety gate. The gate checks:</p>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Table size: if the table exceeds a configured threshold (e.g., 100 GB), the index build is scheduled during the maintenance window with `CREATE INDEX CONCURRENTLY` in PostgreSQL or `WITH (ONLINE = ON)` in SQL Server.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Write amplification: the system estimates the additional write cost by querying DML rates from `pg_stat_user_tables` or `sys.dm_db_index_operational_stats`. If the table sustains more than a configured number of inserts/updates per second, the estimated overhead is computed against available I/O headroom.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Table size: if the table exceeds a configured threshold (e.g., 100 GB), the index build is scheduled during the maintenance window with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WITH (ONLINE = ON)</code> in SQL Server.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Write amplification: the system estimates the additional write cost by querying DML rates from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_db_index_operational_stats</code>. If the table sustains more than a configured number of inserts/updates per second, the estimated overhead is computed against available I/O headroom.</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Redundancy check: before any new index is created, the engine checks whether an existing index already covers the proposed columns, possibly with a superset of keys.</li>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Lifecycle management</strong> closes the loop. An index that was useful during a past workload pattern becomes a pure write tax when that pattern disappears. The autonomous system tracks <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">idx_scan</code> counts from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_user_indexes</code> and the equivalent from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_db_index_usage_stats</code>. When an index has recorded zero scans over a rolling 30-day window and the database has been active throughout that window, it is classified as a dead index and queued for removal — first disabled (SQL Server supports disabling without dropping), then dropped in the next maintenance window after a configurable hold period.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Lifecycle management</strong> closes the loop. An index that was useful during a past workload pattern becomes a pure write tax when that pattern disappears. The autonomous system tracks <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">user_seeks</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">user_scans</code> counts from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_db_index_usage_stats</code>. When an index has recorded zero scans over a rolling 30-day window and the database has been active throughout that window, it is classified as a dead index and queued for removal — first disabled (SQL Server supports disabling without dropping), then dropped in the next maintenance window after a configurable hold period.</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Workload-Aware Statistics Management and Cardinality Feedback</h3>
 
-<p class="text-gray-300 leading-relaxed">The PostgreSQL and SQL Server query planners are both cost-based — they rely on statistics that describe the distribution of values in each column to estimate the number of rows a predicate will match. When those statistics are stale or insufficiently granular for the actual workload, the planner produces bad cardinality estimates, which cascade into bad plan choices. Autonomous statistics management means the system continuously monitors cardinality error rates and triggers targeted statistics updates rather than waiting for the autovacuum/auto-update threshold to fire.</p>
+<p class="text-gray-300 leading-relaxed">The SQL Server query optimizer is cost-based — it relies on statistics that describe the distribution of values in each column to estimate the number of rows a predicate will match. When those statistics are stale or insufficiently granular for the actual workload, the planner produces bad cardinality estimates, which cascade into bad plan choices. Autonomous statistics management means the system continuously monitors cardinality error rates and triggers targeted statistics updates rather than waiting for the auto-update statistics threshold to fire.</p>
 
-<p class="text-gray-300 leading-relaxed">The core signal is the <strong class="text-white">cardinality error ratio</strong>: the ratio of estimated rows in the plan vs. actual rows returned at runtime. Both databases expose this after execution — in PostgreSQL through <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">EXPLAIN (ANALYZE, BUFFERS)</code> or through the auto_explain extension; in SQL Server through Query Store's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">avg_rows</code> vs. the actual row count in DMVs.</p>
+<p class="text-gray-300 leading-relaxed">The core signal is the <strong class="text-white">cardinality error ratio</strong>: the ratio of estimated rows in the plan vs. actual rows returned at runtime. SQL Server exposes this after execution through Query Store's estimated vs. actual row counts and the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">last_rows</code> / <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">avg_rows</code> columns in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_query_stats</code>.</p>
 
 <p class="text-gray-300 leading-relaxed">When cardinality error ratio exceeds a threshold (typically > 10x under-estimate or > 5x over-estimate on a high-frequency query), the autonomous system triggers targeted statistics refresh:</p>
 
@@ -317,9 +304,7 @@ VALUES (
     GETUTCDATE()
 );</code></pre>
 
-<p class="text-gray-300 leading-relaxed">Beyond reactive statistics refresh, the autonomous system must also manage statistics for <strong class="text-white">skewed distributions</strong> — columns where a small number of values dominate (e.g., an <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">order_status</code> column where 95% of rows have status <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">completed</code>). Standard histogram statistics handle these poorly. The pattern is to identify high-skew columns from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stats</code> (PostgreSQL) or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_db_stats_histogram</code> (SQL Server 2016+), and increase the statistics target or create filtered indexes that serve the minority predicate values where skew causes plan failures.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
+<p class="text-gray-300 leading-relaxed">Beyond reactive statistics refresh, the autonomous system must also manage statistics for <strong class="text-white">skewed distributions</strong> — columns where a small number of values dominate (e.g., an <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">order_status</code> column where 95% of rows have status <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">completed</code>). Standard histogram statistics handle these poorly. The pattern is to identify high-skew columns from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_db_stats_histogram</code> (SQL Server 2016+), and increase the statistics target or create filtered indexes that serve the minority predicate values where skew causes plan failures.</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">The Autonomous Validation and Rollback Feedback Loop</h3>
 
@@ -344,14 +329,12 @@ VALUES (
 
 <p class="text-gray-300 leading-relaxed">The evaluation window and improvement threshold are the two parameters that most determine how conservative or aggressive the loop behaves. A short window with a low improvement bar creates noisy, thrashing behavior — the system reverting and reapplying changes as normal variance crosses the threshold. A long window with a high bar makes the system slow to correct clearly bad decisions. Tuning these parameters against the specific workload's variance characteristics, rather than adopting a fixed industry default, is part of operating this system responsibly.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Autonomous query optimization depends on continuous, structured telemetry — `pg_stat_statements` on PostgreSQL and Query Store on SQL Server — but neither surface alone provides a native notion of "recent" activity; PostgreSQL in particular requires external snapshot-and-diff tooling to compute windowed rates from its cumulative counters.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Autonomous query optimization depends on continuous, structured telemetry — Query Store and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_query_stats</code> — where Query Store provides native time windows through its runtime stats intervals, while DMV-based collectors need external snapshot-and-diff tooling to compute windowed rates from cumulative counters.</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Plan regression detection should combine statistical deviation (mean exceeding a multiple of baseline standard deviation) with a minimum call-volume threshold, so the system does not react to noise from low-frequency queries.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> SQL Server's Query Store supports native plan forcing via `sp_query_store_force_plan`; PostgreSQL requires the `pg_hint_plan` extension and a hint table, since the engine has no built-in plan-pinning mechanism.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Autonomous index management must validate candidates with a hypothetical-index tool (`HypoPG` on PostgreSQL, missing-index DMVs on SQL Server) before committing to a real `CREATE INDEX`, and must track index usage over time to retire indexes that no longer serve live workloads.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> SQL Server's Query Store supports native plan forcing via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sp_query_store_force_plan</code>, and Automatic Tuning can apply it autonomously — giving the autonomous layer an engine-native plan-pinning mechanism.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Autonomous index management must validate candidates with a hypothetical-index tool (missing-index DMVs and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">AUTOPILOT</code> hypothetical indexes on SQL Server) before committing to a real <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE INDEX</code>, and must track index usage over time to retire indexes that no longer serve live workloads.</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Every autonomous optimization action needs a validation and rollback loop: a recorded pre-action baseline, a defined observation window, and an automatic reversal path when the action does not produce the expected improvement — without this loop, the system accumulates unverified changes as technical debt.</li>
     </div>
     <div class="mt-14 bg-emerald-950/40 border border-emerald-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">

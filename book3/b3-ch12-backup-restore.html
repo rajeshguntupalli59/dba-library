@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Chapter 12: Autonomous Backup & Restore Systems — The ADE Handbook</title>
-  <meta name="description" content="The ADE Handbook Chapter 12: Autonomous Backup & Restore Systems. Autonomous database engineering for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
+  <meta name="description" content="The ADE Handbook Chapter 12: Autonomous Backup & Restore Systems. Autonomous database engineering for SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
   <script type="module">
     import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
@@ -45,13 +45,11 @@
 
 <p class="text-gray-300 leading-relaxed">Backup and restore have traditionally been the most human-dependent operations in database management — schedules set manually, retention policies enforced inconsistently, restore testing performed quarterly at best, and recovery procedures that exist as PDF documents nobody updates. An autonomous backup system inverts this entirely: it observes the database's change rate, transaction patterns, and business criticality in real time; decides what to back up, how frequently, and to which tiers of storage; executes and validates those backups without operator input; and can initiate restore operations — including full environment reconstruction — based on defined policy or detected corruption. This chapter covers the full architecture of autonomous backup systems: decision logic for adaptive scheduling, continuous validation pipelines, policy-driven restore automation, and the operational patterns that make these systems production-safe at scale.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Adaptive Backup Scheduling Based on Change Velocity</h3>
 
 <p class="text-gray-300 leading-relaxed">Static backup schedules are an artifact of the manual era. A database that processes 500 transactions per hour at 2 AM and 50,000 transactions per hour at noon has a fundamentally different RPO risk profile across those windows, yet most organizations apply a uniform schedule to both. An autonomous system observes write velocity continuously and adjusts backup frequency accordingly.</p>
 
-<p class="text-gray-300 leading-relaxed">The core metric is <strong class="text-white">modified page rate</strong> for SQL Server and <strong class="text-white">WAL generation rate</strong> for PostgreSQL. Both serve as proxies for how quickly the database is diverging from its last known-good backup. When the divergence rate is high, the cost of data loss per unit time is proportionally high, and backup frequency should increase. When the database is quiescent, backup frequency can safely decrease to preserve storage and I/O budget.</p>
+<p class="text-gray-300 leading-relaxed">The core metric is <strong class="text-white">modified page rate</strong> and <strong class="text-white">log generation rate</strong>. Both serve as proxies for how quickly the database is diverging from its last known-good backup. When the divergence rate is high, the cost of data loss per unit time is proportionally high, and backup frequency should increase. When the database is quiescent, backup frequency can safely decrease to preserve storage and I/O budget.</p>
 
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Track modified extent rate using dm_io_virtual_file_stats
@@ -74,18 +72,24 @@ ORDER BY bytes_written DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The scheduler agent consumes this velocity data and maps it to a backup tier decision table:</p>
 
-<p class="text-gray-300 leading-relaxed">| Velocity Band | Full Backup | Incremental / Differential | Log Backup |</p>
-<p class="text-gray-300 leading-relaxed">|---|---|---|---|</p>
-<p class="text-gray-300 leading-relaxed">| HIGH | Weekly | Every 2 hours | Every 5 minutes |</p>
-<p class="text-gray-300 leading-relaxed">| MEDIUM | Weekly | Every 6 hours | Every 15 minutes |</p>
-<p class="text-gray-300 leading-relaxed">| LOW | Weekly | Daily | Every 30 minutes |</p>
-<p class="text-gray-300 leading-relaxed">| QUIESCENT | Bi-weekly | Weekly | Hourly |</p>
-
+<div class="overflow-x-auto my-5"><table class="w-full text-sm text-gray-300 border border-gray-800 rounded-xl overflow-hidden">
+<thead><tr class="bg-gray-900">
+<th class="text-left px-4 py-3 text-white font-semibold border-b border-gray-800">Velocity Band</th>
+<th class="text-left px-4 py-3 text-white font-semibold border-b border-gray-800">Full Backup</th>
+<th class="text-left px-4 py-3 text-white font-semibold border-b border-gray-800">Incremental / Differential</th>
+<th class="text-left px-4 py-3 text-white font-semibold border-b border-gray-800">Log Backup</th>
+</tr></thead>
+<tbody>
+<tr class="border-b border-gray-800/60"><td class="px-4 py-3">HIGH</td><td class="px-4 py-3">Weekly</td><td class="px-4 py-3">Every 2 hours</td><td class="px-4 py-3">Every 5 minutes</td></tr>
+<tr class="border-b border-gray-800/60"><td class="px-4 py-3">MEDIUM</td><td class="px-4 py-3">Weekly</td><td class="px-4 py-3">Every 6 hours</td><td class="px-4 py-3">Every 15 minutes</td></tr>
+<tr class="border-b border-gray-800/60"><td class="px-4 py-3">LOW</td><td class="px-4 py-3">Weekly</td><td class="px-4 py-3">Daily</td><td class="px-4 py-3">Every 30 minutes</td></tr>
+<tr><td class="px-4 py-3">QUIESCENT</td><td class="px-4 py-3">Bi-weekly</td><td class="px-4 py-3">Weekly</td><td class="px-4 py-3">Hourly</td></tr>
+</tbody></table></div>
 <p class="text-gray-300 leading-relaxed">This table is not static configuration — the scheduler agent recalculates it against observed RPO breach probability. If a HIGH-velocity period has been sustained for more than four hours (suggesting a bulk load or migration rather than a transient spike), the scheduler may promote to a more aggressive log backup cadence or trigger an opportunistic incremental.</p>
 
 <p class="text-gray-300 leading-relaxed">The Python scheduler that drives this loop runs as a Kubernetes CronJob with a 1-minute resolution. It reads the velocity band, compares against the last backup timestamp for each tier, and emits backup jobs to a task queue:</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import psycopg2
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import pyodbc
 import redis
 import json
 from datetime import datetime, timezone, timedelta
@@ -117,9 +121,9 @@ def get_velocity_band(conn, database: str) -&gt; VelocityBand:
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT velocity_band FROM backup_monitor.wal_velocity
-            WHERE recorded_at &gt; now() - INTERVAL '10 minutes'
-            ORDER BY recorded_at DESC LIMIT 1
+            SELECT TOP 1 velocity_band FROM backup_monitor.log_velocity
+            WHERE recorded_at &gt; DATEADD(MINUTE, -10, SYSUTCDATETIME())
+            ORDER BY recorded_at DESC
             """
         )
         row = cur.fetchone()
@@ -162,8 +166,8 @@ def evaluate_backup_need(
 
     return decisions
 
-def run_scheduler(pg_dsn: str, redis_url: str, databases: list[str]):
-    conn = psycopg2.connect(pg_dsn)
+def run_scheduler(mssql_dsn: str, redis_url: str, databases: list[str]):
+    conn = pyodbc.connect(mssql_dsn)
     r = redis.from_url(redis_url)
     queue = r.pipeline()
 
@@ -180,8 +184,6 @@ def run_scheduler(pg_dsn: str, redis_url: str, databases: list[str]):
     conn.close()</code></pre>
 
 <p class="text-gray-300 leading-relaxed">This loop runs on a 1-minute Kubernetes CronJob schedule. The actual backup execution is decoupled into a separate worker pool, allowing the scheduler to remain lightweight and the backup workers to scale independently under load.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Continuous Backup Validation Without Human Review</h3>
 
@@ -250,63 +252,64 @@ WHERE bs.backup_finish_date &gt; DATEADD(MINUTE, -5, GETUTCDATE())
 <p class="text-gray-300 leading-relaxed">The restore smoke test uses ephemeral containers managed by a Kubernetes operator. The operator watches the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">backup_catalog.backups</code> table (or its SQL Server equivalent) for entries in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">INTEGRITY_OK</code> state and schedules a restore pod:</p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import subprocess
-import psycopg2
+import pyodbc
 import logging
-from pathlib import Path
 
 logger = logging.getLogger("backup_validator")
 
 SMOKE_TEST_QUERIES = [
-    # Verify pg_catalog is readable
-    "SELECT count(*) FROM pg_catalog.pg_class WHERE relkind = 'r';",
-    # Verify no bloat in pg_attribute that suggests corruption
-    "SELECT count(*) FROM pg_catalog.pg_attribute WHERE attnum &gt; 0;",
-    # Verify sequences are consistent
-    "SELECT count(*) FROM information_schema.sequences;",
+    # Verify system catalog is readable
+    "SELECT COUNT(*) FROM sys.tables;",
+    # Verify physical stats are readable (catches page-level corruption)
+    "SELECT COUNT(*) FROM sys.dm_db_index_physical_stats(DB_ID(), NULL, NULL, NULL, 'LIMITED');",
+    # Verify user data is present
+    "SELECT SUM(row_count) FROM sys.dm_db_partition_stats WHERE index_id IN (0, 1);",
 ]
 
-def restore_to_ephemeral(backup_path: str, restore_port: int) -&gt; bool:
-    """Restore a pgBackRest backup to an ephemeral PostgreSQL instance."""
-    restore_data_dir = f"/tmp/restore_{restore_port}"
-    Path(restore_data_dir).mkdir(parents=True, exist_ok=True)
+# Host of the ephemeral SQL Server used for restore validation
+# (containerized instance managed by the Kubernetes operator)
+EPHEMERAL_SQL_HOST = "sql-verify.default.svc.cluster.local"
 
+def restore_to_ephemeral(backup_path: str, verify_db: str) -&gt; bool:
+    """Restore a native backup to an ephemeral SQL Server database, then CHECKDB it."""
     result = subprocess.run(
         [
-            "pgbackrest",
-            f"--stanza=main",
-            f"--pg1-path={restore_data_dir}",
-            f"--recovery-option=recovery_target=immediate",
-            f"--recovery-option=recovery_target_action=promote",
-            "--type=immediate",
-            "restore",
+            "sqlcmd", "-S", EPHEMERAL_SQL_HOST, "-E", "-b",
+            "-Q",
+            f"RESTORE DATABASE [{verify_db}] FROM DISK = N'{backup_path}' "
+            f"WITH MOVE 'data' TO '/var/opt/mssql/data/{verify_db}.mdf', "
+            f"MOVE 'log' TO '/var/opt/mssql/data/{verify_db}_log.ldf', "
+            "REPLACE, STATS = 10;",
         ],
         capture_output=True,
         text=True,
-        timeout=600,
+        timeout=900,
     )
 
     if result.returncode != 0:
         logger.error("Restore failed: %s", result.stderr)
         return False
 
-    # Start ephemeral postgres instance
-    pg_start = subprocess.run(
-        ["pg_ctl", "-D", restore_data_dir, "-o", f"-p {restore_port}", "start"],
+    # DBCC CHECKDB catches page-level corruption the smoke tests cannot see
+    dbcc = subprocess.run(
+        ["sqlcmd", "-S", EPHEMERAL_SQL_HOST, "-E", "-b",
+         "-Q", f"DBCC CHECKDB ([{verify_db}]) WITH NO_INFOMSGS;"],
         capture_output=True,
         text=True,
-        timeout=60,
+        timeout=900,
     )
-    return pg_start.returncode == 0
+    if dbcc.returncode != 0:
+        logger.error("CHECKDB failed: %s", dbcc.stderr)
+    return dbcc.returncode == 0
 
-def run_smoke_tests(restore_port: int, database: str) -&gt; tuple[bool, str]:
-    """Execute smoke test queries against the restored instance."""
+def run_smoke_tests(verify_db: str, database: str) -&gt; tuple[bool, str]:
+    """Execute smoke test queries against the restored database."""
     try:
-        conn = psycopg2.connect(
-            host="localhost",
-            port=restore_port,
-            dbname=database,
-            user="validator",
-            connect_timeout=10,
+        conn = pyodbc.connect(
+            "DRIVER={ODBC Driver 18 for SQL Server};"
+            f"SERVER={EPHEMERAL_SQL_HOST};DATABASE={verify_db};"
+            "Trusted_Connection=yes;",
+            timeout=10,
         )
         with conn.cursor() as cur:
             for query in SMOKE_TEST_QUERIES:
@@ -319,32 +322,40 @@ def run_smoke_tests(restore_port: int, database: str) -&gt; tuple[bool, str]:
     except Exception as e:
         return False, f"Connection or query error: {e}"
 
+def drop_ephemeral(verify_db: str):
+    subprocess.run(
+        ["sqlcmd", "-S", EPHEMERAL_SQL_HOST, "-E", "-b",
+         "-Q", f"ALTER DATABASE [{verify_db}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; "
+               f"DROP DATABASE [{verify_db}];"],
+        capture_output=True,
+        timeout=300,
+    )
+
 def validate_backup(backup_id: str, backup_path: str, database: str,
                     catalog_dsn: str):
-    restore_port = 55432  # ephemeral port range managed by port allocator
+    verify_db = f"{database}_verify_{backup_id[:8]}"
     try:
-        restored = restore_to_ephemeral(backup_path, restore_port)
+        restored = restore_to_ephemeral(backup_path, verify_db)
         if not restored:
             _update_catalog(catalog_dsn, backup_id, "FAILED", "Restore failed")
             return
 
-        passed, message = run_smoke_tests(restore_port, database)
+        passed, message = run_smoke_tests(verify_db, database)
         state = "RESTORE_OK" if passed else "FAILED"
         _update_catalog(catalog_dsn, backup_id, state, message)
     finally:
-        subprocess.run(["pg_ctl", "-D", f"/tmp/restore_{restore_port}", "stop"],
-                       capture_output=True)
+        drop_ephemeral(verify_db)
 
 def _update_catalog(dsn: str, backup_id: str, state: str, message: str):
-    conn = psycopg2.connect(dsn)
+    conn = pyodbc.connect(dsn)
     with conn.cursor() as cur:
         cur.execute(
             """
             UPDATE backup_catalog.backups
-            SET validation_state = %s,
-                validation_message = %s,
-                validated_at = now()
-            WHERE backup_id = %s
+            SET validation_state = ?,
+                validation_message = ?,
+                validated_at = SYSUTCDATETIME()
+            WHERE backup_id = ?
             """,
             (state, message, backup_id),
         )
@@ -353,18 +364,16 @@ def _update_catalog(dsn: str, backup_id: str, state: str, message: str):
 
 <p class="text-gray-300 leading-relaxed">When a backup fails validation, the system does not simply log the failure. It immediately triggers a fresh backup of the same type, alerts the on-call channel through PagerDuty or Alertmanager, and suppresses all automated restore operations that would have consumed the failed backup. The decision tree is: <strong class="text-white">if validation_state = 'FAILED' and backup_type = 'full', trigger emergency full backup and page; if backup_type = 'log', trigger log backup retry and record the gap in the catalog for PITR range invalidation.</strong></p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Policy-Driven Retention and Tiered Storage Lifecycle</h3>
 
 <p class="text-gray-300 leading-relaxed">Retention management is where backup systems accumulate the most hidden cost and compliance risk simultaneously. Organizations over-retain backups on expensive primary storage because the rules for deletion are unclear or the deletion process requires human approval. An autonomous system encodes retention policy as machine-executable rules and enforces them on a continuous basis.</p>
 
 <p class="text-gray-300 leading-relaxed">Retention policy in an autonomous system has four dimensions:</p>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Time-based retention**: Keep backups for N days regardless of count</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Count-based retention**: Keep the last N full backups regardless of age</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **RPO-coverage retention**: Keep enough logs to satisfy any point-in-time restore within the defined RPO window</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Compliance anchor retention**: Certain backups (e.g., end-of-month full backups) are locked and exempt from normal expiry rules</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Time-based retention</strong>: Keep backups for N days regardless of count</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Count-based retention</strong>: Keep the last N full backups regardless of age</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">RPO-coverage retention</strong>: Keep enough logs to satisfy any point-in-time restore within the defined RPO window</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Compliance anchor retention</strong>: Certain backups (e.g., end-of-month full backups) are locked and exempt from normal expiry rules</li>
 
 <p class="text-gray-300 leading-relaxed">The storage lifecycle manager evaluates each backup against all four dimensions. A backup is eligible for deletion only when it fails all four retention tests. The tier migration logic runs separately: backups older than 7 days move from NVMe-backed primary storage to object storage (S3, Azure Blob, or GCS); backups older than 30 days move to archive storage classes (Glacier, Archive).</p>
 
@@ -428,7 +437,7 @@ ORDER BY backup_finish_date ASC;</code></pre>
 <p class="text-gray-300 leading-relaxed">Tier migration follows a complementary pattern:</p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import boto3
-import psycopg2
+import pyodbc
 from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass
 
@@ -461,14 +470,14 @@ def migrate_backup_tier(
         MetadataDirective="COPY",
     )
     # Update catalog to reflect new tier
-    conn = psycopg2.connect(catalog_dsn)
+    conn = pyodbc.connect(catalog_dsn)
     with conn.cursor() as cur:
         cur.execute(
             """
             UPDATE backup_catalog.backups
-            SET storage_tier = %s,
-                tier_migrated_at = now()
-            WHERE backup_id = %s
+            SET storage_tier = ?,
+                tier_migrated_at = SYSUTCDATETIME()
+            WHERE backup_id = ?
             """,
             (target_class, backup_id),
         )
@@ -477,7 +486,7 @@ def migrate_backup_tier(
 
 def run_tier_lifecycle(catalog_dsn: str, bucket: str, aws_region: str):
     s3 = boto3.client("s3", region_name=aws_region)
-    conn = psycopg2.connect(catalog_dsn)
+    conn = pyodbc.connect(catalog_dsn)
     now = datetime.now(timezone.utc)
 
     for rule in TIER_RULES:
@@ -487,8 +496,8 @@ def run_tier_lifecycle(catalog_dsn: str, bucket: str, aws_region: str):
                 """
                 SELECT backup_id, storage_path, storage_tier
                 FROM backup_catalog.backups
-                WHERE completed_at &lt; %s
-                  AND storage_tier = %s
+                WHERE completed_at &lt; ?
+                  AND storage_tier = ?
                   AND validation_state NOT IN ('FAILED', 'PENDING', 'DELETION_PENDING')
                 """,
                 (cutoff, rule.source_storage_class),
@@ -513,8 +522,6 @@ def run_tier_lifecycle(catalog_dsn: str, bucket: str, aws_region: str):
     conn.close()</code></pre>
 
 <p class="text-gray-300 leading-relaxed">This lifecycle runner executes daily. Because it is idempotent — re-running it on a backup already in the correct tier results in a no-op from S3's perspective and a no-change update in the catalog — it is safe to run more frequently during catch-up scenarios without risk of double-migration charges.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Automated Point-in-Time Restore Orchestration</h3>
 
@@ -589,10 +596,10 @@ SELECT 'Log',          backup_set_id, backup_finish_date, 2 + apply_order
 FROM LogChain
 ORDER BY apply_order;</code></pre>
 
-<p class="text-gray-300 leading-relaxed">The orchestrator consumes the restore plan and drives the actual restore execution. For PostgreSQL environments using pgBackRest, the execution wrapper looks like:</p>
+<p class="text-gray-300 leading-relaxed">The orchestrator consumes the restore plan and drives the actual restore execution. The execution wrapper below drives native RESTORE statements through sqlcmd:</p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import subprocess
-import psycopg2
+import pyodbc
 import time
 import logging
 from dataclasses import dataclass
@@ -600,21 +607,24 @@ from typing import Optional
 
 logger = logging.getLogger("restore_orchestrator")
 
+# SQL Server instance that receives restores (staging target)
+TARGET_SQL_HOST = "sql-primary.default.svc.cluster.local"
+
 @dataclass
 class RestoreRequest:
     database: str
     plan_type: str            # 'latest' | 'pitr' | 'labeled'
     target_time: Optional[str] = None    # ISO 8601 for pitr
     target_lsn: Optional[str]  = None
-    restore_to_path: str = "/var/lib/postgresql/data"
+    restore_db_name: Optional[str] = None  # defaults to <database>_restore
     dry_run: bool = False
 
 def fetch_restore_plan(catalog_dsn: str, request: RestoreRequest) -&gt; dict:
-    conn = psycopg2.connect(catalog_dsn)
+    conn = pyodbc.connect(catalog_dsn)
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT
+            SELECT TOP 1
                 rp.plan_id,
                 rp.base_backup_id,
                 rp.log_sequence,
@@ -623,11 +633,10 @@ def fetch_restore_plan(catalog_dsn: str, request: RestoreRequest) -&gt; dict:
                 b.storage_path AS base_storage_path
             FROM backup_catalog.restore_plans rp
             JOIN backup_catalog.backups b ON b.backup_id = rp.base_backup_id
-            WHERE rp.database_name = %s
-              AND rp.plan_type     = %s
-              AND rp.is_current    = TRUE
+            WHERE rp.database_name = ?
+              AND rp.plan_type     = ?
+              AND rp.is_current    = 1
             ORDER BY rp.computed_at DESC
-            LIMIT 1
             """,
             (request.database, request.plan_type),
         )
@@ -648,39 +657,49 @@ def fetch_restore_plan(catalog_dsn: str, request: RestoreRequest) -&gt; dict:
         "base_storage_path": row[5],
     }
 
-def execute_pgbackrest_restore(
+def execute_native_restore(
     plan: dict,
     request: RestoreRequest,
-    stanza: str,
 ) -&gt; bool:
-    cmd = [
-        "pgbackrest",
-        f"--stanza={stanza}",
-        f"--pg1-path={request.restore_to_path}",
-        "--delta",           # only restore changed files — faster for in-place
+    restore_db = request.restore_db_name or f"{request.database}_restore"
+    statements = [
+        # Base full backup lands with NORECOVERY so the log chain can follow
+        f"RESTORE DATABASE [{restore_db}] FROM DISK = N'{plan['base_storage_path']}' "
+        "WITH NORECOVERY, REPLACE, STATS = 10;",
     ]
 
+    # Apply the log chain captured in the plan (pre-computed at backup time)
+    for log_path in plan.get("log_sequence", []):
+        statements.append(
+            f"RESTORE LOG [{restore_db}] FROM DISK = N'{log_path}' WITH NORECOVERY, STATS = 10;"
+        )
+
+    # Final recovery — STOPAT pins the point-in-time target
     if request.plan_type == "pitr" and request.target_time:
-        cmd += [
-            "--type=time",
-            f"--target={request.target_time}",
-            "--target-action=promote",
-        ]
-    elif request.plan_type == "latest":
-        cmd += ["--type=default"]
+        statements.append(
+            f"RESTORE LOG [{restore_db}] WITH RECOVERY, STOPAT = '{request.target_time}';"
+        )
+    else:
+        statements.append(f"RESTORE DATABASE [{restore_db}] WITH RECOVERY;")
 
     if request.dry_run:
-        logger.info("DRY RUN — would execute: %s", " ".join(cmd))
+        logger.info("DRY RUN — would execute %d statements", len(statements))
+        for s in statements:
+            logger.info("  %s", s)
         return True
 
-    logger.info("Starting restore: %s", " ".join(cmd))
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+    for stmt in statements:
+        logger.info("Executing: %.80s...", stmt)
+        result = subprocess.run(
+            ["sqlcmd", "-S", TARGET_SQL_HOST, "-E", "-b", "-Q", stmt],
+            capture_output=True, text=True, timeout=3600,
+        )
+        if result.returncode != 0:
+            logger.error("Native restore failed:
+%s", result.stderr)
+            return False
 
-    if result.returncode != 0:
-        logger.error("pgBackRest restore failed:\n%s", result.stderr)
-        return False
-
-    logger.info("Restore completed successfully:\n%s", result.stdout)
+    logger.info("Restore completed successfully")
     return True
 
 def record_restore_event(
@@ -691,18 +710,19 @@ def record_restore_event(
     duration_seconds: float,
     message: str,
 ):
-    conn = psycopg2.connect(catalog_dsn)
+    conn = pyodbc.connect(catalog_dsn)
     with conn.cursor() as cur:
         cur.execute(
             """
             INSERT INTO backup_catalog.restore_events (
                 plan_id, database_name, plan_type, target_time,
-                restore_path, success, duration_seconds, message, executed_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, now())
+                restore_db_name, success, duration_seconds, message, executed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, SYSUTCDATETIME())
             """,
             (
                 plan_id, request.database, request.plan_type,
-                request.target_time, request.restore_to_path,
+                request.target_time,
+                request.restore_db_name or f"{request.database}_restore",
                 success, duration_seconds, message,
             ),
         )
@@ -712,7 +732,6 @@ def record_restore_event(
 def orchestrate_restore(
     catalog_dsn: str,
     request: RestoreRequest,
-    stanza: str,
 ):
     start = time.monotonic()
     plan = fetch_restore_plan(catalog_dsn, request)
@@ -720,7 +739,7 @@ def orchestrate_restore(
     message = ""
 
     try:
-        success = execute_pgbackrest_restore(plan, request, stanza)
+        success = execute_native_restore(plan, request)
         message = "Restore completed" if success else "Restore execution failed"
     except Exception as e:
         message = f"Restore orchestration error: {e}"
@@ -735,8 +754,6 @@ def orchestrate_restore(
     return success</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The key design choice here is the separation of <strong class="text-white">plan computation</strong> from <strong class="text-white">plan execution</strong>. Plans are computed continuously as backups complete, so when a restore is triggered — whether by an operator, an automated corruption detector, or a failover controller — the system is not computing a restore sequence under pressure. It is simply retrieving a pre-validated recipe and executing it.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Corruption Detection and Autonomous Recovery Triggers</h3>
 
@@ -794,7 +811,7 @@ ORDER BY z_score DESC;</code></pre>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>from enum import Enum
 from datetime import datetime, timezone, timedelta
-import psycopg2
+import pyodbc
 import logging
 
 logger = logging.getLogger("corruption_trigger")
@@ -815,17 +832,17 @@ def assess_recovery_action(
     or should be deferred.
     Returns a dict with 'action', 'target_time', and 'reason'.
     """
-    conn = psycopg2.connect(catalog_dsn)
+    conn = pyodbc.connect(catalog_dsn)
 
     # Find the last clean log backup before the anomaly
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT backup_id, completed_at, wal_stop_lsn
+            SELECT backup_id, completed_at, last_lsn
             FROM backup_catalog.backups
-            WHERE database_name = %s
+            WHERE database_name = ?
               AND backup_type   = 'log'
-              AND completed_at  &lt; %s
+              AND completed_at  &lt; ?
               AND validation_state IN ('INTEGRITY_OK', 'RESTORE_OK', 'APP_OK')
             ORDER BY completed_at DESC
             LIMIT 1
@@ -875,8 +892,6 @@ def assess_recovery_action(
         }</code></pre>
 
 <p class="text-gray-300 leading-relaxed">This decision logic enforces two safety properties: the system will not restore autonomously when the clean recovery point is ambiguous, and it will not perform an in-place restore when it cannot verify that the restore will land in a state newer than the anomaly detection time. Both properties prevent the worst failure mode in automated recovery: a restore loop where corruption is repeatedly restored back into the live database.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Observability: The Backup Health Dashboard</h3>
 
@@ -933,112 +948,9 @@ ORDER BY rpo_lag_minutes DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">These dashboard queries feed directly into alerting rules. When <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">policy_status = 'POLICY_BREACH'</code> appears for any database, the alerting layer pages the on-call team. When <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">rpo_lag_minutes</code> exceeds the database's defined RPO threshold, a separate high-priority alert fires. The observability layer is the interface through which operators maintain confidence in the autonomous system — it does not replace human judgment, but it ensures that human judgment is applied to the right signals at the right time.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Disaster Recovery Runbooks as Code</h3>
 
 <p class="text-gray-300 leading-relaxed">The final component of a mature autonomous backup system is the replacement of static PDF runbooks with executable recovery definitions. A runbook-as-code is a versioned, testable script that encodes the complete recovery procedure for a specific failure scenario. It is stored in source control alongside application code, reviewed in pull requests, and executed by the recovery orchestrator rather than read by a panicking engineer.</p>
-
-<p class="text-gray-300 leading-relaxed">A minimal runbook-as-code for a PostgreSQL primary failure looks like:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># runbooks/postgres_primary_failure.py
-# Triggered by: primary health check fails for &gt; 60 seconds
-# Preconditions: replica is running and lag &lt; 30 seconds
-# Postconditions: traffic is routed to promoted replica; old primary is fenced
-
-from recovery_framework import (
-    Step, Precondition, Postcondition, RecoveryRunbook,
-    fence_instance, promote_replica, update_dns, verify_traffic,
-    send_notification,
-)
-
-PRIMARY_FAILURE_RUNBOOK = RecoveryRunbook(
-    name="postgres_primary_failure",
-    version="2.4.1",
-    description="Automated failover when PostgreSQL primary becomes unavailable",
-    max_execution_minutes=10,
-
-    preconditions=[
-        Precondition(
-            name="replica_is_healthy",
-            check=lambda ctx: ctx.replica_lag_seconds &lt; 30
-                and ctx.replica_state == "streaming",
-            failure_action="ESCALATE",   # don't proceed if replica isn't ready
-        ),
-        Precondition(
-            name="backup_is_current",
-            check=lambda ctx: ctx.last_backup_age_minutes &lt; 60,
-            failure_action="WARN",       # proceed but alert — backup is stale
-        ),
-    ],
-
-    steps=[
-        Step(
-            name="fence_primary",
-            action=fence_instance,
-            args={"instance_id": "{{primary_instance_id}}"},
-            timeout_seconds=30,
-            on_failure="ABORT",          # if we can't fence, don't continue
-        ),
-        Step(
-            name="promote_replica",
-            action=promote_replica,
-            args={"replica_instance_id": "{{replica_instance_id}}"},
-            timeout_seconds=60,
-            on_failure="ABORT",
-        ),
-        Step(
-            name="update_dns",
-            action=update_dns,
-            args={
-                "record": "{{db_dns_record}}",
-                "target": "{{replica_instance_id}}",
-                "ttl_seconds": 30,
-            },
-            timeout_seconds=30,
-            on_failure="ALERT_AND_CONTINUE",  # DNS failure is recoverable manually
-        ),
-        Step(
-            name="verify_traffic",
-            action=verify_traffic,
-            args={
-                "endpoint": "{{db_dns_record}}",
-                "probe_query": "SELECT 1",
-                "expected_rows": 1,
-            },
-            timeout_seconds=60,
-            on_failure="ESCALATE",
-        ),
-        Step(
-            name="notify_stakeholders",
-            action=send_notification,
-            args={
-                "channel": "{{alert_channel}}",
-                "severity": "P1",
-                "message": (
-                    "Automated failover completed for {{database_name}}. "
-                    "New primary: {{replica_instance_id}}. "
-                    "Failover duration: {{elapsed_seconds}}s."
-                ),
-            },
-            timeout_seconds=10,
-            on_failure="WARN",
-        ),
-    ],
-
-    postconditions=[
-        Postcondition(
-            name="new_primary_is_writable",
-            check=lambda ctx: ctx.new_primary_accepts_writes is True,
-            failure_action="ESCALATE",
-        ),
-        Postcondition(
-            name="replication_lag_recovering",
-            check=lambda ctx: ctx.new_replica_lag_seconds &lt; 120,
-            failure_action="WARN",
-        ),
-    ],
-)</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Each step carries an <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">on_failure</code> disposition: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ABORT</code> halts the runbook and pages the team; <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ESCALATE</code> halts and pages with the current context attached; <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALERT_AND_CONTINUE</code> logs the failure and proceeds; <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WARN</code> records the condition but does not interrupt flow. This disposition model is the key structural difference between a runbook-as-code and a simple shell script — it encodes the decision logic about what is a hard stop versus an acceptable degraded path.</p>
 
@@ -1046,7 +958,7 @@ PRIMARY_FAILURE_RUNBOOK = RecoveryRunbook(
 
 <p class="text-gray-300 leading-relaxed">Runbooks are versioned semantically: the version number in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">PRIMARY_FAILURE_RUNBOOK</code> (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">2.4.1</code>) corresponds to a git tag in the runbook repository. When a new version is deployed, the recovery framework validates that the new runbook's preconditions and postconditions are a superset of the previous version's — a regression in safety invariants requires an explicit override with a documented justification. This is the same principle applied to database schema migrations in Chapter 25, transposed to operational procedure management.</p>
 
-<p class="text-gray-300 leading-relaxed">For SQL Server environments, the equivalent runbook for an Always On availability group failover uses the SQL Server-native failover mechanics but follows the same structural pattern:</p>
+<p class="text-gray-300 leading-relaxed">A minimal runbook-as-code for an Always On availability group failover looks like:</p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># runbooks/sqlserver_ag_failover.py
 # Triggered by: AG primary replica health check fails for &gt; 90 seconds
@@ -1149,19 +1061,17 @@ AG_FAILOVER_RUNBOOK = RecoveryRunbook(
 
 <p class="text-gray-300 leading-relaxed">The value of this approach compounds over time. Each time a runbook executes — whether in a test environment, a chaos engineering drill, or a real incident — the execution log provides evidence about which steps succeed reliably, which steps occasionally time out, and which preconditions are frequently violated. The autonomous system uses this historical execution data to tune timeouts, reorder steps for faster resolution, and flag runbooks that have not been exercised recently for mandatory drill scheduling. Runbooks that go untested for longer than a defined period are automatically queued for a chaos-engineering dry run in the staging environment, ensuring that the entire procedure library remains exercised and current.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Backup scheduling should be demand-driven, not time-driven.** Measuring WAL generation rate (PostgreSQL) or write byte throughput (SQL Server) and mapping it to a velocity band allows the scheduler to increase log backup cadence during high-change periods and reduce it during quiescent periods, keeping RPO tight where it matters without wasteful constant-rate scheduling.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Backup scheduling should be demand-driven, not time-driven.</strong> Measuring log generation rate (write byte throughput) and mapping it to a velocity band allows the scheduler to increase log backup cadence during high-change periods and reduce it during quiescent periods, keeping RPO tight where it matters without wasteful constant-rate scheduling.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Every backup must be tested to the point of data readability before it is trusted.** A three-stage validation pipeline — structural integrity check, restore smoke test, and application-level consistency assertions — run automatically after every backup provides an auditable truth record of restorability and eliminates the silent failure mode where backups exist but cannot actually be restored.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Every backup must be tested to the point of data readability before it is trusted.</strong> A three-stage validation pipeline — structural integrity check, restore smoke test, and application-level consistency assertions — run automatically after every backup provides an auditable truth record of restorability and eliminates the silent failure mode where backups exist but cannot actually be restored.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Retention policy is a machine-executable rule set, not a human judgment call.** Encoding time-based, count-based, PITR-coverage, and compliance-anchor dimensions into a query-driven retention engine, with two-phase deletion and catalog-storage consistency checks, removes both over-retention cost and under-retention compliance risk simultaneously.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Retention policy is a machine-executable rule set, not a human judgment call.</strong> Encoding time-based, count-based, PITR-coverage, and compliance-anchor dimensions into a query-driven retention engine, with two-phase deletion and catalog-storage consistency checks, removes both over-retention cost and under-retention compliance risk simultaneously.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Restore plans should be pre-computed at backup time, not calculated at incident time.** Maintaining a continuously updated restore plan catalog — which base backup to use, which log sequence to apply, what the estimated restore duration is — means the orchestrator can begin execution immediately when a restore is triggered, rather than computing the sequence under operational pressure when time is most scarce.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Restore plans should be pre-computed at backup time, not calculated at incident time.</strong> Maintaining a continuously updated restore plan catalog — which base backup to use, which log sequence to apply, what the estimated restore duration is — means the orchestrator can begin execution immediately when a restore is triggered, rather than computing the sequence under operational pressure when time is most scarce.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Runbooks-as-code with explicit failure dispositions are a prerequisite for safe automation.** Encoding recovery procedures as versioned, testable Python objects with per-step `on_failure` behaviors (`ABORT`, `ESCALATE`, `ALERT_AND_CONTINUE`, `WARN`) transforms static documentation into executable policy, creates an auditable execution history for post-incident review, and enables the system to automatically schedule drills for runbooks that have not been exercised within a defined window.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Runbooks-as-code with explicit failure dispositions are a prerequisite for safe automation.</strong> Encoding recovery procedures as versioned, testable Python objects with per-step <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">on_failure</code> behaviors (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ABORT</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ESCALATE</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALERT_AND_CONTINUE</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WARN</code>) transforms static documentation into executable policy, creates an auditable execution history for post-incident review, and enables the system to automatically schedule drills for runbooks that have not been exercised within a defined window.</li>
     </div>
     <div class="mt-14 bg-emerald-950/40 border border-emerald-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">

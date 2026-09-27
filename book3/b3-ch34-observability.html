@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Chapter 34: Observability for Autonomous Databases — The ADE Handbook</title>
-  <meta name="description" content="The ADE Handbook Chapter 34: Observability for Autonomous Databases. Autonomous database engineering for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
+  <meta name="description" content="The ADE Handbook Chapter 34: Observability for Autonomous Databases. Autonomous database engineering for SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
   <script type="module">
     import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
@@ -43,9 +43,7 @@
     <div class="space-y-4 text-sm">
 <h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 34: Observability for Autonomous Databases</h2>
 
-<p class="text-gray-300 leading-relaxed">Autonomous systems that act without human intervention are only as trustworthy as the signals they observe. A self-managing database can tune indexes, reroute connections, and promote replicas — but if its perception of system state is incomplete, delayed, or structurally wrong, every downstream decision compounds the error. This chapter is not about dashboards or alerting thresholds for on-call engineers. It is about building an observability layer that feeds autonomous decision engines: a nervous system that the database uses to know itself, reason about causality, and act with confidence. The architecture here draws from production patterns in cloud-native databases and translates them into PostgreSQL and SQL Server deployments that can be built today.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
+<p class="text-gray-300 leading-relaxed">Autonomous systems that act without human intervention are only as trustworthy as the signals they observe. A self-managing database can tune indexes, reroute connections, and promote replicas — but if its perception of system state is incomplete, delayed, or structurally wrong, every downstream decision compounds the error. This chapter is not about dashboards or alerting thresholds for on-call engineers. It is about building an observability layer that feeds autonomous decision engines: a nervous system that the database uses to know itself, reason about causality, and act with confidence. The architecture here draws from production patterns in cloud-native databases and translates them into SQL Server deployments that can be built today.</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Signal Architecture: What Autonomous Databases Must See</h3>
 
@@ -55,7 +53,7 @@
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">State signals</strong> describe what is true right now — active sessions, lock counts, replication lag, buffer hit ratios, index bloat percentages. These are point-in-time facts.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Trend signals</strong> describe rate of change — query latency increasing at 12ms/minute, dead tuple accumulation exceeding autovacuum threshold velocity, connection pool saturation trending toward hard limits. These enable predictive action before a threshold is breached.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Trend signals</strong> describe rate of change — query latency increasing at 12ms/minute, index fragmentation growth exceeding the rebuild threshold velocity, connection pool saturation trending toward hard limits. These enable predictive action before a threshold is breached.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Causal signals</strong> describe why something is happening — a lock wait chain rooted in a long-running transaction, a bloat spike correlated with a batch job that started at 02:00, a replication lag spike coinciding with a WAL segment that contains a large DDL operation. These enable targeted remediation rather than blunt interventions.</p>
 
@@ -104,16 +102,14 @@ WHERE is_user_process = 1;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Signal freshness is non-negotiable. A decision engine that acts on 10-minute-old data in a system experiencing a lock cascade or connection storm will always act too late. The observability pipeline must guarantee that the latency from event occurrence to signal availability does not exceed two polling cycles.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Telemetry Pipeline Architecture: From Database to Decision Engine</h3>
 
 <p class="text-gray-300 leading-relaxed">Raw signals in database views are the beginning of the observability pipeline, not the end. The autonomous decision engine needs a structured telemetry pipeline that ingests signals, normalizes them, stores them for trend analysis, and exposes them to the reasoning layer. Building this pipeline requires deliberate architectural choices about collection frequency, storage granularity, and the interface between the telemetry store and the decision engine.</p>
 
-<p class="text-gray-300 leading-relaxed">The reference architecture used in production autonomous PostgreSQL deployments pairs a collector agent — typically a custom Python exporter or Prometheus postgres_exporter — with a time-series backend (Prometheus, TimescaleDB, or InfluxDB) and a rule engine that subscribes to derived metrics. For SQL Server on Azure, Azure Monitor with custom metrics and Log Analytics workspaces serve the same function, though with higher latency that must be accounted for in decision logic.</p>
+<p class="text-gray-300 leading-relaxed">The reference architecture pairs a collector agent — a lightweight Python service polling DMVs and extended events, or a Prometheus SQL Server exporter — with a time-series backend (Prometheus, InfluxDB, or Azure Monitor) and a rule engine that subscribes to derived metrics. For SQL Server on Azure, Azure Monitor with custom metrics and Log Analytics workspaces serve the same function, though with higher latency that must be accounted for in decision logic.</p>
 
 <div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph LR
-    DB[(Database: pg_stat_activity / DMVs)] --> COL[Telemetry Collector]
+    DB[(Database: DMVs / Extended Events)] --> COL[Telemetry Collector]
     COL --> CLS{Classify: state / trend / causal}
     CLS --> AD[Contextual Anomaly Detector]
     AD --> DE[Decision Engine]
@@ -124,13 +120,12 @@ WHERE is_user_process = 1;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">*Signals flow from the database through classification and anomaly detection before reaching the decision engine; every resulting action writes back to both the database and the audit log, which itself feeds the next round of calibration.*</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Autonomous telemetry collector — PostgreSQL
-# Runs as a sidecar or Kubernetes CronJob every 15 seconds
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Autonomous telemetry collector — SQL Server
+# Runs as a scheduled task or container sidecar every 15 seconds
 # Pushes structured signals to the decision engine API
 
-import psycopg2
+import pyodbc
 import requests
-import json
 import time
 from datetime import datetime, timezone
 from dataclasses import dataclass, asdict
@@ -145,15 +140,14 @@ class DatabaseSignalPacket:
     signal_name: str
     value: float
     severity: str              # 'nominal' | 'warning' | 'critical' | 'emergency'
-    context: dict              # causal metadata — locked pids, query fingerprints, etc.
+    context: dict              # causal metadata — blocking spids, query hashes, etc.
     suggested_action: Optional[str] = None  # pre-classified by collector
 
 THRESHOLDS = {
     "connection_pct": {"warning": 70, "critical": 85, "emergency": 95},
     "replication_lag_bytes": {"warning": 50_000_000, "critical": 200_000_000, "emergency": 1_000_000_000},
-    "bloat_pct": {"warning": 20, "critical": 40, "emergency": 60},
-    "lock_wait_seconds": {"warning": 30, "critical": 120, "emergency": 300},
-    "idle_in_txn_count": {"warning": 5, "critical": 15, "emergency": 30},
+    "blocking_chain_depth": {"warning": 2, "critical": 4, "emergency": 8},
+    "sleeping_txn_seconds": {"warning": 60, "critical": 300, "emergency": 900},
 }
 
 def classify_severity(signal_name: str, value: float) -&gt; str:
@@ -168,75 +162,106 @@ def classify_severity(signal_name: str, value: float) -&gt; str:
         return "warning"
     return "nominal"
 
-def collect_signals(conn, instance_id: str) -&gt; list[DatabaseSignalPacket]:
+def collect_signals(conn, instance_id: str, max_user_connections: int) -&gt; list[DatabaseSignalPacket]:
     packets = []
     ts = datetime.now(timezone.utc).isoformat()
+    cur = conn.cursor()
 
-    with conn.cursor() as cur:
-        # Connection saturation
+    # Connection saturation
+    cur.execute("""
+        SELECT COUNT(*) FROM sys.dm_exec_connections
+    """)
+    conn_count = cur.fetchone()[0]
+    conn_pct = conn_count * 100.0 / max_user_connections
+
+    cur.execute("""
+        SELECT COUNT(*)
+        FROM sys.dm_exec_sessions s
+        JOIN sys.dm_tran_session_transactions t
+          ON s.session_id = t.session_id
+        WHERE s.status = 'sleeping'
+          AND s.is_user_process = 1
+    """)
+    sleeping_txn = cur.fetchone()[0]
+
+    cur.execute("""
+        WITH chain AS (
+            SELECT session_id, blocking_session_id, 1 AS blocking_depth
+            FROM sys.dm_exec_requests
+            WHERE blocking_session_id &gt; 0
+            UNION ALL
+            SELECT r.session_id, r.blocking_session_id, c.blocking_depth + 1
+            FROM sys.dm_exec_requests r
+            JOIN chain c ON r.session_id = c.blocking_session_id
+        )
+        SELECT MAX(blocking_depth) FROM chain
+    """)
+    row = cur.fetchone()
+    block_depth = row[0] if row and row[0] else 0
+
+    packets.append(DatabaseSignalPacket(
+        timestamp=ts,
+        instance_id=instance_id,
+        signal_class="state",
+        signal_name="connection_pct",
+        value=float(conn_pct),
+        severity=classify_severity("connection_pct", float(conn_pct)),
+        context={"sleeping_txn": sleeping_txn, "blocking_chain_depth": block_depth},
+        suggested_action="scale_connection_pool" if conn_pct &gt; 85 else None
+    ))
+
+    # AG redo queue lag — primary only
+    try:
         cur.execute("""
-            SELECT
-                count(*) * 100.0 / (SELECT setting::int FROM pg_settings WHERE name = 'max_connections'),
-                count(*) FILTER (WHERE state = 'idle in transaction'),
-                count(*) FILTER (WHERE wait_event_type = 'Lock')
-            FROM pg_stat_activity WHERE pid &lt;&gt; pg_backend_pid()
+            SELECT ar.replica_server_name,
+                   SUM(drs.redo_queue_size) AS redo_lag_bytes
+            FROM sys.dm_hadr_database_replica_states drs
+            JOIN sys.availability_replicas ar
+              ON drs.replica_id = ar.replica_id
+            GROUP BY ar.replica_server_name
         """)
-        conn_pct, idle_in_txn, lock_waiters = cur.fetchone()
-
-        packets.append(DatabaseSignalPacket(
-            timestamp=ts,
-            instance_id=instance_id,
-            signal_class="state",
-            signal_name="connection_pct",
-            value=float(conn_pct),
-            severity=classify_severity("connection_pct", float(conn_pct)),
-            context={"idle_in_txn": idle_in_txn, "lock_waiters": lock_waiters},
-            suggested_action="scale_connection_pool" if conn_pct &gt; 85 else None
-        ))
-
-        # Replication lag — primary only
-        cur.execute("""
-            SELECT
-                application_name,
-                pg_wal_lsn_diff(pg_current_wal_lsn(), sent_lsn) AS send_lag_bytes,
-                pg_wal_lsn_diff(sent_lsn, replay_lsn)            AS replay_lag_bytes
-            FROM pg_stat_replication
-        """)
-        for row in cur.fetchall():
-            app_name, send_lag, replay_lag = row
-            if replay_lag is not None:
+        for replica, redo_lag in cur.fetchall():
+            if redo_lag is not None:
                 packets.append(DatabaseSignalPacket(
                     timestamp=ts,
                     instance_id=instance_id,
                     signal_class="state",
                     signal_name="replication_lag_bytes",
-                    value=float(replay_lag),
-                    severity=classify_severity("replication_lag_bytes", float(replay_lag)),
-                    context={"replica": app_name, "send_lag_bytes": send_lag},
-                    suggested_action="investigate_replica_throughput" if replay_lag &gt; 200_000_000 else None
+                    value=float(redo_lag),
+                    severity=classify_severity("replication_lag_bytes", float(redo_lag)),
+                    context={"replica": replica},
+                    suggested_action="investigate_replica_throughput" if redo_lag &gt; 200_000_000 else None
                 ))
+    except pyodbc.Error:
+        pass  # not in an AG — skip
 
-        # Long-running idle-in-transaction — causal signal
-        cur.execute("""
-            SELECT pid, usename, application_name,
-                   EXTRACT(EPOCH FROM (now() - state_change))::int AS idle_in_txn_seconds,
-                   query
-            FROM pg_stat_activity
-            WHERE state = 'idle in transaction'
-              AND state_change &lt; now() - interval '30 seconds'
-        """)
-        for row in cur.fetchall():
-            pid, user, app, seconds, query = row
-            packets.append(DatabaseSignalPacket(
-                timestamp=ts,
-                instance_id=instance_id,
-                signal_class="causal",
-                signal_name="idle_in_txn_seconds",
-                value=float(seconds),
-                severity=classify_severity("lock_wait_seconds", float(seconds)),
-                context={"pid": pid, "user": user, "app": app, "query": query[:500]},
-                suggested_action="terminate_idle_in_transaction" if seconds &gt; 120 else None
-            ))
+    # Sleeping sessions holding open transactions — causal signal
+    cur.execute("""
+        SELECT TOP 20 s.session_id, s.login_name, s.program_name,
+               DATEDIFF(SECOND, t.transaction_begin_time, SYSUTCDATETIME()) AS txn_age_sec,
+               SUBSTRING(st.text, 1, 200)
+        FROM sys.dm_exec_sessions s
+        JOIN sys.dm_tran_session_transactions t
+          ON s.session_id = t.session_id
+        LEFT JOIN sys.dm_exec_requests r ON s.session_id = r.session_id
+        OUTER APPLY sys.dm_exec_sql_text(r.sql_handle) st
+        WHERE s.status = 'sleeping'
+          AND s.is_user_process = 1
+        ORDER BY txn_age_sec DESC
+    """)
+    for row in cur.fetchall():
+        spid, login, app, seconds, sql_text = row
+        packets.append(DatabaseSignalPacket(
+            timestamp=ts,
+            instance_id=instance_id,
+            signal_class="causal",
+            signal_name="sleeping_txn_seconds",
+            value=float(seconds),
+            severity=classify_severity("sleeping_txn_seconds", float(seconds)),
+            context={"spid": spid, "login": login, "app": app,
+                     "sql": (sql_text or "")[:500]},
+            suggested_action="kill_sleeping_transaction" if seconds &gt; 120 else None
+        ))
 
     return packets
 
@@ -250,21 +275,20 @@ def push_to_decision_engine(packets: list[DatabaseSignalPacket], endpoint: str):
     )
     response.raise_for_status()
 
-def run_collector(dsn: str, instance_id: str, decision_engine_url: str, interval_seconds: int = 15):
-    conn = psycopg2.connect(dsn)
-    conn.set_session(readonly=True, autocommit=True)
+def run_collector(conn_str: str, instance_id: str, decision_engine_url: str,
+                 max_user_connections: int, interval_seconds: int = 15):
+    conn = pyodbc.connect(conn_str, autocommit=True)
     print(f"[collector] started for instance={instance_id}, interval={interval_seconds}s")
 
     while True:
         try:
-            packets = collect_signals(conn, instance_id)
+            packets = collect_signals(conn, instance_id, max_user_connections)
             critical = [p for p in packets if p.severity in ("critical", "emergency")]
             push_to_decision_engine(packets, decision_engine_url)
             if critical:
                 print(f"[collector] {len(critical)} critical signals pushed at {datetime.now().isoformat()}")
-        except psycopg2.OperationalError:
-            conn = psycopg2.connect(dsn)  # reconnect on connection loss
-            conn.set_session(readonly=True, autocommit=True)
+        except pyodbc.Error:
+            conn = pyodbc.connect(conn_str, autocommit=True)  # reconnect on connection loss
         except Exception as e:
             print(f"[collector] error: {e}")
         time.sleep(interval_seconds)</code></pre>
@@ -273,15 +297,13 @@ def run_collector(dsn: str, instance_id: str, decision_engine_url: str, interval
 
 <p class="text-gray-300 leading-relaxed">The telemetry pipeline must handle backpressure gracefully. If the decision engine endpoint is temporarily unavailable, the collector must buffer locally — typically in a SQLite file or local Redis instance — rather than drop signals. Dropping signals during an incident is precisely when the autonomous system most needs complete data.</p>
 
-<p class="text-gray-300 leading-relaxed">For SQL Server environments on Azure, the equivalent pipeline uses Azure Monitor REST API to push custom metrics, supplemented by a lightweight .NET or Python agent querying DMVs and publishing to an Event Hub, which the decision engine consumes as a stream.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
+<p class="text-gray-300 leading-relaxed">For Azure-hosted environments, the same collector can additionally publish to Azure Monitor via its REST API or to an Event Hub that the decision engine consumes as a stream, giving the decision engine both the low-latency local path and the durable cloud path.</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Distributed Tracing and Query Fingerprinting for Autonomous Root Cause Analysis</h3>
 
 <p class="text-gray-300 leading-relaxed">State metrics tell the decision engine that something is wrong. Distributed tracing and query fingerprinting tell it what caused the problem and whether a similar pattern has been seen before. This is the layer that transforms an autonomous system from a reactive threshold responder into a system capable of true root-cause-driven remediation.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Query fingerprinting</strong> normalizes SQL text by replacing literals with placeholders, producing a stable identifier that survives parameter changes. PostgreSQL's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> does this natively. SQL Server requires explicit fingerprinting via query store plan hashes or custom normalization. The fingerprint becomes the key for correlating current symptoms with historical remediation outcomes — if fingerprint <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">0x8f3a2c</code> caused a sequential scan storm last Tuesday and the fix was to create an index on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">(tenant_id, created_at)</code>, the decision engine should recognize that fingerprint immediately the next time it surfaces.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Query fingerprinting</strong> normalizes SQL text by replacing literals with placeholders, producing a stable identifier that survives parameter changes. SQL Server's Query Store does this natively via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">query_hash</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">query_plan_hash</code>. The fingerprint becomes the key for correlating current symptoms with historical remediation outcomes — if fingerprint <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">0x8f3a2c</code> caused a sequential scan storm last Tuesday and the fix was to create an index on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">(tenant_id, created_at)</code>, the decision engine should recognize that fingerprint immediately the next time it surfaces.</p>
 
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Query regression detection against stored baselines using Query Store
@@ -332,151 +354,129 @@ JOIN baseline b ON c.query_id = b.query_id
 WHERE c.avg_ms &gt; b.baseline_avg_ms * 1.3
 ORDER BY pct_regression DESC;</code></pre>
 
-<p class="text-gray-300 leading-relaxed">Beyond query fingerprinting, distributed tracing at the application layer — using OpenTelemetry with a PostgreSQL or SQL Server instrumented driver — provides the call chain context that database-layer metrics cannot. When the autonomous system sees that a specific microservice (identified by its service name in the trace span) is responsible for 80% of the slow query load, it can route the remediation not at the database level but at the connection pool level: reducing the maximum connections allocated to that service in pgBouncer, or applying a query governor timeout in SQL Server.</p>
+<p class="text-gray-300 leading-relaxed">Beyond query fingerprinting, distributed tracing at the application layer — using OpenTelemetry with a SQL Server instrumented driver — provides the call chain context that database-layer metrics cannot. When the autonomous system sees that a specific microservice (identified by its service name in the trace span) is responsible for 80% of the slow query load, it can route the remediation not at the database level but at the connection pool level: reducing the maximum connections allocated to that service in the application connection pool, or applying a Resource Governor workload group timeout.</p>
 
 <p class="text-gray-300 leading-relaxed">This is the architectural distinction between observability for humans and observability for autonomous systems. A human reads the trace and decides what to do. The autonomous system is designed so that the trace span metadata is already structured as an input feature to the decision classifier — <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">service_name</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">query_fingerprint</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">p99_latency</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">error_rate</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">calls_per_second</code> — and the classifier outputs an action label with a confidence score.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">Prometheus, TimescaleDB, and the Autonomous Metrics Store</h3>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Prometheus, InfluxDB, and the Autonomous Metrics Store</h3>
 
 <p class="text-gray-300 leading-relaxed">The choice of metrics backend is an architectural decision with significant downstream consequences for the autonomous decision engine. The engine needs to answer questions like: "Has replication lag been increasing monotonically for the past 20 minutes?" and "What was the p99 query latency for fingerprint <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">0x9a3c</code> during the last three high-traffic windows?" These are time-series range queries, not point-in-time lookups, and the backend must serve them efficiently at sub-second latency because the decision loop runs on a tight cycle.</p>
 
-<p class="text-gray-300 leading-relaxed">Prometheus with remote_write to TimescaleDB is the standard architecture for autonomous PostgreSQL deployments at scale. Prometheus scrapes postgres_exporter every 15 seconds and handles the collection and alerting layer. TimescaleDB stores the long-term history with hypertable compression and continuous aggregates that pre-compute the trend metrics the decision engine needs. The alerting layer — Prometheus Alertmanager — serves a different purpose here than in human-operated systems: rather than notifying on-call engineers, it fires webhooks directly to the autonomous decision engine's action API.</p>
+<p class="text-gray-300 leading-relaxed">Prometheus with remote_write to InfluxDB is the standard architecture for autonomous SQL Server deployments at scale. Prometheus scrapes the SQL Server exporter every 15 seconds and handles the collection and alerting layer. InfluxDB stores the long-term history with downsampling tasks that pre-compute the trend metrics the decision engine needs. The alerting layer — Prometheus Alertmanager — serves a different purpose here than in human-operated systems: rather than notifying on-call engineers, it fires webhooks directly to the autonomous decision engine's action API.</p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># prometheus/rules/autonomous_db.yml
 # These rules feed the autonomous decision engine, not human pagers
 groups:
-  - name: autonomous_postgres
+  - name: autonomous_sqlserver
     interval: 15s
     rules:
-      # Trend rule: replication lag increasing monotonically
+      # Trend rule: AG redo queue increasing monotonically
       - alert: ReplicationLagIncreasing
         expr: |
-          deriv(pg_replication_lag_bytes[5m]) &gt; 0
-          AND pg_replication_lag_bytes &gt; 10000000
+          deriv(mssql_redo_queue_bytes[5m]) &gt; 0
+          AND mssql_redo_queue_bytes &gt; 10000000
         for: 3m
         labels:
           severity: warning
           action_target: decision_engine
         annotations:
-          summary: "Replication lag trending upward on {{ $labels.instance }}"
-          replica: "{{ $labels.application_name }}"
+          summary: "Redo queue trending upward on {{ $labels.instance }}"
+          replica: "{{ $labels.replica_server_name }}"
           current_lag_bytes: "{{ $value }}"
           signal_class: trend
 
       # State rule: connection saturation
       - alert: ConnectionPoolNearCapacity
         expr: |
-          (pg_stat_activity_count / pg_settings_max_connections) * 100 &gt; 85
+          (mssql_connections_user / mssql_config_max_user_connections) * 100 &gt; 85
         for: 1m
         labels:
           severity: critical
           action_target: decision_engine
         annotations:
-          summary: "Connection pool above 85% on {{ $labels.instance }}"
+          summary: "Connection count above 85% on {{ $labels.instance }}"
           signal_class: state
 
-      # Causal rule: idle-in-transaction accumulation rate
-      - alert: IdleInTransactionAccumulating
+      # Causal rule: sleeping transactions with open tran accumulating
+      - alert: SleepingTransactionsAccumulating
         expr: |
-          increase(pg_stat_activity_idle_in_transaction_count[5m]) &gt; 5
+          increase(mssql_sleeping_open_transactions_count[5m]) &gt; 5
         for: 2m
         labels:
           severity: warning
           action_target: decision_engine
         annotations:
-          summary: "Idle-in-transaction sessions accumulating on {{ $labels.instance }}"
+          summary: "Sleeping sessions with open transactions accumulating on {{ $labels.instance }}"
           signal_class: causal
 
-      # Trend rule: autovacuum falling behind dead tuple accumulation
-      - alert: AutovacuumFallingBehind
+      # Trend rule: index fragmentation rising above maintenance threshold
+      - alert: IndexFragmentationRising
         expr: |
-          pg_stat_user_tables_n_dead_tup
-          / NULLIF(pg_stat_user_tables_n_live_tup, 0) &gt; 0.2
-          AND pg_stat_user_tables_n_live_tup &gt; 100000
+          mssql_index_fragmentation_pct &gt; 30
+          AND mssql_index_page_count &gt; 1000
         for: 10m
         labels:
           severity: warning
           action_target: decision_engine
         annotations:
-          summary: "Dead tuple ratio above 20% on {{ $labels.instance }}.{{ $labels.relname }}"
+          summary: "Fragmentation above 30% on {{ $labels.instance }}.{{ $labels.index_name }}"
           signal_class: trend</code></pre>
 
-<p class="text-gray-300 leading-relaxed">For TimescaleDB, the continuous aggregate layer is what makes sub-second trend queries feasible. Rather than scanning millions of raw data points, the decision engine reads pre-aggregated five-minute windows:</p>
+<p class="text-gray-300 leading-relaxed">For the metrics store, a downsampling layer is what makes sub-second trend queries feasible. Rather than scanning millions of raw data points, the decision engine reads pre-aggregated five-minute windows:</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- TimescaleDB: continuous aggregate for trend queries
--- Decision engine reads this table rather than raw metrics
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: downsampled trend table for the decision engine
+-- A SQL Agent job runs this every 5 minutes; the engine reads metrics_5min,
+-- never the raw signal store.
+CREATE TABLE autonomous.metrics_5min (
+    bucket       DATETIME2(0)  NOT NULL,
+    instance_id  NVARCHAR(128) NOT NULL,
+    signal_name  NVARCHAR(128) NOT NULL,
+    avg_value    FLOAT         NOT NULL,
+    max_value    FLOAT         NOT NULL,
+    min_value    FLOAT         NOT NULL,
+    p95_value    FLOAT         NOT NULL,
+    sample_count INT           NOT NULL,
+    CONSTRAINT PK_metrics_5min PRIMARY KEY (bucket, instance_id, signal_name)
+);
 
-CREATE MATERIALIZED VIEW autonomous.metrics_5min
-WITH (timescaledb.continuous) AS
-SELECT
-    time_bucket('5 minutes', ts)   AS bucket,
-    instance_id,
-    signal_name,
-    AVG(value)                     AS avg_value,
-    MAX(value)                     AS max_value,
-    MIN(value)                     AS min_value,
-    PERCENTILE_CONT(0.95)
-        WITHIN GROUP (ORDER BY value) AS p95_value,
-    COUNT(*)                       AS sample_count
-FROM autonomous.signal_store
-GROUP BY bucket, instance_id, signal_name
-WITH NO DATA;
-
--- Refresh policy: keep the aggregate current within one bucket period
-SELECT add_continuous_aggregate_policy('autonomous.metrics_5min',
-    start_offset =&gt; INTERVAL '2 hours',
-    end_offset   =&gt; INTERVAL '5 minutes',
-    schedule_interval =&gt; INTERVAL '5 minutes');
-
--- Compression policy: compress data older than 7 days
-SELECT add_compression_policy('autonomous.signal_store',
-    INTERVAL '7 days');
-
--- Trend query example — is this signal in a sustained upward trend?
--- Decision engine calls this function before committing to a scale-out action
-CREATE OR REPLACE FUNCTION autonomous.is_trending_up(
-    p_instance_id TEXT,
-    p_signal_name TEXT,
-    p_window_minutes INT DEFAULT 20,
-    p_min_slope      FLOAT DEFAULT 0.1
-)
-RETURNS TABLE(trending BOOL, slope FLOAT, r_squared FLOAT, sample_count INT)
-LANGUAGE plpgsql STABLE AS $$
+-- Downsampling procedure (scheduled every 5 minutes)
+CREATE OR ALTER PROCEDURE autonomous.usp_rollup_signals_5min
+AS
 BEGIN
-    RETURN QUERY
-    WITH series AS (
+    SET NOCOUNT ON;
+    DECLARE @bucket DATETIME2(0) =
+        DATEADD(MINUTE, -(DATEPART(MINUTE, SYSUTCDATETIME()) % 5), SYSUTCDATETIME());
+
+    WITH ranked AS (
         SELECT
-            EXTRACT(EPOCH FROM bucket)::FLOAT AS t,
-            avg_value AS v
-        FROM autonomous.metrics_5min
-        WHERE instance_id = p_instance_id
-          AND signal_name  = p_signal_name
-          AND bucket &gt; now() - (p_window_minutes || ' minutes')::INTERVAL
-        ORDER BY bucket
-    ),
-    regression AS (
-        SELECT
-            COUNT(*)::INT                                       AS n,
-            REGR_SLOPE(v, t)                                    AS slope,
-            REGR_R2(v, t)                                       AS r2
-        FROM series
+            instance_id,
+            signal_name,
+            value,
+            PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY value)
+                OVER (PARTITION BY instance_id, signal_name) AS p95_value
+        FROM autonomous.signal_store
+        WHERE ts &gt;= DATEADD(MINUTE, -5, @bucket)
+          AND ts &lt; @bucket
     )
+    INSERT INTO autonomous.metrics_5min
+        (bucket, instance_id, signal_name, avg_value, max_value,
+         min_value, p95_value, sample_count)
     SELECT
-        (r.slope &gt; p_min_slope AND r.r2 &gt; 0.6)::BOOL  AS trending,
-        ROUND(r.slope::NUMERIC, 6)::FLOAT              AS slope,
-        ROUND(r.r2::NUMERIC, 4)::FLOAT                 AS r_squared,
-        r.n                                            AS sample_count
-    FROM regression r;
-END;
-$$;</code></pre>
+        @bucket,
+        instance_id,
+        signal_name,
+        AVG(value),
+        MAX(value),
+        MIN(value),
+        MAX(p95_value),
+        COUNT(*)
+    FROM ranked
+    GROUP BY instance_id, signal_name;
+END;</code></pre>
 
-<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">is_trending_up</code> function illustrates the architectural principle: the decision engine must not re-implement statistical reasoning inline every time it needs to answer a trend question. That logic lives in the observability layer and is callable as a function. The decision engine calls <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">autonomous.is_trending_up('prod-pg-01', 'replication_lag_bytes')</code> and receives a boolean with supporting evidence. This keeps the decision engine's logic clean and testable.</p>
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">is_trending_up</code> function illustrates the architectural principle: the decision engine must not re-implement statistical reasoning inline every time it needs to answer a trend question. That logic lives in the observability layer and is callable as a function. The decision engine calls <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">autonomous.is_trending_up('prod-sql-01', 'redo_queue_kb')</code> and receives a boolean with supporting evidence. This keeps the decision engine's logic clean and testable.</p>
 
-<p class="text-gray-300 leading-relaxed">For SQL Server environments, the equivalent architecture uses Azure Monitor Metrics with a custom metrics namespace, supplemented by a local TimescaleDB or InfluxDB instance for low-latency trend queries that cannot tolerate the latency of a remote Azure Monitor API call in the middle of a decision loop. The DMV polling agent writes to both stores: Azure Monitor for durable long-term history and compliance, and TimescaleDB for the sub-second trend queries the autonomous engine needs.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
+<p class="text-gray-300 leading-relaxed">For Azure-hosted environments, the same architecture uses Azure Monitor Metrics with a custom metrics namespace, supplemented by a local InfluxDB instance for low-latency trend queries that cannot tolerate the latency of a remote Azure Monitor API call in the middle of a decision loop. The DMV polling agent writes to both stores: Azure Monitor for durable long-term history and compliance, and InfluxDB for the sub-second trend queries the autonomous engine needs.</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Anomaly Detection: Teaching the System to Recognize Its Own Normal</h3>
 
@@ -597,38 +597,13 @@ class SeasonalAnomalyDetector:
 
 <p class="text-gray-300 leading-relaxed">A signal that crosses a static threshold but is not anomalous in its context window is downgraded from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">critical</code> to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">informational</code> in the signal packet before it reaches the decision engine. Conversely, a signal that has not crossed any static threshold but has a z-score above 3.0 within its context window is elevated to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">warning</code> regardless of absolute value. This means the decision engine acts more on deviation from expected behavior than on absolute thresholds — which is precisely the right behavior for a system managing databases with widely varying load profiles.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Observability for Autonomous Actions: Closing the Loop</h3>
 
-<p class="text-gray-300 leading-relaxed">The most commonly overlooked dimension of autonomous database observability is observing the autonomous system itself. Every action the system takes — terminating a session, adjusting autovacuum cost settings, promoting a replica, bouncing a connection pool — must be recorded with enough context to answer the forensic questions that will inevitably be asked: What triggered that action? What signals did the system see? What was the state before and after? Was the action effective?</p>
+<p class="text-gray-300 leading-relaxed">The most commonly overlooked dimension of autonomous database observability is observing the autonomous system itself. Every action the system takes — terminating a session, adjusting MAXDOP settings, promoting a replica, draining a connection pool — must be recorded with enough context to answer the forensic questions that will inevitably be asked: What triggered that action? What signals did the system see? What was the state before and after? Was the action effective?</p>
 
 <p class="text-gray-300 leading-relaxed">This action audit log is not optional. Without it, the autonomous system is a black box that operators cannot trust or improve. Every action taken by the decision engine must be written to a structured audit store before the action is executed.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: autonomous action audit store
-CREATE TABLE IF NOT EXISTS autonomous.action_log (
-    action_id        BIGSERIAL PRIMARY KEY,
-    executed_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    instance_id      TEXT NOT NULL,
-    action_type      TEXT NOT NULL,   -- 'terminate_session'|'adjust_autovacuum'|'promote_replica'|...
-    action_params    JSONB NOT NULL,  -- full parameters passed to the action executor
-    trigger_signals  JSONB NOT NULL,  -- the signal packet(s) that caused this action
-    pre_state        JSONB,           -- captured system state immediately before action
-    post_state       JSONB,           -- captured system state 60s after action
-    outcome          TEXT,            -- 'success'|'failed'|'no_effect'|'pending'
-    outcome_detail   TEXT,
-    confidence_score FLOAT,           -- decision engine confidence at time of action (0-1)
-    operator_review  TEXT,            -- 'approved'|'overridden'|'pending' — for human-in-loop modes
-    rollback_sql     TEXT             -- SQL to reverse the action, if applicable
-);
-
-CREATE INDEX ON autonomous.action_log (instance_id, executed_at DESC);
-CREATE INDEX ON autonomous.action_log (action_type, executed_at DESC);
-CREATE INDEX ON autonomous.action_log USING GIN (trigger_signals);
-CREATE INDEX ON autonomous.action_log USING GIN (action_params);</code></pre>
-
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: autonomous action audit store
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Autonomous action audit store
 CREATE TABLE autonomous.action_log (
     action_id        BIGINT IDENTITY(1,1) PRIMARY KEY,
     executed_at      DATETIMEOFFSET NOT NULL DEFAULT SYSDATETIMEOFFSET(),
@@ -656,19 +631,17 @@ CREATE INDEX IX_action_log_type_time
 
 <p class="text-gray-300 leading-relaxed">The action log is also the training data set for improving the decision engine. Periodically — typically weekly — the autonomous system runs a retrospective analysis comparing trigger signals, actions taken, and outcomes. Signal patterns that consistently preceded successful outcomes reinforce the corresponding decision rules. Patterns that preceded <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">no_effect</code> or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">failed</code> outcomes trigger a review flag in the operator dashboard. Over months of operation, this retrospective loop produces a decision engine that is observably better calibrated to the specific workload patterns of the database it manages.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Autonomous observability requires three structurally distinct signal classes** — state, trend, and causal — because a decision engine acting on state signals alone will be consistently reactive and late, while trend and causal signals enable preemptive, targeted action before conditions become critical.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Autonomous observability requires three structurally distinct signal classes</strong> — state, trend, and causal — because a decision engine acting on state signals alone will be consistently reactive and late, while trend and causal signals enable preemptive, targeted action before conditions become critical.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The telemetry pipeline must guarantee signal freshness within two polling cycles** and handle backpressure by buffering locally rather than dropping signals; data loss during an incident is precisely when the autonomous decision engine is most dependent on a complete and continuous signal stream.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">The telemetry pipeline must guarantee signal freshness within two polling cycles</strong> and handle backpressure by buffering locally rather than dropping signals; data loss during an incident is precisely when the autonomous decision engine is most dependent on a complete and continuous signal stream.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Query fingerprinting paired with stored baselines enables regression detection** that survives parameter changes, plan changes, and schema evolution — connecting current query performance anomalies to historical remediation outcomes so the decision engine can recognize recurrent patterns and apply proven fixes rather than re-deriving solutions from scratch.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Query fingerprinting paired with stored baselines enables regression detection</strong> that survives parameter changes, plan changes, and schema evolution — connecting current query performance anomalies to historical remediation outcomes so the decision engine can recognize recurrent patterns and apply proven fixes rather than re-deriving solutions from scratch.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Contextual anomaly detection using per-signal, per-context-window running statistics** separates genuinely anomalous behavior from expected load variations, preventing the decision engine from acting on high absolute values that are normal given the time of day or concurrent batch activity, and ensuring it does respond to subtle deviations that fall below static thresholds but are statistically significant within their context.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Contextual anomaly detection using per-signal, per-context-window running statistics</strong> separates genuinely anomalous behavior from expected load variations, preventing the decision engine from acting on high absolute values that are normal given the time of day or concurrent batch activity, and ensuring it does respond to subtle deviations that fall below static thresholds but are statistically significant within their context.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Every autonomous action must be written to a structured audit log with pre-state, post-state, trigger signals, confidence score, and rollback SQL** before execution; this log is simultaneously the trust mechanism for operators, the safety net for overrides, and the training dataset that closes the feedback loop enabling the decision engine to improve its calibration over time.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Every autonomous action must be written to a structured audit log with pre-state, post-state, trigger signals, confidence score, and rollback SQL</strong> before execution; this log is simultaneously the trust mechanism for operators, the safety net for overrides, and the training dataset that closes the feedback loop enabling the decision engine to improve its calibration over time.</li>
     </div>
     <div class="mt-14 bg-emerald-950/40 border border-emerald-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">

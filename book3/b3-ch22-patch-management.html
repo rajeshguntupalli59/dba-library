@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Chapter 22: Autonomous Patch Management — The ADE Handbook</title>
-  <meta name="description" content="The ADE Handbook Chapter 22: Autonomous Patch Management. Autonomous database engineering for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
+  <meta name="description" content="The ADE Handbook Chapter 22: Autonomous Patch Management. Autonomous database engineering for SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
   <script type="module">
     import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
@@ -43,85 +43,80 @@
     <div class="space-y-4 text-sm">
 <h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 22: Autonomous Patch Management</h2>
 
-<p class="text-gray-300 leading-relaxed">Patch management sits at the intersection of security posture, availability guarantees, and operational risk — and in most organizations, it remains the most stubbornly manual process in the DBA's portfolio. Security advisories arrive unpredictably, maintenance windows are negotiated weeks in advance, and the gap between a CVE publication and a patched production cluster is measured in weeks or months. An autonomous patch management system collapses that gap by treating patching as a pipeline: continuous vulnerability ingestion, automated risk scoring, staged rollout with self-validation, and rollback triggered without human escalation. This chapter builds that pipeline end to end, covering both PostgreSQL and SQL Server environments, with the goal of reducing the human decision surface to policy definition rather than per-patch approval.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
+<p class="text-gray-300 leading-relaxed">Patch management sits at the intersection of security posture, availability guarantees, and operational risk — and in most organizations, it remains the most stubbornly manual process in the DBA's portfolio. Security advisories arrive unpredictably, maintenance windows are negotiated weeks in advance, and the gap between a CVE publication and a patched production cluster is measured in weeks or months. An autonomous patch management system collapses that gap by treating patching as a pipeline: continuous vulnerability ingestion, automated risk scoring, staged rollout with self-validation, and rollback triggered without human escalation. This chapter builds that pipeline end to end for SQL Server environments, with the goal of reducing the human decision surface to policy definition rather than per-patch approval.</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">22.1 Vulnerability Intelligence Pipelines: From CVE Feed to Patch Priority Score</h3>
 
 <p class="text-gray-300 leading-relaxed">The first obligation of an autonomous patch system is awareness — knowing what patches exist, what vulnerabilities they address, and how urgently each matters in your specific environment. Manual monitoring of vendor security pages does not scale. An ADE-level system subscribes to structured vulnerability feeds and enriches them with local context automatically.</p>
 
-<p class="text-gray-300 leading-relaxed">The National Vulnerability Database (NVD) publishes a JSON feed at <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">https://nvd.nist.gov/feeds/json/cve/1.1/</code>. PostgreSQL-relevant CVEs carry CPE strings like <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">cpe:2.3:a:postgresql:postgresql:*</code>, while SQL Server advisories arrive through the Microsoft Security Response Center (MSRC) API at <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">https://api.msrc.microsoft.com/cvrf/v2.0/</code>. Both feeds are machine-consumable and should be polled on a schedule — hourly for NVD, daily for MSRC — by an ingestion service that stores results in a patch intelligence table.</p>
+<p class="text-gray-300 leading-relaxed">SQL Server security advisories arrive through the Microsoft Security Response Center (MSRC) API at <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">https://api.msrc.microsoft.com/cvrf/v2.0/</code>, and the Microsoft SQL Server release notes track every Cumulative Update with its fixed KBs. The MSRC feed is machine-consumable and should be polled daily by an ingestion service that stores results in a patch intelligence table. Cross-referencing advisories with the installed build of each instance tells the system exactly which machines are exposed.</p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import httpx
 import json
 from datetime import datetime, timedelta
-import psycopg2
+import pyodbc
 
-NVD_BASE = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 MSRC_BASE = "https://api.msrc.microsoft.com/cvrf/v2.0/updates"
 
-def fetch_nvd_postgres_cves(days_back: int = 1) -&gt; list[dict]:
-    pub_start = (datetime.utcnow() - timedelta(days=days_back)).strftime(
-        "%Y-%m-%dT%H:%M:%S.000"
-    )
-    params = {
-        "cpeName": "cpe:2.3:a:postgresql:postgresql:*",
-        "pubStartDate": pub_start,
-        "pubEndDate": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.000"),
-    }
-    resp = httpx.get(NVD_BASE, params=params, timeout=30)
+def fetch_msrc_sqlserver_updates(days_back: int = 1) -&gt; list[dict]:
+    """Fetch MSRC security updates mentioning SQL Server products."""
+    resp = httpx.get(MSRC_BASE, timeout=30,
+                     params={"$filter": "cvrfID ge '2026-Jan'"})
     resp.raise_for_status()
-    return resp.json().get("vulnerabilities", [])
+    updates = resp.json().get("value", [])
+    # Keep only updates whose product tree includes SQL Server
+    return [u for u in updates
+            if "SQL Server" in json.dumps(u.get("ProductTree", {}))]
 
-def compute_priority_score(cve: dict) -&gt; float:
+def compute_priority_score(update: dict) -&gt; float:
     """
     Weighted score combining CVSS base score, exploit availability,
     and local asset exposure. Returns 0.0–100.0.
     """
-    metrics = cve.get("cve", {}).get("metrics", {})
     cvss_score = 0.0
-    if "cvssMetricV31" in metrics:
-        cvss_score = metrics["cvssMetricV31"][0]["cvssData"]["baseScore"]
-    elif "cvssMetricV30" in metrics:
-        cvss_score = metrics["cvssMetricV30"][0]["cvssData"]["baseScore"]
+    for metric in update.get("cvss", []):
+        if metric.get("cvssSource") in ("NVD", "MSRC"):
+            cvss_score = max(cvss_score, metric.get("baseScore", 0.0))
 
     # Exploit maturity multiplier — check EPSS score from api.first.org
-    epss_score = fetch_epss_score(cve["cve"]["id"])  # returns 0.0–1.0
+    epss_score = fetch_epss_score(update["DocumentTracking"]["ID"])  # returns 0.0–1.0
 
-    # Asset exposure: how many clusters run the affected version?
-    affected_clusters = count_affected_clusters(cve)
+    # Asset exposure: how many instances run the affected build?
+    affected_instances = count_affected_instances(update)
 
-    exposure_multiplier = min(1.5, 1.0 + (affected_clusters / 10.0))
+    exposure_multiplier = min(1.5, 1.0 + (affected_instances / 10.0))
     raw = (cvss_score * 10) * (1 + epss_score) * exposure_multiplier
     return min(100.0, raw)
 
-def ingest_cves_to_catalog(conn, cves: list[dict]):
+def ingest_updates_to_catalog(conn, updates: list[dict]):
     cur = conn.cursor()
-    for vuln in cves:
-        cve_id = vuln["cve"]["id"]
-        score = compute_priority_score(vuln)
+    for update in updates:
+        update_id = update["DocumentTracking"]["ID"]
+        score = compute_priority_score(update)
         cur.execute("""
-            INSERT INTO patch_catalog (cve_id, db_engine, priority_score,
-                                       published_at, raw_payload, ingested_at)
-            VALUES (%s, 'postgresql', %s, %s, %s, NOW())
-            ON CONFLICT (cve_id) DO UPDATE
-                SET priority_score = EXCLUDED.priority_score,
-                    ingested_at = NOW()
-        """, (cve_id, score, vuln["cve"].get("published"), json.dumps(vuln)))
+            MERGE patch_catalog AS target
+            USING (SELECT ? AS update_id) AS src
+            ON target.update_id = src.update_id
+            WHEN MATCHED THEN
+                UPDATE SET priority_score = ?, ingested_at = SYSUTCDATETIME()
+            WHEN NOT MATCHED THEN
+                INSERT (update_id, db_engine, priority_score,
+                        published_at, raw_payload, ingested_at)
+                VALUES (?, 'sqlserver', ?, ?, ?, SYSUTCDATETIME());
+        """, (update_id, score, update_id, score,
+              update.get("DocumentTracking", {}).get("CurrentReleaseDate"),
+              json.dumps(update)))
     conn.commit()</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">priority_score</code> formula is intentional — it does not treat all CVEs equally. A CVSS 9.8 with no known exploit and zero affected clusters scores lower than a CVSS 7.5 with active exploitation and fifty clusters on the vulnerable version. The Exploit Prediction Scoring System (EPSS) from FIRST.org provides daily updated exploit probability scores that feed this calculation.</p>
 
 <p class="text-gray-300 leading-relaxed">Once scores are assigned, the system classifies patches into three tiers that drive downstream automation behavior:</p>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Tier 1 (score ≥ 80):** Deploy within 24 hours, bypass standard change freeze</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Tier 2 (score 50–79):** Deploy within next scheduled maintenance window (≤ 7 days)</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Tier 3 (score < 50):** Batch with next planned minor version upgrade</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Tier 1 (score ≥ 80):</strong> Deploy within 24 hours, bypass standard change freeze</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Tier 2 (score 50–79):</strong> Deploy within next scheduled maintenance window (≤ 7 days)</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Tier 3 (score < 50):</strong> Batch with next planned minor version upgrade</li>
 
 <p class="text-gray-300 leading-relaxed">This tiering is stored alongside the CVE record and queried by the patch orchestrator to determine rollout timing without human input.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">22.2 Version Inventory and Drift Detection Across Fleet Clusters</h3>
 
@@ -154,60 +149,55 @@ FROM dbo.SqlInstanceInventory
 WHERE DriftDetected = 1
 ORDER BY Environment DESC, DaysSinceCheckin DESC;</code></pre>
 
-<p class="text-gray-300 leading-relaxed">Inventory agents run as lightweight daemons on each node. On PostgreSQL, a simple Python agent connects locally and extracts version data:</p>
+<p class="text-gray-300 leading-relaxed">Inventory agents run as lightweight daemons on each node. On SQL Server, a simple Python agent connects locally and extracts version data:</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import psycopg2
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import pyodbc
 import httpx
 import socket
-import json
 
-MANAGEMENT_DB_URL = "postgresql://patch_agent:secret@mgmt-db:5432/patch_catalog"
+LOCAL_CONN = "DRIVER={ODBC Driver 18 for SQL Server};SERVER=localhost;Trusted_Connection=yes;"
+MGMT_CONN = "DRIVER={ODBC Driver 18 for SQL Server};SERVER=mgmt-db;DATABASE=patch_catalog;UID=patch_agent;PWD=*******;"
 
 def collect_and_report():
     # Connect to local instance
-    local_conn = psycopg2.connect("postgresql:///postgres")
+    local_conn = pyodbc.connect(LOCAL_CONN)
     cur = local_conn.cursor()
-    
-    cur.execute("SELECT version(), current_setting('server_version')")
-    full_version, numeric_version = cur.fetchone()
-    
+
     cur.execute("""
-        SELECT name, default_version, installed_version
-        FROM pg_available_extensions
-        WHERE installed_version IS NOT NULL
+        SELECT @@VERSION,
+               SERVERPROPERTY('ProductVersion'),
+               SERVERPROPERTY('ProductLevel'),
+               SERVERPROPERTY('Edition')
     """)
-    extensions = {row[0]: row[2] for row in cur.fetchall()}
-    
+    full_version, build, level, edition = cur.fetchone()
+
     # Report to central management DB
-    mgmt_conn = psycopg2.connect(MANAGEMENT_DB_URL)
+    mgmt_conn = pyodbc.connect(MGMT_CONN)
     mgmt_cur = mgmt_conn.cursor()
     mgmt_cur.execute("""
-        INSERT INTO cluster_version_inventory
-            (cluster_id, environment, region, pg_version,
-             pg_minor_version, extensions, last_seen)
-        VALUES (%s, %s, %s, %s, %s, %s, NOW())
-        ON CONFLICT (cluster_id) DO UPDATE
-            SET pg_minor_version = EXCLUDED.pg_minor_version,
-                extensions       = EXCLUDED.extensions,
-                last_seen        = NOW()
+        MERGE dbo.SqlInstanceInventory AS target
+        USING (SELECT ? AS InstanceId) AS src
+        ON target.InstanceId = src.InstanceId
+        WHEN MATCHED THEN
+            UPDATE SET SqlVersion = ?, BuildNumber = ?,
+                       PatchLevel = ?, LastSeen = SYSUTCDATETIME()
+        WHEN NOT MATCHED THEN
+            INSERT (InstanceId, Environment, Region, SqlVersion,
+                    BuildNumber, PatchLevel, ApprovedBaseline, LastSeen)
+            VALUES (?, 'production', 'us-east-1', ?, ?, ?, NULL, SYSUTCDATETIME());
     """, (
         socket.gethostname(),
-        "production",
-        "us-east-1",
-        full_version,
-        numeric_version,
-        json.dumps(extensions)
+        full_version, build, level,
+        socket.gethostname(), full_version, build, level
     ))
     mgmt_conn.commit()
 
 if __name__ == "__main__":
     collect_and_report()</code></pre>
 
-<p class="text-gray-300 leading-relaxed">On Kubernetes-managed PostgreSQL (CloudNativePG, Crunchy Data Operator), the same inventory function is expressed as a CronJob that queries the operator's cluster status API and writes results to the central catalog. The cluster reconciliation loop in these operators already tracks version state; the autonomous patch system subscribes to those events rather than implementing its own polling.</p>
+<p class="text-gray-300 leading-relaxed">On Kubernetes-hosted SQL Server (StatefulSets or Azure Arc-enabled SQL Server), the same inventory function is expressed as a CronJob that connects to the instance over the service DNS name and writes results to the central catalog. The autonomous patch system subscribes to instance lifecycle events rather than implementing its own polling.</p>
 
 <p class="text-gray-300 leading-relaxed">Drift detection feeds into the patch scheduler: clusters with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">minor_versions_behind >= 3</code> are escalated to Tier 2 regardless of the CVE score, because version gaps introduce an operational complexity cost beyond security risk alone. The system auto-generates a patch work order for these clusters and assigns them to the next available maintenance window.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">22.3 Staged Rollout Architecture: Canary, Ring, and Fleet Propagation</h3>
 
@@ -310,7 +300,7 @@ class PatchOrchestrator:
             f"Reason: {reason}. Rollback complete. Human review required."
         )</code></pre>
 
-<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">validator.evaluate()</code> call queries Prometheus for a set of pre-defined SLIs: connection error rate, query latency P99, replication lag (for PostgreSQL streaming replication via Patroni), and active connection count relative to max_connections. For SQL Server Always On Availability Groups, the equivalent validator checks the DMV <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_hadr_database_replica_states</code> for synchronization health and redo queue depth.</p>
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">validator.evaluate()</code> call queries Prometheus for a set of pre-defined SLIs: connection error rate, query latency P99, AG synchronization health, and active connection count. For SQL Server Always On Availability Groups, the validator checks the DMV <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_hadr_database_replica_states</code> for synchronization health and redo queue depth.</p>
 
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Validation query run by the patch orchestrator against each SQL Server AG replica
@@ -335,61 +325,82 @@ WHERE drs.is_local = 0;  -- secondary replicas only</code></pre>
 
 <p class="text-gray-300 leading-relaxed">When <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">patch_gate_status</code> returns any <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">FAIL</code> row, the orchestrator halts the ring immediately. A <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WARN</code> during the dwell window triggers increased monitoring frequency (60-second checks instead of 5-minute) but does not by itself halt propagation — it must persist for 30 consecutive minutes before triggering a halt. This hysteresis prevents transient load spikes from stopping legitimate patch rollouts.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">22.4 Zero-Downtime Patch Execution for SQL Server Always On</h3>
 
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">22.4 Zero-Downtime Patch Execution for PostgreSQL HA and SQL Server Always On</h3>
+<p class="text-gray-300 leading-relaxed">Applying a patch to a production database cluster without downtime requires understanding the AG topology and executing the patch sequence in the right order: patch secondary replicas first, verify they re-synchronize, then move the primary role to a patched replica, and finally patch the former primary.</p>
 
-<p class="text-gray-300 leading-relaxed">Applying a patch to a production database cluster without downtime requires understanding the HA topology and executing the patch sequence in the right order. The mechanics differ significantly between PostgreSQL (with Patroni or pg_auto_failover) and SQL Server Always On Availability Groups.</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL / Patroni:</strong> The safest sequence is replica-first, then controlled primary failover. Patroni's REST API exposes the topology and failover controls that the autonomous patcher calls directly.</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import httpx
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">AG patch sequencer:</strong> The safest sequence is replica-first, then controlled primary failover. The autonomous patcher queries the AG topology from the DMVs and drives failover itself:</p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import pyodbc
 import time
 
-PATRONI_API = "http://{host}:8008"
+def get_ag_topology(conn) -&gt; tuple[str, list[str]]:
+    """Return (primary_replica, secondary_replicas) for the production AG."""
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT ar.replica_server_name, ars.role_desc
+        FROM sys.availability_groups ag
+        JOIN sys.availability_replicas ar
+            ON ag.group_id = ar.group_id
+        JOIN sys.dm_hadr_availability_replica_states ars
+            ON ar.replica_id = ars.replica_id
+        WHERE ag.name = 'AG_Production'
+    """)
+    primary, secondaries = None, []
+    for replica_name, role in cur.fetchall():
+        if role == 'PRIMARY':
+            primary = replica_name
+        else:
+            secondaries.append(replica_name)
+    return primary, secondaries
 
-def patch_patroni_cluster(cluster_hosts: list[str], patch_fn):
+def wait_for_sync(conn, timeout_seconds: int = 600):
+    deadline = time.time() + timeout_seconds
+    while time.time() &lt; deadline:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT COUNT(*)
+            FROM sys.dm_hadr_database_replica_states
+            WHERE is_local = 0
+              AND synchronization_health_desc != 'HEALTHY'
+        """)
+        if cur.fetchone()[0] == 0:
+            return
+        time.sleep(15)
+    raise RuntimeError("AG did not return to HEALTHY within timeout")
+
+def patch_ag_cluster(admin_conn_str: str, patch_fn):
     """
     patch_fn: callable that accepts a hostname and performs the OS-level
-    package upgrade (e.g., apt-get install postgresql-16=16.x.y)
+    Cumulative Update install (e.g., via Azure Update Manager or
+    AWS Systems Manager) and restarts the SQL Server service.
     """
+    conn = pyodbc.connect(admin_conn_str, autocommit=True)
+
     # Step 1: Identify topology
-    topology = {}
-    for host in cluster_hosts:
-        resp = httpx.get(f"{PATRONI_API.format(host=host)}/patroni")
-        data = resp.json()
-        topology[host] = data["role"]  # 'master' or 'replica'
+    primary, secondaries = get_ag_topology(conn)
 
-    primary = next(h for h, r in topology.items() if r == "master")
-    replicas = [h for h, r in topology.items() if r == "replica"]
-
-    # Step 2: Patch replicas first (no traffic disruption)
-    for replica in replicas:
+    # Step 2: Patch secondary replicas first (no traffic disruption)
+    for replica in secondaries:
         patch_fn(replica)
         time.sleep(30)  # Brief settle period
-        # Verify replica rejoined replication
-        resp = httpx.get(f"{PATRONI_API.format(host=replica)}/health")
-        assert resp.json()["state"] == "running", \
-            f"Replica {replica} did not recover after patch"
+        wait_for_sync(conn)  # Verify replica rejoined and re-synchronized
 
-    # Step 3: Trigger controlled failover to a now-patched replica
-    target_replica = replicas[0]
-    httpx.post(
-        f"{PATRONI_API.format(host=primary)}/failover",
-        json={"master": primary, "candidate": target_replica}
-    )
-    time.sleep(15)  # Allow leader election to complete
+    # Step 3: Move primary role to a now-patched replica
+    cur = conn.cursor()
+    cur.execute("ALTER AVAILABILITY GROUP [AG_Production] FAILOVER")
+    time.sleep(15)  # Allow role transition to complete
 
-    # Step 4: Verify new primary is the patched replica
-    resp = httpx.get(f"{PATRONI_API.format(host=target_replica)}/master")
-    assert resp.status_code == 200, "Failover did not complete successfully"
+    # Step 4: Verify the new primary is the patched replica
+    new_primary, _ = get_ag_topology(conn)
+    assert new_primary != primary, "Failover did not complete successfully"
 
-    # Step 5: Patch the old primary (now demoted to replica)
-    patch_fn(primary)</code></pre>
+    # Step 5: Patch the old primary (now a secondary)
+    patch_fn(primary)
+    wait_for_sync(conn)</code></pre>
 
-<p class="text-gray-300 leading-relaxed">The actual <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">patch_fn</code> calls the package manager on the target host via SSH or an Ansible runner, then restarts the PostgreSQL service. On Patroni-managed clusters, the service restart is handled through <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">patronictl restart</code> rather than systemd directly, ensuring Patroni maintains the DCS lock correctly throughout.</p>
+<p class="text-gray-300 leading-relaxed">The actual <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">patch_fn</code> submits the Cumulative Update through the platform's update orchestration — Azure Update Manager, AWS Systems Manager Patch Manager, or an Ansible playbook — and restarts the SQL Server service on the target host. The restart is coordinated so the AG role is already off the node being patched, which keeps the WSFC quorum intact throughout.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server Always On:</strong> The equivalent sequence uses PowerShell (or dbatools) to orchestrate the patch across AG replicas. The autonomous patcher calls the SQL Server Management API through <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pyodbc</code> or the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dbatools</code> module via subprocess.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Pre-patch gate:</strong> Before any patch sequence begins, the autonomous patcher verifies the AG is fully synchronized.</p>
 
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Pre-patch validation: verify AG is fully synchronized before beginning
@@ -417,12 +428,10 @@ WHERE ars.synchronization_health_desc != 'HEALTHY'
 
 <p class="text-gray-300 leading-relaxed">For SQL Server, the patch sequence is: patch synchronous secondary replicas → verify they come back online and re-synchronize → move primary role to a patched replica using <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALTER AVAILABILITY GROUP ... FAILOVER</code> → patch the former primary. The Windows Update orchestration can be handled through Azure Update Manager, AWS Systems Manager Patch Manager, or a Terraform-driven Ansible playbook — the autonomous patcher generates and submits the job rather than executing it inline.</p>
 
-<p class="text-gray-300 leading-relaxed">One non-obvious edge case: PostgreSQL extension upgrades often require <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALTER EXTENSION name UPDATE</code> to be run in each database after the package upgrade, and this must happen before the new binary serves queries that depend on the updated extension functions. The autonomous patcher includes a post-patch SQL execution step that iterates through the extension catalog and applies pending updates:</p>
+<p class="text-gray-300 leading-relaxed">One non-obvious edge case: a Cumulative Update can change engine behavior gated behind a higher database compatibility level, and post-patch the optimizer may choose different plans. The autonomous patcher includes a post-patch SQL execution step that refreshes statistics and validates consistency on each patched replica before it is allowed to take the primary role:</p>
 
 
 <p class="text-gray-300 leading-relaxed">This runs as part of the post-patch validation phase and its output is logged to the patch audit trail.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">22.5 Autonomous Rollback: Decision Logic, Trigger Conditions, and Recovery Verification</h3>
 
@@ -431,10 +440,10 @@ WHERE ars.synchronization_health_desc != 'HEALTHY'
 <p class="text-gray-300 leading-relaxed">Rollback triggers fall into three categories:</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Hard triggers</strong> — immediate rollback, no dwell, no override:</p>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> PostgreSQL process exits within 60 seconds of service restart (crash loop)</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Replication slot advancing stops (lag growing monotonically for 10 minutes post-patch)</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> SQL Server service exits within 60 seconds of service restart (crash loop)</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> AG secondary redo queue growing monotonically for 10 minutes post-patch</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Connection rejection rate exceeds 5% over a 2-minute window</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> SQL Server AG replica enters `NOT_SYNCHRONIZING` state post-patch</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> SQL Server AG replica enters <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">NOT_SYNCHRONIZING</code> state post-patch</li>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Soft triggers</strong> — rollback if condition persists beyond hysteresis window (30 minutes):</p>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Query latency P99 elevated > 20% above pre-patch baseline</li>
@@ -443,9 +452,9 @@ WHERE ars.synchronization_health_desc != 'HEALTHY'
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> TempDB allocation failures per minute > 0 (SQL Server specific)</li>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Informational triggers</strong> — logged, escalated to human, no automatic rollback:</p>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> New query plan regressions detected (via `pg_stat_statements` diff or Query Store)</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> New query plan regressions detected (via Query Store)</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Checkpoint duration increase > 50%</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Autovacuum bloat increase in tracked tables</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Index fragmentation increase in tracked tables</li>
 
 <p class="text-gray-300 leading-relaxed">The distinction between hard and soft triggers is intentional. Hard triggers represent conditions where continued operation is objectively unsafe — the database is either crashing, disconnecting clients, or losing replication. Soft triggers represent degradation that could be transient (a batch job, a sudden traffic spike) and need the hysteresis window to distinguish noise from signal.</p>
 
@@ -494,7 +503,7 @@ class RollbackEvaluator:
         if m.get("process_crash_detected"):
             return RollbackDecision(
                 trigger_type    = TriggerType.HARD,
-                trigger_reason  = "PostgreSQL process crash detected",
+                trigger_reason  = "SQL Server service crash detected",
                 fired_at        = datetime.utcnow(),
                 should_rollback = True,
                 escalate_human  = True,
@@ -655,15 +664,13 @@ class RollbackEvaluator:
     )
     return False</code></pre>
 
-<p class="text-gray-300 leading-relaxed">The distinction between a failed rollback and a slow recovery is time-bounded: ten minutes is sufficient for a PostgreSQL cluster to re-establish streaming replication and drain in-flight queries after a binary revert. If the cluster is still degraded at that point, the issue is not the patch reversal but something deeper — possibly a catalog corruption, a config file inconsistency, or an infrastructure-layer failure — and human judgment is genuinely needed.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
+<p class="text-gray-300 leading-relaxed">The distinction between a failed rollback and a slow recovery is time-bounded: ten minutes is sufficient for an AG to re-establish synchronization and drain in-flight queries after a binary revert. If the AG is still degraded at that point, the issue is not the patch reversal but something deeper — possibly a corrupted page, a config inconsistency, or an infrastructure-layer failure — and human judgment is genuinely needed.</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">22.6 Patch Audit Trails and Compliance Reporting</h3>
 
 <p class="text-gray-300 leading-relaxed">Autonomous systems that operate without human approval at each step face a higher evidentiary standard than manual processes. When an auditor asks "who approved patching this cluster at 2 AM?" the answer "the policy authorized it and the orchestrator executed autonomously" must be substantiated by a complete, tamper-evident record of every decision, every trigger condition evaluated, and every action taken.</p>
 
-<p class="text-gray-300 leading-relaxed">The patch audit log is append-only by design. On PostgreSQL, this is enforced using row-level security combined with a privilege structure that grants INSERT but never UPDATE or DELETE to the patch agent role:</p>
+<p class="text-gray-300 leading-relaxed">The patch audit log is append-only by design. In SQL Server this is enforced using a ledger table (SQL Server 2022+) or an INSERT-only permission structure where the patch agent role is granted <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">INSERT</code> but never <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">UPDATE</code> or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DELETE</code> on the audit tables.</p>
 
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE dbo.PatchAuditLog (
@@ -703,10 +710,10 @@ END;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Compliance reports query the audit log to produce evidence artifacts. A typical SOC 2 or PCI-DSS audit requires demonstrating that patches were applied within the required timeframe of CVE publication and that a complete approval chain exists. The autonomous model satisfies this by making the policy itself the auditable artifact:</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: Patch SLA compliance report
--- Shows CVEs published in the last quarter and whether they were patched within tier SLA
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Patch SLA compliance report
+-- Shows MSRC updates published in the last quarter and whether they were patched within tier SLA
 SELECT
-    pc.cve_id,
+    pc.update_id,
     pc.priority_score,
     CASE
         WHEN pc.priority_score &gt;= 80 THEN 'Tier 1 (24h)'
@@ -714,22 +721,21 @@ SELECT
         ELSE                              'Tier 3 (next upgrade)'
     END                                                   AS tier,
     pc.published_at,
-    MIN(pal.event_time) FILTER (WHERE pal.event_type = 'patch_applied')
-                                                          AS first_applied_at,
-    EXTRACT(EPOCH FROM (
-        MIN(pal.event_time) FILTER (WHERE pal.event_type = 'patch_applied')
-        - pc.published_at
-    )) / 3600                                             AS hours_to_first_patch,
+    MIN(CASE WHEN pal.event_type = 'patch_applied'
+             THEN pal.event_time END)                     AS first_applied_at,
+    DATEDIFF(HOUR, pc.published_at,
+        MIN(CASE WHEN pal.event_type = 'patch_applied'
+                 THEN pal.event_time END))                AS hours_to_first_patch,
     CASE
         WHEN pc.priority_score &gt;= 80
-         AND EXTRACT(EPOCH FROM (
-               MIN(pal.event_time) FILTER (WHERE pal.event_type = 'patch_applied')
-               - pc.published_at)) / 3600 &lt;= 24
+         AND DATEDIFF(HOUR, pc.published_at,
+               MIN(CASE WHEN pal.event_type = 'patch_applied'
+                        THEN pal.event_time END)) &lt;= 24
          THEN 'COMPLIANT'
         WHEN pc.priority_score &gt;= 50
-         AND EXTRACT(EPOCH FROM (
-               MIN(pal.event_time) FILTER (WHERE pal.event_type = 'patch_applied')
-               - pc.published_at)) / 3600 &lt;= 168
+         AND DATEDIFF(HOUR, pc.published_at,
+               MIN(CASE WHEN pal.event_type = 'patch_applied'
+                        THEN pal.event_time END)) &lt;= 168
          THEN 'COMPLIANT'
         WHEN pc.priority_score &lt; 50
          THEN 'TIER3_DEFERRED'
@@ -737,10 +743,9 @@ SELECT
     END                                                   AS sla_status
 FROM patch_catalog pc
 LEFT JOIN patch_audit_log pal
-       ON pal.patch_id = pc.cve_id
-WHERE pc.published_at &gt;= NOW() - INTERVAL '90 days'
-GROUP BY pc.cve_id, pc.priority_score, pc.published_at
-ORDER BY pc.priority_score DESC, pc.published_at DESC;</code></pre>
+       ON pal.patch_id = pc.update_id
+GROUP BY pc.update_id, pc.priority_score, pc.published_at
+ORDER BY pc.published_at DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server equivalent:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>SELECT
@@ -780,8 +785,6 @@ GROUP BY pc.CveId, pc.PriorityScore, pc.PublishedAt
 ORDER BY pc.PriorityScore DESC, pc.PublishedAt DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Beyond the compliance report, the audit log surfaces operational metrics that feed continuous improvement of the patch policy itself. Rollback rates per patch tier, average dwell time before ring advancement, frequency of soft-trigger false positives — all of these are computable from the log and should be reviewed quarterly to tighten or relax thresholds as the fleet matures.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">22.7 Integrating with Change Management Systems: Autonomous Tickets Without Human Approval</h3>
 
@@ -888,8 +891,6 @@ def close_patch_change_record(sys_id: str, outcome: str, notes: str):
 
 <p class="text-gray-300 leading-relaxed">A timeout is treated differently from a rejection: a timed-out approval means the CAB did not act within the window, which may itself be an SLA violation on the ITSM side. The orchestrator logs this separately and notifies both the DBA team and the ITSM administrators, rather than silently dropping the patch.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">22.8 Testing the Patch Pipeline: Chaos Injection and Dry-Run Mode</h3>
 
 <p class="text-gray-300 leading-relaxed">An autonomous patch pipeline that has never been exercised under failure conditions will fail unpredictably when it encounters one in production. The patch pipeline requires its own test regime: scheduled dry runs that walk the full orchestration path without applying any package changes, and chaos injection tests that deliberately trigger rollback conditions to verify the rollback path executes correctly.</p>
@@ -972,19 +973,17 @@ latency_scenario = {
 
 <p class="text-gray-300 leading-relaxed">Chaos tests run in a dedicated test environment on a monthly cadence and their results are recorded in the audit log under <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">event_type = 'chaos_test'</code>. A chaos test that does not trigger the expected rollback within the specified time budget is treated as a pipeline defect and blocks the next production patch cycle until resolved. This is the test-as-gate model: the autonomous system must continuously prove its own safety mechanisms work before it is trusted to act autonomously in production.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Patch priority scoring combines CVSS base score, exploit probability (EPSS), and local fleet exposure** — treating all CVEs as equal severity leads to alert fatigue and delays action on genuinely dangerous vulnerabilities while wasting resources on theoretical ones.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Patch priority scoring combines CVSS base score, exploit probability (EPSS), and local fleet exposure</strong> — treating all CVEs as equal severity leads to alert fatigue and delays action on genuinely dangerous vulnerabilities while wasting resources on theoretical ones.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The ring rollout model gates fleet-wide propagation on dwell-time validation** — no ring advances until the previous ring has operated within defined SLI tolerances for the full dwell period, converting patch deployment from a single high-risk event into a series of validated, low-radius steps.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">The ring rollout model gates fleet-wide propagation on dwell-time validation</strong> — no ring advances until the previous ring has operated within defined SLI tolerances for the full dwell period, converting patch deployment from a single high-risk event into a series of validated, low-radius steps.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Rollback triggers are stratified into hard triggers (immediate, no override) and soft triggers (hysteresis-gated)** — this distinction prevents transient load spikes from causing unnecessary rollbacks while ensuring genuinely dangerous post-patch conditions receive an immediate response without waiting for human review.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Rollback triggers are stratified into hard triggers (immediate, no override) and soft triggers (hysteresis-gated)</strong> — this distinction prevents transient load spikes from causing unnecessary rollbacks while ensuring genuinely dangerous post-patch conditions receive an immediate response without waiting for human review.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Append-only audit logs with privilege-enforced write restrictions provide the evidentiary foundation** for autonomous operation in regulated environments — the policy itself becomes the auditable approval artifact, replacing per-change human sign-off with documented, machine-verifiable policy adherence.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Append-only audit logs with privilege-enforced write restrictions provide the evidentiary foundation</strong> for autonomous operation in regulated environments — the policy itself becomes the auditable approval artifact, replacing per-change human sign-off with documented, machine-verifiable policy adherence.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Dry-run mode and monthly chaos injection tests verify the rollback path remains functional** — an untested autonomous rollback is operationally equivalent to no rollback at all, and the patch pipeline must treat its own safety mechanisms as first-class test subjects with gate conditions that block production use when tests fail.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Dry-run mode and monthly chaos injection tests verify the rollback path remains functional</strong> — an untested autonomous rollback is operationally equivalent to no rollback at all, and the patch pipeline must treat its own safety mechanisms as first-class test subjects with gate conditions that block production use when tests fail.</li>
     </div>
     <div class="mt-14 bg-emerald-950/40 border border-emerald-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">

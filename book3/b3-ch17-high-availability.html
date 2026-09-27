@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Chapter 17: Zero-Touch High Availability — The ADE Handbook</title>
-  <meta name="description" content="The ADE Handbook Chapter 17: Zero-Touch High Availability. Autonomous database engineering for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
+  <meta name="description" content="The ADE Handbook Chapter 17: Zero-Touch High Availability. Autonomous database engineering for SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
   <script type="module">
     import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
@@ -43,9 +43,7 @@
     <div class="space-y-4 text-sm">
 <h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 17: Zero-Touch High Availability</h2>
 
-<p class="text-gray-300 leading-relaxed">High availability in autonomous systems is not a feature you configure once and monitor manually — it is a continuous, self-executing contract between your infrastructure and your uptime SLA. The moment a human must intervene to restore service, you have failed the ADE standard. This chapter covers the architecture and implementation of HA systems that detect failure, make promotion decisions, reroute traffic, reintegrate replicas, and validate their own health — all without a pager going off at 2 a.m. The patterns here apply across Patroni-managed PostgreSQL clusters, SQL Server Always On Availability Groups orchestrated by Kubernetes operators, and hybrid topologies that span on-premises and cloud. The goal is not just fast failover — it is *correct*, *reversible*, and *observable* failover that a system can execute and explain without human involvement.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
+<p class="text-gray-300 leading-relaxed">High availability in autonomous systems is not a feature you configure once and monitor manually — it is a continuous, self-executing contract between your infrastructure and your uptime SLA. The moment a human must intervene to restore service, you have failed the ADE standard. This chapter covers the architecture and implementation of HA systems that detect failure, make promotion decisions, reroute traffic, reintegrate replicas, and validate their own health — all without a pager going off at 2 a.m. The patterns here apply across SQL Server Always On Availability Groups on WSFC, AGs orchestrated by Kubernetes operators, and hybrid topologies that span on-premises and cloud. The goal is not just fast failover — it is <em>correct</em>, <em>reversible</em>, and <em>observable</em> failover that a system can execute and explain without human involvement.</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">17.1 The Anatomy of a Zero-Touch Failover Event</h3>
 
@@ -61,32 +59,9 @@
 
 <p class="text-gray-300 leading-relaxed">A production autonomous HA system evaluates signals across all three tiers before acting. The decision matrix looks like this:</p>
 
-<p class="text-gray-300 leading-relaxed">| Signal | Source | Threshold | Weight |</p>
-<p class="text-gray-300 leading-relaxed">|---|---|---|---|</p>
-<p class="text-gray-300 leading-relaxed">| TCP connectivity | HAProxy / pgBouncer health check | 3 consecutive failures | High |</p>
-<p class="text-gray-300 leading-relaxed">| Replication lag | <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_replication</code> / AG DMVs | > 30 seconds | Medium |</p>
-<p class="text-gray-300 leading-relaxed">| Replica quorum | Patroni DCS / WSFC | Majority unreachable | High |</p>
-<p class="text-gray-300 leading-relaxed">| Transaction throughput | Prometheus <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_database</code> | Drop > 80% in 60s | Medium |</p>
-<p class="text-gray-300 leading-relaxed">| OS-level process | Patroni watchdog / WSFC | Process absent | High |</p>
+<div class="my-6 overflow-x-auto"><table class="w-full text-sm text-gray-300"><thead><tr class="border-b border-gray-700"><th class="text-left py-2 pr-4 text-white">Signal</th><th class="text-left py-2 pr-4 text-white">Source</th><th class="text-left py-2 pr-4 text-white">Threshold</th><th class="text-left py-2 text-white">Weight</th></tr></thead><tbody><tr class="border-b border-gray-800"><td class="py-2 pr-4 font-medium text-white">TCP connectivity</td><td class="py-2 pr-4">AG listener / load balancer health check</td><td class="py-2 pr-4">3 consecutive failures</td><td class="py-2">High</td></tr><tr class="border-b border-gray-800"><td class="py-2 pr-4 font-medium text-white">Replication lag</td><td class="py-2 pr-4"><code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_hadr_database_replica_states</code> redo queue</td><td class="py-2 pr-4">&gt; 30 seconds</td><td class="py-2">Medium</td></tr><tr class="border-b border-gray-800"><td class="py-2 pr-4 font-medium text-white">Replica quorum</td><td class="py-2 pr-4">WSFC quorum votes</td><td class="py-2 pr-4">Majority unreachable</td><td class="py-2">High</td></tr><tr class="border-b border-gray-800"><td class="py-2 pr-4 font-medium text-white">Transaction throughput</td><td class="py-2 pr-4">Prometheus sql_exporter batch requests/sec</td><td class="py-2 pr-4">Drop &gt; 80% in 60s</td><td class="py-2">Medium</td></tr><tr class="border-b border-gray-800"><td class="py-2 pr-4 font-medium text-white">OS-level process</td><td class="py-2 pr-4">WSFC resource monitor / Kubernetes liveness probe</td><td class="py-2 pr-4">Process absent</td><td class="py-2">High</td></tr></tbody></table></div><p class="text-gray-300 leading-relaxed">An autonomous system acts only when the aggregate signal exceeds a confidence threshold — typically, a combination of at least two High-weight signals or one High plus two Medium signals. This prevents failover storms triggered by transient network blips.</p>
 
-<p class="text-gray-300 leading-relaxed">An autonomous system acts only when the aggregate signal exceeds a confidence threshold — typically, a combination of at least two High-weight signals or one High plus two Medium signals. This prevents failover storms triggered by transient network blips.</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL — querying replication state for decision input:</strong></p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Run on replica; used by the HA agent to evaluate whether primary is healthy
-SELECT
-    client_addr,
-    state,
-    sent_lsn,
-    write_lsn,
-    flush_lsn,
-    replay_lsn,
-    (sent_lsn - replay_lsn)           AS replication_lag_bytes,
-    extract(epoch FROM (now() - reply_time)) AS seconds_since_heartbeat
-FROM pg_stat_replication
-WHERE application_name = 'replica1';</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server — querying AG synchronization state for decision input:</strong></p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Querying AG synchronization state for decision input:</strong></p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Run on any replica; exposes per-replica health for the orchestration layer
 SELECT
@@ -111,114 +86,127 @@ ORDER BY ag.name, ar.replica_server_name;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">These queries are not run interactively — they are ingested every 10 seconds by the HA orchestration layer, stored as time-series metrics, and evaluated against the decision matrix. The HA agent is a consumer of this data, not a human.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">17.2 WSFC Quorum and the Lease Contract: Autonomous Promotion Architecture</h3>
 
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">17.2 Patroni and the DCS Contract: Autonomous Promotion Architecture</h3>
+<p class="text-gray-300 leading-relaxed">Windows Server Failover Cluster (WSFC) quorum is the autonomous HA framework for SQL Server at scale. Its architecture is worth studying not just as a tool but as a design pattern: it externalizes consensus to a vote-based quorum model, making the cluster's leadership state a shared, durable, observable fact rather than an assumption held by individual nodes.</p>
 
-<p class="text-gray-300 leading-relaxed">Patroni is the de facto autonomous HA framework for PostgreSQL at scale. Its architecture is worth studying not just as a tool but as a design pattern: it externalizes consensus to a Distributed Configuration Store (DCS — etcd, Consul, or ZooKeeper), making the cluster's leadership state a shared, durable, observable fact rather than an assumption held by individual nodes.</p>
+<p class="text-gray-300 leading-relaxed">The WSFC architecture for zero-touch HA rests on three contracts:</p>
 
-<p class="text-gray-300 leading-relaxed">The Patroni architecture for zero-touch HA rests on three contracts:</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">The Quorum Vote.</strong> Every node (and optional witness) holds votes. A cluster can only bring resources online — including the availability group — while it holds a majority of votes. If a partition splits the cluster, the side without majority stops rather than risking split-brain. No external signal is needed — the absence of quorum is itself the trigger that halts the minority side.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">The Leadership Lease.</strong> The primary holds a TTL-bound key in the DCS. If the primary fails to renew the lease within the TTL window (typically 30 seconds), the key expires and replicas become eligible for promotion. No external signal is needed — the absence of a heartbeat is itself the trigger.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">The Candidate Election.</strong> When the primary replica fails, automatic failover requires both <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SYNCHRONOUS_COMMIT</code> availability mode and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">AUTOMATIC</code> failover mode on the target secondary. The AG promotes the synchronous secondary with the most hardened log sequence, minimizing data loss. With <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">REQUIRED_SYNCHRONIZED_SECONDARIES_TO_COMMIT</code> set, a transaction cannot commit until the required number of secondaries has hardened it — giving a zero-data-loss guarantee under automatic failover.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">The Candidate Election.</strong> When the leadership key expires, replicas race to acquire it. The winning replica must have the highest <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_last_wal_receive_lsn()</code> among candidates — Patroni enforces this. The system promotes the replica with the most current WAL position, minimizing data loss.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">The Health Lease.</strong> SQL Server reports instance health to the cluster through <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sp_server_diagnostics</code>, which runs on a repeating interval (by default one third of the lease timeout). If diagnostics report unhealthy — or stop reporting before the lease timeout (default 20 seconds) expires — the cluster initiates failover. This prevents a scenario where a frozen SQL Server holds cluster resources while being unable to serve writes — a subtle split-brain vector.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">The Watchdog Contract.</strong> Patroni runs a kernel-level watchdog daemon on the primary. If the Patroni process itself hangs (but the PostgreSQL process is still running), the watchdog reboots the node before the DCS lease expires. This prevents a scenario where a frozen Patroni agent holds a lease while being unable to serve writes — a subtle split-brain vector.</p>
+<p class="text-gray-300 leading-relaxed">The AG configuration for autonomous failover behavior is dense with tunable parameters that directly affect the decision logic:</p>
 
-<p class="text-gray-300 leading-relaxed">The Patroni configuration for autonomous failover behavior is dense with tunable parameters that directly affect the decision logic:</p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- AG-level health and timeout tuning for autonomous failover
+ALTER AVAILABILITY GROUP [ProductionAG]
+    SET (HEALTH_CHECK_TIMEOUT = 30000);   -- ms before cluster declares replica unhealthy
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># patroni.yml — production autonomous HA configuration
-bootstrap:
-  dcs:
-    ttl: 30                        # Primary lease TTL in seconds
-    loop_wait: 10                  # DCS polling interval
-    retry_timeout: 10              # DCS operation timeout
-    maximum_lag_on_failover: 1048576  # Max replica lag (bytes) to be eligible for promotion
-    synchronous_mode: true         # Only synchronous replicas can be promoted
-    synchronous_mode_strict: false # If true, blocks writes when no sync replica is available
+-- Per-replica session timeout controls how long the primary waits
+-- for a secondary's ping before marking it disconnected
+ALTER AVAILABILITY GROUP [ProductionAG]
+    MODIFY REPLICA ON N'sqlag-replica1'
+    WITH (SESSION_TIMEOUT = 10);          -- seconds
 
-postgresql:
-  parameters:
-    wal_level: replica
-    max_wal_senders: 10
-    wal_keep_size: 1GB
-    hot_standby: on
-    synchronous_commit: on
+-- Lease timeout lives in the cluster resource, not in T-SQL:
+-- Get-ClusterResource "ProductionAG" | Set-ClusterParameter LeaseTimeout 20000</code></pre>
 
-watchdog:
-  mode: required                   # Fail hard if watchdog is unavailable
-  device: /dev/watchdog
-  safety_margin: 5</code></pre>
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">HEALTH_CHECK_TIMEOUT</code> parameter is critical for autonomous operation. It bounds how long the cluster waits for <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sp_server_diagnostics</code> to return before declaring the replica unhealthy and triggering failover. Too short, and transient diagnostic stalls cause failover storms; too long, and real outages go unremediated.</p>
 
-<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">maximum_lag_on_failover</code> parameter is critical for autonomous operation. If a replica is more than 1 MB behind the primary's WAL at the time of failover, Patroni excludes it from election. This is a data-safety gate that prevents promoting a significantly stale replica — a decision that would otherwise require human judgment.</p>
+<p class="text-gray-300 leading-relaxed">When a synchronous secondary falls behind or disconnects, the primary's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">REQUIRED_SYNCHRONIZED_SECONDARIES_TO_COMMIT</code> setting determines whether writes block or continue. An autonomous HA controller watches the count of synchronized secondaries and can dynamically relax this setting during a degraded window — trading a bounded RPO increase for continued write availability — then restore it when the secondary recovers.</p>
 
-<p class="text-gray-300 leading-relaxed">When <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">synchronous_mode: true</code> is set, Patroni dynamically manages <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">synchronous_standby_names</code> in PostgreSQL. If the designated synchronous replica falls behind or disconnects, Patroni re-evaluates the sync replica set and updates the parameter without human intervention. This is autonomous configuration management driven by replication health signals.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Python — AG DMV integration for autonomous monitoring:</strong></p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Python — Patroni REST API integration for autonomous monitoring:</strong></p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import httpx
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import pyodbc
 import time
 import logging
 from dataclasses import dataclass
 from typing import Optional
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("patroni_monitor")
+logger = logging.getLogger("ag_monitor")
 
 @dataclass
-class PatroniClusterState:
-    leader: str
+class AGClusterState:
+    primary: str
     members: list
     failover_in_progress: bool
-    sync_standby: Optional[str]
+    sync_secondaries: list
 
-PATRONI_ENDPOINTS = [
-    "http://pg-node1:8008",
-    "http://pg-node2:8008",
-    "http://pg-node3:8008",
+AG_ENDPOINTS = [
+    "DRIVER={ODBC Driver 18 for SQL Server};SERVER=sqlag-primary;Trusted_Connection=yes;",
+    "DRIVER={ODBC Driver 18 for SQL Server};SERVER=sqlag-replica1;Trusted_Connection=yes;",
+    "DRIVER={ODBC Driver 18 for SQL Server};SERVER=sqlag-replica2;Trusted_Connection=yes;",
 ]
 
-def fetch_cluster_state() -&gt; Optional[PatroniClusterState]:
+CLUSTER_QUERY = """
+SELECT
+    ar.replica_server_name,
+    ars.role_desc,
+    ar.availability_mode_desc,
+    ar.failover_mode_desc,
+    ars.synchronization_health_desc,
+    drs.redo_queue_size
+FROM sys.availability_replicas ar
+JOIN sys.dm_hadr_availability_replica_states ars
+    ON ar.replica_id = ars.replica_id
+LEFT JOIN sys.dm_hadr_database_replica_states drs
+    ON ar.replica_id = drs.replica_id AND drs.is_local = 1
+"""
+
+def fetch_cluster_state() -&gt; Optional[AGClusterState]:
     """
-    Query each Patroni node until one responds.
-    In a real split-brain scenario, nodes may disagree on leadership —
-    this function returns the DCS-authoritative view, not node self-report.
+    Query each replica until one responds.
+    In a real split-brain scenario, replicas may disagree on role —
+    the quorum-holding side is authoritative, not any single node.
     """
-    for endpoint in PATRONI_ENDPOINTS:
+    for dsn in AG_ENDPOINTS:
         try:
-            r = httpx.get(f"{endpoint}/cluster", timeout=5.0)
-            if r.status_code == 200:
-                data = r.json()
-                leader = next(
-                    (m["name"] for m in data["members"] if m["role"] == "leader"), None
-                )
-                sync = next(
-                    (m["name"] for m in data["members"] if m["role"] == "sync_standby"),
-                    None,
-                )
-                return PatroniClusterState(
-                    leader=leader,
-                    members=data["members"],
-                    failover_in_progress=data.get("failover", False),
-                    sync_standby=sync,
-                )
-        except (httpx.RequestError, KeyError) as e:
-            logger.warning(f"Could not reach {endpoint}: {e}")
+            conn = pyodbc.connect(dsn, timeout=5)
+            cur = conn.cursor()
+            cur.execute(CLUSTER_QUERY)
+            members = [
+                {
+                    "name": row[0], "role": row[1], "avail_mode": row[2],
+                    "failover_mode": row[3], "health": row[4],
+                    "redo_queue_kb": row[5] or 0,
+                }
+                for row in cur.fetchall()
+            ]
+            conn.close()
+            primary = next(
+                (m["name"] for m in members if m["role"] == "PRIMARY"), None
+            )
+            sync = [
+                m["name"] for m in members
+                if m["role"] == "SECONDARY"
+                and m["avail_mode"] == "SYNCHRONOUS_COMMIT"
+            ]
+            return AGClusterState(
+                primary=primary,
+                members=members,
+                failover_in_progress=primary is None,
+                sync_secondaries=sync,
+            )
+        except pyodbc.Error as e:
+            logger.warning(f"Could not reach endpoint: {e}")
     return None
 
-def evaluate_and_alert(state: PatroniClusterState):
+def evaluate_and_alert(state: AGClusterState):
     lagging = [
         m for m in state.members
-        if m.get("lag", 0) &gt; 1_048_576 and m["role"] != "leader"
+        if m["redo_queue_kb"] &gt; 1024 and m["role"] != "PRIMARY"
     ]
     if lagging:
         logger.warning(
-            f"Replicas exceeding failover lag threshold: "
+            f"Secondaries exceeding redo-queue threshold: "
             f"{[m['name'] for m in lagging]}"
         )
-    if not state.sync_standby:
+    if not state.sync_secondaries:
         logger.error(
-            "No synchronous standby present — cluster is operating in async mode. "
+            "No synchronous secondary present — cluster is operating in async mode. "
             "RPO guarantee is degraded."
         )
 
@@ -229,13 +217,11 @@ if __name__ == "__main__":
             evaluate_and_alert(state)
         time.sleep(15)</code></pre>
 
-<p class="text-gray-300 leading-relaxed">This script is not a replacement for Patroni's own decision-making — it is a secondary observer that feeds into an alerting and audit trail, allowing the autonomous system to record *why* it made a failover decision in language that a post-incident review can parse.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
+<p class="text-gray-300 leading-relaxed">This script is not a replacement for WSFC's own decision-making — it is a secondary observer that feeds into an alerting and audit trail, allowing the autonomous system to record <em>why</em> it made a failover decision in language that a post-incident review can parse.</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">17.3 SQL Server Always On and the Kubernetes Operator Model</h3>
 
-<p class="text-gray-300 leading-relaxed">SQL Server's Always On Availability Groups provide the same leadership-election semantics as Patroni, but with a different operational model. In Windows Server Failover Cluster (WSFC) deployments, quorum is managed by a cluster quorum resource — a concept structurally identical to Patroni's DCS lease. In containerized deployments (SQL Server on Kubernetes), the SQL Server Operator from the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">mssql-operator</code> or community <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sql-server-k8s-operator</code> replaces WSFC entirely.</p>
+<p class="text-gray-300 leading-relaxed">SQL Server's Always On Availability Groups provide quorum-based leadership-election semantics through the cluster service. In Windows Server Failover Cluster (WSFC) deployments, quorum is managed by a cluster quorum resource — a vote-based lease that makes leadership a shared, observable fact. In containerized deployments (SQL Server on Kubernetes), the SQL Server Operator from the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">mssql-operator</code> or community <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sql-server-k8s-operator</code> replaces WSFC entirely.</p>
 
 <p class="text-gray-300 leading-relaxed">The Kubernetes operator model is significant because it brings SQL Server HA into the same orchestration plane as the rest of the application stack. An operator is a custom Kubernetes controller that watches a Custom Resource Definition (CRD) representing the AG's desired state and continuously reconciles actual state to match it. When a primary pod dies, Kubernetes detects the pod failure, the operator observes the AG state change via the DMVs, elects a new primary from the healthy replicas, and updates the Service object that application connections point to — all within the reconciliation loop.</p>
 
@@ -300,113 +286,92 @@ WHERE ag.name = 'ProductionAG';</code></pre>
 
 <p class="text-gray-300 leading-relaxed">A critical architectural consideration in zero-touch SQL Server HA is the handling of the AG listener after failover. The listener is a virtual network name (VNN) that clients connect to. In WSFC, the cluster updates DNS automatically. In Kubernetes, the operator updates the ClusterIP Service. In both cases, the connection rerouting is transparent to application code — but only if applications are using the AG listener or Service name, never the direct node IP. Autonomous HA systems enforce this at the infrastructure layer: direct-node connection strings are blocked by network policy, forcing all traffic through the abstraction layer that the operator controls.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">17.4 Traffic Rerouting Without Human Intervention: pgBouncer, HAProxy, and Service Mesh Patterns</h3>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">17.4 Traffic Rerouting Without Human Intervention: AG Listeners and Read-Only Routing</h3>
 
 <p class="text-gray-300 leading-relaxed">Promoting a replica to primary is half the problem. The other half is getting client connections to the new primary before application-level timeouts cascade into a service outage. In autonomous systems, connection rerouting must happen in under 5 seconds in most SLA frameworks — which rules out DNS TTL-based approaches for latency-sensitive workloads.</p>
 
-<p class="text-gray-300 leading-relaxed">The standard architecture for zero-touch traffic rerouting in PostgreSQL uses a layered approach:</p>
+<p class="text-gray-300 leading-relaxed">The standard architecture for zero-touch traffic rerouting in SQL Server uses a layered approach:</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>Application → pgBouncer (connection pooler) → HAProxy (TCP load balancer) → PostgreSQL nodes</code></pre>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>Application → AG Listener (virtual network name) → Primary replica / Read-only routing list</code></pre>
 
-<p class="text-gray-300 leading-relaxed">HAProxy performs active health checks against each PostgreSQL node and routes write traffic only to the node responding <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">200</code> on the Patroni REST <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">/primary</code> endpoint:</p>
+<p class="text-gray-300 leading-relaxed">The availability group listener is a virtual network name (VNN) with its own IP that always points at the current primary. On failover, the cluster moves the listener to the new primary and updates DNS. Applications connect to the listener name — never to a node IP — so rerouting is transparent. Read-only routing extends this: connections specifying <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ApplicationIntent=ReadOnly</code> are redirected by the primary to a readable secondary from the routing list, offloading reporting traffic automatically:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Read-only routing list: reporting connections land on secondaries automatically
+ALTER AVAILABILITY GROUP [ProductionAG]
+    MODIFY REPLICA ON N'sqlag-primary'
+    WITH (SECONDARY_ROLE (READ_ONLY_ROUTING_LIST = (N'sqlag-replica1', N'sqlag-replica2')));
+
+ALTER AVAILABILITY GROUP [ProductionAG]
+    MODIFY REPLICA ON N'sqlag-replica1'
+    WITH (SECONDARY_ROLE (READ_ONLY_ROUTING_LIST = (N'sqlag-replica2', N'sqlag-primary')));</code></pre>
+
+<p class="text-gray-300 leading-relaxed">In Kubernetes, the operator updates the ClusterIP Service that application connections point to, achieving the same effect as the WSFC listener move. In both cases, autonomous HA systems enforce listener-based connectivity at the infrastructure layer: direct-node connection strings are blocked by network policy, forcing all traffic through the abstraction layer that the operator controls.</p>
+
+<p class="text-gray-300 leading-relaxed">Where an extra TCP proxy tier is required in front of the listener, HAProxy performs active port health checks against each replica and routes write traffic only to the node currently holding the primary role:</p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># haproxy.cfg — relevant sections for autonomous primary routing
-frontend postgres_write
-    bind *:5432
+frontend sql_write
+    bind *:1433
     mode tcp
-    default_backend postgres_primary
+    default_backend sql_primary
 
-backend postgres_primary
+backend sql_primary
     mode tcp
-    option httpchk GET /primary
-    http-check expect status 200
+    option tcp-check
     default-server inter 2s fall 3 rise 2 on-marked-down shutdown-sessions
-    server pg-node1 10.0.1.1:5432 check port 8008
-    server pg-node2 10.0.1.2:5432 check port 8008
-    server pg-node3 10.0.1.3:5432 check port 8008
+    server sqlag-primary  10.0.1.1:1433 check
+    server sqlag-replica1 10.0.1.2:1433 check backup
+    server sqlag-replica2 10.0.1.3:1433 check backup</code></pre>
 
-backend postgres_replicas
-    mode tcp
-    balance roundrobin
-    option httpchk GET /replica
-    http-check expect status 200
-    server pg-node1 10.0.1.1:5432 check port 8008
-    server pg-node2 10.0.1.2:5432 check port 8008
-    server pg-node3 10.0.1.3:5432 check port 8008</code></pre>
+<p class="text-gray-300 leading-relaxed">The key directive here is <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">on-marked-down shutdown-sessions</code>. When HAProxy's health check marks the current primary as down, it immediately tears down all existing connections to that node. This forces the application's connection pool to re-establish connections, which then hit the backend pool and land on the new primary. The total rerouting time is bounded by: HAProxy check interval (2s) × fall threshold (3) = 6 seconds worst case.</p>
 
-<p class="text-gray-300 leading-relaxed">The key directive here is <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">on-marked-down shutdown-sessions</code>. When HAProxy's health check marks the current primary as down, it immediately tears down all existing connections to that node. This forces pgBouncer to re-establish connections, which then hit the backend pool and land on the new primary (which is now returning <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">200</code> on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">/primary</code>). The total rerouting time is bounded by: HAProxy check interval (2s) × fall threshold (3) = 6 seconds worst case.</p>
+<p class="text-gray-300 leading-relaxed">For workloads that cannot tolerate even 6 seconds of connection disruption, a service mesh approach using Envoy or Istio reduces this to sub-second. An Envoy TCP health check against port 1433 runs at 500ms intervals, and active request draining ensures in-flight transactions are completed before the connection is terminated. The trade-off is operational complexity — service mesh HA configuration is significantly more involved than HAProxy.</p>
 
-<p class="text-gray-300 leading-relaxed">For workloads that cannot tolerate even 6 seconds of connection disruption, a service mesh approach using Envoy or Istio reduces this to sub-second. An Envoy health check against the Patroni endpoint runs at 500ms intervals, and active request draining ensures in-flight transactions are completed before the connection is terminated. The trade-off is operational complexity — service mesh HA configuration is significantly more involved than HAProxy.</p>
+<p class="text-gray-300 leading-relaxed">The application's connection string is the other half of failover resilience. SqlClient's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ConnectRetryCount</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ConnectRetryInterval</code> parameters absorb the reconnection burst that follows a failover, so the application retries internally instead of surfacing errors:</p>
 
-<p class="text-gray-300 leading-relaxed">pgBouncer sits in front of HAProxy in this architecture to manage connection multiplexing and to handle the reconnection storm that follows a failover. Without pgBouncer, hundreds of application connections simultaneously attempting to reconnect to the new primary can overwhelm it. pgBouncer's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">server_login_retry</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">query_wait_timeout</code> parameters absorb the reconnection burst:</p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Connection string parameters relevant to failover resilience
+Server=ag-listener;Database=orders;Trusted_Connection=True;
+ConnectRetryCount=3;          -- retry the open attempt 3 times
+ConnectRetryInterval=10;      -- wait 10s between retries
+ApplicationIntent=ReadWrite;  -- route to the primary replica
+MultiSubnetFailover=True      -- parallel connection attempts across listener IPs</code></pre>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># pgbouncer.ini — parameters relevant to failover resilience
-[pgbouncer]
-pool_mode = transaction
-server_login_retry = 0.5         ; Retry server connection every 500ms
-query_wait_timeout = 15          ; Hold client connections up to 15s waiting for a server
-server_connect_timeout = 5       ; Give up on a server connection after 5s
-server_check_delay = 10          ; Verify server health every 10s
-server_check_query = SELECT 1    ; Health check query</code></pre>
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ConnectRetryCount = 3</code> setting is particularly important: it means that during the 6-second HAProxy switchover window, client connection attempts are retried by the driver rather than failing with connection errors. From the application's perspective, queries slow down for a few seconds rather than returning errors. This is the correct behavior for a zero-touch system — transient slowness is acceptable; connection errors are not.</p>
 
-<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">query_wait_timeout = 15</code> setting is particularly important: it means that during the 6-second HAProxy switchover window, client queries are queued in pgBouncer rather than failing with connection errors. From the application's perspective, queries slow down for a few seconds rather than returning errors. This is the correct behavior for a zero-touch system — transient slowness is acceptable; connection errors are not.</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL — verifying connection routing post-failover:</strong></p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Verifying connection routing post-failover:</strong></p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Run against the new primary after promotion
 -- Confirms that application traffic has successfully rerouted
 SELECT
-    datname,
-    usename,
-    application_name,
-    client_addr,
-    state,
-    count(*) AS connection_count,
-    max(extract(epoch FROM (now() - state_change))) AS max_seconds_in_state
-FROM pg_stat_activity
-WHERE datname NOT IN ('postgres', 'template0', 'template1')
-  AND state != 'idle'
-GROUP BY datname, usename, application_name, client_addr, state
+    c.client_net_address,
+    s.program_name,
+    s.status,
+    COUNT(*) AS connection_count,
+    MAX(DATEDIFF(SECOND, s.last_request_start_time, GETUTCDATE()))
+        AS max_seconds_since_request
+FROM sys.dm_exec_connections c
+JOIN sys.dm_exec_sessions s
+    ON c.session_id = s.session_id
+WHERE s.is_user_process = 1
+  AND s.status <> 'sleeping'
+GROUP BY c.client_net_address, s.program_name, s.status
 ORDER BY connection_count DESC;</code></pre>
 
-<p class="text-gray-300 leading-relaxed">This query is executed by the post-failover validation routine — not a human — to confirm that application connections have landed on the new primary and are in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">active</code> rather than <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">idle in transaction</code> state, which would indicate stuck transactions from the failed primary.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
+<p class="text-gray-300 leading-relaxed">This query is executed by the post-failover validation routine — not a human — to confirm that application connections have landed on the new primary and are in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">running</code> rather than <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">suspended</code> state, which would indicate stuck requests from the failed primary.</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">17.5 Self-Healing Replica Reintegration After Failover</h3>
 
-<p class="text-gray-300 leading-relaxed">Failover is a one-way event unless the system also handles replica reintegration autonomously. After a primary fails and is promoted away, the former primary — once recovered — must rejoin the cluster as a replica. This process involves: detecting that the former primary is back online, identifying its divergence point from the new primary's WAL timeline, rebuilding the data directory if necessary, and streaming replication from the new primary. In Patroni, this is handled natively through the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_rewind</code> integration. In SQL Server, the AG automatically re-synchronizes a rejoined replica.</p>
+<p class="text-gray-300 leading-relaxed">Failover is a one-way event unless the system also handles replica reintegration autonomously. After a primary fails and is promoted away, the former primary — once recovered — must rejoin the cluster as a secondary. The AG automatically re-synchronizes a rejoined replica through log shipping catch-up: the former primary rolls back any uncommitted work from its divergent tail and applies the new primary's log stream until it is synchronized.</p>
 
-<p class="text-gray-300 leading-relaxed">The Patroni <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_rewind</code> flow works as follows: when the former primary comes back online, Patroni checks whether its WAL history diverges from the current primary's timeline. If the divergence is within the rewind window (controlled by <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">wal_log_hints = on</code> and sufficient WAL on the primary), Patroni executes <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_rewind</code> to synchronize the data directory to the branch point and then restarts streaming replication. If <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_rewind</code> cannot reconcile the divergence — because the primary has already checkpointed past the divergence point and WAL is no longer available — Patroni falls back to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_basebackup</code> to rebuild the replica from scratch.</p>
+<p class="text-gray-300 leading-relaxed">The AG rejoin flow works as follows: when the former primary comes back online, it contacts the new primary and negotiates the common log sequence. If the divergence is within the available log on the primary, the secondary rolls back and catches up automatically. If the divergence exceeds the available log — because the primary has already truncated past the divergence point — the replica must be reseeded: the autonomous system removes it from the AG, restores a fresh backup with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">NORECOVERY</code>, and rejoins it.</p>
 
-<p class="text-gray-300 leading-relaxed">Monitoring the reintegration process autonomously requires tracking WAL receiver state and replication lag from the moment the former primary reconnects:</p>
+<p class="text-gray-300 leading-relaxed">Monitoring the reintegration process autonomously requires tracking data movement state and redo queue from the moment the former primary reconnects:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL — tracking replica reintegration progress:</strong></p>
+<p class="text-gray-300 leading-relaxed">The autonomous reintegration policy is: if <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">estimated_seconds_to_sync</code> keeps growing over three consecutive evaluations during reintegration, suspend and resume data movement on the replica once and retry. If three resume attempts fail, quarantine the node — remove it from the read-only routing list, suspend its AG data movement, and generate a human-escalation alert. This is the one scenario where zero-touch fails gracefully into a managed-intervention state: the system has exhausted its automated recovery options and is explicitly communicating that human attention is required.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Run on the rejoining node during pg_rewind / basebackup recovery
-SELECT
-    status,
-    receive_start_lsn,
-    receive_start_tli,
-    written_lsn,
-    flushed_lsn,
-    received_tli,
-    last_msg_send_time,
-    last_msg_receipt_time,
-    latest_end_lsn,
-    latest_end_time,
-    extract(epoch FROM (now() - last_msg_receipt_time)) AS seconds_since_last_message,
-    slot_name,
-    sender_host
-FROM pg_stat_wal_receiver;</code></pre>
+<p class="text-gray-300 leading-relaxed">Replica reintegration after an AG failover is observable through the DMV layer:</p>
 
-<p class="text-gray-300 leading-relaxed">The autonomous reintegration policy is: if <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">seconds_since_last_message</code> exceeds 60 seconds during reintegration, trigger a Patroni restart on the node and retry. If three restart attempts fail, quarantine the node — remove it from the HAProxy backend pool, flag it in the DCS, and generate a human-escalation alert. This is the one scenario where zero-touch fails gracefully into a managed-intervention state: the system has exhausted its automated recovery options and is explicitly communicating that human attention is required.</p>
-
-<p class="text-gray-300 leading-relaxed">For SQL Server, replica reintegration after an AG failover is observable through the DMV layer:</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server — monitoring replica reintegration and data movement:</strong></p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Monitoring replica reintegration and data movement:</strong></p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Tracks the progress of a replica rejoining the AG after primary failure
 SELECT
@@ -432,38 +397,35 @@ ORDER BY drs.log_send_queue_size DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">estimated_seconds_to_sync</code> calculated column is what the autonomous system uses to decide whether to mark the rejoining replica as <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pending</code> (expected to finish within SLA) or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">degraded</code> (reintegration is taking longer than expected, possibly indicating storage or network issues on the rejoining node). This metric feeds into the cluster health dashboard and the replica promotion eligibility gate.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">17.6 Autonomous Runbook Execution and Post-Failover Validation</h3>
 
 <p class="text-gray-300 leading-relaxed">The final layer of zero-touch HA is not the failover itself — it is the automated validation that follows. A failover that succeeds technically but leaves the system in a degraded or undiscovered state is a failure in the autonomous contract. Post-failover validation is the system's self-assessment: it must confirm that the new primary is healthy, that replication has resumed, that connections are routed correctly, that any dependent services have reconnected, and that the cluster is in a state where a second failover — if required — could succeed.</p>
 
 <p class="text-gray-300 leading-relaxed">Autonomous runbook execution treats the post-failover sequence as a directed acyclic graph of checks, each with a pass/fail condition, a timeout, and an escalation policy:</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>[1] New primary responds on port 5432
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>[1] New primary responds on port 1433 and reports PRIMARY role in DMVs
     → PASS: continue
     → FAIL after 10s: re-evaluate candidate replicas, attempt second promotion
 
-[2] pg_stat_replication shows at least one active replica
+[2] sys.dm_hadr_database_replica_states shows at least one synchronizing secondary
     → PASS: continue
-    → FAIL after 60s: alert, degrade RPO guarantee flag in DCS
+    → FAIL after 60s: alert, degrade RPO guarantee flag in cluster metadata
 
 [3] Application connection count matches pre-failover baseline (±20%)
     → PASS: continue
-    → FAIL after 30s: check pgBouncer pool health, force pool reconnect
+    → FAIL after 30s: check AG listener DNS, force connection pool recycle
 
 [4] Write throughput returns to baseline (±30%)
     → PASS: mark failover complete
     → FAIL after 120s: escalate to on-call — performance anomaly on new primary
 
-[5] Former primary rejoins as replica
+[5] Former primary rejoins as secondary
     → PASS within 300s: full cluster health restored
     → FAIL after 300s: quarantine former primary, alert for manual inspection</code></pre>
 
 <p class="text-gray-300 leading-relaxed">This runbook is implemented as an orchestration script that reads cluster state at each step rather than assuming the previous step's side effects persist:</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import httpx
-import psycopg2
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import pyodbc
 import time
 import logging
 from enum import Enum
@@ -495,34 +457,44 @@ def run_check_with_timeout(
     return CheckResult.TIMEOUT
 
 def check_primary_reachable(dsn: str) -&gt; bool:
-    conn = psycopg2.connect(dsn, connect_timeout=5)
+    conn = pyodbc.connect(dsn, timeout=5)
     cur = conn.cursor()
-    cur.execute("SELECT pg_is_in_recovery()")
-    is_replica = cur.fetchone()[0]
+    cur.execute("""
+        SELECT ars.role_desc
+        FROM sys.dm_hadr_availability_replica_states ars
+        WHERE ars.is_local = 1
+    """)
+    role = cur.fetchone()[0]
     conn.close()
-    return not is_replica  # True only if this node believes it is primary
+    return role == "PRIMARY"  # True only if this node believes it is primary
 
 def check_replication_active(dsn: str, min_replicas: int = 1) -&gt; bool:
-    conn = psycopg2.connect(dsn, connect_timeout=5)
+    conn = pyodbc.connect(dsn, timeout=5)
     cur = conn.cursor()
-    cur.execute(
-        "SELECT count(*) FROM pg_stat_replication WHERE state = 'streaming'"
-    )
+    cur.execute("""
+        SELECT COUNT(*)
+        FROM sys.dm_hadr_database_replica_states
+        WHERE synchronization_state_desc IN ('SYNCHRONIZED', 'SYNCHRONIZING')
+          AND is_local = 0
+    """)
     count = cur.fetchone()[0]
     conn.close()
     return count &gt;= min_replicas
 
-def check_patroni_cluster_complete(patroni_url: str, expected_members: int) -&gt; bool:
-    r = httpx.get(f"{patroni_url}/cluster", timeout=5.0)
-    if r.status_code != 200:
-        return False
-    data = r.json()
-    running = [m for m in data["members"] if m.get("state") == "running"]
-    return len(running) &gt;= expected_members
+def check_cluster_complete(dsn: str, expected_members: int) -&gt; bool:
+    conn = pyodbc.connect(dsn, timeout=5)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT COUNT(*)
+        FROM sys.dm_hadr_availability_replica_states
+        WHERE connected_state_desc = 'CONNECTED'
+    """)
+    count = cur.fetchone()[0]
+    conn.close()
+    return count &gt;= expected_members
 
 def execute_post_failover_runbook(
     new_primary_dsn: str,
-    patroni_url: str,
     expected_cluster_size: int,
     escalation_fn: Callable[[str], None],
 ):
@@ -541,7 +513,7 @@ def execute_post_failover_runbook(
         ),
         (
             "cluster_complete",
-            lambda: check_patroni_cluster_complete(patroni_url, expected_cluster_size),
+            lambda: check_cluster_complete(new_primary_dsn, expected_cluster_size),
             300,
             False,
         ),
@@ -563,9 +535,9 @@ def execute_post_failover_runbook(
 
     logger.info("Post-failover runbook complete. Cluster health validated.")</code></pre>
 
-<p class="text-gray-300 leading-relaxed">The escalation function passed into <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">execute_post_failover_runbook</code> is deliberately abstract — in practice it dispatches to a PagerDuty API, a Slack webhook, or an incident management system. The point is that escalation is the *last resort* in the autonomous contract: the runbook exhausts every automated recovery option before producing a human-visible alert.</p>
+<p class="text-gray-300 leading-relaxed">The escalation function passed into <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">execute_post_failover_runbook</code> is deliberately abstract — in practice it dispatches to a PagerDuty API, a Slack webhook, or an incident management system. The point is that escalation is the <em>last resort</em> in the autonomous contract: the runbook exhausts every automated recovery option before producing a human-visible alert.</p>
 
-<p class="text-gray-300 leading-relaxed">For SQL Server, an equivalent post-failover validation script runs T-SQL checks against the DMVs and posts results to a centralized monitoring table that the operator controller reads:</p>
+<p class="text-gray-300 leading-relaxed">A companion post-failover validation script runs T-SQL checks against the DMVs and posts results to a centralized monitoring table that the operator controller reads:</p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Post-failover health summary for autonomous AG validation
 -- Insert into a shared audit table read by the orchestration layer
@@ -603,15 +575,13 @@ GROUP BY ag.name;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dba.ag_failover_audit</code> table becomes the authoritative record of every failover event: what triggered it, when it occurred, who became primary, how long reintegration took, and whether post-failover validation passed. This table is read by the automated reporting layer to produce post-incident summaries without human authorship — the system describes what happened to itself.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">17.7 Split-Brain Prevention: Fencing, STONITH, and Consensus Guarantees</h3>
 
 <p class="text-gray-300 leading-relaxed">Every automated HA system faces one adversarial scenario that cannot be resolved by checking metrics: the network partition where both the primary and a promoted replica believe they are the authoritative write endpoint. This is split-brain, and it is the failure mode that turns an HA system into a data consistency catastrophe.</p>
 
 <p class="text-gray-300 leading-relaxed">Zero-touch HA does not just detect split-brain — it prevents it architecturally. The prevention mechanisms operate at three levels.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Level 1: DCS-enforced leader exclusivity.</strong> In Patroni, the leadership key in etcd is held by exactly one node at a time. A replica cannot become primary without acquiring the key. A primary that loses DCS connectivity pauses writes (via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pause</code> state) rather than continuing to serve writes without a valid lease. The DCS is the arbiter — no DCS connection, no primary designation.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Level 1: Quorum-enforced primary exclusivity.</strong> In WSFC, the cluster can only bring the availability group online on the side holding a majority of quorum votes. A replica cannot become primary without quorum. A primary that loses quorum connectivity is taken offline rather than continuing to serve writes without a valid majority. The quorum vote is the arbiter — no quorum, no primary designation.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Level 2: STONITH (Shoot The Other Node In The Head).</strong> When a replica is promoted, it must ensure the former primary cannot continue accepting writes. STONITH accomplishes this by issuing a fencing command — typically a power cycle or network isolation command — through an out-of-band management interface (IPMI, AWS EC2 stop-instance API, Azure VM deallocate). The promotion is not considered complete until the fencing operation confirms the former primary is offline.</p>
 
@@ -625,8 +595,8 @@ logger = logging.getLogger("stonith")
 def fence_instance(instance_id: str, region: str) -&gt; bool:
     """
     Hard fence an EC2 instance by stopping it via the AWS API.
-    Called by the Patroni custom_bootstrap script when a replica is promoted
-    and the former primary's DCS lease has not been gracefully released.
+    Called by the HA orchestrator when a replica is promoted
+    and the former primary's cluster membership has not been gracefully released.
     Used as a STONITH mechanism to guarantee the former primary cannot write.
     """
     ec2 = boto3.client("ec2", region_name=region)
@@ -645,39 +615,36 @@ def fence_instance(instance_id: str, region: str) -&gt; bool:
         )
         return False</code></pre>
 
-<p class="text-gray-300 leading-relaxed">If STONITH fails — if the fencing operation cannot reach the management API, or the API returns an error — the autonomous system must not complete the promotion. Instead, it must halt the election, relinquish the DCS key if it was acquired, and generate a critical alert. A failed fence is worse than a failed failover: a failed failover leaves you with no primary; a failed fence with a completed promotion leaves you with two primaries.</p>
+<p class="text-gray-300 leading-relaxed">If STONITH fails — if the fencing operation cannot reach the management API, or the API returns an error — the autonomous system must not complete the promotion. Instead, it must halt the election and generate a critical alert. A failed fence is worse than a failed failover: a failed failover leaves you with no primary; a failed fence with a completed promotion leaves you with two primaries.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Level 3: PostgreSQL <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">recovery_min_apply_delay</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_ctl promote</code> sequencing.</strong> When Patroni issues the promotion command, it does so only after confirming the fencing operation succeeded and the DCS key is held. The sequencing is:</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Level 3: Forced-failover sequencing.</strong> When the orchestrator issues the promotion command, it does so only after confirming the fencing operation succeeded and quorum majority is held. The sequencing is:</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>1. Acquire DCS leadership key
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>1. Confirm quorum majority on the surviving side
 2. Confirm fencing of former primary (API acknowledgment)
-3. Execute pg_ctl promote on the winning replica
-4. Update DCS with new primary's connection information
-5. Signal HAProxy health endpoint change (Patroni REST /primary returns 200)</code></pre>
+3. Execute ALTER AVAILABILITY GROUP ... FORCE_FAILOVER_ALLOW_DATA_LOSS on the winning replica
+4. Move the AG listener to the new primary and update DNS
+5. Confirm sp_server_diagnostics reports healthy before opening client traffic</code></pre>
 
-<p class="text-gray-300 leading-relaxed">Step 2 must complete before step 3. This is not a best-effort sequence — it is enforced in Patroni's promotion code path. Any HA framework that promotes first and fences second is architecturally unsafe.</p>
+<p class="text-gray-300 leading-relaxed">Step 2 must complete before step 3. This is not a best-effort sequence — it is enforced in the orchestrator's promotion code path. Any HA framework that promotes first and fences second is architecturally unsafe.</p>
 
 <div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">sequenceDiagram
-    participant DCS as DCS (etcd/Consul)
+    participant Quorum as WSFC Quorum
     participant Replica as Candidate Replica
     participant Fence as Fencing API (IPMI/Cloud)
     participant OldPrimary as Former Primary
-    participant Proxy as HAProxy/pgBouncer
+    participant Listener as AG Listener
 
-    Replica->>DCS: Acquire leadership key
-    DCS-->>Replica: Key granted
+    Replica->>Quorum: Confirm majority held
+    Quorum-->>Replica: Majority confirmed
     Replica->>Fence: Fence former primary
     Fence->>OldPrimary: Power cycle / network isolate
     Fence-->>Replica: Fence confirmed
-    Replica->>Replica: pg_ctl promote
-    Replica->>DCS: Update primary connection info
-    DCS-->>Proxy: /primary health check returns 200
-    Proxy->>Replica: Route write traffic</pre></div>
+    Replica->>Replica: ALTER AVAILABILITY GROUP ... FORCE_FAILOVER
+    Replica->>Listener: Move listener to new primary
+    Listener->>Replica: Route write traffic</pre></div>
 <p class="text-gray-300 leading-relaxed">*Promotion only proceeds after the fence is confirmed — a failed fence halts the sequence rather than risking dual primaries.*</p>
 
-<p class="text-gray-300 leading-relaxed">For SQL Server in WSFC, the equivalent fencing mechanism is the cluster's quorum vote. When a partition occurs and a node loses quorum, WSFC takes that node offline rather than allowing it to continue as a split-brain primary. The quorum configuration — <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Node Majority</code> for odd-node clusters, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Node and File Share Majority</code> for even-node clusters — must be reviewed as part of any zero-touch HA deployment because misconfigured quorum is the most common cause of split-brain in production WSFC environments.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
+<p class="text-gray-300 leading-relaxed">The quorum configuration itself deserves periodic autonomous review — <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Node Majority</code> for odd-node clusters, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Node and File Share Majority</code> for even-node clusters, plus dynamic quorum and dynamic witness behavior. An autonomous controller validates that the effective vote count still yields a strict majority after every topology change, because misconfigured quorum is the most common cause of split-brain in production WSFC environments.</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">17.8 Observable Failover: The Audit Trail That Explains Itself</h3>
 
@@ -685,49 +652,48 @@ def fence_instance(instance_id: str, region: str) -&gt; bool:
 
 <p class="text-gray-300 leading-relaxed">The audit trail is not a log file — it is a structured database record that can be queried, compared across failover events, and used to improve the decision logic over time. Each failover event is a first-class entity:</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL schema for autonomous failover audit
-CREATE TABLE ha.failover_events (
-    event_id            BIGSERIAL PRIMARY KEY,
-    event_time          TIMESTAMPTZ NOT NULL DEFAULT now(),
-    trigger_signal      TEXT NOT NULL,         -- e.g., 'TCP_HEALTH_CHECK_FAILED'
-    trigger_details     JSONB,                 -- raw signal data at decision time
-    former_primary      TEXT NOT NULL,
-    new_primary         TEXT NOT NULL,
-    candidate_set       JSONB,                 -- all replicas evaluated, with LSN
-    winning_candidate   TEXT NOT NULL,
-    fence_attempted     BOOLEAN NOT NULL,
-    fence_succeeded     BOOLEAN,
-    promotion_time      TIMESTAMPTZ,
-    haproxy_switch_time TIMESTAMPTZ,
-    first_client_conn   TIMESTAMPTZ,
-    replication_resumed TIMESTAMPTZ,
-    total_downtime_ms   INTEGER,
-    validation_status   TEXT,
-    escalated           BOOLEAN NOT NULL DEFAULT FALSE,
-    escalation_reason   TEXT
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Failover audit schema for autonomous HA
+CREATE TABLE dba.failover_events (
+    event_id            BIGINT IDENTITY(1,1) PRIMARY KEY,
+    event_time          DATETIMEOFFSET NOT NULL DEFAULT SYSDATETIMEOFFSET(),
+    ag_name             NVARCHAR(128) NOT NULL,
+    trigger_signal      NVARCHAR(256) NOT NULL,  -- e.g., 'TCP_HEALTH_CHECK_FAILED'
+    trigger_details     NVARCHAR(MAX),           -- raw signal data at decision time (JSON)
+    former_primary      NVARCHAR(128) NOT NULL,
+    new_primary         NVARCHAR(128) NOT NULL,
+    candidate_set       NVARCHAR(MAX),           -- all replicas evaluated, with hardened LSN
+    winning_candidate   NVARCHAR(128) NOT NULL,
+    fence_attempted     BIT NOT NULL,
+    fence_succeeded     BIT,
+    promotion_time      DATETIMEOFFSET,
+    listener_switch_time DATETIMEOFFSET,
+    first_client_conn   DATETIMEOFFSET,
+    replication_resumed DATETIMEOFFSET,
+    total_downtime_ms   INT,
+    validation_status   NVARCHAR(32),
+    escalated           BIT NOT NULL DEFAULT 0,
+    escalation_reason   NVARCHAR(MAX)
 );
 
--- Index for post-incident analysis
-CREATE INDEX ON ha.failover_events (event_time DESC);
-CREATE INDEX ON ha.failover_events (former_primary, event_time DESC);
+-- Indexes for post-incident analysis
+CREATE INDEX IX_failover_events_time ON dba.failover_events (event_time DESC);
+CREATE INDEX IX_failover_events_primary ON dba.failover_events (former_primary, event_time DESC);
+GO
 
 -- View for SLA reporting: downtime per calendar month
-CREATE VIEW ha.monthly_ha_summary AS
+CREATE OR ALTER VIEW dba.monthly_ha_summary AS
 SELECT
-    date_trunc('month', event_time)         AS month,
-    count(*)                                AS failover_count,
-    avg(total_downtime_ms)                  AS avg_downtime_ms,
-    max(total_downtime_ms)                  AS max_downtime_ms,
-    sum(total_downtime_ms) / 1000.0         AS total_downtime_seconds,
-    count(*) FILTER (WHERE escalated)       AS escalated_count,
-    count(*) FILTER (
-        WHERE validation_status = 'VALIDATED'
-    )                                       AS clean_failovers
-FROM ha.failover_events
-GROUP BY date_trunc('month', event_time)
-ORDER BY month DESC;</code></pre>
+    DATEFROMPARTS(YEAR(event_time), MONTH(event_time), 1) AS month,
+    COUNT(*)                                              AS failover_count,
+    AVG(CAST(total_downtime_ms AS FLOAT))                 AS avg_downtime_ms,
+    MAX(total_downtime_ms)                                AS max_downtime_ms,
+    SUM(CAST(total_downtime_ms AS BIGINT)) / 1000.0        AS total_downtime_seconds,
+    SUM(CASE WHEN escalated = 1 THEN 1 ELSE 0 END)         AS escalated_count,
+    SUM(CASE WHEN validation_status = N'VALIDATED' THEN 1 ELSE 0 END) AS clean_failovers
+FROM dba.failover_events
+GROUP BY DATEFROMPARTS(YEAR(event_time), MONTH(event_time), 1);</code></pre>
 
-<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">trigger_details</code> JSONB column stores the raw signal values at the moment the decision was made — the replication lag in bytes, the seconds since the last heartbeat, the HAProxy health check response count. This is the evidence record that answers the post-incident question: "Why did the system fail over at 03:47?" The answer is not "because Patroni said so" — it is a structured document showing that replication lag was 2.3 MB (above the 1 MB threshold), the last heartbeat was 38 seconds ago (above the 30-second TTL), and TCP connectivity had failed three consecutive checks in the preceding 6 seconds.</p>
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">trigger_details</code> JSON column stores the raw signal values at the moment the decision was made — the redo queue in KB, the seconds since the last <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sp_server_diagnostics</code> heartbeat, the load balancer health check failure count. This is the evidence record that answers the post-incident question: "Why did the system fail over at 03:47?" The answer is not "because the cluster said so" — it is a structured document showing that the redo queue was 2.3 GB, the last diagnostics heartbeat was 38 seconds ago (above the 20-second lease timeout), and TCP connectivity had failed three consecutive checks in the preceding 6 seconds.</p>
 
 <p class="text-gray-300 leading-relaxed">The equivalent SQL Server audit table captures the same causal chain but reads from DMV snapshots captured at the time of the operator's reconciliation loop:</p>
 
@@ -749,21 +715,19 @@ CREATE TABLE dba.ag_failover_events (
     notes                 NVARCHAR(MAX)
 );</code></pre>
 
-<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">operator_version</code> column is subtle but important: it records which version of the Kubernetes operator or Patroni daemon executed the failover. When a failover behaves unexpectedly — too slow, incorrect candidate selection, fence failure — the operator version is the first variable to investigate. Autonomous systems evolve, and their audit trails must capture the version of the autonomous agent that made each decision, not just the decision itself.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">operator_version</code> column is subtle but important: it records which version of the Kubernetes operator or cluster service executed the failover. When a failover behaves unexpectedly — too slow, incorrect candidate selection, fence failure — the operator version is the first variable to investigate. Autonomous systems evolve, and their audit trails must capture the version of the autonomous agent that made each decision, not just the decision itself.</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Zero-touch failover requires a multi-signal decision matrix, not a single trip-wire.** Autonomous HA systems act on the aggregate of TCP connectivity, replication lag, replica quorum, and process health signals — preventing failover storms from transient network events while catching real outages with high confidence.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Zero-touch failover requires a multi-signal decision matrix, not a single trip-wire.</strong> Autonomous HA systems act on the aggregate of TCP connectivity, replication lag, replica quorum, and process health signals — preventing failover storms from transient network events while catching real outages with high confidence.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Patroni's DCS lease and SQL Server's WSFC quorum serve identical architectural roles:** they externalize leadership state into a shared, durable medium so that no individual node can unilaterally claim primary status. Any HA framework that does not anchor leadership in external consensus is architecturally unsafe for autonomous operation.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">WSFC quorum serves a single architectural role:</strong> it externalizes leadership state into a shared, durable medium so that no individual node can unilaterally claim primary status. Any HA framework that does not anchor leadership in external consensus is architecturally unsafe for autonomous operation.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Traffic rerouting speed is determined by the health-check stack, not DNS.** The combination of HAProxy's interval-based health checks against the Patroni REST endpoint, pgBouncer's `query_wait_timeout`, and `on-marked-down shutdown-sessions` delivers sub-10-second connection rerouting without application code changes or DNS TTL dependency.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Traffic rerouting speed is determined by the health-check stack, not DNS.</strong> The combination of the AG listener move, HAProxy's interval-based TCP health checks with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">on-marked-down shutdown-sessions</code>, and the driver's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ConnectRetryCount</code> delivers sub-10-second connection rerouting without application code changes or DNS TTL dependency.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Split-brain prevention is non-negotiable and must be enforced by sequencing:** acquire consensus key, confirm fencing, then promote. An HA system that promotes first and fences later — or that treats fencing as optional — exposes the cluster to dual-primary data corruption. Failed fencing must halt the promotion, not ignore the error.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Split-brain prevention is non-negotiable and must be enforced by sequencing:</strong> acquire consensus key, confirm fencing, then promote. An HA system that promotes first and fences later — or that treats fencing as optional — exposes the cluster to dual-primary data corruption. Failed fencing must halt the promotion, not ignore the error.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The failover audit trail is as important as the failover itself.** A structured, queryable record of every trigger signal, candidate evaluation, fencing outcome, and validation result turns an autonomous HA system from a black box into an accountable agent — one that can explain its decisions to post-incident reviews, compliance auditors, and the next iteration of its own decision logic.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">The failover audit trail is as important as the failover itself.</strong> A structured, queryable record of every trigger signal, candidate evaluation, fencing outcome, and validation result turns an autonomous HA system from a black box into an accountable agent — one that can explain its decisions to post-incident reviews, compliance auditors, and the next iteration of its own decision logic.</li>
     </div>
     <div class="mt-14 bg-emerald-950/40 border border-emerald-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">

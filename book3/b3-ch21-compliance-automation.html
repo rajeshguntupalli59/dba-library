@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Chapter 21: Policy-Driven Compliance Automation — The ADE Handbook</title>
-  <meta name="description" content="The ADE Handbook Chapter 21: Policy-Driven Compliance Automation. Autonomous database engineering for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
+  <meta name="description" content="The ADE Handbook Chapter 21: Policy-Driven Compliance Automation. Autonomous database engineering for SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
   <script type="module">
     import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
@@ -45,8 +45,6 @@
 
 <p class="text-gray-300 leading-relaxed">Compliance frameworks — SOC 2, HIPAA, PCI-DSS, GDPR, ISO 27001 — share a common engineering problem: humans cannot reliably enforce policy at the speed and scale that modern database platforms demand. An autonomous compliance system doesn't wait for an audit cycle to discover that a staging database received production PII, that a service account accumulated excessive privileges over six months, or that an unencrypted backup landed in the wrong storage tier. It detects the drift, evaluates it against a machine-readable policy graph, and corrects or escalates the deviation without a ticket being opened. This chapter walks through how to build that system end-to-end — from encoding compliance rules as enforceable policy objects, to building the detection layer, to wiring autonomous remediation actions that leave a complete, auditor-readable record of every decision made.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">From Compliance Checklists to Machine-Readable Policy Objects</h3>
 
 <p class="text-gray-300 leading-relaxed">The foundational shift in autonomous compliance is treating regulatory requirements not as PDF documents reviewed quarterly, but as versioned, structured objects that the platform can evaluate programmatically at any time. A policy object answers three questions: what condition must be true, what evidence proves it is true, and what action restores compliance when it is not.</p>
@@ -77,7 +75,7 @@ class CompliancePolicy:
     description:        str
     target_scope:       List[str]    # ["production", "staging-pii"]
     detection_query:    str          # SQL or PromQL
-    detection_platform: str          # "postgresql", "sqlserver", "prometheus"
+    detection_platform: str          # "sqlserver", "prometheus"
     severity:           Severity
     remediation_mode:   RemediationMode
     remediation_action: str          # function name in remediation registry
@@ -88,23 +86,25 @@ class CompliancePolicy:
 
 <p class="text-gray-300 leading-relaxed">A YAML representation of a real policy under PCI-DSS 8.6.1 (system account password management) might look like this:</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>policy_id: pci-8-6-1-pg-default-passwords
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>policy_id: pci-8-6-1-sqlserver-default-logins
 framework: PCI-DSS
 control_ref: "PCI-DSS 8.6.1"
-description: "No database role may retain a default or empty password in production"
+description: "No SQL Server login may retain a default, blank, or common password in production"
 target_scope: ["production"]
 detection_query: |
-  SELECT rolname FROM pg_authid
-  WHERE rolcanlogin = true
-  AND (rolpassword IS NULL OR rolpassword = 'md5' || md5(''))
-detection_platform: postgresql
+  SELECT name FROM sys.sql_logins
+  WHERE is_disabled = 0
+    AND (is_policy_checked = 0
+         OR PWDCOMPARE(N'Password123', password_hash) = 1
+         OR PWDCOMPARE(N'sa', password_hash) = 1)
+detection_platform: sqlserver
 severity: critical
 remediation_mode: auto
 remediation_action: rotate_default_password
 evidence_query: |
-  SELECT rolname, rolpassword IS NOT NULL as has_password,
-         now() as checked_at
-  FROM pg_authid WHERE rolcanlogin = true
+  SELECT name, is_policy_checked, is_expiration_checked,
+         SYSUTCDATETIME() as checked_at
+  FROM sys.sql_logins WHERE is_disabled = 0
 sla_minutes: 15
 owner: platform-security@company.com
 tags: ["pci", "authentication", "credentials"]</code></pre>
@@ -123,7 +123,7 @@ CREATE TABLE compliance_policies (
     target_scope        NVARCHAR(MAX) NOT NULL,  -- JSON array stored as string
     detection_query     NVARCHAR(MAX) NOT NULL,
     detection_platform  NVARCHAR(50)  NOT NULL
-                        CHECK (detection_platform IN ('postgresql','sqlserver','prometheus')),
+                        CHECK (detection_platform IN ('sqlserver','prometheus')),
     severity            NVARCHAR(20)  NOT NULL
                         CHECK (severity IN ('critical','high','medium','low')),
     remediation_mode    NVARCHAR(20)  NOT NULL
@@ -163,8 +163,6 @@ CREATE INDEX IX_findings_sla    ON compliance_findings (sla_deadline)
     WHERE status = 'open';</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The separation of <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">detection_query</code> from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">evidence_query</code> is intentional: the detection query is optimized for fast violation identification (it may return only violating rows), while the evidence query produces the full snapshot that goes into the audit report. Running the evidence query only at finding time and at resolution time keeps audit storage manageable without sacrificing completeness.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">The Compliance Detection Loop: Continuous Evaluation Architecture</h3>
 
@@ -256,18 +254,7 @@ class ComplianceLoop:
             raise
 
     async def _run_detection_query(self, policy, target: Dict) -&gt; List[Any]:
-        if policy.detection_platform == "postgresql":
-            conn = await asyncpg.connect(
-                host=target["host"], port=target.get("port", 5432),
-                database=target["database"],
-                user=target["user"], password=target["password"]
-            )
-            try:
-                rows = await conn.fetch(policy.detection_query)
-                return [dict(r) for r in rows]
-            finally:
-                await conn.close()
-        elif policy.detection_platform == "sqlserver":
+        if policy.detection_platform == "sqlserver":
             # pyodbc path, called synchronously in executor
             return await asyncio.get_event_loop().run_in_executor(
                 None, self._run_sqlserver_query,
@@ -340,8 +327,6 @@ WHERE  policy_id       = @policy_id
                                timeout=aiohttp.ClientTimeout(total=10))
         logger.warning("Escalated %d overdue compliance findings", len(overdue))</code></pre>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Autonomous Remediation: What Gets Auto-Fixed and What Doesn't</h3>
 
 <p class="text-gray-300 leading-relaxed">Not all compliance violations should be autonomously remediated. The remediation mode embedded in each policy object encodes the decision: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">auto</code> means the system corrects the violation immediately and records what it did; <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">approve</code> means it opens an approval request and waits up to the SLA deadline before either escalating or self-approving based on risk tier; <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">alert</code> means it only notifies.</p>
@@ -410,7 +395,7 @@ BEGIN TRANSACTION;
 
 COMMIT TRANSACTION;</code></pre>
 
-<p class="text-gray-300 leading-relaxed">Notice that both remediation scripts write to a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">compliance_remediation_audit</code> table *before* executing the change. This is non-negotiable for autonomous systems: the audit record must exist even if the remediation command partially fails. The finding's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">remediation_result</code> column then receives the full result including the audit record ID, so any auditor can trace a finding through its detection, approval, remediation, and evidence chain as a linked set of records rather than isolated log lines.</p>
+<p class="text-gray-300 leading-relaxed">Notice that both remediation scripts write to a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">compliance_remediation_audit</code> table <em>before</em> executing the change. This is non-negotiable for autonomous systems: the audit record must exist even if the remediation command partially fails. The finding's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">remediation_result</code> column then receives the full result including the audit record ID, so any auditor can trace a finding through its detection, approval, remediation, and evidence chain as a linked set of records rather than isolated log lines.</p>
 
 <p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">compliance_remediation_audit</code> table schema supports this linkage:</p>
 
@@ -436,53 +421,13 @@ CREATE INDEX IX_remediation_audit_finding
 CREATE INDEX IX_remediation_audit_policy
     ON compliance_remediation_audit (policy_id, executed_at DESC);</code></pre>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">PII Detection and Classification as a Continuous Policy</h3>
 
 <p class="text-gray-300 leading-relaxed">Data classification — knowing which columns contain personally identifiable information — is not a one-time labeling exercise. Schemas evolve, new tables appear during feature deployments, and developers occasionally copy a production column into a reporting view without triggering any security review. Autonomous compliance treats classification as a standing policy that runs on every schema change event and on a periodic sweep of all unlabeled columns.</p>
 
 <p class="text-gray-300 leading-relaxed">The detection approach combines two techniques: pattern matching on column names and statistical sampling of column contents. Name-based detection is fast and catches the obvious cases (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">email</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ssn</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dob</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">credit_card_number</code>). Content-based detection using regex sampling catches columns with opaque names (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">col_7</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">field_b</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">attr_value</code>) that happen to hold PII.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL — PII column name detection query:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Detection query for compliance policy: pii-unlabeled-columns
-SELECT
-    n.nspname                       AS schema_name,
-    c.relname                       AS table_name,
-    a.attname                       AS column_name,
-    t.typname                       AS data_type,
-    md5(n.nspname || '.' || c.relname || '.' || a.attname)
-                                    AS fingerprint
-FROM pg_attribute a
-JOIN pg_class     c ON c.oid = a.attrelid
-JOIN pg_namespace n ON n.oid = c.relnamespace
-JOIN pg_type      t ON t.oid = a.atttypid
-WHERE a.attnum &gt; 0
-  AND NOT a.attisdropped
-  AND c.relkind = 'r'
-  AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
-  -- Name-pattern match
-  AND (
-        a.attname ~* '(email|phone|mobile|ssn|social.?sec|
-                        tax.?id|passport|dob|date.?of.?birth|
-                        credit.?card|card.?number|cvv|pan|
-                        ip.?addr|postal.?code|zip.?code|
-                        first.?name|last.?name|full.?name|
-                        birth.?date|gender|race|ethnicity|
-                        salary|account.?num|iban|routing)'
-  )
-  -- Not already classified
-  AND NOT EXISTS (
-        SELECT 1 FROM information_schema.columns cols
-        JOIN pg_description d ON d.objoid = c.oid
-                              AND d.objsubid = a.attnum
-        WHERE cols.table_schema = n.nspname
-          AND cols.table_name   = c.relname
-          AND cols.column_name  = a.attname
-          AND d.description LIKE '%pii_class:%'
-  );</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server — PII column name detection query:</strong></p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PII column name detection query:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Detection query for compliance policy: pii-unlabeled-columns
 SELECT
     SCHEMA_NAME(t.schema_id)        AS schema_name,
@@ -606,8 +551,6 @@ WHEN NOT MATCHED THEN
             src.pii_type, src.sensitivity, src.detection_method,
             src.classified_at, src.policy_id);</code></pre>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Privilege Drift Detection and the Least-Privilege Enforcement Loop</h3>
 
 <p class="text-gray-300 leading-relaxed">Privilege accumulation is among the most common compliance findings in real database environments. Service accounts gain SELECT on a new table for a one-time migration and the grant is never revoked. A developer is given temporary DBA access to investigate an incident and the elevated role persists for months. The autonomous privilege drift engine maintains a desired-state model of every role and periodically compares it against actual state, generating findings for every deviation.</p>
@@ -660,9 +603,7 @@ WHERE dp.state IN ('G', 'W')   -- GRANT or GRANT WITH GRANT OPTION
 
 <p class="text-gray-300 leading-relaxed">The remediation action for privilege drift in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">auto</code> mode revokes the unauthorized grant and records the pre-remediation state. For <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">approve</code> mode, the system writes a pending approval record and the remediation is held until a human approves or the SLA deadline triggers escalation.</p>
 
-<p class="text-gray-300 leading-relaxed">One practical detail: the revocation must be idempotent. If the detection query finds a privilege, the remediation revokes it, but the next evaluation cycle runs before the revocation propagates fully (rare but possible in federated environments), the remediation must not error on a double-revoke. Both PostgreSQL and SQL Server's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">REVOKE</code> statement is safe to run when the privilege does not exist — it raises a notice rather than an error in PostgreSQL, and in SQL Server it simply has no effect.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
+<p class="text-gray-300 leading-relaxed">One practical detail: the revocation must be idempotent. If the detection query finds a privilege, the remediation revokes it, but the next evaluation cycle runs before the revocation propagates fully (rare but possible in federated environments), the remediation must not error on a double-revoke. SQL Server's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">REVOKE</code> statement is safe to run when the privilege does not exist — it simply has no effect.</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Generating Audit Evidence Packages</h3>
 
@@ -789,8 +730,6 @@ async def generate_evidence_package(
 
 <p class="text-gray-300 leading-relaxed">The output of <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">generate_evidence_package</code> can be signed with a platform key and stored in immutable object storage (S3 Object Lock, Azure Blob immutability policies) the moment it is generated. This produces a tamper-evident audit trail that can be presented to auditors without involving any engineer in the evidence collection process — which itself satisfies an independence requirement in several audit frameworks.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Cross-Framework Policy Inheritance and Deduplication</h3>
 
 <p class="text-gray-300 leading-relaxed">A mature compliance program covers multiple frameworks simultaneously. PCI-DSS, HIPAA, and SOC 2 all require activity logging, encryption in transit, and access control reviews, but they phrase the requirement differently and assign different SLA expectations. Maintaining separate policy objects for each framework's version of "enable TLS" leads to three detection queries running against the same target, generating three findings for the same violation, and creating confusion in the remediation workflow.</p>
@@ -822,11 +761,9 @@ VALUES
 
 <p class="text-gray-300 leading-relaxed">When the evidence package generator runs for a specific framework, it queries the mapping table to find all canonical policies that contribute to that framework, then assembles evidence across all of them. A single finding on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">tls-required-pg</code> surfaces in the PCI-DSS, HIPAA, SOC 2, and ISO 27001 evidence packages simultaneously, because the mapping table links them. Engineers receive one finding, one remediation task, and one resolution event — the multi-framework coverage is a reporting-layer concern, not a detection-layer concern.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Change Window Enforcement as a Policy Class</h3>
 
-<p class="text-gray-300 leading-relaxed">Compliance frameworks that require change management (SOC 2 CC8.1, ITIL-aligned controls, certain PCI-DSS requirements) impose restrictions on *when* schema and configuration changes may occur. The autonomous system enforces change windows not only by blocking out-of-window DDL (covered in Chapter 28), but by detecting DDL that *did* execute outside an approved window and raising it as a compliance finding.</p>
+<p class="text-gray-300 leading-relaxed">Compliance frameworks that require change management (SOC 2 CC8.1, ITIL-aligned controls, certain PCI-DSS requirements) impose restrictions on <em>when</em> schema and configuration changes may occur. The autonomous system enforces change windows not only by blocking out-of-window DDL (covered in Chapter 28), but by detecting DDL that <em>did</em> execute outside an approved window and raising it as a compliance finding.</p>
 
 <p class="text-gray-300 leading-relaxed">The DDL audit detection query requires that DDL event logging is already active:</p>
 
@@ -860,19 +797,17 @@ WHERE event_time &gt;= DATEADD(HOUR, -1, SYSDATETIMEOFFSET())
 
 <p class="text-gray-300 leading-relaxed">Because DDL outside change windows cannot typically be undone (the schema change already happened), the remediation mode for this policy class is almost always <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">alert</code> or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">approve</code>, with the remediation action being a forced review ticket rather than a database operation. The compliance finding serves as the immutable record that the deviation occurred, regardless of whether the resulting schema state is ultimately accepted or rolled back.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Policy objects are the unit of compliance work.** Encoding each regulatory requirement as a versioned, machine-readable object with a detection query, evidence query, remediation action, and SLA creates a complete, auditable compliance control that can be tested, deployed, and updated through standard engineering workflows rather than manual procedures.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Policy objects are the unit of compliance work.</strong> Encoding each regulatory requirement as a versioned, machine-readable object with a detection query, evidence query, remediation action, and SLA creates a complete, auditable compliance control that can be tested, deployed, and updated through standard engineering workflows rather than manual procedures.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Idempotent fingerprinting prevents finding noise.** Every violation row produced by a detection query must be reduced to a stable fingerprint before writing to the findings table. Without fingerprinting, repeated evaluation cycles generate duplicate findings for active violations and misfire auto-resolution logic, destroying the reliability of the detection layer.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Idempotent fingerprinting prevents finding noise.</strong> Every violation row produced by a detection query must be reduced to a stable fingerprint before writing to the findings table. Without fingerprinting, repeated evaluation cycles generate duplicate findings for active violations and misfire auto-resolution logic, destroying the reliability of the detection layer.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Remediation mode is a risk classification, not a technical limitation.** The distinction between `auto`, `approve`, and `alert` is a deliberate risk decision encoded in the policy object — not a reflection of what the system is technically capable of doing. Privilege revocations and credential rotations can be automated safely; object drops and cluster-level configuration changes warrant human review even when they are technically straightforward to script.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Remediation mode is a risk classification, not a technical limitation.</strong> The distinction between <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">auto</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">approve</code>, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">alert</code> is a deliberate risk decision encoded in the policy object — not a reflection of what the system is technically capable of doing. Privilege revocations and credential rotations can be automated safely; object drops and cluster-level configuration changes warrant human review even when they are technically straightforward to script.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Cross-framework deduplication belongs in the mapping layer, not the detection layer.** A single canonical policy detecting one technical condition satisfies multiple regulatory frameworks simultaneously. Maintaining separate detection queries per framework multiplies operational noise without adding control coverage. The evidence package generator, not the detection loop, is responsible for rendering a finding against each applicable framework.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Cross-framework deduplication belongs in the mapping layer, not the detection layer.</strong> A single canonical policy detecting one technical condition satisfies multiple regulatory frameworks simultaneously. Maintaining separate detection queries per framework multiplies operational noise without adding control coverage. The evidence package generator, not the detection loop, is responsible for rendering a finding against each applicable framework.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Evidence packages must be generated autonomously and stored immutably at the moment of collection.** An audit evidence system that requires an engineer to manually gather query outputs, sign them, and submit them introduces both latency and integrity risk. Evidence generated programmatically from the evaluation log, signed with a platform key, and committed to immutable object storage the moment it is produced satisfies the independence and tamper-evidence requirements that modern compliance auditors expect from automated control systems.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Evidence packages must be generated autonomously and stored immutably at the moment of collection.</strong> An audit evidence system that requires an engineer to manually gather query outputs, sign them, and submit them introduces both latency and integrity risk. Evidence generated programmatically from the evaluation log, signed with a platform key, and committed to immutable object storage the moment it is produced satisfies the independence and tamper-evidence requirements that modern compliance auditors expect from automated control systems.</li>
     </div>
     <div class="mt-14 bg-emerald-950/40 border border-emerald-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">

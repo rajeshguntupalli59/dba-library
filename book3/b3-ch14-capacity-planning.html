@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Chapter 14: Autonomous Capacity Planning — The ADE Handbook</title>
-  <meta name="description" content="The ADE Handbook Chapter 14: Autonomous Capacity Planning. Autonomous database engineering for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
+  <meta name="description" content="The ADE Handbook Chapter 14: Autonomous Capacity Planning. Autonomous database engineering for SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
   <script type="module">
     import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
@@ -45,8 +45,6 @@
 
 <p class="text-gray-300 leading-relaxed">Capacity planning in traditional database operations is a quarterly ritual — a DBA pulls growth trends, builds a spreadsheet, presents a forecast, and waits for procurement. By the time new hardware arrives, the situation has already changed. Autonomous capacity planning replaces this cycle with a continuously running feedback system that observes resource consumption, projects future demand using statistical and ML-based models, triggers provisioning actions through infrastructure APIs, and validates outcomes — all without a human in the scheduling loop. This chapter walks through building that system end-to-end: the signal collection layer, the forecasting engine, the decision rules that translate forecasts into actions, and the integration with Kubernetes, Terraform, and cloud-native scaling APIs that make those actions real.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">14.1 Measuring What Actually Constrains Your Database</h3>
 
 <p class="text-gray-300 leading-relaxed">Before any forecasting model is worth building, the signal collection layer must be honest about which resources are actually binding constraints. Storage exhaustion is obvious and easy to measure. What kills production systems more often is a subtler constellation of pressures: buffer pool saturation, WAL write amplification, connection exhaustion at the proxy layer, I/O queue depth at the block device level, and CPU contention during checkpoint storms. An autonomous system that only watches disk is dangerous — it will declare the environment healthy while the query engine is thrashing.</p>
@@ -78,25 +76,26 @@ SELECT
     (SELECT physical_memory_kb * 1024
      FROM sys.dm_os_sys_info)                                  AS total_host_memory_bytes;</code></pre>
 
-<p class="text-gray-300 leading-relaxed">Store these snapshots in a dedicated metrics database — not in the production instance you are monitoring. Use TimescaleDB on a separate PostgreSQL instance, or push to Prometheus with a scrape interval of 30 seconds and long-term retention via Thanos or Cortex. The key architectural decision here is <strong class="text-white">separation of the observer from the observed</strong>: if your capacity system depends on the health of the system it monitors, you lose visibility exactly when you need it most.</p>
+<p class="text-gray-300 leading-relaxed">Store these snapshots in a dedicated metrics database — not in the production instance you are monitoring. Use a dedicated SQL Server instance as the metrics database, or push to Prometheus with a scrape interval of 30 seconds and long-term retention via Thanos or Cortex. The key architectural decision here is <strong class="text-white">separation of the observer from the observed</strong>: if your capacity system depends on the health of the system it monitors, you lose visibility exactly when you need it most.</p>
 
 <p class="text-gray-300 leading-relaxed">For I/O, do not rely on database-layer counters alone. Instrument at the OS level using <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">node_exporter</code> for Linux hosts (or the Windows Exporter for SQL Server on Windows), and correlate <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">diskstats</code> metrics — specifically <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">io_time_ms</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">await</code> — with the database-layer write rates. A rising <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">await</code> with stable write volume signals block device saturation before any database-level metric reflects it.</p>
 
-<p class="text-gray-300 leading-relaxed">Connection pressure is particularly insidious. PgBouncer exposes a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SHOW POOLS</code> admin command that reveals the number of client connections waiting for a server slot. When <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">cl_waiting</code> grows beyond zero consistently, the system is already degraded — a capacity event has effectively started. Capture this metric explicitly:</p>
+<p class="text-gray-300 leading-relaxed">Connection pressure is particularly insidious. SQL Server exposes live connection counts through <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_connections</code> and the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">User Connections</code> performance counter. When the connection count approaches the configured <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">user connections</code> limit — or when the rate of new connections spikes without a matching rise in active requests — the system is already degraded: a capacity event has effectively started. Capture this metric explicitly:</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># PgBouncer connection pool pressure — export to Prometheus via pgbouncer_exporter
-# or poll directly from automation scripts
-
-psql -h 127.0.0.1 -p 6432 -U pgbouncer pgbouncer -c "SHOW POOLS;" \
-  | awk 'NR&gt;2 {print $1, $2, $5, $6, $7}' \
-  | while read db user cl_active cl_waiting sv_idle; do
-      echo "pgbouncer_pool_cl_waiting{database=\"$db\",user=\"$user\"} $cl_waiting"
-      echo "pgbouncer_pool_sv_idle{database=\"$db\",user=\"$user\"} $sv_idle"
-    done</code></pre>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server connection pressure — run every 30s, export to Prometheus via sql_exporter
+SELECT
+    COUNT(*)                                              AS total_connections,
+    SUM(CASE WHEN s.status = 'running' THEN 1 ELSE 0 END) AS active_requests,
+    SUM(CASE WHEN DATEDIFF(MINUTE, c.connect_time, GETUTCDATE()) &gt; 60
+              AND s.status = 'sleeping' THEN 1 ELSE 0 END) AS idle_over_60min,
+    -- Connections waiting on a worker = pressure signal
+    SUM(CASE WHEN w.wait_type IS NOT NULL THEN 1 ELSE 0 END) AS waiting_connections
+FROM sys.dm_exec_connections c
+LEFT JOIN sys.dm_exec_sessions s ON s.session_id = c.session_id
+LEFT JOIN sys.dm_os_waiting_tasks w
+    ON w.session_id = c.session_id AND w.wait_type LIKE 'THREADPOOL%';</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Push these metrics into the same time-series store as your database-level snapshots. The forecasting engine needs a unified view.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">14.2 Forecasting Models Calibrated for Database Workload Patterns</h3>
 
@@ -104,9 +103,9 @@ psql -h 127.0.0.1 -p 6432 -U pgbouncer pgbouncer -c "SHOW POOLS;" \
 
 <p class="text-gray-300 leading-relaxed">The practical forecasting stack for an autonomous system combines three approaches depending on the resource dimension:</p>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Linear regression with drift detection** for storage (growth is mostly monotonic; the anomaly is when it isn't)</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Prophet or SARIMA** for connection counts and CPU (strong seasonality, predictable cycles)</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Percentile-based headroom analysis** for buffer pool and memory (you care about P95/P99, not mean)</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Linear regression with drift detection</strong> for storage (growth is mostly monotonic; the anomaly is when it isn't)</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Prophet or SARIMA</strong> for connection counts and CPU (strong seasonality, predictable cycles)</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Percentile-based headroom analysis</strong> for buffer pool and memory (you care about P95/P99, not mean)</li>
 
 <p class="text-gray-300 leading-relaxed">The following Python script implements the forecasting engine. It pulls raw metrics from Prometheus, applies Prophet for connection forecasting, and emits a structured capacity recommendation. This runs as a Kubernetes CronJob every four hours.</p>
 
@@ -222,10 +221,12 @@ def push_recommendation(client: redis.Redis, recommendation: dict):
 def main():
     r = redis.from_url(REDIS_URL)
 
+    # Metric names depend on the sql_exporter collectors enabled;
+    # adjust to match your deployment's collector configuration.
     metric_map = {
-        "connections": 'pg_stat_activity_count{state="active"}',
-        "storage_bytes": "pg_database_size_bytes",
-        "memory_bytes": "process_resident_memory_bytes{job=\"postgres\"}",
+        "connections": 'sqlserver_performance{counter="User Connections"}',
+        "storage_bytes": "sqlserver_database_size_bytes",
+        "memory_bytes": 'sqlserver_performance{counter="Total Server Memory (KB)"} * 1024',
     }
 
     for resource, prometheus_metric in metric_map.items():
@@ -248,15 +249,13 @@ if __name__ == "__main__":
 
 <p class="text-gray-300 leading-relaxed">Calibrate <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">RECOMMENDATION_THRESHOLD_PCT</code> per resource type. Connections should trigger at 80% because connection exhaustion is instantaneous — there is no graceful degradation. Storage can trigger at 85% because growth is observable and provisioning has lead time. Memory should trigger at 75% because you need buffer to absorb a reporting query spike before the OOM killer becomes involved.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">14.3 Translating Forecasts into Provisioning Actions via Infrastructure APIs</h3>
 
 <p class="text-gray-300 leading-relaxed">A capacity forecast that produces a report is still manual capacity planning. The autonomous layer converts forecast outputs into concrete provisioning actions executed against infrastructure APIs without waiting for human approval, subject to safety guardrails that define the action envelope. The architecture here follows the same observe-decide-act loop described in earlier chapters, but the decision layer is more conservative than in performance tuning because provisioning actions are typically irreversible or expensive to reverse.</p>
 
 <p class="text-gray-300 leading-relaxed">The action hierarchy for capacity events, in ascending order of impact and required confidence:</p>
 
-<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Rebalance connection pools</strong> — adjust PgBouncer <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pool_size</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_client_conn</code> dynamically via the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pgbouncer.ini</code> reload mechanism. Zero risk, zero cost, immediate effect.</p>
+<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Rebalance connection governance</strong> — tighten Resource Governor workload group caps (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">MAX_DOP</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">REQUEST_MAX_MEMORY_GRANT_PERCENT</code>) for reporting workloads and raise the application connection pool ceiling via config reload. Zero risk, zero cost, immediate effect.</p>
 <p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Expand vertical resources</strong> — increase instance size via cloud provider API (RDS <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ModifyDBInstance</code>, Azure SQL service tier change). Requires maintenance window awareness.</p>
 <p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Add read replicas</strong> — provision a new read replica via Terraform or cloud API to offload read workload. Increases cost, takes 15–30 minutes for large databases.</p>
 <p class="text-gray-300 leading-relaxed">4. <strong class="text-white">Expand storage</strong> — increase allocated storage or tablespace via cloud API. Usually non-disruptive on modern cloud platforms; can be disruptive on self-managed storage.</p>
@@ -344,41 +343,42 @@ def expand_rds_storage(current_gb: int, increment_pct: float = 0.30) -&gt; dict:
     }
 
 
-def scale_pgbouncer_pool(utilization_pct: float) -&gt; dict:
-    """
-    Dynamically adjust PgBouncer pool configuration.
-    Writes a new pgbouncer.ini section and sends SIGHUP.
-    """
-    import subprocess
-    import configparser
+MSSQL_DSN = (
+    "DRIVER={ODBC Driver 18 for SQL Server};"
+    "SERVER=sql-primary;DATABASE=master;Trusted_Connection=yes;"
+)
 
-    config_path = "/etc/pgbouncer/pgbouncer.ini"
-    cfg = configparser.ConfigParser()
-    cfg.read(config_path)
 
-    current_pool_size = int(cfg.get("pgbouncer", "default_pool_size", fallback="20"))
+def scale_connection_governance(utilization_pct: float) -&gt; dict:
+    """
+    Shed load under connection pressure by tightening Resource Governor
+    limits on the reporting workload group, protecting the OLTP group.
+    """
+    import pyodbc
+
     if utilization_pct &gt;= 90:
-        new_pool_size = min(current_pool_size + 10, 80)
+        new_max_dop, new_grant_pct = 2, 10
     elif utilization_pct &gt;= 85:
-        new_pool_size = min(current_pool_size + 5, 80)
+        new_max_dop, new_grant_pct = 4, 15
     else:
-        new_pool_size = current_pool_size
+        return {"action": "governor_noop"}
 
-    if new_pool_size == current_pool_size:
-        return {"action": "pgbouncer_noop", "pool_size": current_pool_size}
-
-    cfg.set("pgbouncer", "default_pool_size", str(new_pool_size))
-    with open(config_path, "w") as f:
-        cfg.write(f)
-
-    subprocess.run(["pkill", "-SIGHUP", "pgbouncer"], check=True)
-    log.info("PgBouncer pool_size adjusted: %d -&gt; %d",
-             current_pool_size, new_pool_size)
+    conn = pyodbc.connect(MSSQL_DSN, autocommit=True)
+    cur = conn.cursor()
+    cur.execute(
+        "ALTER WORKLOAD GROUP reporting_group WITH "
+        f"(MAX_DOP = {new_max_dop}, "
+        f"REQUEST_MAX_MEMORY_GRANT_PERCENT = {new_grant_pct});"
+    )
+    cur.execute("ALTER RESOURCE GOVERNOR RECONFIGURE;")
+    conn.close()
+    log.info("Resource Governor tightened: MAX_DOP=%d grant_pct=%d",
+             new_max_dop, new_grant_pct)
 
     return {
-        "action": "pgbouncer_pool_adjustment",
-        "old_pool_size": current_pool_size,
-        "new_pool_size": new_pool_size,
+        "action": "governor_adjustment",
+        "max_dop": new_max_dop,
+        "grant_pct": new_grant_pct,
     }
 
 
@@ -393,7 +393,7 @@ def handle_recommendation(rec: dict) -&gt; dict | None:
     result = None
 
     if resource == "connections":
-        result = scale_pgbouncer_pool(utilization)
+        result = scale_connection_governance(utilization)
 
     elif resource == "storage_bytes":
         current_gb = int(rec["limit"] / (1024 ** 3))
@@ -460,8 +460,6 @@ client.databases.begin_create_or_update(
     }
 ).result()</code></pre>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">14.4 Kubernetes-Native Capacity Scaling for Database Workloads</h3>
 
 <p class="text-gray-300 leading-relaxed">When databases run inside Kubernetes — whether as StatefulSets managed by the CloudNativePG operator, CrunchyData PGO, or the SQL Server on Kubernetes operator — capacity planning integrates with the Kubernetes resource model. This introduces both tighter feedback loops and new failure modes. PersistentVolumeClaims can be expanded online (on supporting storage classes) by patching the PVC spec. CPU and memory requests can be adjusted by updating the StatefulSet, which triggers a rolling pod restart. Connection scaling is handled by the operator's pooler abstraction.</p>
@@ -485,51 +483,36 @@ custom_api = client.CustomObjectsApi()
 core_api = client.CoreV1Api()
 
 NAMESPACE = "databases"
-CLUSTER_NAME = "postgres-primary"
+STATEFULSET_NAME = "mssql-primary"
+PVC_NAME = "mssql-data-mssql-primary-0"
 
 
 def expand_pvc_storage(new_size_gi: int):
     """
-    Patch the CloudNativePG Cluster storageSize — operator handles PVC expansion.
-    Requires the storage class to support volume expansion.
+    Patch the data PVC — the CSI driver handles online volume expansion.
+    Requires the storage class to allow volume expansion.
     """
-    patch = {
-        "spec": {
-            "storage": {
-                "size": f"{new_size_gi}Gi"
-            }
-        }
-    }
-    custom_api.patch_namespaced_custom_object(
-        group="postgresql.cnpg.io",
-        version="v1",
+    patch = {"spec": {"resources": {"requests": {"storage": f"{new_size_gi}Gi"}}}}
+    core_api.patch_namespaced_persistent_volume_claim(
+        name=PVC_NAME,
         namespace=NAMESPACE,
-        plural="clusters",
-        name=CLUSTER_NAME,
         body=patch,
     )
-    log.info("Patched CloudNativePG Cluster storage to %dGi", new_size_gi)
+    log.info("Patched PVC %s storage to %dGi", PVC_NAME, new_size_gi)
 
 
-def scale_replica_count(new_instances: int):
+def scale_read_replicas(new_replicas: int):
     """
-    Increase the number of instances in the CloudNativePG Cluster.
-    Additional instances become read replicas automatically.
+    Scale the AG secondary StatefulSet. The operator's reconcile loop
+    joins new pods to the availability group automatically.
     """
-    patch = {
-        "spec": {
-            "instances": new_instances
-        }
-    }
-    custom_api.patch_namespaced_custom_object(
-        group="postgresql.cnpg.io",
-        version="v1",
+    apps_api = client.AppsV1Api()
+    apps_api.patch_namespaced_stateful_set_scale(
+        name="mssql-secondary",
         namespace=NAMESPACE,
-        plural="clusters",
-        name=CLUSTER_NAME,
-        body=patch,
+        body={"spec": {"replicas": new_replicas}},
     )
-    log.info("Patched CloudNativePG Cluster instances to %d", new_instances)
+    log.info("Scaled AG secondary StatefulSet to %d replicas", new_replicas)
 
 
 def update_resource_requests(cpu_request: str,
@@ -537,64 +520,61 @@ def update_resource_requests(cpu_request: str,
                               cpu_limit: str,
                               memory_limit: str):
     """
-    Update CPU and memory resource requests for the Cluster pods.
-    This triggers a rolling restart of all instances — use with care.
+    Update CPU and memory resource requests on the primary StatefulSet.
+    This triggers a rolling restart — use with care.
     """
-    patch = {
-        "spec": {
-            "resources": {
-                "requests": {
-                    "cpu": cpu_request,
-                    "memory": memory_request,
-                },
-                "limits": {
-                    "cpu": cpu_limit,
-                    "memory": memory_limit,
-                }
-            }
-        }
-    }
-    custom_api.patch_namespaced_custom_object(
-        group="postgresql.cnpg.io",
-        version="v1",
+    apps_api = client.AppsV1Api()
+    sts = apps_api.read_namespaced_stateful_set(
+        name=STATEFULSET_NAME, namespace=NAMESPACE)
+    container = sts.spec.template.spec.containers[0]
+    container.resources.requests = {"cpu": cpu_request, "memory": memory_request}
+    container.resources.limits = {"cpu": cpu_limit, "memory": memory_limit}
+    apps_api.patch_namespaced_stateful_set(
+        name=STATEFULSET_NAME,
         namespace=NAMESPACE,
-        plural="clusters",
-        name=CLUSTER_NAME,
-        body=patch,
+        body={"spec": {"template": {"spec": {"containers": [
+            {"name": container.name, "resources": container.resources.to_dict()}
+        ]}}}},
     )
-    log.info("Patched CloudNativePG Cluster resources: cpu=%s mem=%s",
+    log.info("Patched StatefulSet resources: cpu=%s mem=%s",
              cpu_request, memory_request)
 
 
-def get_current_cluster_spec() -&gt; dict:
-    cluster = custom_api.get_namespaced_custom_object(
-        group="postgresql.cnpg.io",
-        version="v1",
-        namespace=NAMESPACE,
-        plural="clusters",
-        name=CLUSTER_NAME,
-    )
-    return cluster["spec"]
+def get_current_statefulset_spec() -&gt; dict:
+    apps_api = client.AppsV1Api()
+    sts = apps_api.read_namespaced_stateful_set(
+        name=STATEFULSET_NAME, namespace=NAMESPACE)
+    container = sts.spec.template.spec.containers[0]
+    return {
+        "replicas": sts.spec.replicas,
+        "resources": {
+            "requests": dict(container.resources.requests or {}),
+            "limits": dict(container.resources.limits or {}),
+        },
+    }
 
 
 def autonomous_scale_decision(recommendation: dict) -&gt; None:
-    spec = get_current_cluster_spec()
+    spec = get_current_statefulset_spec()
     resource = recommendation["resource"]
     utilization = recommendation["forecast_utilization_pct"]
 
     if resource == "storage_bytes":
-        current_size_str = spec["storage"]["size"]  # e.g. "500Gi"
+        # PVC size is tracked separately from the pod spec
+        pvc = core_api.read_namespaced_persistent_volume_claim(
+            name=PVC_NAME, namespace=NAMESPACE)
+        current_size_str = pvc.spec.resources.requests["storage"]  # e.g. "500Gi"
         current_gi = int(current_size_str.replace("Gi", ""))
         new_gi = int(current_gi * 1.35)  # 35% expansion
         new_gi = max(new_gi, current_gi + 100)  # floor increment
         expand_pvc_storage(new_gi)
 
     elif resource == "connections":
-        current_instances = spec.get("instances", 1)
-        if utilization &gt;= 90 and current_instances &lt; 5:
-            scale_replica_count(current_instances + 1)
-            log.info("Added read replica: %d -&gt; %d instances",
-                     current_instances, current_instances + 1)
+        current_replicas = spec.get("replicas", 1)
+        if utilization &gt;= 90 and current_replicas &lt; 5:
+            scale_read_replicas(current_replicas + 1)
+            log.info("Added read replica: %d -&gt; %d replicas",
+                     current_replicas, current_replicas + 1)
 
     elif resource == "memory_bytes":
         # Only auto-scale memory if headroom is extremely tight
@@ -617,44 +597,44 @@ def autonomous_scale_decision(recommendation: dict) -&gt; None:
             log.info("Memory at %.1f%% — below auto-scale threshold, "
                      "escalating", utilization)</code></pre>
 
-<p class="text-gray-300 leading-relaxed">The key behavioral rule embedded in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">autonomous_scale_decision</code> is that storage and read-replica counts are scaled automatically, while memory resource updates are gated at a higher utilization threshold because they force a pod restart. This asymmetry reflects the actual cost profile of each operation: PVC expansion is non-disruptive on most CSI drivers (Ceph RBD, EBS, GCE PD), but pod restarts always carry a brief promotion or failover sequence, even with proper readiness probes.</p>
+<p class="text-gray-300 leading-relaxed">The key behavioral rule embedded in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">autonomous_scale_decision</code> is that storage and read-replica counts are scaled automatically, while memory resource updates are gated at a higher utilization threshold because they force a pod restart (and an AG failover sequence). This asymmetry reflects the actual cost profile of each operation: PVC expansion is non-disruptive on most CSI drivers (Ceph RBD, EBS, GCE PD), but pod restarts always carry a brief promotion or failover sequence, even with proper readiness probes.</p>
 
-<p class="text-gray-300 leading-relaxed">For SQL Server running on Kubernetes via the SQL Server Operator or as a plain StatefulSet, the same approach applies: patch the StatefulSet's resource requests for memory and CPU, patch the PVC for storage, and manage the number of replicas through the availability group configuration. The operator-agnostic version uses the Kubernetes batch API directly rather than a CRD abstraction.</p>
+<p class="text-gray-300 leading-relaxed">The functions above use the operator-agnostic approach: patch the StatefulSet for memory and CPU, patch the PVC for storage, and manage secondary replicas through the availability group configuration — no operator-specific CRD required.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Horizontal Pod Autoscaler integration for connection proxies:</strong></p>
 
-<p class="text-gray-300 leading-relaxed">The database itself cannot be HPA-scaled (it is stateful), but the PgBouncer or ProxySQL layer in front of it can be. The following HPA manifest scales the pooler deployment based on active connection saturation as a custom metric:</p>
+<p class="text-gray-300 leading-relaxed">The database itself cannot be HPA-scaled (it is stateful), but the connection proxy layer in front of it can be. The following HPA manifest scales the proxy deployment based on connection wait pressure as a custom metric:</p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
-  name: pgbouncer-hpa
+  name: sqlproxy-hpa
   namespace: databases
 spec:
   scaleTargetRef:
     apiVersion: apps/v1
     kind: Deployment
-    name: pgbouncer
+    name: sqlproxy
   minReplicas: 2
   maxReplicas: 10
   metrics:
   - type: External
     external:
       metric:
-        name: pgbouncer_pool_cl_waiting
+        name: sqlserver_proxy_connection_waits
         selector:
           matchLabels:
-            database: postgres-primary
+            database: mssql-primary
       target:
         type: AverageValue
         averageValue: "0"   # any nonzero waiting clients triggers scale-out
   - type: External
     external:
       metric:
-        name: pgbouncer_pool_sv_idle
+        name: sqlserver_proxy_idle_connections
         selector:
           matchLabels:
-            database: postgres-primary
+            database: mssql-primary
       target:
         type: AverageValue
         averageValue: "5"   # scale in when avg idle &gt; 5 per pod
@@ -673,8 +653,6 @@ spec:
         periodSeconds: 120</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">cl_waiting</code> metric is binary in intent — any sustained nonzero value means clients are being throttled. Setting the target to zero means any waiting client detected above the stabilization window triggers scale-out. The scale-in stabilization window of ten minutes prevents oscillation after a burst subsides.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">14.5 Terraform-Driven Capacity Automation with State Drift Detection</h3>
 
@@ -844,32 +822,13 @@ def apply_capacity_recommendation(recommendation: dict):
 
     return {"drift": False, "instance_class": actual_class}</code></pre>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">14.6 Validating That Capacity Actions Worked</h3>
 
 <p class="text-gray-300 leading-relaxed">Executing a provisioning action is not the end of the loop. The autonomous system must validate that the action achieved its intended effect and that the validated outcome is fed back into the forecasting model as a signal. Without this feedback, the system will re-forecast against stale assumptions and potentially trigger redundant or contradictory actions.</p>
 
-<p class="text-gray-300 leading-relaxed">The validation cycle runs after a resource-specific settlement period (storage: 15 minutes for the cloud API to reflect the new size; connection pool: 5 minutes for PgBouncer to restart and stabilize; instance resize: 30 minutes including failover and warm-up).</p>
+<p class="text-gray-300 leading-relaxed">The validation cycle runs after a resource-specific settlement period (storage: 15 minutes for the cloud API to reflect the new size; connection governance: 5 minutes for the Resource Governor reconfigure to take effect; instance resize: 30 minutes including failover and warm-up).</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL — post-action storage validation:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Verify that the allocated storage expansion was reflected at the OS/filesystem layer
--- Run after the settlement period following an expand_rds_storage action
-
-SELECT
-    now()                                             AS validated_at,
-    pg_database_size(current_database())              AS db_size_bytes,
-    pg_size_pretty(pg_database_size(current_database())) AS db_size_human,
-    -- pg_tablespace_location maps tablespace to filesystem path
-    -- On RDS, the data directory growth appears in pg_database_size
-    (SELECT setting FROM pg_settings WHERE name = 'data_directory') AS data_dir,
-    -- Residual pressure: how much headroom remains after expansion
-    (
-        (SELECT 1099511627776)  -- replace with new_size_bytes from action result
-        - pg_database_size(current_database())
-    )                                                 AS remaining_headroom_bytes;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server — post-action storage validation:</strong></p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Post-action storage validation:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Verify storage expansion outcome in SQL Server environment
 -- Run after the settlement window following Azure SQL storage tier update
 
@@ -918,13 +877,13 @@ WHERE
 
     # Query actual current state
     if resource == "storage_bytes":
-        actual = query_current_db_size_bytes()   # calls pg or sqlserver
+        actual = query_current_db_size_bytes()   # sqlserver
         expected = result.get("new_size_gb", 0) * (1024 ** 3)
         # Storage expansion is validated if actual db_size &lt; 85% of new limit
         success = actual &lt; (expected * 0.85)
 
     elif resource == "connections":
-        actual_waiting = query_pgbouncer_waiting_clients()
+        actual_waiting = query_sqlserver_waiting_connections()
         success = actual_waiting == 0
 
     elif resource == "memory_bytes":
@@ -954,55 +913,48 @@ WHERE
 
 <p class="text-gray-300 leading-relaxed">Failed validations are escalated, not retried automatically. Automatic retry of a failed provisioning action risks compounding the error — if an RDS storage expansion failed because the instance was in a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">modifying</code> state, retrying immediately will fail again and potentially leave the instance in a confused state. Human review of failed validations is the correct response. The autonomous system has done its job by detecting the failure and escalating it with full context.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">14.7 Capacity Planning for Multi-Tenant Database Architectures</h3>
 
 <p class="text-gray-300 leading-relaxed">Multi-tenant architectures add a layer of complexity: resources are shared across tenants, but tenant growth rates are independent and often uncorrelated. A single large tenant onboarding a new product line can exhaust storage allocated to dozens of smaller tenants. The autonomous capacity system must track resource consumption per tenant and forecast at the tenant level, not just the aggregate.</p>
 
-<p class="text-gray-300 leading-relaxed">In a shared-schema multi-tenant PostgreSQL deployment, tenant isolation typically uses Row Level Security with a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">tenant_id</code> column. Resource attribution requires measuring table and index sizes per tenant:</p>
+<p class="text-gray-300 leading-relaxed">In a shared-schema multi-tenant SQL Server deployment, tenant isolation typically uses Row-Level Security with a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">tenant_id</code> column. Resource attribution requires estimating storage per tenant from row counts and average record size:</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Per-tenant storage consumption — run nightly and store in capacity metrics database
--- Assumes a shared schema where all tenant data carries tenant_id
-
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Per-tenant storage consumption (shared schema) — run nightly and store in
+-- the capacity metrics database. Assumes a tenant_table_registry mapping
+-- table names to tenant_id.
 SELECT
-    tenant_id,
-    count(distinct tablename)                              AS table_count,
-    sum(pg_total_relation_size(schemaname || '.' || tablename)) AS total_bytes,
-    pg_size_pretty(
-        sum(pg_total_relation_size(schemaname || '.' || tablename))
-    )                                                      AS total_size_human,
-    now()                                                  AS measured_at
-FROM
-    pg_tables
-    -- Join to tenant_table_registry if your schema tracks which tables are tenant-scoped
-WHERE
-    schemaname = 'public'
-GROUP BY
-    tenant_id
-ORDER BY
-    total_bytes DESC;</code></pre>
-
+    t.tenant_id,
+    COUNT(DISTINCT st.name)                              AS table_count,
+    SUM(CAST(p.rows AS BIGINT) * ips.avg_record_size_in_bytes) AS estimated_bytes,
+    GETUTCDATE()                                         AS measured_at
+FROM sys.tables st
+JOIN sys.partitions p
+    ON st.object_id = p.object_id
+JOIN sys.dm_db_index_physical_stats(DB_ID(), NULL, NULL, NULL, 'SAMPLED') ips
+    ON ips.object_id = st.object_id AND ips.index_id = p.index_id
+JOIN tenant_table_registry t
+    ON st.name = t.table_name
+WHERE p.index_id IN (0, 1)   -- heap or clustered index only
+GROUP BY t.tenant_id
+ORDER BY estimated_bytes DESC;</code></pre>
 <p class="text-gray-300 leading-relaxed">For a schema-per-tenant deployment, attribution is simpler — the schema size is directly attributable:</p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Schema-per-tenant storage attribution
 SELECT
-    schema_name                                            AS tenant_schema,
-    sum(pg_total_relation_size(schemaname || '.' || tablename)) AS total_bytes,
-    pg_size_pretty(
-        sum(pg_total_relation_size(schemaname || '.' || tablename))
-    )                                                      AS total_size_human,
-    now()                                                  AS measured_at
-FROM
-    information_schema.tables t
-    JOIN information_schema.schemata s
-        ON t.table_schema = s.schema_name
-WHERE
-    s.schema_name NOT IN ('pg_catalog', 'information_schema', 'public')
-GROUP BY
-    schema_name
-ORDER BY
-    total_bytes DESC;</code></pre>
+    s.name                                AS tenant_schema,
+    SUM(pa.used_pages * 8192)             AS used_bytes,
+    GETUTCDATE()                          AS measured_at
+FROM sys.schemas s
+JOIN sys.tables st
+    ON st.schema_id = s.schema_id
+JOIN sys.partitions p
+    ON p.object_id = st.object_id
+JOIN sys.allocation_units pa
+    ON pa.container_id = p.partition_id
+WHERE s.name NOT IN ('dbo', 'sys', 'information_schema', 'guest')
+  AND p.index_id IN (0, 1)   -- heap or clustered index only
+GROUP BY s.name
+ORDER BY used_bytes DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server — per-tenant storage in a shared database:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Per-tenant table size attribution in shared SQL Server database
@@ -1032,8 +984,6 @@ ORDER BY
 <p class="text-gray-300 leading-relaxed">The per-tenant forecast then runs Prophet independently per tenant, and the aggregate forecast is built by summing tenant forecasts. This prevents the "average is fine but one tenant is exploding" failure mode. When a single tenant's forecast exceeds a per-tenant quota threshold, the action is tenant-specific: notify the tenant, apply storage limits if the architecture supports them, or accelerate the migration of that tenant to a dedicated instance.</p>
 
 <p class="text-gray-300 leading-relaxed">The tenant-level capacity data also feeds churn modeling. A tenant whose storage growth rate is decelerating sharply and whose connection count is falling is showing pre-churn signal. That is not a capacity problem — it is a business problem. The capacity system surfaces it; the business system acts on it. Keeping these concerns separated at the data layer but unified at the metrics layer is what makes the autonomous system genuinely useful beyond pure infrastructure management.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">14.8 Failure Modes and Safety Boundaries</h3>
 
@@ -1105,19 +1055,17 @@ def close_circuit(r: redis.Redis):
 
 <p class="text-gray-300 leading-relaxed">The combination of pre-action validation, bounded envelopes, blackout windows, and a circuit breaker gives the autonomous system a defined safety surface. It will not fix every problem perfectly, but it will not make a bad situation dramatically worse through unbounded autonomous action.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Signal honesty before forecasting accuracy:** An autonomous capacity system is only as reliable as its observability layer. Measure all five resource dimensions — storage, memory, compute, I/O, and connection throughput — at the database instance level, separated from the systems being monitored, before investing in forecasting sophistication.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Signal honesty before forecasting accuracy:</strong> An autonomous capacity system is only as reliable as its observability layer. Measure all five resource dimensions — storage, memory, compute, I/O, and connection throughput — at the database instance level, separated from the systems being monitored, before investing in forecasting sophistication.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Match the forecasting model to the resource pattern:** Use linear regression for monotonic resources like storage, seasonal models such as Prophet or SARIMA for cyclical resources like connection counts and CPU, and percentile-based headroom analysis for memory pressure. Applying a single model across all resource types produces forecasts that are right on average and wrong at the moments that matter.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Match the forecasting model to the resource pattern:</strong> Use linear regression for monotonic resources like storage, seasonal models such as Prophet or SARIMA for cyclical resources like connection counts and CPU, and percentile-based headroom analysis for memory pressure. Applying a single model across all resource types produces forecasts that are right on average and wrong at the moments that matter.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Preserve Terraform state integrity:** When Terraform manages your infrastructure, the autonomous system must write to the variable layer and trigger controlled Terraform runs rather than calling cloud APIs directly. Out-of-band API calls create state drift that the next planned `terraform apply` will silently revert, potentially causing unplanned changes at the worst possible moment.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Preserve Terraform state integrity:</strong> When Terraform manages your infrastructure, the autonomous system must write to the variable layer and trigger controlled Terraform runs rather than calling cloud APIs directly. Out-of-band API calls create state drift that the next planned <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">terraform apply</code> will silently revert, potentially causing unplanned changes at the worst possible moment.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Calibrate the action hierarchy to reversibility:** Not all capacity actions carry the same risk. Connection pool adjustments are immediate and costless to reverse; instance resizes force failover windows; storage contractions are irreversible on most platforms. The autonomous system should act freely at the low-risk end of the hierarchy and escalate — not act autonomously — as the cost and irreversibility of an action increase.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Calibrate the action hierarchy to reversibility:</strong> Not all capacity actions carry the same risk. Connection pool adjustments are immediate and costless to reverse; instance resizes force failover windows; storage contractions are irreversible on most platforms. The autonomous system should act freely at the low-risk end of the hierarchy and escalate — not act autonomously — as the cost and irreversibility of an action increase.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Close the loop with validated outcomes and a circuit breaker:** Executing a provisioning action and moving on is incomplete automation. The system must validate that each action achieved its intended effect after a resource-specific settlement period, feed validated outcomes back into the forecasting model, and trip a circuit breaker after a defined number of consecutive validation failures to prevent a malfunctioning component from compounding infrastructure problems through repeated unchecked action.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Close the loop with validated outcomes and a circuit breaker:</strong> Executing a provisioning action and moving on is incomplete automation. The system must validate that each action achieved its intended effect after a resource-specific settlement period, feed validated outcomes back into the forecasting model, and trip a circuit breaker after a defined number of consecutive validation failures to prevent a malfunctioning component from compounding infrastructure problems through repeated unchecked action.</li>
     </div>
     <div class="mt-14 bg-emerald-950/40 border border-emerald-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">

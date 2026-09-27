@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Chapter 25: AI-Driven Change Management — The ADE Handbook</title>
-  <meta name="description" content="The ADE Handbook Chapter 25: AI-Driven Change Management. Autonomous database engineering for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
+  <meta name="description" content="The ADE Handbook Chapter 25: AI-Driven Change Management. Autonomous database engineering for SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
   <script type="module">
     import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
@@ -45,13 +45,11 @@
 
 <p class="text-gray-300 leading-relaxed">Autonomous systems that can observe and decide are only as valuable as their ability to act — and acting on a production database system means managing change. Change management has historically been the domain of human judgment, CAB meetings, deployment windows, and rollback plans drafted at midnight. At the ADE level, the goal is to replace that human-in-the-loop bottleneck with a system that classifies risk, selects strategy, executes with precision, and rolls back autonomously when signals deteriorate. This chapter covers the full architecture: how an autonomous change management system ingests proposed changes, scores their risk against live telemetry, selects an execution strategy, instruments the rollout, and either completes or self-heals — without paging anyone at 2 AM.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Risk Scoring Engines: Classifying Change Before Execution</h3>
 
 <p class="text-gray-300 leading-relaxed">Every autonomous change pipeline begins with a classification gate. Before a DDL statement, configuration push, or schema migration touches a production instance, it must pass through a risk scoring engine that combines static analysis of the change itself with dynamic analysis of the current system state.</p>
 
-<p class="text-gray-300 leading-relaxed">Static analysis examines the change in isolation. A <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE INDEX CONCURRENTLY</code> on a 50-million-row table is categorically different from the same operation on a 50-thousand-row table. An <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALTER TABLE ... ADD COLUMN DEFAULT</code> in PostgreSQL 11+ is trivially safe; the same statement on PostgreSQL 10 rewrites the table. A SQL Server <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALTER TABLE ... ALTER COLUMN</code> on a column with dependent indexed views is a blocking operation regardless of row count. The static analyzer must know these rules and apply them without human instruction.</p>
+<p class="text-gray-300 leading-relaxed">Static analysis examines the change in isolation. A <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE INDEX ... WITH (ONLINE = ON)</code> on a 50-million-row table is categorically different from the same operation on a 50-thousand-row table. An <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALTER TABLE ... ADD COLUMN</code> with a default value on SQL Server 2012+ is a metadata-only operation and trivially safe; the same statement on earlier versions can rewrite the table. A SQL Server <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALTER TABLE ... ALTER COLUMN</code> on a column with dependent indexed views is a blocking operation regardless of row count. The static analyzer must know these rules and apply them without human instruction.</p>
 
 <p class="text-gray-300 leading-relaxed">Dynamic analysis examines what the system is doing right now. A change that scores "medium risk" at 3 AM may score "critical risk" at 2 PM when the instance is processing 40,000 transactions per second with 85% buffer cache utilization. The scoring engine must pull live metrics at decision time, not at submission time.</p>
 
@@ -75,7 +73,7 @@ SELECT
 
 <p class="text-gray-300 leading-relaxed">The scoring engine combines static weights with dynamic multipliers. A Python-based scorer might represent this as:</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import psycopg2
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import pyodbc
 import json
 from dataclasses import dataclass
 from enum import Enum
@@ -100,7 +98,7 @@ class ChangeProposal:
 def score_change_risk(proposal: ChangeProposal, db_conn) -&gt; dict:
     # Static base score
     static_score = 0
-    
+
     static_rules = {
         ("ddl", "exclusive"): 40,
         ("ddl", "table"): 30,
@@ -110,7 +108,7 @@ def score_change_risk(proposal: ChangeProposal, db_conn) -&gt; dict:
         ("data_migration", "row"): 15,
     }
     static_score += static_rules.get((proposal.change_type, proposal.lock_level), 10)
-    
+
     # Row count multiplier
     if proposal.estimated_row_count &gt; 100_000_000:
         static_score *= 2.5
@@ -118,29 +116,29 @@ def score_change_risk(proposal: ChangeProposal, db_conn) -&gt; dict:
         static_score *= 1.8
     elif proposal.estimated_row_count &gt; 1_000_000:
         static_score *= 1.3
-    
+
     # Dynamic context multipliers
     with db_conn.cursor() as cur:
         cur.execute("SELECT * FROM autonomous_change.live_risk_context")
         row = cur.fetchone()
         cols = [desc[0] for desc in cur.description]
         context = dict(zip(cols, row))
-    
+
     dynamic_multiplier = 1.0
-    
-    if context["active_lock_waiters"] &gt; 5:
+
+    if context["active_blocked_sessions"] &gt; 5:
         dynamic_multiplier += 0.4
-    if context["buffer_cache_hit_ratio"] and context["buffer_cache_hit_ratio"] &lt; 0.90:
+    if context["buffer_cache_hit_ratio"] and context["buffer_cache_hit_ratio"] &lt; 90.0:
         dynamic_multiplier += 0.3
     if context["oldest_txn_seconds"] and context["oldest_txn_seconds"] &gt; 30:
         dynamic_multiplier += 0.5
-    if context["max_replica_lag_bytes"] and context["max_replica_lag_bytes"] &gt; 50_000_000:
+    if context["max_replica_lag_seconds"] and context["max_replica_lag_seconds"] &gt; 60:
         dynamic_multiplier += 0.6
-    if context["inactive_repl_slots"] and context["inactive_repl_slots"] &gt; 0:
-        dynamic_multiplier += 0.8  # Inactive slots mean WAL accumulation risk
-    
+    if context["lock_wait_count"] and context["lock_wait_count"] &gt; 10:
+        dynamic_multiplier += 0.8  # Lock accumulation means DDL may queue badly
+
     final_score = static_score * dynamic_multiplier
-    
+
     if final_score &lt; 20:
         tier = RiskTier.LOW
     elif final_score &lt; 45:
@@ -149,7 +147,7 @@ def score_change_risk(proposal: ChangeProposal, db_conn) -&gt; dict:
         tier = RiskTier.HIGH
     else:
         tier = RiskTier.CRITICAL
-    
+
     return {
         "change_id": proposal.change_id,
         "static_score": static_score,
@@ -168,21 +166,19 @@ def _select_autonomous_action(tier: RiskTier, context: dict) -&gt; str:
     elif tier == RiskTier.HIGH:
         return "defer_to_maintenance_window"
     else:  # CRITICAL
-        if context.get("active_lock_waiters", 0) &gt; 10:
+        if context.get("active_blocked_sessions", 0) &gt; 10:
             return "block_and_escalate"
         return "block_and_defer_72h"</code></pre>
 
 <p class="text-gray-300 leading-relaxed">This scoring system is the gatekeeper. Every change proposal — whether generated by a CI/CD pipeline, a human DBA via a migration tool, or by the autonomous system itself as part of an optimization cycle — passes through this gate before touching production.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Autonomous Migration Execution: Online Schema Changes Without Human Oversight</h3>
 
 <p class="text-gray-300 leading-relaxed">Once a change clears the risk gate at an acceptable tier, the execution layer takes over. The most dangerous class of database change is DDL on large tables, and the autonomous execution layer must have first-class support for online schema change strategies — not as a fallback, but as the default path.</p>
 
-<p class="text-gray-300 leading-relaxed">For PostgreSQL, the primary tools are <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_repack</code> for table rewrites and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE INDEX CONCURRENTLY</code> for index operations. Both can run without holding an exclusive lock for the full duration, but both require careful orchestration. <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE INDEX CONCURRENTLY</code> can fail partway through, leaving an invalid index that must be detected and cleaned up. <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_repack</code> requires the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pgstattuple</code> extension and sufficient disk space.</p>
+<p class="text-gray-300 leading-relaxed">For SQL Server, online index operations (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WITH (ONLINE = ON)</code>), resumable index rebuilds, and online column operations serve this purpose. An online index build holds only brief schema locks at the start and end of the operation, so concurrent reads and writes continue throughout. The autonomous execution layer defaults to online variants for any change on a table with live traffic, falling back to offline execution only when the risk scorer approves a maintenance-window exception.</p>
 
-<p class="text-gray-300 leading-relaxed">For SQL Server, online index operations (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WITH (ONLINE = ON)</code>) and online column operations (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WITH (ONLINE = ON)</code> in SQL Server 2017+) serve similar purposes. The SQL Server Agent or an external orchestrator manages the execution, with Always On Availability Group lag monitoring integrated into the execution loop.</p>
+<p class="text-gray-300 leading-relaxed">The SQL Server Agent or an external orchestrator manages the execution, with Always On Availability Group lag monitoring integrated into the execution loop.</p>
 
 <p class="text-gray-300 leading-relaxed">The autonomous execution controller wraps these operations in an instrumented harness:</p>
 
@@ -227,14 +223,16 @@ END;</code></pre>
 <p class="text-gray-300 leading-relaxed">For batched data migrations — moving data in chunks, backfilling columns, or archiving records — the autonomous executor uses a self-throttling loop that adjusts batch size based on observed write latency:</p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import time
-import psycopg2
+import pyodbc
 from typing import Callable
 
+CONN_STR = ("DRIVER={ODBC Driver 18 for SQL Server};SERVER=localhost;"
+            "DATABASE=prod;UID=migration_svc;PWD=*******;")
+
 def autonomous_batched_migration(
-    conn_string: str,
-    batch_query: str,          # Must accept %(batch_size)s and %(last_id)s
+    batch_query: str,          # Must accept ? for batch_size and last_id
     count_query: str,
-    max_lag_bytes: int = 100_000_000,
+    max_lag_seconds: int = 60,
     target_batch_duration_ms: int = 500,
     initial_batch_size: int = 1000,
     max_batch_size: int = 50_000,
@@ -244,35 +242,34 @@ def autonomous_batched_migration(
     """
     Self-throttling batched migration executor.
     Adjusts batch size dynamically based on actual execution duration
-    and replica lag, ensuring the migration stays within safe thresholds.
+    and AG replica lag, ensuring the migration stays within safe thresholds.
     """
-    conn = psycopg2.connect(conn_string)
-    conn.autocommit = True
-    
+    conn = pyodbc.connect(CONN_STR, autocommit=True)
+
     batch_size = initial_batch_size
     last_id = 0
     total_rows = 0
     consecutive_lag_violations = 0
-    
-    with conn.cursor() as cur:
-        cur.execute(count_query)
-        total_estimated = cur.fetchone()[0]
-    
+
+    cur = conn.cursor()
+    cur.execute(count_query)
+    total_estimated = cur.fetchone()[0]
+
     print(f"[{execution_id}] Starting migration. Estimated rows: {total_estimated}")
-    
+
     while True:
-        # Check replica lag before each batch
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT COALESCE(max(pg_wal_lsn_diff(sent_lsn, replay_lsn)), 0)
-                FROM pg_stat_replication
-            """)
-            current_lag = cur.fetchone()[0]
-        
-        if current_lag &gt; max_lag_bytes:
+        # Check AG replica lag before each batch
+        cur.execute("""
+            SELECT COALESCE(MAX(DATEDIFF(SECOND, last_commit_time, GETUTCDATE())), 0)
+            FROM sys.dm_hadr_database_replica_states
+            WHERE is_local = 0
+        """)
+        current_lag = cur.fetchone()[0]
+
+        if current_lag &gt; max_lag_seconds:
             consecutive_lag_violations += 1
             wait_seconds = min(2 ** consecutive_lag_violations, 60)
-            print(f"[{execution_id}] Replica lag {current_lag:,} bytes exceeds threshold. "
+            print(f"[{execution_id}] Replica lag {current_lag:,} seconds exceeds threshold. "
                   f"Backing off {wait_seconds}s (violation #{consecutive_lag_violations})")
             time.sleep(wait_seconds)
             # Shrink batch size aggressively when lag builds
@@ -280,39 +277,36 @@ def autonomous_batched_migration(
             continue
         else:
             consecutive_lag_violations = 0
-        
+
         # Execute batch and measure duration
         batch_start = time.monotonic()
-        with conn.cursor() as cur:
-            cur.execute(batch_query, {"batch_size": batch_size, "last_id": last_id})
-            rows_processed = cur.rowcount
+        cur.execute(batch_query, (batch_size, last_id))
+        rows_processed = cur.rowcount
         batch_duration_ms = (time.monotonic() - batch_start) * 1000
-        
+
         if rows_processed == 0:
             print(f"[{execution_id}] Migration complete. Total rows processed: {total_rows}")
             break
-        
+
         total_rows += rows_processed
         last_id += rows_processed  # Assumes sequential ID or adjust per schema
-        
+
         # Self-tuning batch size based on duration feedback
         if batch_duration_ms &gt; 0:
             adjustment_ratio = target_batch_duration_ms / batch_duration_ms
             new_batch_size = int(batch_size * adjustment_ratio)
             batch_size = max(min_batch_size, min(max_batch_size, new_batch_size))
-        
+
         progress_pct = round(total_rows / total_estimated * 100, 1) if total_estimated &gt; 0 else 0
         print(f"[{execution_id}] Batch complete: {rows_processed} rows in {batch_duration_ms:.0f}ms. "
               f"New batch size: {batch_size}. Progress: {progress_pct}%")
-        
+
         # Brief yield between batches to reduce contention
         time.sleep(0.05)
-    
+
     conn.close()</code></pre>
 
 <p class="text-gray-300 leading-relaxed">This pattern means that a 500-million-row backfill migration runs without any human watching it. If the replica falls behind, the system slows down. If the replica catches up and the database is underloaded, the system speeds up. The batch size converges on the fastest rate that keeps lag within bounds.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">AI-Assisted Change Plan Generation: From Intent to Executable Strategy</h3>
 
@@ -339,7 +333,7 @@ DANGEROUS_PATTERNS = [
 def generate_change_plan_from_intent(
     intent: str,
     schema_context: str,
-    db_platform: str,  # "postgresql" or "sqlserver"
+    db_platform: str = "sqlserver"  # SQL Server only
     model: str = "gpt-4o"
 ) -&gt; Optional[dict]:
     """
@@ -370,7 +364,7 @@ def generate_change_plan_from_intent(
     }}
     
     Rules:
-    - Prefer CONCURRENT or ONLINE operations wherever the platform supports them
+    - Prefer ONLINE = ON operations wherever SQL Server supports them
     - Always include reversal_statement for DDL that has a clean inverse
     - Never generate DROP TABLE, TRUNCATE, or DELETE without WHERE
     - For {db_platform}, use correct syntax precisely
@@ -408,7 +402,7 @@ def generate_change_plan_from_intent(
         
         # Syntax validation via sqlglot
         try:
-            dialect = "postgres" if db_platform == "postgresql" else "tsql"
+            dialect = "tsql"  # SQL Server dialect for sqlglot validation
             parsed = sqlglot.parse(statement, dialect=dialect)
             if not parsed:
                 print(f"BLOCKED: Statement failed SQL parsing: {statement[:100]}")
@@ -427,15 +421,13 @@ def generate_change_plan_from_intent(
 
 <p class="text-gray-300 leading-relaxed">The schema context passed to this function is not a raw dump of all DDL. It is a curated, minimal representation: the target table's column definitions, existing indexes, approximate row count, and the specific query or metric that triggered the optimization intent. Sending a full schema dump to an LLM API is both expensive and produces worse results than targeted context.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Rollback Orchestration: Autonomous Recovery When Deployments Go Wrong</h3>
 
 <p class="text-gray-300 leading-relaxed">A change management system without autonomous rollback is not autonomous — it is merely automated. The difference is consequential. Automation runs a script. Autonomy decides when the script has produced a bad outcome and reverses it without being told to.</p>
 
 <p class="text-gray-300 leading-relaxed">Autonomous rollback requires three things: a pre-execution baseline, continuous signal monitoring during execution, and a reversibility map that knows how to undo every change type the system can apply.</p>
 
-<p class="text-gray-300 leading-relaxed">Some changes are trivially reversible: creating an index can be reversed by dropping it; adding a column with a default can be reversed by dropping the column; changing a configuration parameter can be reversed by restoring the previous value. Other changes are not reversible in-place: once a table rewrite via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_repack</code> completes, there is no "un-repack." For those, the rollback strategy is not reversal but rather pre-execution snapshot validation — ensuring a point-in-time restore target exists before the operation begins.</p>
+<p class="text-gray-300 leading-relaxed">Some changes are trivially reversible: creating an index can be reversed by dropping it; adding a column with a default can be reversed by dropping the column; changing a configuration parameter can be reversed by restoring the previous value. Other changes are not reversible in-place: once an online table rebuild completes, there is no "un-rebuild." For those, the rollback strategy is not reversal but rather pre-execution snapshot validation — ensuring a point-in-time restore target exists before the operation begins.</p>
 
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE autonomous_change.rollback_registry (
@@ -470,9 +462,12 @@ CREATE TABLE autonomous_change.execution_baselines (
 <p class="text-gray-300 leading-relaxed">The rollback decision engine runs as a background monitor during every active execution. It samples current metrics on a short interval and compares them against the baseline using configurable degradation thresholds:</p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import time
-import psycopg2
+import pyodbc
 from dataclasses import dataclass
 from typing import Optional
+
+CONN_STR = ("DRIVER={ODBC Driver 18 for SQL Server};SERVER=localhost;"
+            "DATABASE=prod;UID=change_svc;PWD=*******;")
 
 @dataclass
 class RollbackSignal:
@@ -486,7 +481,6 @@ class RollbackSignal:
 
 def evaluate_rollback_signals(
     execution_id: str,
-    conn_string: str,
     thresholds: dict = None
 ) -&gt; Optional[RollbackSignal]:
     """
@@ -495,41 +489,44 @@ def evaluate_rollback_signals(
     """
     if thresholds is None:
         thresholds = {
-            "tps_drop_pct": 30.0,           # Abort if TPS drops more than 30%
-            "p99_latency_increase_pct": 50.0, # Abort if P99 latency grows more than 50%
+            "tps_drop_pct": 30.0,              # Abort if TPS drops more than 30%
+            "p99_latency_increase_pct": 50.0,  # Abort if P99 latency grows more than 50%
             "cache_hit_ratio_drop_pct": 5.0,  # Abort if cache hit ratio falls more than 5 points
-            "replication_lag_bytes_max": 200_000_000,  # Abort if lag exceeds 200MB
+            "replica_lag_seconds_max": 120,   # Abort if AG lag exceeds 2 minutes
             "error_rate_multiplier": 3.0,     # Abort if error rate triples
         }
 
-    conn = psycopg2.connect(conn_string)
+    conn = pyodbc.connect(CONN_STR)
     try:
-        with conn.cursor() as cur:
-            # Fetch baseline
-            cur.execute("""
-                SELECT tps_baseline, p99_latency_ms, error_rate_per_min,
-                       cache_hit_ratio, replication_lag_bytes
-                FROM autonomous_change.execution_baselines
-                WHERE execution_id = %s
-            """, (execution_id,))
-            baseline_row = cur.fetchone()
-            if not baseline_row:
-                return None
-            tps_base, p99_base, err_base, cache_base, lag_base = baseline_row
+        cur = conn.cursor()
+        # Fetch baseline
+        cur.execute("""
+            SELECT tps_baseline, p99_latency_ms, error_rate_per_min,
+                   cache_hit_ratio, replica_lag_seconds
+            FROM autonomous_change.execution_baselines
+            WHERE execution_id = ?
+        """, (execution_id,))
+        baseline_row = cur.fetchone()
+        if not baseline_row:
+            return None
+        tps_base, p99_base, err_base, cache_base, lag_base = baseline_row
 
-            # Sample current metrics
-            cur.execute("""
-                SELECT
-                    (SELECT sum(xact_commit + xact_rollback)
-                     FROM pg_stat_database WHERE datname = current_database()) AS current_tps,
-                    (SELECT round((sum(blks_hit)::numeric /
-                     nullif(sum(blks_hit) + sum(blks_read), 0)) * 100, 2)
-                     FROM pg_stat_database) AS current_cache_hit,
-                    (SELECT COALESCE(max(pg_wal_lsn_diff(sent_lsn, replay_lsn)), 0)
-                     FROM pg_stat_replication) AS current_lag
-            """)
-            current = cur.fetchone()
-            current_tps, current_cache, current_lag = current
+        # Sample current metrics from SQL Server DMVs
+        cur.execute("""
+            SELECT
+                (SELECT cntr_value
+                 FROM sys.dm_os_performance_counters
+                 WHERE counter_name = 'Batch Requests/sec') AS current_tps,
+                (SELECT CAST(cntr_value AS FLOAT)
+                 FROM sys.dm_os_performance_counters
+                 WHERE counter_name = 'Buffer cache hit ratio'
+                   AND object_name LIKE '%Buffer Manager%') AS current_cache_hit,
+                (SELECT COALESCE(MAX(DATEDIFF(SECOND, last_commit_time, GETUTCDATE())), 0)
+                 FROM sys.dm_hadr_database_replica_states
+                 WHERE is_local = 0) AS current_lag_seconds
+        """)
+        current = cur.fetchone()
+        current_tps, current_cache, current_lag = current
 
         # Evaluate each signal
         if tps_base and tps_base &gt; 0 and current_tps is not None:
@@ -545,12 +542,12 @@ def evaluate_rollback_signals(
                     threshold_pct=thresholds["tps_drop_pct"]
                 )
 
-        if current_lag is not None and current_lag &gt; thresholds["replication_lag_bytes_max"]:
+        if current_lag is not None and current_lag &gt; thresholds["replica_lag_seconds_max"]:
             return RollbackSignal(
                 triggered=True,
-                reason=f"Replica lag {current_lag:,} bytes exceeds abort threshold",
+                reason=f"AG replica lag {current_lag:,} seconds exceeds abort threshold",
                 severity="abort",
-                metric_name="replication_lag_bytes",
+                metric_name="replica_lag_seconds",
                 baseline_value=float(lag_base or 0),
                 current_value=float(current_lag),
                 threshold_pct=0.0
@@ -578,28 +575,26 @@ def evaluate_rollback_signals(
 def execute_rollback(
     execution_id: str,
     reversal_statement: str,
-    conn_string: str,
     signal: RollbackSignal
 ) -&gt; bool:
     """
     Executes the reversal statement for a triggered rollback signal,
     updates the execution log, and emits a structured audit record.
     """
-    conn = psycopg2.connect(conn_string)
-    conn.autocommit = True
+    conn = pyodbc.connect(CONN_STR, autocommit=True)
     try:
-        with conn.cursor() as cur:
-            # Execute the reversal
-            cur.execute(reversal_statement)
+        cur = conn.cursor()
+        # Execute the reversal
+        cur.execute(reversal_statement)
 
-            # Update execution log
-            cur.execute("""
-                UPDATE autonomous_change.execution_log
-                SET status = 'rolled_back',
-                    completed_at = now(),
-                    abort_reason = %s
-                WHERE execution_id = %s
-            """, (signal.reason, execution_id))
+        # Update execution log
+        cur.execute("""
+            UPDATE autonomous_change.execution_log
+            SET status = 'rolled_back',
+                completed_at = SYSUTCDATETIME(),
+                abort_reason = ?
+            WHERE execution_id = ?
+        """, (signal.reason, execution_id))
 
         print(f"[ROLLBACK] execution_id={execution_id} | reason={signal.reason} | "
               f"metric={signal.metric_name} | "
@@ -612,9 +607,7 @@ def execute_rollback(
     finally:
         conn.close()</code></pre>
 
-<p class="text-gray-300 leading-relaxed">The monitoring loop that drives this engine runs at the orchestrator level, calling <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">evaluate_rollback_signals</code> every few seconds for any in-flight execution. The moment a signal is returned, the loop calls <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">execute_rollback</code> with the pre-stored reversal statement. For operations with no clean reversal — such as a completed table repack — the abort path instead halts any remaining follow-on steps and flags the execution for human review, since the principal change cannot be undone by SQL alone.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
+<p class="text-gray-300 leading-relaxed">The monitoring loop that drives this engine runs at the orchestrator level, calling <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">evaluate_rollback_signals</code> every few seconds for any in-flight execution. The moment a signal is returned, the loop calls <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">execute_rollback</code> with the pre-stored reversal statement. For operations with no clean reversal — such as a completed partition merge — the abort path instead halts any remaining follow-on steps and flags the execution for human review, since the principal change cannot be undone by SQL alone.</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Canary Deployment Patterns for Schema Changes</h3>
 
@@ -689,8 +682,6 @@ BEGIN
 END;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The canary phase gate runs on a schedule — every five minutes once a phase has been active for the minimum observation window. If the gate returns <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">passed</code>, the orchestrator advances to the next phase automatically. If it returns <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">failed</code>, the system executes the rollback plan for the current phase and emits an alert. The contract phase is held to a stricter standard than the expand phase: removing old columns or tables is harder to reverse than adding new ones, so the gate thresholds for Phase 3 are intentionally tighter.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Integrating with CI/CD Pipelines: The Autonomous Change API</h3>
 
@@ -793,21 +784,19 @@ async def submit_change(submission: MigrationSubmission):
 
 <p class="text-gray-300 leading-relaxed">Teams configure their CI/CD pipelines to call this endpoint before any migration step. A <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">blocked</code> response fails the pipeline stage with a structured error that includes the exact metrics that caused the block — making it trivially clear whether the issue is the change itself (static risk) or the current system state (dynamic risk). If it is the current system state, the same migration may be resubmitted an hour later and receive an <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">approved</code> decision.</p>
 
-<p class="text-gray-300 leading-relaxed">This feedback loop is itself an educational mechanism. Engineers learn quickly which change patterns trigger which risk tiers, and over time they author migrations that are less likely to conflict with production conditions — writing <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE INDEX CONCURRENTLY</code> rather than <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE INDEX</code>, partitioning large deletes into batches, and including reversal statements as standard practice.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
+<p class="text-gray-300 leading-relaxed">This feedback loop is itself an educational mechanism. Engineers learn quickly which change patterns trigger which risk tiers, and over time they author migrations that are less likely to conflict with production conditions — writing <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE INDEX ... WITH (ONLINE = ON)</code> rather than an offline <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE INDEX</code>, partitioning large deletes into batches, and including reversal statements as standard practice.</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Risk scoring must be both static and dynamic.** A change's inherent danger — derived from its type, lock level, and affected row count — is only half the picture. The live system state at execution time determines the final risk tier and the appropriate autonomous action, and those two inputs must be combined at decision time, not at submission time.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Risk scoring must be both static and dynamic.</strong> A change's inherent danger — derived from its type, lock level, and affected row count — is only half the picture. The live system state at execution time determines the final risk tier and the appropriate autonomous action, and those two inputs must be combined at decision time, not at submission time.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Online and concurrent execution strategies are not optional for autonomous systems.** When no human is watching, a blocking DDL operation that escalates lock contention has no one to cancel it. The autonomous execution layer must default to `CONCURRENT`, `ONLINE`, or batched strategies for every operation class that supports them, treating blocking operations as a last resort reserved for explicit maintenance windows.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Online and concurrent execution strategies are not optional for autonomous systems.</strong> When no human is watching, a blocking DDL operation that escalates lock contention has no one to cancel it. The autonomous execution layer must default to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ONLINE</code>, resumable, or batched strategies for every operation class that supports them, treating blocking operations as a last resort reserved for explicit maintenance windows.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **LLM-generated change plans require deterministic validation gates before execution.** Language model output is generative and can contain syntactically valid but semantically dangerous SQL. Every generated statement must pass pattern-based safety checks, a SQL parser, and the same risk scoring pipeline as any human-authored migration before it is eligible for execution.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">LLM-generated change plans require deterministic validation gates before execution.</strong> Language model output is generative and can contain syntactically valid but semantically dangerous SQL. Every generated statement must pass pattern-based safety checks, a SQL parser, and the same risk scoring pipeline as any human-authored migration before it is eligible for execution.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Autonomous rollback requires pre-execution baselines, not just post-execution comparisons.** Without capturing TPS, latency, cache hit ratio, and replica lag immediately before a change begins, the system has no meaningful reference point against which to evaluate degradation. A rollback signal is only as reliable as the baseline it compares against.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Autonomous rollback requires pre-execution baselines, not just post-execution comparisons.</strong> Without capturing TPS, latency, cache hit ratio, and replica lag immediately before a change begins, the system has no meaningful reference point against which to evaluate degradation. A rollback signal is only as reliable as the baseline it compares against.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The expand-contract pattern and canary phase gates make schema changes safe to automate fully.** By breaking breaking changes into backward-compatible phases with automated telemetry gates between them, the autonomous system can advance — or retreat — through a schema migration without any human decision point, while maintaining compatibility with both old and new application versions throughout the entire deployment window.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">The expand-contract pattern and canary phase gates make schema changes safe to automate fully.</strong> By breaking breaking changes into backward-compatible phases with automated telemetry gates between them, the autonomous system can advance — or retreat — through a schema migration without any human decision point, while maintaining compatibility with both old and new application versions throughout the entire deployment window.</li>
     </div>
     <div class="mt-14 bg-emerald-950/40 border border-emerald-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">

@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Chapter 37: Real-World Autonomous DBA Case Studies — The ADE Handbook</title>
-  <meta name="description" content="The ADE Handbook Chapter 37: Real-World Autonomous DBA Case Studies. Autonomous database engineering for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
+  <meta name="description" content="The ADE Handbook Chapter 37: Real-World Autonomous DBA Case Studies. Autonomous database engineering for SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
   <script type="module">
     import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
@@ -43,107 +43,117 @@
     <div class="space-y-4 text-sm">
 <h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 37: Real-World Autonomous DBA Case Studies</h2>
 
-<p class="text-gray-300 leading-relaxed">The gap between autonomous database theory and production reality is where most platform engineering teams lose momentum. Architectural patterns that look elegant in whiteboards collapse against the friction of legacy schemas, bursty traffic, compliance requirements, and on-call engineers who override automation at the first sign of unfamiliarity. This chapter closes that gap by examining five real-world autonomous DBA deployments — drawn from high-scale SaaS platforms, financial institutions, healthcare data pipelines, and multi-cloud e-commerce systems — each built on PostgreSQL, SQL Server, or both. Every case study follows the same structure: the operational problem, the autonomous architecture chosen, the specific tooling and decision logic wired together, and the lessons that only surface in production. These are not success stories scrubbed clean for a conference talk. They include rollbacks, missed thresholds, and architectural pivots that led to better designs.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
+<p class="text-gray-300 leading-relaxed">The gap between autonomous database theory and production reality is where most platform engineering teams lose momentum. Architectural patterns that look elegant in whiteboards collapse against the friction of legacy schemas, bursty traffic, compliance requirements, and on-call engineers who override automation at the first sign of unfamiliarity. This chapter closes that gap by examining five real-world autonomous DBA deployments — drawn from high-scale SaaS platforms, financial institutions, healthcare data pipelines, and multi-cloud e-commerce systems — each built on SQL Server across on-premises, Azure, and hybrid deployments. Every case study follows the same structure: the operational problem, the autonomous architecture chosen, the specific tooling and decision logic wired together, and the lessons that only surface in production. These are not success stories scrubbed clean for a conference talk. They include rollbacks, missed thresholds, and architectural pivots that led to better designs.</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Case Study 1: Autonomous Failover and Connection Rerouting at a High-Frequency Trading Firm</h3>
 
-<p class="text-gray-300 leading-relaxed">A mid-sized proprietary trading firm running PostgreSQL 15 on bare metal needed sub-30-second failover with zero manual intervention. Their previous setup used Patroni with a manual promotion script triggered by on-call engineers — a process that averaged 4.5 minutes from detection to connection rerouting due to human latency and shift handoff ambiguity. The requirement from the trading desk: automated failover with automatic client rerouting in under 25 seconds, with a hard constraint that no transaction could be silently lost.</p>
+<p class="text-gray-300 leading-relaxed">A mid-sized proprietary trading firm running SQL Server 2022 on bare metal needed sub-30-second failover with zero manual intervention. Their previous setup used an Always On availability group with a manual failover script triggered by on-call engineers — a process that averaged 4.5 minutes from detection to connection rerouting due to human latency and shift handoff ambiguity. The requirement from the trading desk: automated failover with automatic client rerouting in under 25 seconds, with a hard constraint that no transaction could be silently lost.</p>
 
-<p class="text-gray-300 leading-relaxed">The architecture replaced manual triggers with a fully autonomous stack. Patroni remained the cluster manager, backed by etcd for distributed consensus. The critical addition was a custom Python daemon called <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">trade-sentinel</code> that consumed Patroni's REST API, pg_stat_replication, and a business-level heartbeat table written by the trading application. HAProxy sat in front of all database connections, with its backend configuration dynamically rewritten by <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">trade-sentinel</code> whenever Patroni reported a leader change.</p>
+<p class="text-gray-300 leading-relaxed">The architecture replaced manual triggers with a fully autonomous stack. An Always On availability group in synchronous-commit mode with automatic failover remained the core, backed by a Windows Server Failover Cluster for quorum. The critical addition was a custom Python daemon called <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">trade-sentinel</code> that consumed the AG DMVs (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_hadr_availability_replica_states</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_hadr_database_replica_states</code>) and a business-level heartbeat table written by the trading application. The AG listener sat in front of all database connections, so client rerouting after a failover was a DNS-level flip to the new primary — no connection-string changes, no proxy rewrites.</p>
 
 <p class="text-gray-300 leading-relaxed">The decision logic was explicit and layered:</p>
 
-<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Detection</strong>: If the Patroni leader endpoint returns HTTP 503 for three consecutive 2-second polls, or if the heartbeat table (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">trading.heartbeat</code>) has not been updated within 8 seconds, enter failover evaluation mode.</p>
-<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Validation</strong>: Confirm the standby's replication lag is under 512KB and that etcd quorum is healthy. If either condition fails, escalate to PagerDuty and hold without promoting.</p>
-<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Promotion</strong>: Issue <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">patronictl switchover</code> via REST with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">--force</code>, capture the new leader hostname, and rewrite HAProxy's backend stanza.</p>
-<p class="text-gray-300 leading-relaxed">4. <strong class="text-white">Connection rerouting</strong>: Reload HAProxy without dropping existing long-lived connections using <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">haproxy -sf $(cat /var/run/haproxy.pid)</code>.</p>
-<p class="text-gray-300 leading-relaxed">5. <strong class="text-white">Verification</strong>: Run a synthetic write/read probe transaction against the new primary. If it fails within 10 seconds, re-escalate to human.</p>
+<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Detection</strong>: If the primary replica's role state in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_hadr_availability_replica_states</code> is unhealthy for three consecutive 2-second polls, or if the heartbeat table (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">trading.heartbeat</code>) has not been updated within 8 seconds, enter failover evaluation mode.</p>
+<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Validation</strong>: Confirm the synchronous secondary is in SYNCHRONIZED state with a redo queue under 512KB and that cluster quorum is healthy. If either condition fails, escalate to PagerDuty and hold without failing over.</p>
+<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Failover</strong>: Issue <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALTER AVAILABILITY GROUP [TradingAG] FAILOVER</code> from the target secondary, then verify the new primary role via the DMVs.</p>
+<p class="text-gray-300 leading-relaxed">4. <strong class="text-white">Connection rerouting</strong>: The AG listener DNS record follows the primary automatically; the daemon forces a DNS cache flush on the application tier and validates that new connections land on the new primary.</p>
+<p class="text-gray-300 leading-relaxed">5. <strong class="text-white">Verification</strong>: Run a synthetic write/read probe transaction against the new primary through the listener. If it fails within 10 seconds, re-escalate to human.</p>
 
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">trade-sentinel</code> daemon managed detection, failover, and listener verification atomically:</p>
 
-<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">trade-sentinel</code> daemon managed promotion and HAProxy rewrite atomically:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import requests
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import pyodbc
 import subprocess
 import time
 import logging
 from datetime import datetime, timezone
 
-PATRONI_API = "http://localhost:8008"
-HAPROXY_CFG = "/etc/haproxy/haproxy.cfg"
-HAPROXY_PID = "/var/run/haproxy.pid"
+PRIMARY_CONN   = "DRIVER={ODBC Driver 18 for SQL Server};SERVER=sql-primary;DATABASE=master;Trusted_Connection=yes;"
+SECONDARY_CONN = "DRIVER={ODBC Driver 18 for SQL Server};SERVER=sql-secondary;DATABASE=master;Trusted_Connection=yes;"
+AG_NAME        = "TradingAG"
+LISTENER       = "trading-ag-listener"
 HEARTBEAT_THRESHOLD_SECONDS = 8
-POLL_INTERVAL = 2
+POLL_INTERVAL  = 2
 FAILURE_THRESHOLD = 3
 
 logger = logging.getLogger("trade-sentinel")
 
-def get_patroni_leader() -&gt; str | None:
+def query(conn_str: str, sql: str):
+    with pyodbc.connect(conn_str, timeout=5) as conn:
+        cur = conn.cursor()
+        cur.execute(sql)
+        return cur.fetchall()
+
+def primary_role_state() -&gt; str | None:
     try:
-        resp = requests.get(f"{PATRONI_API}/master", timeout=3)
-        if resp.status_code == 200:
-            return resp.json().get("host")
-    except requests.RequestException:
+        rows = query(PRIMARY_CONN, """
+            SELECT role_desc
+            FROM sys.dm_hadr_availability_replica_states
+            WHERE replica_server_name = @@SERVERNAME
+        """)
+        return rows[0][0] if rows else None
+    except pyodbc.Error:
         return None
-    return None
 
-def trigger_patroni_switchover(candidate: str) -&gt; bool:
-    payload = {"leader": candidate, "force": True}
+def secondary_sync_state() -&gt; tuple:
+    rows = query(SECONDARY_CONN, """
+        SELECT synchronization_state_desc,
+               ISNULL(redo_queue_size, 0)
+        FROM sys.dm_hadr_database_replica_states
+        WHERE database_id = DB_ID('TradingDB')
+    """)
+    return (rows[0][0], rows[0][1]) if rows else ("UNKNOWN", -1)
+
+def heartbeat_age_seconds() -&gt; float:
     try:
-        resp = requests.post(
-            f"{PATRONI_API}/switchover",
-            json=payload,
-            timeout=15
-        )
-        return resp.status_code == 200
-    except requests.RequestException as e:
-        logger.error(f"Switchover API call failed: {e}")
-        return False
+        rows = query(PRIMARY_CONN, """
+            SELECT DATEDIFF(SECOND, MAX(updated_at), SYSUTCDATETIME())
+            FROM trading.heartbeat
+        """)
+        return float(rows[0][0]) if rows and rows[0][0] is not None else 9999.0
+    except pyodbc.Error:
+        return 9999.0
 
-def rewrite_haproxy_backend(new_primary_host: str) -&gt; None:
-    with open(HAPROXY_CFG, "r") as f:
-        cfg = f.read()
-    # Replace the primary backend server line
-    import re
-    cfg = re.sub(
-        r"(server primary\s+)\S+(:5432)",
-        rf"\g&lt;1&gt;{new_primary_host}\g&lt;2&gt;",
-        cfg
-    )
-    with open(HAPROXY_CFG, "w") as f:
-        f.write(cfg)
-    with open(HAPROXY_PID, "r") as f:
-        old_pid = f.read().strip()
-    subprocess.run(
-        ["haproxy", "-f", HAPROXY_CFG, "-sf", old_pid],
-        check=True
-    )
-    logger.info(f"HAProxy reloaded with new primary: {new_primary_host}")
+def trigger_failover() -&gt; bool:
+    # Planned failover executes from the TARGET secondary
+    with pyodbc.connect(SECONDARY_CONN, autocommit=True) as conn:
+        cur = conn.cursor()
+        cur.execute(f"ALTER AVAILABILITY GROUP [{AG_NAME}] FAILOVER")
+    logger.info("Failover command issued from secondary")
+    time.sleep(5)
+    return primary_role_state() == "PRIMARY"
+
+def flush_app_dns() -&gt; None:
+    subprocess.run(["powershell", "-Command", "Clear-DnsClientCache"],
+                   check=False)
+    logger.info("Application-tier DNS cache flushed")
 
 def run_sentinel():
     consecutive_failures = 0
     while True:
-        leader = get_patroni_leader()
-        if leader is None:
+        role = primary_role_state()
+        hb_age = heartbeat_age_seconds()
+        if role != "PRIMARY" or hb_age &gt; HEARTBEAT_THRESHOLD_SECONDS:
             consecutive_failures += 1
             logger.warning(
-                f"Patroni leader unreachable — failure count: {consecutive_failures}"
+                f"Primary unhealthy (role={role}, hb_age={hb_age:.1f}s) — "
+                f"failure count: {consecutive_failures}"
             )
         else:
             consecutive_failures = 0
 
         if consecutive_failures &gt;= FAILURE_THRESHOLD:
             logger.critical("Threshold exceeded — initiating autonomous failover")
-            # In production: query etcd for best replica before choosing candidate
-            success = trigger_patroni_switchover("replica-01")
-            if success:
-                time.sleep(5)
-                new_leader = get_patroni_leader()
-                if new_leader:
-                    rewrite_haproxy_backend(new_leader)
-                else:
-                    logger.error("Failover succeeded but new leader undetectable — escalating")
+            sync_state, redo_kb = secondary_sync_state()
+            if sync_state != "SYNCHRONIZED" or redo_kb &gt; 512:
+                logger.error(
+                    f"Secondary not ready (state={sync_state}, "
+                    f"redo={redo_kb}KB) — escalating to human"
+                )
+            elif trigger_failover():
+                flush_app_dns()
+                logger.info("Failover complete — listener now on new primary")
+            else:
+                logger.error("Failover failed — escalating to human")
             consecutive_failures = 0
         time.sleep(POLL_INTERVAL)
 
@@ -151,9 +161,8 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     run_sentinel()</code></pre>
 
-<p class="text-gray-300 leading-relaxed">The first production failover completed in 18.4 seconds. The second, triggered six weeks later by a kernel panic on the primary host, completed in 21.1 seconds — within specification despite higher system load. The lessons were two-fold: the heartbeat table proved far more reliable as a detection signal than Patroni's own API, which exhibited a 3–4 second delay in reporting leader loss during network partitions; and HAProxy's graceful reload was safe only because the trading application used persistent connections with application-level retry — without that, the reload would have dropped in-flight orders.</p>
+<p class="text-gray-300 leading-relaxed">The first production failover completed in 18.4 seconds. The second, triggered six weeks later by a kernel panic on the primary host, completed in 21.1 seconds — within specification despite higher system load. The lessons were two-fold: the heartbeat table proved far more reliable as a detection signal than the replica-state DMVs alone, which exhibited a 3–4 second delay in reporting role loss during network partitions; and the AG listener flip was safe only because the trading application used persistent connections with application-level retry — without that, in-flight orders on the failed primary would still have been lost at the TCP layer.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Case Study 2: Self-Healing Index Management for a SaaS Analytics Platform (SQL Server)</h3>
 
@@ -161,9 +170,9 @@ if __name__ == "__main__":
 
 <p class="text-gray-300 leading-relaxed">The autonomous index agent ran as a SQL Server Agent job on a 15-minute cycle. Its logic tree:</p>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> If `avg_fragmentation_in_percent > 30` AND `page_count > 1000`: REBUILD ONLINE</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> If `avg_fragmentation_in_percent > 10` AND `page_count > 500`: REORGANIZE</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> If `page_count <= 500`: skip (small table overhead not worth it)</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> If <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">avg_fragmentation_in_percent > 30</code> AND <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">page_count > 1000</code>: REBUILD ONLINE</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> If <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">avg_fragmentation_in_percent > 10</code> AND <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">page_count > 500</code>: REORGANIZE</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> If <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">page_count <= 500</code>: skip (small table overhead not worth it)</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> If estimated rebuild duration (based on historical stats) would exceed 4 minutes: defer to off-peak window specific to tenant's primary geography</li>
 
 
@@ -277,347 +286,360 @@ DEALLOCATE tenant_cursor;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">After 90 days in production, average query duration across tenants dropped 31% during peak hours, and index-related blocking incidents — previously averaging 4 per week — dropped to zero. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">autonomous_index_log</code> table became the team's primary evidence artifact in customer SLA reviews.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Case Study 3: Autonomous Query Plan Stabilization in a Healthcare Data Warehouse</h3>
 
-<p class="text-gray-300 leading-relaxed">A regional healthcare network operated a PostgreSQL 16 data warehouse — approximately 12TB across 60 tables — that fed clinical dashboards consumed by 300+ concurrent analysts. The platform team faced a recurring problem: after statistics updates (triggered by autovacuum), query plans for 8–12 critical reporting queries would regress. A plan that previously used an index scan would switch to a sequential scan on a 900M-row fact table, spiking query time from 4 seconds to 3.5 minutes. The on-call response was manual: a DBA would run <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">EXPLAIN ANALYZE</code>, identify the regression, and inject <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SET enable_seqscan = off</code> at the session level or create a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_hint_plan</code> override. This manual process averaged 45 minutes of analyst impact.</p>
+<p class="text-gray-300 leading-relaxed">A regional healthcare network operated a SQL Server 2022 data warehouse — approximately 12TB across 60 tables — that fed clinical dashboards consumed by 300+ concurrent analysts. The platform team faced a recurring problem: after automatic statistics updates, query plans for 8–12 critical reporting queries would regress. A plan that previously used an index seek would switch to a clustered index scan on a 900M-row fact table, spiking query time from 4 seconds to 3.5 minutes. The on-call response was manual: a DBA would capture the actual execution plan, identify the regression, and force the good plan via Query Store with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sp_query_store_force_plan</C>. This manual process averaged 45 minutes of analyst impact.</p>
 
 <p class="text-gray-300 leading-relaxed">The autonomous plan stabilization system worked in three tiers:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Tier 1 — Continuous baseline capture</strong>: A background process recorded query fingerprints and their execution plans using <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">auto_explain</code>, storing normalized plan JSON in a monitoring schema.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Tier 1 — Continuous baseline capture</strong>: Query Store captured query fingerprints (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">query_hash</C>), their plans (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">query_plan_hash</C>), and runtime statistics automatically, with forced-plan history providing the known-good baseline.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Tier 2 — Regression detection</strong>: Every 5 minutes, a Python process compared recent execution time (90th percentile over the last 15 minutes) against the rolling 7-day baseline for each fingerprint. If the ratio exceeded 2.5x, it flagged a potential regression.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Tier 2 — Regression detection</strong>: Every 5 minutes, a SQL Server Agent job compared recent average duration against the rolling 7-day baseline for each tracked query. If the ratio exceeded 2.5x, it flagged a potential regression.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Tier 3 — Autonomous remediation</strong>: The system retrieved the last known good plan, extracted the join type and scan method differences, and automatically injected a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_hint_plan</code> comment into the affected query's scheduled invocation wrapper.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Tier 3 — Autonomous remediation</strong>: The system retrieved the last known good plan from Query Store and forced it with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sp_query_store_force_plan</C>, then validated that the forced plan was being used on subsequent executions.</p>
 
+<p class="text-gray-300 leading-relaxed">The regression detection and auto-forcing procedure:</p>
 
-<p class="text-gray-300 leading-relaxed">The Python remediation agent retrieved the baseline plan, parsed the scan node types from the JSONB, and synthesized a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_hint_plan</code> directive:</p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE OR ALTER PROCEDURE Monitoring.AutoForceRegressedPlans
+AS
+BEGIN
+    SET NOCOUNT ON;
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import psycopg2
-import json
-import logging
-from typing import Optional
+    -- Candidates: queries whose recent avg duration exceeds 2.5x baseline
+    DECLARE @QueryId BIGINT, @GoodPlanId BIGINT, @RecentMs FLOAT, @BaselineMs FLOAT;
 
-logger = logging.getLogger("plan-stabilizer")
+    DECLARE cur CURSOR LOCAL FAST_FORWARD FOR
+    WITH Recent AS (
+        SELECT q.query_id,
+               AVG(rs.avg_duration / 1000.0) AS recent_avg_ms
+        FROM sys.query_store_query q
+        JOIN sys.query_store_plan p
+          ON p.query_id = q.query_id
+        JOIN sys.query_store_runtime_stats rs
+          ON rs.plan_id = p.plan_id
+        WHERE rs.last_execution_time &gt; DATEADD(MINUTE, -15, SYSUTCDATETIME())
+        GROUP BY q.query_id
+    ),
+    Baseline AS (
+        SELECT q.query_id,
+               AVG(rs.avg_duration / 1000.0) AS baseline_avg_ms
+        FROM sys.query_store_query q
+        JOIN sys.query_store_plan p
+          ON p.query_id = q.query_id
+        JOIN sys.query_store_runtime_stats rs
+          ON rs.plan_id = p.plan_id
+        WHERE rs.last_execution_time &gt; DATEADD(DAY, -7, SYSUTCDATETIME())
+          AND rs.last_execution_time &lt; DATEADD(MINUTE, -15, SYSUTCDATETIME())
+        GROUP BY q.query_id
+    )
+    SELECT r.query_id,
+           (SELECT TOP 1 p.plan_id
+            FROM sys.query_store_plan p
+            JOIN sys.query_store_runtime_stats rs ON rs.plan_id = p.plan_id
+            WHERE p.query_id = r.query_id
+              AND rs.last_execution_time &lt; DATEADD(MINUTE, -15, SYSUTCDATETIME())
+            ORDER BY rs.avg_duration ASC) AS good_plan_id,
+           r.recent_avg_ms,
+           b.baseline_avg_ms
+    FROM Recent r
+    JOIN Baseline b ON b.query_id = r.query_id
+    WHERE r.recent_avg_ms &gt; b.baseline_avg_ms * 2.5
+      AND b.baseline_avg_ms &gt; 1000   -- ignore sub-second noise
+      AND NOT EXISTS (                  -- not already forced
+            SELECT 1 FROM sys.query_store_plan fp
+            WHERE fp.query_id = r.query_id AND fp.force_failure_count = 0
+              AND fp.plan_id IN (
+                  SELECT plan_id FROM sys.query_store_query_hints
+                  WHERE query_id = r.query_id));
 
-def extract_hint_from_plan(plan_json: dict) -&gt; Optional[str]:
-    """
-    Walk the plan tree and extract scan/join hints.
-    Returns a pg_hint_plan directive string or None.
-    """
-    hints = []
+    OPEN cur;
+    FETCH NEXT FROM cur INTO @QueryId, @GoodPlanId, @RecentMs, @BaselineMs;
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        IF @GoodPlanId IS NOT NULL
+        BEGIN
+            EXEC sp_query_store_force_plan @QueryId, @GoodPlanId;
 
-    def walk(node: dict):
-        node_type = node.get("Node Type", "")
-        relation = node.get("Relation Name", "")
+            INSERT INTO Monitoring.PlanStabilizationLog
+                (QueryId, ForcedPlanId, RecentAvgMs, BaselineAvgMs,
+                 ForcedAt, InitiatedBy)
+            VALUES
+                (@QueryId, @GoodPlanId, @RecentMs, @BaselineMs,
+                 SYSUTCDATETIME(), 'autonomous-plan-stabilizer');
+        END
+        ELSE
+        BEGIN
+            -- No known-good plan: escalate for human review
+            INSERT INTO Monitoring.PlanRegressionQueue
+                (QueryId, RecentAvgMs, BaselineAvgMs,
+                 DetectedAt, Status)
+            VALUES
+                (@QueryId, @RecentMs, @BaselineMs,
+                 SYSUTCDATETIME(), 'pending_review');
+        END
+        FETCH NEXT FROM cur INTO @QueryId, @GoodPlanId, @RecentMs, @BaselineMs;
+    END
+    CLOSE cur;
+    DEALLOCATE cur;
+END;</code></pre>
 
-        if node_type == "Index Scan" and relation:
-            idx = node.get("Index Name", "")
-            if idx:
-                hints.append(f"IndexScan({relation} {idx})")
-        elif node_type == "Seq Scan" and relation:
-            # Baseline used index — force it back
-            pass
-        elif "Hash Join" in node_type:
-            inner = node.get("Plans", [{}])[1].get("Relation Name", "")
-            outer = node.get("Plans", [{}])[0].get("Relation Name", "")
-            if inner and outer:
-                hints.append(f"HashJoin({outer} {inner})")
+<p class="text-gray-300 leading-relaxed">A companion un-force job ran hourly: if a forced plan's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">force_failure_count</C> climbed or its recent performance no longer beat the unforced baseline, the system called <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sp_query_store_unforce_plan</C> and logged the outcome. This prevented stale forced plans from fossilizing into the workload — the most common failure mode the team had seen with manual plan forcing.</p>
 
-        for child in node.get("Plans", []):
-            walk(child)
-
-    walk(plan_json.get("Plan", {}))
-    return "/*+ " + " ".join(hints) + " */" if hints else None
-
-def apply_plan_stabilization(conn_str: str, fingerprint: int) -&gt; None:
-    conn = psycopg2.connect(conn_str)
-    cur = conn.cursor()
-
-    # Retrieve last known good baseline plan
-    cur.execute("""
-        SELECT plan_json, query_sample
-        FROM monitoring.query_plan_history
-        WHERE fingerprint = %s
-          AND is_baseline = TRUE
-        ORDER BY captured_at DESC
-        LIMIT 1
-    """, (fingerprint,))
-    row = cur.fetchone()
-
-    if not row:
-        logger.warning(f"No baseline plan found for fingerprint {fingerprint}")
-        return
-
-    plan_json, query_sample = row
-    hint = extract_hint_from_plan(plan_json)
-
-    if hint:
-        # Store hint in the plan override registry — applications
-        # read this table to prepend hints at query construction time
-        cur.execute("""
-            INSERT INTO monitoring.plan_override_registry
-                (fingerprint, hint_directive, applied_at, source)
-            VALUES (%s, %s, now(), 'autonomous-plan-stabilizer')
-            ON CONFLICT (fingerprint) DO UPDATE
-                SET hint_directive = EXCLUDED.hint_directive,
-                    applied_at     = EXCLUDED.applied_at
-        """, (fingerprint, hint))
-        conn.commit()
-        logger.info(
-            f"Plan hint applied for fingerprint {fingerprint}: {hint}"
-        )
-    else:
-        logger.warning(
-            f"Could not synthesize hint for fingerprint {fingerprint} — escalating"
-        )
-
-    cur.close()
-    conn.close()</code></pre>
-
-<p class="text-gray-300 leading-relaxed">The production deployment stabilized 11 of the 12 identified regression fingerprints autonomously. The twelfth required manual intervention — the regression was caused by a schema change (a new partial index that changed cardinality estimates) rather than statistics drift, and the baseline plan was genuinely suboptimal for the new schema. This distinction — regression caused by data drift versus regression caused by schema change — became a classification dimension added to the detection layer in the next iteration.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
-
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">Case Study 4: Autonomous Capacity Scaling in a Multi-Tenant E-Commerce Platform (PostgreSQL on Kubernetes)</h3>
-
-<p class="text-gray-300 leading-relaxed">A direct-to-consumer e-commerce company ran PostgreSQL 16 via the CloudNativePG operator on a Kubernetes cluster (AWS EKS) spanning three availability zones. Their traffic profile was violently bursty: normal load was 800 TPS, but flash sales and influencer-driven traffic spikes routinely hit 12,000–15,000 TPS within 90 seconds of an event trigger. Vertical scaling was too slow (node provisioning took 7–12 minutes); the autonomous solution was horizontal read scaling through automated replica addition and pgBouncer pool expansion, combined with query routing logic that redirected read queries based on real-time lag monitoring.</p>
-
-<p class="text-gray-300 leading-relaxed">The scaling loop was implemented as a Kubernetes controller (using the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">kopf</code> framework in Python) that watched a custom resource <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">PostgreSQLScalePolicy</code> and acted on Prometheus metrics fed through the Prometheus Adapter for Kubernetes:</p>
-
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> When `pg_stat_activity_count{state="active"} / max_connections > 0.75` for 60 seconds: scale pgBouncer pool size up by 20%, add one read replica via CloudNativePG's `instances` field patch.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> When replica lag on any standby exceeds 30MB: do not add more replicas; instead reduce connection pressure by throttling non-critical background jobs via a priority queue table.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> When `pg_stat_activity_count{state="active"} / max_connections < 0.35` for 300 seconds: scale down one replica if replica count > 2.</li>
+<p class="text-gray-300 leading-relaxed">After 60 days in production, plan-regression incidents on the 12 tracked reporting queries dropped from an average of 3 per week to zero analyst-visible events. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Monitoring.PlanStabilizationLog</C> table became the team's primary evidence artifact in incident reviews.</p>
 
 
-<p class="text-gray-300 leading-relaxed">The Kubernetes controller patched CloudNativePG's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Cluster</code> resource to add replicas dynamically:</p>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Case Study 4: Autonomous Capacity Scaling in a Multi-Tenant E-Commerce Platform (SQL Server on Azure)</h3>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import kopf
-import kubernetes
+<p class="text-gray-300 leading-relaxed">A direct-to-consumer e-commerce company ran SQL Server on Azure SQL Database Hyperscale across three regions. Their traffic profile was violently bursty: normal load was 800 TPS, but flash sales and influencer-driven traffic spikes routinely hit 12,000–15,000 TPS within 90 seconds of an event trigger. Manual scaling was too slow (tier changes took several minutes and required change approval); the autonomous solution was a control loop that scaled vCores up and down via the Azure control plane and expanded Hyperscale named replicas for read offload, driven by real-time resource utilization signals.</p>
+
+<p class="text-gray-300 leading-relaxed">The scaling loop was implemented as a Python daemon (running as an Azure Container Instance on a 60-second timer) that read resource signals from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_db_resource_stats</code> and acted through the Azure CLI:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> When average CPU over the last 5 minutes exceeds 75% for 60 seconds: scale vCores up one tier via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">az sql db update</code>, and add one Hyperscale named replica for read offload.</LI>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> When log write or data I/O waits dominate and replica count is already at the cap: do not add more replicas; instead throttle non-critical background jobs via a priority queue table.</LI>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> When average CPU stays below 35% for 300 seconds: scale down one tier if vCores are above the floor.</LI>
+
+<p class="text-gray-300 leading-relaxed">The daemon adjusted the database service tier directly through the Azure control plane:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import pyodbc
+import subprocess
 import logging
 import time
-from prometheus_api_client import PrometheusConnect
+import json
 
-PROMETHEUS_URL   = "http://prometheus.monitoring.svc.cluster.local:9090"
-CNPG_GROUP       = "postgresql.cnpg.io"
-CNPG_VERSION     = "v1"
-CNPG_PLURAL      = "clusters"
-NAMESPACE        = "databases"
-CLUSTER_NAME     = "ecommerce-pg"
-MIN_REPLICAS     = 2
-MAX_REPLICAS     = 8
-SCALE_UP_RATIO   = 0.75
-SCALE_DOWN_RATIO = 0.35
-SCALE_COOLDOWN   = 180  # seconds between scale events
+DB_CONN      = "DRIVER={ODBC Driver 18 for SQL Server};SERVER=ecommerce-sql.database.windows.net;DATABASE=ShopDB;Authentication=ActiveDirectoryMsi;"
+RESOURCE_GROUP = "rg-ecommerce-prod"
+SERVER         = "ecommerce-sql"
+DATABASE       = "ShopDB"
+MIN_VCORES     = 4
+MAX_VCORES     = 80
+SCALE_UP_CPU   = 75.0
+SCALE_DOWN_CPU = 35.0
+SCALE_COOLDOWN = 180  # seconds between scale events
 
-prom  = PrometheusConnect(url=PROMETHEUS_URL, disable_ssl=True)
-k8s   = kubernetes.client.CustomObjectsApi()
+TIERS = [4, 8, 16, 24, 32, 40, 48, 64, 80]
 last_scale_time = 0
 
-def get_connection_utilization() -&gt; float:
-    result = prom.custom_query(
-        'sum(pg_stat_activity_count{state="active",cluster="ecommerce-pg"}) '
-        '/ sum(pg_settings_max_connections{cluster="ecommerce-pg"})'
-    )
-    if result:
-        return float(result[0]["value"][1])
-    return 0.0
+def query(sql: str):
+    with pyodbc.connect(DB_CONN, timeout=10) as conn:
+        cur = conn.cursor()
+        cur.execute(sql)
+        return cur.fetchall()
 
-def get_current_replica_count() -&gt; int:
-    cluster = k8s.get_namespaced_custom_object(
-        group=CNPG_GROUP, version=CNPG_VERSION,
-        namespace=NAMESPACE, plural=CNPG_PLURAL,
-        name=CLUSTER_NAME
-    )
-    return cluster["spec"]["instances"]
+def avg_cpu_pct_5min() -&gt; float:
+    rows = query("""
+        SELECT AVG(avg_cpu_percent)
+        FROM sys.dm_db_resource_stats
+        WHERE end_time &gt; DATEADD(MINUTE, -5, GETUTCDATE())
+    """)
+    return float(rows[0][0]) if rows and rows[0][0] is not None else 0.0
 
-def patch_replica_count(new_count: int) -&gt; None:
-    patch = {"spec": {"instances": new_count}}
-    k8s.patch_namespaced_custom_object(
-        group=CNPG_GROUP, version=CNPG_VERSION,
-        namespace=NAMESPACE, plural=CNPG_PLURAL,
-        name=CLUSTER_NAME, body=patch
+def current_vcores() -&gt; int:
+    out = subprocess.run(
+        ["az", "sql", "db", "show", "--resource-group", RESOURCE_GROUP,
+         "--server", SERVER, "--name", DATABASE,
+         "--query", "currentServiceObjectiveName", "-o", "tsv"],
+        capture_output=True, text=True, check=True
     )
-    logging.info(f"Patched CloudNativePG cluster to {new_count} instances")
+    name = out.stdout.strip()  # e.g. "HS_Gen5_16"
+    return int(name.rsplit("_", 1)[1])
 
-def get_max_replication_lag_bytes() -&gt; int:
-    result = prom.custom_query(
-        'max(pg_replication_lag_bytes{cluster="ecommerce-pg"})'
+def scale_to_vcores(vcores: int) -&gt; None:
+    tier = f"HS_Gen5_{vcores}"
+    subprocess.run(
+        ["az", "sql", "db", "update", "--resource-group", RESOURCE_GROUP,
+         "--server", SERVER, "--name", DATABASE,
+         "--service-objective", tier],
+        check=True
     )
-    if result:
-        return int(float(result[0]["value"][1]))
-    return 0
+    logging.info(f"Scaled {DATABASE} to {tier}")
 
-@kopf.timer("postgresql.cnpg.io", "v1", "clusters", interval=60.0)
-def autoscale_loop(spec, name, namespace, **kwargs):
+def throttle_background_jobs() -&gt; None:
+    """Pause non-critical batch work via a coordination table."""
+    with pyodbc.connect(DB_CONN) as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            MERGE ops.scaling_signals AS tgt
+            USING (SELECT 'background_throttle' AS signal_key) AS src
+              ON tgt.signal_key = src.signal_key
+            WHEN MATCHED THEN
+                UPDATE SET signal_value = 'true',
+                           updated_at = SYSUTCDATETIME()
+            WHEN NOT MATCHED THEN
+                INSERT (signal_key, signal_value, updated_at)
+                VALUES ('background_throttle', 'true', SYSUTCDATETIME());
+        """)
+        conn.commit()
+    logging.info("Background job throttle signal set")
+
+def avg_log_write_pct_5min() -&gt; float:
+    rows = query("""
+        SELECT AVG(avg_log_write_percent)
+        FROM sys.dm_db_resource_stats
+        WHERE end_time &gt; DATEADD(MINUTE, -5, GETUTCDATE())
+    """)
+    return float(rows[0][0]) if rows and rows[0][0] is not None else 0.0
+
+def autoscale_loop():
     global last_scale_time
-    if name != CLUSTER_NAME or namespace != NAMESPACE:
-        return
-
     now = time.time()
     if (now - last_scale_time) &lt; SCALE_COOLDOWN:
         logging.debug("Inside cooldown window — skipping scale evaluation")
         return
 
-    utilization  = get_connection_utilization()
-    current_reps = get_current_replica_count()
-    lag_bytes    = get_max_replication_lag_bytes()
+    cpu       = avg_cpu_pct_5min()
+    log_write = avg_log_write_pct_5min()
+    current   = current_vcores()
+    idx       = TIERS.index(current)
+    logging.info(f"CPU={cpu:.1f}%, log_write={log_write:.1f}%, vcores={current}")
 
-    logging.info(
-        f"Utilization={utilization:.2f}, replicas={current_reps}, "
-        f"max_lag_bytes={lag_bytes}"
-    )
-
-    LAG_CEILING = 30 * 1024 * 1024  # 30 MB
-
-    if utilization &gt; SCALE_UP_RATIO:
-        if lag_bytes &gt; LAG_CEILING:
+    if cpu &gt; SCALE_UP_CPU:
+        if log_write &gt; 90.0:
+            # Log throughput is the bottleneck — more vCores will not help;
+            # shed background load instead
             logging.warning(
-                "High connection pressure but replication lag exceeds 30MB — "
-                "holding replica count, throttling background jobs instead"
+                "High CPU but log write saturated — throttling background jobs"
             )
             throttle_background_jobs()
-        elif current_reps &lt; MAX_REPLICAS:
-            patch_replica_count(current_reps + 1)
+        elif idx &lt; len(TIERS) - 1:
+            scale_to_vcores(TIERS[idx + 1])
             last_scale_time = now
-    elif utilization &lt; SCALE_DOWN_RATIO and current_reps &gt; MIN_REPLICAS:
-        patch_replica_count(current_reps - 1)
+    elif cpu &lt; SCALE_DOWN_CPU and idx &gt; 0 and current &gt; MIN_VCORES:
+        scale_to_vcores(TIERS[idx - 1])
         last_scale_time = now
 
-def throttle_background_jobs() -&gt; None:
-    """
-    Signals the job priority queue to pause non-critical batch work
-    by setting a cluster-wide throttle flag in the coordination table.
-    """
-    import psycopg2
-    import os
-    conn = psycopg2.connect(os.environ["PG_CONN_STR"])
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO ops.scaling_signals (signal_key, signal_value, updated_at)
-        VALUES ('background_throttle', 'true', now())
-        ON CONFLICT (signal_key) DO UPDATE
-            SET signal_value = 'true',
-                updated_at   = now()
-    """)
-    conn.commit()
-    cur.close()
-    conn.close()
-    logging.info("Background job throttle signal set")</code></pre>
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    while True:
+        autoscale_loop()
+        time.sleep(60)</code></pre>
 
-<p class="text-gray-300 leading-relaxed">The most significant lesson from this deployment was the interaction between replica provisioning latency and connection pool saturation. CloudNativePG required approximately 45–90 seconds to bring a new replica online and fully sync. During that window, if the spike was sharp enough, pgBouncer's pool would saturate and begin queuing connections. The mitigation was to trigger pool expansion (pgBouncer's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pool_size</code> via its admin interface) immediately — before the replica was ready — so that queued connections had somewhere to land as soon as the replica joined the pool. The sequence mattered: pool first, then replica.</p>
+<p class="text-gray-300 leading-relaxed">The most significant lesson from this deployment was the interaction between tier-change latency and connection pool saturation. A vCore scale-up on Hyperscale required approximately 45–90 seconds to complete. During that window, if the spike was sharp enough, the application's connection pool would saturate and begin queuing. The mitigation was to throttle non-critical background jobs immediately — before the scale completed — so that queued connections had somewhere to land as soon as capacity arrived. The sequence mattered: shed load first, then scale.</p>
 
 <p class="text-gray-300 leading-relaxed">The second lesson was that the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SCALE_COOLDOWN</code> window needed to be asymmetric: 60 seconds for scale-up (to react quickly), 300 seconds for scale-down (to avoid thrashing when traffic declines slowly). A symmetric cooldown caused premature scale-down during the trailing edge of flash sales, requiring an immediate re-scale that itself triggered the cooldown again.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
 
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">Case Study 5: Autonomous Compliance Auditing and Remediation in a Financial Services PostgreSQL Deployment</h3>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Case Study 5: Autonomous Compliance Auditing and Remediation in a Financial Services SQL Server Deployment</h3>
 
-<p class="text-gray-300 leading-relaxed">A regional bank's data engineering team operated PostgreSQL 15 databases containing customer PII, transaction records, and loan origination data, subject to audit requirements from both their internal compliance framework and external regulatory guidance. Their pain point was not detection — they had extensive logging — but remediation latency: when a compliance violation was identified (a column without row-level security, an unencrypted backup path, a role with excessive <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">GRANT</code> permissions), the ticket-to-fix cycle averaged 11 business days due to approval workflows and DBA bandwidth.</p>
+<p class="text-gray-300 leading-relaxed">A regional bank's data engineering team operated SQL Server 2022 databases containing customer PII, transaction records, and loan origination data, subject to audit requirements from both their internal compliance framework and external regulatory guidance. Their pain point was not detection — they had extensive logging — but remediation latency: when a compliance violation was identified (a table without row-level security, an unencrypted backup path, a login with excessive <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">GRANT</code> permissions), the ticket-to-fix cycle averaged 11 business days due to approval workflows and DBA bandwidth.</p>
 
 <p class="text-gray-300 leading-relaxed">The autonomous compliance agent shortened this cycle by classifying violations into three tiers:</p>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Tier 1 (Auto-Remediate)**: Violations where the corrective action is reversible, low-risk, and pre-approved by the security team (e.g., revoking a PUBLIC schema execute permission, adding a column-level `SECURITY LABEL`).</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Tier 2 (Auto-Draft + Human Approve)**: Violations where the fix is known but the blast radius requires sign-off (e.g., modifying RLS policies on tables with active sessions, revoking a role with 50+ dependent objects).</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Tier 3 (Alert Only)**: Violations requiring architectural judgment (e.g., an entire schema missing encryption at rest, a cross-database link to an unapproved external system).</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Tier 1 (Auto-Remediate)</strong>: Violations where the corrective action is reversible, low-risk, and pre-approved by the security team (e.g., revoking a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">PUBLIC</code> schema execute permission, adding a column-level data mask).</LI>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Tier 2 (Auto-Draft + Human Approve)</strong>: Violations where the fix is known but the blast radius requires sign-off (e.g., adding a row-level security policy on tables with active sessions, revoking a role with 50+ dependent objects).</LI>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Tier 3 (Alert Only)</strong>: Violations requiring architectural judgment (e.g., an entire database missing TDE, a linked server to an unapproved external system).</LI>
 
+<p class="text-gray-300 leading-relaxed">The autonomous remediation procedures for Tier 1 violations:</p>
 
-<p class="text-gray-300 leading-relaxed">The autonomous remediation function for Tier 1 violations:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Tier 1 auto-remediation: revoke PUBLIC schema DML permissions
-CREATE OR REPLACE PROCEDURE compliance.auto_remediate_public_exposure()
-LANGUAGE plpgsql
-AS $$
-DECLARE
-    v_schema  TEXT;
-    v_table   TEXT;
-    v_priv    TEXT;
-    v_sql     TEXT;
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Tier 1 auto-remediation: revoke PUBLIC schema permissions
+CREATE OR ALTER PROCEDURE Compliance.AutoRemediatePublicExposure
+AS
 BEGIN
-    FOR v_schema, v_table, v_priv IN
-        SELECT table_schema, table_name, privilege_type
-        FROM compliance.public_schema_overexposure
-    LOOP
-        v_sql := format(
-            'REVOKE %I ON %I.%I FROM PUBLIC',
-            v_priv, v_schema, v_table
-        );
+    SET NOCOUNT ON;
+
+    DECLARE @SchemaName SYSNAME, @TableName SYSNAME, @PrivName SYSNAME, @Sql NVARCHAR(MAX);
+
+    DECLARE cur CURSOR LOCAL FAST_FORWARD FOR
+        SELECT SchemaName, TableName, PrivilegeName
+        FROM Compliance.PublicSchemaOverexposure;
+
+    OPEN cur;
+    FETCH NEXT FROM cur INTO @SchemaName, @TableName, @PrivName;
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        SET @Sql = N'REVOKE ' + QUOTENAME(@PrivName)
+                 + N' ON ' + QUOTENAME(@SchemaName) + N'.' + QUOTENAME(@TableName)
+                 + N' FROM PUBLIC';
 
         -- Audit before execution
-        INSERT INTO compliance.remediation_log
-            (violation_type, object_identifier, action_sql,
-             tier, remediated_at, initiated_by)
+        INSERT INTO Compliance.RemediationLog
+            (ViolationType, ObjectIdentifier, ActionSql,
+             Tier, RemediatedAt, InitiatedBy)
         VALUES
             ('public_schema_overexposure',
-             v_schema || '.' || v_table,
-             v_sql, 1, now(), 'autonomous-compliance-agent');
+             @SchemaName + N'.' + @TableName,
+             @Sql, 1, SYSUTCDATETIME(), 'autonomous-compliance-agent');
 
-        EXECUTE v_sql;
-    END LOOP;
+        EXEC sp_executesql @Sql;
+        FETCH NEXT FROM cur INTO @SchemaName, @TableName, @PrivName;
+    END
+    CLOSE cur;
+    DEALLOCATE cur;
 END;
-$$;
 
--- Enable RLS on regulated tables (Tier 1 where no active sessions on table)
-CREATE OR REPLACE PROCEDURE compliance.auto_enable_rls_safe()
-LANGUAGE plpgsql
-AS $$
-DECLARE
-    v_schema  TEXT;
-    v_table   TEXT;
-    v_active  INT;
-    v_sql     TEXT;
+-- Enable row-level security on regulated tables
+-- (Tier 1 only when no active sessions are touching the table)
+CREATE OR ALTER PROCEDURE Compliance.AutoEnableRLSSafe
+AS
 BEGIN
-    FOR v_schema, v_table IN
-        SELECT schema_name, table_name
-        FROM compliance.tables_missing_rls
-    LOOP
-        -- Only auto-enable RLS if no active queries are currently touching this table
-        SELECT COUNT(*) INTO v_active
-        FROM pg_stat_activity psa
-        JOIN pg_locks pl ON psa.pid = pl.pid
-        JOIN pg_class pc ON pl.relation = pc.oid
-        JOIN pg_namespace pn ON pc.relnamespace = pn.oid
-        WHERE pn.nspname = v_schema
-          AND pc.relname = v_table
-          AND psa.state  = 'active';
+    SET NOCOUNT ON;
 
-        IF v_active = 0 THEN
-            v_sql := format(
-                'ALTER TABLE %I.%I ENABLE ROW LEVEL SECURITY',
-                v_schema, v_table
-            );
+    DECLARE @SchemaName SYSNAME, @TableName SYSNAME, @Active INT, @Sql NVARCHAR(MAX);
 
-            INSERT INTO compliance.remediation_log
-                (violation_type, object_identifier, action_sql,
-                 tier, remediated_at, initiated_by)
+    DECLARE cur CURSOR LOCAL FAST_FORWARD FOR
+        SELECT SchemaName, TableName
+        FROM Compliance.TablesMissingRLS;
+
+    OPEN cur;
+    FETCH NEXT FROM cur INTO @SchemaName, @TableName;
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        -- Only auto-enable RLS if no active requests are touching this table
+        SELECT @Active = COUNT(*)
+        FROM sys.dm_exec_requests r
+        JOIN sys.dm_tran_locks l
+          ON l.request_session_id = r.session_id
+        JOIN sys.partitions p
+          ON p.hobt_id = l.resource_associated_entity_id
+        JOIN sys.objects o
+          ON o.object_id = p.object_id
+        JOIN sys.schemas s
+          ON s.schema_id = o.schema_id
+        WHERE s.name = @SchemaName
+          AND o.name = @TableName
+          AND r.status = 'running';
+
+        IF @Active = 0
+        BEGIN
+            SET @Sql = N'ALTER SECURITY POLICY '
+                     + QUOTENAME(@SchemaName + N'_rls_policy')
+                     + N' ADD FILTER PREDICATE Compliance.fn_SecurityPredicate(UserName)'
+                     + N' ON ' + QUOTENAME(@SchemaName) + N'.' + QUOTENAME(@TableName);
+
+            INSERT INTO Compliance.RemediationLog
+                (ViolationType, ObjectIdentifier, ActionSql,
+                 Tier, RemediatedAt, InitiatedBy)
             VALUES
-                ('missing_rls', v_schema || '.' || v_table,
-                 v_sql, 1, now(), 'autonomous-compliance-agent');
+                ('missing_rls', @SchemaName + N'.' + @TableName,
+                 @Sql, 1, SYSUTCDATETIME(), 'autonomous-compliance-agent');
 
-            EXECUTE v_sql;
+            EXEC sp_executesql @Sql;
+        END
         ELSE
+        BEGIN
             -- Escalate to Tier 2: table is active, needs human approval
-            INSERT INTO compliance.remediation_queue
-                (violation_type, object_identifier, recommended_sql,
-                 tier, queued_at, approval_status)
+            INSERT INTO Compliance.RemediationQueue
+                (ViolationType, ObjectIdentifier, RecommendedSql,
+                 Tier, QueuedAt, ApprovalStatus)
             VALUES
-                ('missing_rls', v_schema || '.' || v_table,
-                 format('ALTER TABLE %I.%I ENABLE ROW LEVEL SECURITY',
-                        v_schema, v_table),
-                 2, now(), 'pending');
-        END IF;
-    END LOOP;
-END;
-$$;</code></pre>
+                ('missing_rls', @SchemaName + N'.' + @TableName,
+                 N'ALTER SECURITY POLICY '
+                 + QUOTENAME(@SchemaName + N'_rls_policy')
+                 + N' ADD FILTER PREDICATE Compliance.fn_SecurityPredicate(UserName)'
+                 + N' ON ' + QUOTENAME(@SchemaName) + N'.' + QUOTENAME(@TableName),
+                 2, SYSUTCDATETIME(), 'pending');
+        END
+        FETCH NEXT FROM cur INTO @SchemaName, @TableName;
+    END
+    CLOSE cur;
+    DEALLOCATE cur;
+END;</code></pre>
 
-<p class="text-gray-300 leading-relaxed">The Tier 2 workflow connected to the bank's internal approval platform via a webhook: once a record appeared in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">compliance.remediation_queue</code> with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">approval_status = 'pending'</code>, a notification triggered a Slack approval message with a one-click approval button. Approved records updated <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">approval_status = 'approved'</code> and triggered the agent to execute the stored <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">recommended_sql</code>. The average Tier 2 remediation time dropped from 11 business days to 6.2 hours — driven almost entirely by the pre-drafted SQL that security reviewers could read, approve, or reject without any DBA ticket creation or back-and-forth.</p>
+<p class="text-gray-300 leading-relaxed">The Tier 2 workflow connected to the bank's internal approval platform via a webhook: once a record appeared in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Compliance.RemediationQueue</code> with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ApprovalStatus = 'pending'</code>, a notification triggered a Teams approval message with a one-click approval button. Approved records updated <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ApprovalStatus = 'approved'</code> and triggered the agent to execute the stored <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">RecommendedSql</code>. The average Tier 2 remediation time dropped from 11 business days to 6.2 hours — driven almost entirely by the pre-drafted SQL that security reviewers could read, approve, or reject without any DBA ticket creation or back-and-forth.</p>
 
-<p class="text-gray-300 leading-relaxed">The most important architectural lesson from this case study was the value of the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">remediation_log</code> table as a compliance artifact. External auditors could query the log to verify that violations were detected and remediated within specific SLA windows, with full SQL provenance. The autonomous system was not just faster — it was more auditable than the manual process, which relied on ticket comments and email threads that were difficult to correlate with actual database state changes.</p>
+<p class="text-gray-300 leading-relaxed">The most important architectural lesson from this case study was the value of the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">RemediationLog</code> table as a compliance artifact. External auditors could query the log to verify that violations were detected and remediated within specific SLA windows, with full SQL provenance. The autonomous system was not just faster — it was more auditable than the manual process, which relied on ticket comments and email threads that were difficult to correlate with actual database state changes.</p>
 
-<p class="text-gray-300 leading-relaxed">A secondary lesson was the necessity of scoping Tier 1 carefully. On the third week of deployment, the agent auto-revoked an <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">EXECUTE</code> permission on a stored procedure that a batch job had relied on for 4 years — a procedure that was not documented anywhere except a comment in the source code of a decommissioned internal tool. The batch job failed silently overnight. This prompted a refinement: Tier 1 actions now require the affected object to appear in a pre-approved object registry (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">compliance.tier1_eligible_objects</code>) before autonomous action can proceed. The registry is maintained by DBAs and reviewed quarterly.</p>
+<p class="text-gray-300 leading-relaxed">A secondary lesson was the necessity of scoping Tier 1 carefully. On the third week of deployment, the agent auto-revoked an <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">EXECUTE</code> permission on a stored procedure that a batch job had relied on for 4 years — a procedure that was not documented anywhere except a comment in the source code of a decommissioned internal tool. The batch job failed silently overnight. This prompted a refinement: Tier 1 actions now require the affected object to appear in a pre-approved object registry (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Compliance.Tier1EligibleObjects</code>) before autonomous action can proceed. The registry is maintained by DBAs and reviewed quarterly.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Synthesis: Patterns Across All Five Deployments</h3>
 
@@ -643,15 +665,13 @@ $$;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The silent batch job failure from the compliance case, the replica provisioning lag from the Kubernetes autoscaler, and the schema-change-versus-data-drift distinction from the healthcare platform all led to architectural refinements that would not have been discoverable through any amount of upfront design. Each case study team built a feedback loop from production incidents back into the autonomous system's decision logic — not just into runbooks.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Autonomous systems earn trust through auditability, not just performance**: every production deployment in this chapter succeeded in gaining organizational acceptance partly because the system's decisions were fully logged with provenance, enabling retrospective review by both engineers and external auditors.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Detection signal quality determines autonomous system reliability more than remediation sophistication**: the trading firm's heartbeat table outperformed Patroni's own API as a failure signal; the healthcare platform's regression ratio proved more stable than raw execution time comparisons; signal design deserves as much engineering attention as the remediation logic.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The boundary between Tier 1 (auto-act) and Tier 2 (human-approve) actions must be defined by blast radius and reversibility, not by technical complexity**: some technically simple actions (revoking a permission) have large blast radii; some technically complex actions (online index rebuild) are easily reversible. Conflating complexity with risk leads to either under-automation or over-automation.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Cooldown windows and lag guards are not optional safety theater — they are architectural requirements**: every case study that skipped or underestimated these guards experienced oscillation, thrashing, or a preventable failure before adding them back; asymmetric cooldowns (faster to engage protective action, slower to disengage it) consistently outperformed symmetric ones.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The object registry pattern — maintaining a pre-approved list of objects eligible for autonomous action — is the practical solution to the scope creep problem in autonomous remediation systems**: without it, autonomous agents inevitably encounter edge cases (undocumented dependencies, legacy objects, objects shared across teams) that cause silent failures; with it, the blast radius of any autonomous action is bounded and reviewable before deployment.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Autonomous systems earn trust through auditability, not just performance</strong>: every production deployment in this chapter succeeded in gaining organizational acceptance partly because the system's decisions were fully logged with provenance, enabling retrospective review by both engineers and external auditors.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Detection signal quality determines autonomous system reliability more than remediation sophistication</strong>: the trading firm's heartbeat table outperformed the AG replica-state DMVs as a failure signal; the healthcare platform's regression ratio proved more stable than raw execution time comparisons; signal design deserves as much engineering attention as the remediation logic.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">The boundary between Tier 1 (auto-act) and Tier 2 (human-approve) actions must be defined by blast radius and reversibility, not by technical complexity</strong>: some technically simple actions (revoking a permission) have large blast radii; some technically complex actions (online index rebuild) are easily reversible. Conflating complexity with risk leads to either under-automation or over-automation.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Cooldown windows and lag guards are not optional safety theater — they are architectural requirements</strong>: every case study that skipped or underestimated these guards experienced oscillation, thrashing, or a preventable failure before adding them back; asymmetric cooldowns (faster to engage protective action, slower to disengage it) consistently outperformed symmetric ones.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">The object registry pattern — maintaining a pre-approved list of objects eligible for autonomous action — is the practical solution to the scope creep problem in autonomous remediation systems</strong>: without it, autonomous agents inevitably encounter edge cases (undocumented dependencies, legacy objects, objects shared across teams) that cause silent failures; with it, the blast radius of any autonomous action is bounded and reviewable before deployment.</li>
     </div>
     <div class="mt-14 bg-emerald-950/40 border border-emerald-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">

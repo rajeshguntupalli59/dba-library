@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Chapter 15: Intelligent Workload Classification — The ADE Handbook</title>
-  <meta name="description" content="The ADE Handbook Chapter 15: Intelligent Workload Classification. Autonomous database engineering for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
+  <meta name="description" content="The ADE Handbook Chapter 15: Intelligent Workload Classification. Autonomous database engineering for SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
   <script type="module">
     import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
@@ -43,10 +43,10 @@
     <div class="space-y-4 text-sm">
 <h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 15: Intelligent Workload Classification</h2>
 
-<p class="text-gray-300 leading-relaxed">Autonomous database systems can only act intelligently when they understand *what* they're running. Query tuning, resource allocation, connection routing, and scheduling decisions all depend on knowing whether a given workload is OLTP, analytical, batch, ETL, or something in between — and that classification must happen continuously, at runtime, without human annotation. This chapter builds the full stack of intelligent workload classification: from raw signal extraction through feature engineering, model-based classification, and the downstream control loops that consume those labels to make autonomous decisions. The architecture described here runs in production today, using PostgreSQL's statistics infrastructure and SQL Server's Query Store as primary data sources, augmented by custom instrumentation and ML inference layers that operate with sub-second latency for hot decisions and background model refresh cycles for drift correction.</p>
+<p class="text-gray-300 leading-relaxed">Autonomous database systems can only act intelligently when they understand <em>what</em> they're running. Query tuning, resource allocation, connection routing, and scheduling decisions all depend on knowing whether a given workload is OLTP, analytical, batch, ETL, or something in between — and that classification must happen continuously, at runtime, without human annotation. This chapter builds the full stack of intelligent workload classification: from raw signal extraction through feature engineering, model-based classification, and the downstream control loops that consume those labels to make autonomous decisions. The architecture described here runs in production today, using SQL Server's Query Store and DMV telemetry as primary data sources, augmented by custom instrumentation and ML inference layers that operate with sub-second latency for hot decisions and background model refresh cycles for drift correction.</p>
 
 <div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph LR
-    A[pg_stat_statements /<br/>Query Store] --> B[Signal Extraction]
+    A[Query Store / DMV Telemetry] --> B[Signal Extraction]
     B --> C[Feature Engineering<br/>burst coef, plan instability, etc.]
     C --> D[Classification Model<br/>LightGBM/XGBoost]
     D --> E{Confidence >= 0.65?}
@@ -59,20 +59,18 @@
 
 <p class="text-gray-300 leading-relaxed">*The end-to-end classification loop: raw telemetry becomes feature vectors, a model assigns a workload class, a hysteresis filter prevents thrashing before routing changes are applied, and drift detection keeps the model calibrated over time.*</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">15.1 Signal Extraction: Reading Workload DNA from Native Instrumentation</h3>
 
-<p class="text-gray-300 leading-relaxed">Classification begins with signals. Both PostgreSQL and SQL Server expose rich runtime telemetry, but the signals that matter for workload classification are not the obvious ones like CPU or memory — they are behavioral fingerprints embedded in execution statistics, wait profiles, and access patterns.</p>
+<p class="text-gray-300 leading-relaxed">Classification begins with signals. SQL Server exposes rich runtime telemetry, but the signals that matter for workload classification are not the obvious ones like CPU or memory — they are behavioral fingerprints embedded in execution statistics, wait profiles, and access patterns.</p>
 
 <p class="text-gray-300 leading-relaxed">The core features for workload classification fall into four categories:</p>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Execution profile**: rows examined vs. rows returned ratio, execution frequency, plan stability</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Resource signature**: buffer hits vs. disk reads, temp space usage, parallelism degree</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Wait topology**: the distribution of wait types encountered during execution</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Temporal pattern**: time-of-day clustering, burst coefficient, inter-arrival time variance</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Execution profile</strong>: rows examined vs. rows returned ratio, execution frequency, plan stability</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Resource signature</strong>: buffer hits vs. disk reads, temp space usage, parallelism degree</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Wait topology</strong>: the distribution of wait types encountered during execution</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Temporal pattern</strong>: time-of-day clustering, burst coefficient, inter-arrival time variance</li>
 
-<p class="text-gray-300 leading-relaxed">PostgreSQL exposes most of this through <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_user_tables</code>, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_activity</code>. The challenge is that <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> normalizes queries and loses some instance-level variance. Augmenting it with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">auto_explain</code> for sampling and a custom background worker that snapshots <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_activity</code> at 1-second intervals gives you the full picture.</p>
+<p class="text-gray-300 leading-relaxed">SQL Server exposes this through <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.query_store_runtime_stats</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_query_stats</code>, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_sessions</code>. The challenge is that Query Store normalizes query text and loses some instance-level variance. Augmenting it with lightweight Extended Events sampling (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sql_batch_completed</code>) and a collector that snapshots <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_requests</code> at 1-second intervals gives you the full picture.</p>
 
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Extract equivalent workload signals from Query Store
@@ -101,11 +99,9 @@ WHERE qsrs.count_executions &gt; 10
 GROUP BY qsq.query_id, qsqt.query_sql_text
 ORDER BY SUM(qsrs.avg_duration * qsrs.count_executions) DESC;</code></pre>
 
-<p class="text-gray-300 leading-relaxed">Wait profiles require a separate collection path. In PostgreSQL, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_activity.wait_event</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_activity.wait_event_type</code> give per-session instantaneous wait data. A 1-second polling collector running as a background process builds a wait histogram per query pattern over time. In SQL Server, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_os_wait_stats</code> and per-query waits from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_query_stats</code> joined with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_query_plan</code> provide richer per-plan wait attribution.</p>
+<p class="text-gray-300 leading-relaxed">Wait profiles require a separate collection path. <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_os_wait_stats</code> gives cumulative waits; per-query waits come from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_query_stats</code> joined with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_query_plan</code> for per-plan wait attribution. A 1-second polling collector that snapshots <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_requests</code> builds a wait histogram per query pattern over time.</p>
 
 <p class="text-gray-300 leading-relaxed">The wait topology feature is then encoded as a distribution vector: what fraction of total wait time falls into Lock, LWLock/Buffer, IO, CPU, Network, and Idle categories. OLTP workloads show high Lock and short CPU spikes. Analytical workloads show sustained CPU with sequential IO. Batch ETL workloads show high IO and Log write waits with low Lock contention.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">15.2 Feature Engineering for Runtime Classification</h3>
 
@@ -124,8 +120,7 @@ ORDER BY SUM(qsrs.avg_duration * qsrs.count_executions) DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The following Python feature engineering pipeline runs as a scheduled collector — pulling from both databases, computing derived features, and publishing to a Redis time-series store that feeds the classification inference layer.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import psycopg2
-import pyodbc
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import pyodbc
 import redis
 import json
 import time
@@ -136,7 +131,6 @@ import numpy as np
 @dataclass
 class WorkloadFeatureVector:
     query_id: str
-    database_type: str  # 'postgresql' | 'sqlserver'
     avg_exec_ms: float
     exec_time_cv: float           # coefficient of variation
     avg_rows_returned: float
@@ -178,28 +172,21 @@ def compute_derived_features(raw: dict, burst_history: list[float]) -&gt; dict:
     }
 
 class FeatureCollector:
-    def __init__(self, pg_dsn: str, mssql_dsn: str, redis_url: str):
-        self.pg_conn = psycopg2.connect(pg_dsn)
+    def __init__(self, mssql_dsn: str, redis_url: str):
         self.mssql_conn = pyodbc.connect(mssql_dsn)
         self.redis = redis.from_url(redis_url)
         self.burst_cache: dict[str, list[float]] = {}
 
     def collect_and_publish(self):
-        pg_features = self._collect_postgresql()
         ms_features = self._collect_sqlserver()
 
-        for fv in pg_features + ms_features:
-            key = f"wl:features:{fv.database_type}:{fv.query_id}"
+        for fv in ms_features:
+            key = f"wl:features:sqlserver:{fv.query_id}"
             self.redis.setex(key, 3600, json.dumps(asdict(fv)))
             # Append to time-series for burst calculation
-            ts_key = f"wl:timeseries:{fv.database_type}:{fv.query_id}"
+            ts_key = f"wl:timeseries:sqlserver:{fv.query_id}"
             self.redis.lpush(ts_key, fv.calls_per_hour)
             self.redis.ltrim(ts_key, 0, 11)  # keep 12 windows = 60 minutes
-
-    def _collect_postgresql(self) -&gt; list[WorkloadFeatureVector]:
-        # ... execute the pg_stat_statements query and build feature vectors
-        # burst history retrieved from Redis time-series
-        pass  # implementation follows same pattern as SQL Server below
 
     def _collect_sqlserver(self) -&gt; list[WorkloadFeatureVector]:
         cur = self.mssql_conn.cursor()
@@ -256,21 +243,19 @@ class FeatureCollector:
             results.append(fv)
         return results</code></pre>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">15.3 The Classification Model: Architecture and Label Taxonomy</h3>
 
 <p class="text-gray-300 leading-relaxed">The classification model sits at the core of the autonomous control loop. It receives feature vectors and produces workload labels that drive downstream decisions. The label taxonomy needs to be precise enough to guide action but stable enough to avoid thrashing.</p>
 
 <p class="text-gray-300 leading-relaxed">A five-class taxonomy works well across all production scenarios:</p>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **OLTP_POINT**: Short-duration, high-frequency, index-bound, single-digit row access. Classic transactional. Action: prioritize in connection pools, protect from query plan regression.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **OLTP_MODERATE**: Slightly wider queries — small range scans, multi-table joins, under 100ms. Action: standard SLA tier.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **ANALYTICAL**: Long-running, high-row-count aggregations, sequential scans, parallel execution. Action: route to read replica, assign lower CPU priority, allow longer lock waits.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **BATCH_ETL**: High write amplification, sequential access, predictable schedule, large temp usage. Action: schedule during maintenance window, pre-warm buffers, expand autovacuum budget post-run.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **MAINTENANCE**: VACUUM, ANALYZE, index builds, statistics updates, DBCC operations. Action: track separately, do not apply SLA enforcement, use as calibration signal.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">OLTP_POINT</strong>: Short-duration, high-frequency, index-bound, single-digit row access. Classic transactional. Action: prioritize in connection pools, protect from query plan regression.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">OLTP_MODERATE</strong>: Slightly wider queries — small range scans, multi-table joins, under 100ms. Action: standard SLA tier.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">ANALYTICAL</strong>: Long-running, high-row-count aggregations, sequential scans, parallel execution. Action: route to read replica, assign lower CPU priority, allow longer lock waits.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">BATCH_ETL</strong>: High write amplification, sequential access, predictable schedule, large tempdb usage. Action: schedule during maintenance window, pre-warm buffers, expand the index maintenance budget post-run.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">MAINTENANCE</strong>: VACUUM, ANALYZE, index builds, statistics updates, DBCC operations. Action: track separately, do not apply SLA enforcement, use as calibration signal.</li>
 
-<p class="text-gray-300 leading-relaxed">The classifier itself is a gradient-boosted tree model (XGBoost or LightGBM) trained on labeled historical data from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> and Query Store. The labeling phase is the only place human judgment enters: a DBA manually labels 500–1000 representative query patterns once, and the model generalizes from there. Semi-supervised bootstrapping can extend coverage to new query patterns by treating high-confidence predictions as pseudo-labels for retraining.</p>
+<p class="text-gray-300 leading-relaxed">The classifier itself is a gradient-boosted tree model (XGBoost or LightGBM) trained on labeled historical data from Query Store. The labeling phase is the only place human judgment enters: a DBA manually labels 500–1000 representative query patterns once, and the model generalizes from there. Semi-supervised bootstrapping can extend coverage to new query patterns by treating high-confidence predictions as pseudo-labels for retraining.</p>
 
 <p class="text-gray-300 leading-relaxed">In production, the classifier runs as a FastAPI microservice with a 5ms SLA for batch classification of up to 200 feature vectors per request. The model is loaded into memory and refreshed weekly via a background retraining pipeline triggered by concept drift detection.</p>
 
@@ -352,15 +337,13 @@ def classify_batch(requests: List[ClassificationRequest]):
 
 <p class="text-gray-300 leading-relaxed">The confidence threshold of 0.65 is not arbitrary. Below this level, empirical testing shows that misclassifications cause more harm (wrong resource allocation, incorrect routing) than the safe default of OLTP_MODERATE. Queries below threshold are published to a review queue consumed weekly by the DBA for manual labeling — feeding the retraining loop.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">15.4 Real-Time Classification Routing and Resource Policy Enforcement</h3>
 
 <p class="text-gray-300 leading-relaxed">Classification labels are only valuable when they drive action at runtime. The downstream control loop connects workload labels to three enforcement mechanisms: connection pool routing, resource group assignment, and query timeout policies.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Connection Pool Routing via pgBouncer</strong></p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Connection Routing via Resource Governor Classification</strong></p>
 
-<p class="text-gray-300 leading-relaxed">pgBouncer does not natively support dynamic pool assignment, but its configuration can be rewritten and reloaded without dropping connections via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">RELOAD</code>. An orchestration agent monitors the classification service and, when it detects that a query pattern has been reclassified (e.g., a formerly OLTP query has migrated to ANALYTICAL due to data growth), it rewrites the pgBouncer pool assignment and issues a reload.</p>
+<p class="text-gray-300 leading-relaxed">SQL Server has no external pooler tier to reconfigure — routing happens in the Resource Governor classifier function and the AG read-only routing list. When the classification service reclassifies a query pattern (e.g., a formerly OLTP query has migrated to ANALYTICAL due to data growth), the orchestration agent updates the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dbo.workload_routing_rules</code> table below; the classifier function picks up the new routing at the next connection without any restart.</p>
 
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: Resource Governor workload group assignment
@@ -487,18 +470,18 @@ class ClassificationState:
         return self.candidate_streak &gt;= hysteresis_periods
 
 class ReclassificationAgent:
-    def __init__(self, classifier_url: str, pg_dsn: str,
+    def __init__(self, classifier_url: str, mssql_dsn: str,
                  scoring_interval_sec: int = 60,
                  hysteresis_periods: int = 3):
         self.classifier_url  = classifier_url
-        self.pg_dsn          = pg_dsn
+        self.mssql_dsn       = mssql_dsn
         self.interval        = scoring_interval_sec
         self.hysteresis      = hysteresis_periods
         self.states: dict[str, ClassificationState] = {}
 
     def run(self):
-        import requests, psycopg2
-        conn = psycopg2.connect(self.pg_dsn)
+        import requests, pyodbc
+        conn = pyodbc.connect(self.mssql_dsn)
         while True:
             features = self._fetch_features(conn)
             if not features:
@@ -547,8 +530,8 @@ class ReclassificationAgent:
     def _apply_routing(self, conn, query_id: str, workload_class: str):
         with conn.cursor() as cur:
             cur.execute(
-                "CALL assign_workload_resource_group(%s, %s)",
-                (int(query_id), workload_class)
+                "EXEC dbo.assign_workload_resource_group @query_id = ?, @workload_class = ?",
+                int(query_id), workload_class
             )
         conn.commit()
 
@@ -556,20 +539,18 @@ class ReclassificationAgent:
                                      old_class: str, new_class: str):
         with conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO workload_reclassification_log
+                INSERT INTO dbo.workload_reclassification_log
                     (query_id, old_class, new_class, event_time)
-                VALUES (%s, %s, %s, now())
-            """, (int(query_id), old_class, new_class))
+                VALUES (?, ?, ?, SYSUTCDATETIME())
+            """, int(query_id), old_class, new_class)
         conn.commit()
 
     def _fetch_features(self, conn) -&gt; list:
-        # Fetch from Redis or directly from pg_stat_statements
+        # Fetch from Redis or directly from Query Store
         # Returns list of {query_id, features: {...}} dicts
         pass</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Three consecutive scoring intervals — with a 60-second default interval — means a reclassification event must persist for three minutes before action is taken. This eliminates transient noise while still responding to genuine workload character changes within a few minutes.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">15.5 Concept Drift Detection and Model Refresh</h3>
 
@@ -773,105 +754,91 @@ def retrain_classifier(
 
     return new_model</code></pre>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">15.6 Workload Fingerprinting for Query Plan Stability</h3>
 
 <p class="text-gray-300 leading-relaxed">Classification labels serve a second purpose beyond resource allocation: they anchor query plan stability enforcement. A query classified as OLTP_POINT should never suddenly acquire a parallel plan or a hash join it did not have before — such changes are almost always regressions for this workload type. An ANALYTICAL query, conversely, should be allowed — encouraged — to use new parallel strategies as the optimizer sees them.</p>
 
 <p class="text-gray-300 leading-relaxed">This insight leads to class-specific plan enforcement policies:</p>
 
-<p class="text-gray-300 leading-relaxed">| Workload Class | Plan Enforcement Policy |</p>
-<p class="text-gray-300 leading-relaxed">|---|---|</p>
-<p class="text-gray-300 leading-relaxed">| OLTP_POINT | Freeze plan on first stable execution; force via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_hint_plan</code> or SQL Server plan guide |</p>
-<p class="text-gray-300 leading-relaxed">| OLTP_MODERATE | Soft lock: alert on plan change, auto-test new plan before promoting |</p>
-<p class="text-gray-300 leading-relaxed">| ANALYTICAL | No plan locking; allow optimizer freedom; monitor regression by execution time |</p>
-<p class="text-gray-300 leading-relaxed">| BATCH_ETL | Lock to validated plan for each ETL step; rebuild plan on schema changes |</p>
-<p class="text-gray-300 leading-relaxed">| MAINTENANCE | No plan management; use default optimizer behavior |</p>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL: Plan Fingerprinting and Stability Monitoring</strong></p>
+<div class="my-6 overflow-x-auto"><table class="w-full text-sm text-gray-300"><thead><tr class="border-b border-gray-700"><th class="text-left py-2 pr-4 text-white">Workload Class</th><th class="text-left py-2 text-white">Plan Enforcement Policy</th></tr></thead><tbody><tr class="border-b border-gray-800"><td class="py-2 pr-4 font-medium text-white">OLTP_POINT</td><td class="py-2">Freeze plan on first stable execution; force via SQL Server plan guide or Query Store plan forcing</td></tr><tr class="border-b border-gray-800"><td class="py-2 pr-4 font-medium text-white">OLTP_MODERATE</td><td class="py-2">Soft lock: alert on plan change, auto-test new plan before promoting</td></tr><tr class="border-b border-gray-800"><td class="py-2 pr-4 font-medium text-white">ANALYTICAL</td><td class="py-2">No plan locking; allow optimizer freedom; monitor regression by execution time</td></tr><tr class="border-b border-gray-800"><td class="py-2 pr-4 font-medium text-white">BATCH_ETL</td><td class="py-2">Lock to validated plan for each ETL step; rebuild plan on schema changes</td></tr><tr class="border-b border-gray-800"><td class="py-2 pr-4 font-medium text-white">MAINTENANCE</td><td class="py-2">No plan management; use default optimizer behavior</td></tr></tbody></table></div><p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server: Plan Fingerprinting and Stability Monitoring</strong></p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Track plan stability per query class
-CREATE TABLE IF NOT EXISTS query_plan_registry (
-    query_id          BIGINT        NOT NULL,
-    workload_class    TEXT          NOT NULL,
-    plan_hash         TEXT          NOT NULL,  -- MD5 of normalized plan JSON
-    plan_json         JSONB         NOT NULL,
-    first_seen        TIMESTAMPTZ   NOT NULL DEFAULT now(),
-    last_seen         TIMESTAMPTZ   NOT NULL DEFAULT now(),
-    execution_count   BIGINT        NOT NULL DEFAULT 1,
-    avg_exec_ms       FLOAT         NOT NULL,
-    is_locked         BOOLEAN       NOT NULL DEFAULT FALSE,
-    PRIMARY KEY (query_id, plan_hash)
+CREATE TABLE dbo.query_plan_registry (
+    query_id        INT            NOT NULL,
+    workload_class  NVARCHAR(32)   NOT NULL,
+    plan_hash       BINARY(8)      NOT NULL,  -- query_plan_hash from Query Store
+    first_seen      DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME(),
+    last_seen       DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME(),
+    execution_count BIGINT         NOT NULL DEFAULT 1,
+    avg_exec_ms     FLOAT          NOT NULL,
+    is_locked       BIT            NOT NULL DEFAULT 0,
+    CONSTRAINT PK_query_plan_registry PRIMARY KEY (query_id, plan_hash)
 );
+GO
 
--- Procedure called by the classification agent when a new plan hash
+-- Called by the classification agent when a new plan hash
 -- is observed for a locked query
-CREATE OR REPLACE PROCEDURE handle_plan_change(
-    p_query_id     BIGINT,
-    p_new_plan_hash TEXT,
-    p_new_plan_json JSONB,
-    p_avg_exec_ms   FLOAT
-)
-LANGUAGE plpgsql AS $$
-DECLARE
-    v_class          TEXT;
-    v_locked_plan    TEXT;
-    v_locked_exec_ms FLOAT;
-    v_regression_pct FLOAT;
+CREATE OR ALTER PROCEDURE dbo.handle_plan_change
+    @query_id       INT,
+    @new_plan_hash  BINARY(8),
+    @avg_exec_ms    FLOAT
+AS
 BEGIN
-    SELECT workload_class, plan_hash, avg_exec_ms
-    INTO   v_class, v_locked_plan, v_locked_exec_ms
-    FROM   query_plan_registry
-    WHERE  query_id = p_query_id
-      AND  is_locked = TRUE
-    LIMIT 1;
+    SET NOCOUNT ON;
 
-    IF NOT FOUND THEN
+    DECLARE @class NVARCHAR(32), @locked_plan BINARY(8),
+            @locked_exec_ms FLOAT, @regression_pct FLOAT;
+
+    SELECT @class = workload_class, @locked_plan = plan_hash,
+           @locked_exec_ms = avg_exec_ms
+    FROM dbo.query_plan_registry
+    WHERE query_id = @query_id AND is_locked = 1;
+
+    IF @@ROWCOUNT = 0
+    BEGIN
         -- No locked plan yet; record this as baseline
-        INSERT INTO query_plan_registry
-            (query_id, workload_class, plan_hash, plan_json, avg_exec_ms, is_locked)
-        SELECT p_query_id, workload_class, p_new_plan_hash,
-               p_new_plan_json, p_avg_exec_ms,
-               workload_class IN ('OLTP_POINT', 'BATCH_ETL')
-        FROM   workload_routing_map
-        WHERE  query_id = p_query_id
-        ON CONFLICT DO NOTHING;
+        INSERT INTO dbo.query_plan_registry
+            (query_id, workload_class, plan_hash, avg_exec_ms, is_locked)
+        SELECT @query_id, workload_class, @new_plan_hash, @avg_exec_ms,
+               CASE WHEN workload_class IN (N'OLTP_POINT', N'BATCH_ETL')
+                    THEN 1 ELSE 0 END
+        FROM dbo.workload_routing_map
+        WHERE query_id = @query_id;
         RETURN;
-    END IF;
+    END;
 
-    -- If plan changed on a locked class, evaluate regression
-    IF v_locked_plan &lt;&gt; p_new_plan_hash THEN
-        v_regression_pct := (p_avg_exec_ms - v_locked_exec_ms)
-                            / NULLIF(v_locked_exec_ms, 0) * 100;
+    -- If the plan changed on a locked class, evaluate the regression
+    IF @locked_plan &lt;&gt; @new_plan_hash
+    BEGIN
+        SET @regression_pct = (@avg_exec_ms - @locked_exec_ms)
+                              / NULLIF(@locked_exec_ms, 0) * 100;
 
-        INSERT INTO plan_change_alerts
+        INSERT INTO dbo.plan_change_alerts
             (query_id, workload_class, old_plan_hash, new_plan_hash,
              old_exec_ms, new_exec_ms, regression_pct, detected_at)
         VALUES
-            (p_query_id, v_class, v_locked_plan, p_new_plan_hash,
-             v_locked_exec_ms, p_avg_exec_ms, v_regression_pct, now());
+            (@query_id, @class, @locked_plan, @new_plan_hash,
+             @locked_exec_ms, @avg_exec_ms, @regression_pct, SYSUTCDATETIME());
 
-        -- For OLTP_POINT: immediately flag for plan forcing
-        -- The orchestration layer will apply pg_hint_plan override
-        IF v_class = 'OLTP_POINT' AND v_regression_pct &gt; 10 THEN
-            UPDATE query_plan_registry
-            SET    last_seen = now()
-            WHERE  query_id  = p_query_id
-              AND  plan_hash = v_locked_plan;
+        -- For OLTP_POINT: flag for plan forcing via the locked plan hash.
+        -- The orchestration layer forces the known-good plan through
+        -- sys.sp_query_store_force_plan.
+        IF @class = N'OLTP_POINT' AND @regression_pct &gt; 10
+        BEGIN
+            UPDATE dbo.query_plan_registry
+            SET last_seen = SYSUTCDATETIME()
+            WHERE query_id = @query_id AND plan_hash = @locked_plan;
 
-            -- Signal orchestration agent to force the locked plan
-            PERFORM pg_notify('plan_regression',
-                json_build_object(
-                    'query_id',   p_query_id,
-                    'plan_hash',  v_locked_plan,
-                    'regression', v_regression_pct
-                )::text
-            );
-        END IF;
-    END IF;
+            INSERT INTO dbo.autonomous_actions_log
+                (action_type, query_id, detail, performed_at)
+            VALUES
+                ('PLAN_FORCE_REQUESTED', @query_id,
+                 'Force locked plan hash for regressed OLTP_POINT query',
+                 SYSUTCDATETIME());
+        END;
+    END;
 END;
-$$;</code></pre>
+GO</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server: Plan Guide Automation</strong></p>
 
@@ -885,7 +852,7 @@ AS
 BEGIN
     SET NOCOUNT ON;
 
-    DECLARE @guide_name NVARCHAR(256) = N'PG_AUTO_' + CAST(@query_id AS NVARCHAR);
+    DECLARE @guide_name NVARCHAR(256) = N'ADE_AUTO_' + CAST(@query_id AS NVARCHAR);
     DECLARE @hints      NVARCHAR(MAX);
 
     -- Extract USE PLAN hint XML from the plan handle
@@ -917,8 +884,6 @@ END;
 GO</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The plan guide enforcement path completes the feedback loop: the classifier identifies a query's workload class, the plan registry tracks its execution plan history, and when a regression is detected on a locked class, the autonomous agent restores the known-good plan without waiting for DBA intervention.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">15.7 Observability: Making the Classification System Legible</h3>
 
@@ -959,8 +924,8 @@ GROUP BY
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Reclassification history and audit trail</strong> — DBAs need to see the timeline of classification changes for any query and the reason each change was made. This is both an operational tool and an audit record for compliance environments where resource policy decisions must be explainable.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: Reclassification history with feature deltas
-CREATE OR ALTER VIEW workload_reclassification_history AS
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Reclassification history with feature deltas
+CREATE OR ALTER VIEW dbo.workload_reclassification_history AS
 SELECT
     rl.query_id,
     rl.old_class,
@@ -970,28 +935,28 @@ SELECT
     ce_new.top_features                              AS features_at_change,
     ce_new.confidence                                AS confidence_at_change,
     -- Time in previous class
-    rl.event_time - LAG(rl.event_time) OVER
-        (PARTITION BY rl.query_id ORDER BY rl.event_time) AS time_in_prior_class
-FROM workload_reclassification_log rl
-LEFT JOIN classification_explanations ce_new
+    DATEDIFF(SECOND,
+        LAG(rl.event_time) OVER
+            (PARTITION BY rl.query_id ORDER BY rl.event_time),
+        rl.event_time)                               AS seconds_in_prior_class
+FROM dbo.workload_reclassification_log rl
+LEFT JOIN dbo.classification_explanations ce_new
     ON rl.query_id = ce_new.query_id
-ORDER BY rl.event_time DESC;</code></pre>
+</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The three observability layers — current classification state, feature explanations, and reclassification history — together provide the operational transparency required for DBAs to trust the autonomous system. When something unexpected occurs, the first question — "why did this query get classified as ANALYTICAL?" — has an immediate, data-backed answer in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">classification_explanations</code>. The second question — "when did that change, and what triggered it?" — is answered by <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">workload_reclassification_history</code>.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Workload classification requires behavioral fingerprints, not just resource metrics.** Features like result compression ratio, temporal burst coefficient, write amplification, and plan instability carry far more discriminative signal than raw CPU or memory consumption figures. Extracting these features from `pg_stat_statements` and Query Store requires derived computation, not direct column reads.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Workload classification requires behavioral fingerprints, not just resource metrics.</strong> Features like result compression ratio, temporal burst coefficient, write amplification, and plan instability carry far more discriminative signal than raw CPU or memory consumption figures. Extracting these features from Query Store requires derived computation, not direct column reads.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **A five-class taxonomy — OLTP_POINT, OLTP_MODERATE, ANALYTICAL, BATCH_ETL, MAINTENANCE — is sufficient to drive all meaningful autonomous control decisions,** including connection pool routing, resource group assignment, query timeout policy, and plan stability enforcement. Finer-grained taxonomies introduce instability without corresponding control benefit.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">A five-class taxonomy — OLTP_POINT, OLTP_MODERATE, ANALYTICAL, BATCH_ETL, MAINTENANCE — is sufficient to drive all meaningful autonomous control decisions,</strong> including connection pool routing, resource group assignment, query timeout policy, and plan stability enforcement. Finer-grained taxonomies introduce instability without corresponding control benefit.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Hysteresis filtering is non-negotiable in reclassification pipelines.** Acting on every classification signal change causes resource thrashing that is more harmful than a slightly stale classification. Requiring three consecutive scoring intervals of agreement before committing a reclassification balances responsiveness against stability.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Hysteresis filtering is non-negotiable in reclassification pipelines.</strong> Acting on every classification signal change causes resource thrashing that is more harmful than a slightly stale classification. Requiring three consecutive scoring intervals of agreement before committing a reclassification balances responsiveness against stability.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Concept drift degrades classifiers silently.** Monitoring the Population Stability Index across all input features and the confidence score distribution of model outputs provides early warning of drift before misclassifications accumulate to operational impact. Semi-supervised pseudo-labeling with a high confidence gate (≥ 0.85) allows continuous model adaptation without requiring ongoing human annotation effort.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Concept drift degrades classifiers silently.</strong> Monitoring the Population Stability Index across all input features and the confidence score distribution of model outputs provides early warning of drift before misclassifications accumulate to operational impact. Semi-supervised pseudo-labeling with a high confidence gate (≥ 0.85) allows continuous model adaptation without requiring ongoing human annotation effort.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Autonomous classification systems require layered observability to earn operational trust.** The classification decision itself, the feature contributions that drove it, and the full reclassification history for each query must all be queryable in real time. Without this transparency, operations teams will override or disable the system at the first unexpected outcome, defeating the purpose of autonomy.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Autonomous classification systems require layered observability to earn operational trust.</strong> The classification decision itself, the feature contributions that drove it, and the full reclassification history for each query must all be queryable in real time. Without this transparency, operations teams will override or disable the system at the first unexpected outcome, defeating the purpose of autonomy.</li>
     </div>
     <div class="mt-14 bg-emerald-950/40 border border-emerald-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">

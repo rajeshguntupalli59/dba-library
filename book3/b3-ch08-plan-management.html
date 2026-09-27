@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Chapter 8: Autonomous Execution Plan Management — The ADE Handbook</title>
-  <meta name="description" content="The ADE Handbook Chapter 8: Autonomous Execution Plan Management. Autonomous database engineering for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
+  <meta name="description" content="The ADE Handbook Chapter 8: Autonomous Execution Plan Management. Autonomous database engineering for SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
   <script type="module">
     import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
@@ -45,17 +45,15 @@
 
 <p class="text-gray-300 leading-relaxed">Query execution plans are the contracts between your application's intent and the database engine's physical execution strategy. When those contracts degrade — through statistics drift, parameter sensitivity, schema evolution, or optimizer regressions introduced by version upgrades — performance collapses in ways that are rarely caught by traditional monitoring until users are already impacted. An autonomous execution plan management system detects plan instability before it manifests as user-visible latency, evaluates candidate plans against production workloads, promotes or pins the best-performing plan, and rolls back regressions — all without a DBA touching a keyboard. This chapter constructs that system in full, covering the detection infrastructure, the decision engine, the execution and feedback loop, and the production patterns that make it safe to run unsupervised in regulated, high-traffic environments.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">8.1 Anatomy of Plan Instability: What the Autonomous System Must Observe</h3>
 
 <p class="text-gray-300 leading-relaxed">Before automation can act, it must observe the right signals. Plan instability does not always announce itself as a slow query. More often it presents as variance — the same query running in 8ms one minute and 800ms the next. The autonomous system must distinguish between three categories of instability that require different responses.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Regression</strong> is the simplest case: a plan that was stable is replaced by a worse plan. This happens when statistics are stale, when a new index is created and the optimizer picks it incorrectly, or when a minor schema change shifts cardinality estimates past a threshold that flips a join strategy from nested loop to hash join with the wrong side as the build input.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Parameter sensitivity</strong> (also called parameter sniffing in SQL Server, or the analogous plan cache pollution in PostgreSQL's prepared statement protocol) describes a plan compiled for one parameter value that performs poorly for a different distribution. A stored procedure compiled on a date range of one day serves a query asking for three months of data with the same nested loop plan — and collapses.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Parameter sensitivity</strong> (parameter sniffing) describes a plan compiled for one parameter value that performs poorly for a different distribution. A stored procedure compiled on a date range of one day serves a query asking for three months of data with the same nested loop plan — and collapses.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Optimizer regression</strong> occurs during version upgrades. PostgreSQL 15 to 16 may change the cost model for parallel hash join. SQL Server CU updates regularly adjust cardinality estimator behavior. A plan that was correct under the prior optimizer model becomes wrong under the new one without any data or schema change.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Optimizer regression</strong> occurs during version upgrades. SQL Server cumulative updates regularly adjust cardinality estimator behavior. A plan that was correct under the prior optimizer model becomes wrong under the new one without any data or schema change.</p>
 
 <p class="text-gray-300 leading-relaxed">The observability infrastructure must capture plan identifiers, execution statistics, and plan text at a granularity that makes these three categories distinguishable.</p>
 
@@ -80,56 +78,19 @@ ORDER BY avg_elapsed_us DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The coefficient of variation (stddev/mean) and the volatility ratio (max/avg elapsed) are your primary instability signals. A CV above 1.5 or a volatility ratio above 3.0 flags a query as a candidate for automated plan investigation. These thresholds are calibrated starting points — your production system will tune them over time based on false-positive rates in your workload.</p>
 
-<p class="text-gray-300 leading-relaxed">For PostgreSQL, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> gives you aggregate statistics but not plan-level differentiation. To get plan-level tracking, you need <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">auto_explain</code> for sampling and a custom collection table, or the commercial <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_store_plans</code> extension. For SQL Server, the Query Store provides the full plan-per-query-hash history that makes plan-level analysis native.</p>
+<p class="text-gray-300 leading-relaxed">For SQL Server, the Query Store provides the full plan-per-query-hash history that makes plan-level analysis native — no extensions or custom collection tables are required.</p>
 
 <p class="text-gray-300 leading-relaxed">The autonomous collector runs this detection query on a configurable interval — typically every five minutes for OLTP systems — and writes results to a plan instability log table. This table is the input queue for the decision engine described in section 8.3.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">8.2 Plan Baseline Architecture: Building the Ground Truth Store</h3>
 
 <p class="text-gray-300 leading-relaxed">An autonomous plan management system needs a reference point — a "known good" state to measure against and to roll back to. This is the plan baseline. The architecture of your baseline store determines what the automation can do: a shallow baseline supports only regression detection, while a deep baseline with execution context supports full plan pinning, forced plan rotation, and A/B evaluation.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL baseline store using <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_hint_plan</code> and a custom schema:</strong></p>
+<p class="text-gray-300 leading-relaxed">The autonomous baseline store is a thin management layer on top of Query Store — the forcing mechanism itself is native, so the overlay only needs to track which plans were forced, when, why, and what the performance outcome was.</p>
 
-<p class="text-gray-300 leading-relaxed">The PostgreSQL optimizer does not have a native plan forcing mechanism equivalent to SQL Server's Query Store forced plans. The production pattern uses <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_hint_plan</code>, which intercepts queries and injects optimizer hints before planning. The baseline store must therefore persist both the plan description and the hint string required to reproduce it.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Baseline store built on Query Store forced plans:</strong></p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Schema for the PostgreSQL autonomous plan baseline
-CREATE SCHEMA IF NOT EXISTS ade_plan_mgmt;
-
-CREATE TABLE ade_plan_mgmt.plan_baselines (
-    baseline_id         BIGSERIAL PRIMARY KEY,
-    queryid             BIGINT NOT NULL,           -- from pg_stat_statements
-    query_fingerprint   TEXT NOT NULL,             -- normalized query text
-    hint_string         TEXT NOT NULL,             -- pg_hint_plan compatible hint
-    plan_json           JSONB NOT NULL,            -- EXPLAIN (FORMAT JSON) output
-    captured_at         TIMESTAMPTZ DEFAULT now(),
-    last_validated_at   TIMESTAMPTZ,
-    mean_exec_time_ms   NUMERIC(12,3),
-    validation_count    INTEGER DEFAULT 0,
-    status              TEXT DEFAULT 'candidate'   -- candidate | accepted | rejected | pinned
-        CHECK (status IN ('candidate','accepted','rejected','pinned')),
-    promoted_by         TEXT,                      -- 'autonomous' | 'manual'
-    notes               TEXT
-);
-
-CREATE INDEX ON ade_plan_mgmt.plan_baselines (queryid, status);
-CREATE INDEX ON ade_plan_mgmt.plan_baselines (captured_at);
-
--- Execution history for trend analysis
-CREATE TABLE ade_plan_mgmt.plan_execution_log (
-    log_id          BIGSERIAL PRIMARY KEY,
-    baseline_id     BIGINT REFERENCES ade_plan_mgmt.plan_baselines(baseline_id),
-    observed_at     TIMESTAMPTZ DEFAULT now(),
-    exec_time_ms    NUMERIC(12,3),
-    rows_returned   BIGINT,
-    buffers_hit     BIGINT,
-    buffers_read    BIGINT
-);</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server baseline using Query Store forced plans:</strong></p>
-
-<p class="text-gray-300 leading-relaxed">SQL Server's Query Store provides a native plan forcing mechanism. The autonomous system's baseline store is a thin management layer on top of Query Store — it tracks which plans were forced, when, why, and what the performance outcome was.</p>
+<p class="text-gray-300 leading-relaxed">The overlay below is the only custom schema required:</p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Autonomous plan management overlay for Query Store
 CREATE TABLE dbo.ade_plan_baselines (
@@ -165,16 +126,19 @@ CREATE INDEX IX_ade_plan_baselines_queryid
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>EXEC sys.sp_query_store_force_plan @query_id = ?, @plan_id = ?;</code></pre>
 
-<p class="text-gray-300 leading-relaxed">For PostgreSQL, the automation writes the hint string into the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_hint_plan.hint_plan</code> table at plan promotion time:</p>
+<p class="text-gray-300 leading-relaxed">At plan promotion time, the automation forces the accepted plan in Query Store and records the decision in the overlay table:</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>INSERT INTO hint_plan.hints (norm_query_string, application_name, hints)
-VALUES (?, '', ?)
-ON CONFLICT (norm_query_string, application_name)
-DO UPDATE SET hints = EXCLUDED.hints;</code></pre>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Promotion: force the validated plan, then audit the decision
+EXEC sys.sp_query_store_force_plan @query_id = @query_id, @plan_id = @plan_id;
 
-<p class="text-gray-300 leading-relaxed">The baseline store also integrates with your version control system. Each promotion event generates a migration record — the hint string or forced plan identifier — that can be tracked in Git alongside schema changes. This audit trail is non-negotiable in regulated environments.</p>
+INSERT INTO dbo.ade_plan_baselines
+    (query_id, plan_id, query_hash, query_sql_text, avg_duration_us,
+     force_status, forced_by, regression_threshold_pct, notes)
+VALUES
+    (@query_id, @plan_id, @query_hash, @query_text, @avg_duration_us,
+     'forced', 'autonomous', 20, @rationale);</code></pre>
 
-<p class="text-gray-300 leading-relaxed">---</p>
+<p class="text-gray-300 leading-relaxed">The baseline store also integrates with your version control system. Each promotion event generates a migration record — the forced plan identifier and rationale — that can be tracked in Git alongside schema changes. This audit trail is non-negotiable in regulated environments.</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">8.3 The Autonomous Decision Engine: From Signal to Action</h3>
 
@@ -186,14 +150,13 @@ DO UPDATE SET hints = EXCLUDED.hints;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Instability rule</strong>: If the coefficient of variation exceeds the configured threshold for a query with no pinned plan, capture the current plan as a candidate baseline during the next clean performance window (CV < 0.3 and mean time within 10% of 30-day low).</p>
 
-<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Validation rule</strong>: Before promoting a candidate to accepted, the engine generates a EXPLAIN ANALYZE (PostgreSQL) or SET STATISTICS TIME ON (SQL Server) against a read replica with production-representative data and records the measured execution time.</p>
+<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Validation rule</strong>: Before promoting a candidate to accepted, the engine runs it with SET STATISTICS TIME, IO ON against a readable secondary with production-representative data and records the measured execution time.</p>
 
 <p class="text-gray-300 leading-relaxed">4. <strong class="text-white">Escalation rule</strong>: Any action that would affect a query running more than 500 times per second, or any query touching more than 10 tables, requires human confirmation before proceeding. The system opens a Slack/PagerDuty alert and waits up to 4 hours before timing out and escalating to critical.</p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Autonomous plan decision engine — core evaluation loop
 # Runs as a scheduled task every 5 minutes (Kubernetes CronJob or systemd timer)
 
-import psycopg2
 import pyodbc
 import json
 import logging
@@ -286,8 +249,7 @@ def dispatch_action(action: PlanAction, signal: QuerySignal,
     logger.info(f"QueryID {signal.queryid}: {action.value} — {rationale}")
 
     if action == PlanAction.FORCE_EXISTING_BASELINE:
-        # For SQL Server: sp_query_store_force_plan
-        # For PostgreSQL: update hint_plan.hints
+        # SQL Server: sp_query_store_force_plan via force_plan()
         force_plan(signal.queryid, signal.pinned_plan_id, db_conn)
         log_action_audit(signal.queryid, action, rationale, db_conn)
 
@@ -305,8 +267,6 @@ def dispatch_action(action: PlanAction, signal: QuerySignal,
 
 <p class="text-gray-300 leading-relaxed">The decision engine is intentionally stateless between runs — all context comes from the database tables. This means it can be restarted, replaced, or scaled horizontally without losing decision continuity. The audit log table records every evaluation, the signal values at decision time, the action taken, and the outcome measured on the next evaluation cycle. This retrospective data is what you use to tune thresholds.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">8.4 Plan Validation Before Promotion: The Shadow Execution Framework</h3>
 
 <p class="text-gray-300 leading-relaxed">Autonomous systems that force execution plans without validating them first will cause outages. The validation framework is the safety net between the decision engine's recommendation and the actual plan forcing action. It runs candidate plans against production-representative data in a controlled environment before they advance to accepted status.</p>
@@ -315,7 +275,7 @@ def dispatch_action(action: PlanAction, signal: QuerySignal,
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Setting up the validation environment:</strong></p>
 
-<p class="text-gray-300 leading-relaxed">For PostgreSQL, the validation target is a streaming replica with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">hot_standby = on</code>. The automation connects to the replica, runs <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)</code> with the candidate hint applied, and records the actual execution metrics. This gives you real statistics and real data distributions without risk to production.</p>
+<p class="text-gray-300 leading-relaxed">The validation target is a readable secondary in the availability group. The automation connects to the secondary, runs the candidate workload with SET STATISTICS TIME, IO ON, captures the actual execution plan, and records the real execution metrics. This gives you real statistics and real data distributions without risk to the primary.</p>
 
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Validation via USE PLAN hint with Query Store plan XML
@@ -391,8 +351,6 @@ def evaluate_candidate_plan(
 
 <p class="text-gray-300 leading-relaxed">The shadow execution framework should also run continuously against accepted baselines — not just candidates — on a weekly cycle. Statistics drift can make yesterday's validated baseline wrong for today's data distribution. Baselines that fail re-validation are demoted to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">candidate</code> status automatically, and a new capture cycle begins.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">8.5 Regression Rollback Automation: Closing the Control Loop</h3>
 
 <p class="text-gray-300 leading-relaxed">A plan management system that only detects regressions without acting on them is a monitoring system. The autonomous system closes the control loop by executing rollbacks without waiting for human intervention. This section describes the rollback execution path, the safeguards that prevent rollback cascades, and the feedback mechanism that makes each rollback event improve the system's future decisions.</p>
@@ -441,34 +399,30 @@ BEGIN
     VALUES (@query_id, @plan_id, 'FORCE_PLAN', @reason, SYSUTCDATETIME());
 END</code></pre>
 
-<p class="text-gray-300 leading-relaxed">For PostgreSQL, the equivalent rollback is a hint-table update rather than a native plan-forcing call, since PostgreSQL has no built-in forced-plan mechanism:</p>
+<p class="text-gray-300 leading-relaxed">Rollback is a native Query Store operation: unforcing the plan returns the optimizer to free choice, and the overlay records the reversal:</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Autonomous rollback: reinstate the accepted baseline hint string
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Autonomous rollback: unforce the regressed plan
 -- Called by the decision engine when the regression rule fires
-UPDATE ade_plan_mgmt.plan_baselines
-SET status = 'pinned',
-    promoted_by = 'autonomous',
-    last_validated_at = now()
-WHERE queryid = $1
-  AND status = 'accepted';
+EXEC sys.sp_query_store_unforce_plan @query_id = @query_id, @plan_id = @plan_id;
 
-INSERT INTO hint_plan.hints (norm_query_string, application_name, hints)
-SELECT query_fingerprint, '', hint_string
-FROM ade_plan_mgmt.plan_baselines
-WHERE queryid = $1 AND status = 'pinned'
-ON CONFLICT (norm_query_string, application_name)
-DO UPDATE SET hints = EXCLUDED.hints;</code></pre>
+UPDATE dbo.ade_plan_baselines
+SET force_status = 'retired',
+    notes = CONCAT('Rolled back: ', @reason)
+WHERE query_id = @query_id
+  AND plan_id = @plan_id
+  AND force_status = 'forced';
+
+INSERT INTO dbo.ade_plan_action_log (query_id, plan_id, action, reason, acted_at)
+VALUES (@query_id, @plan_id, 'UNFORCE_PLAN', @reason, SYSUTCDATETIME());</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Rollback cascade prevention</strong> is the safeguard that keeps this loop from oscillating. If a forced plan itself starts regressing — because the underlying data distribution has shifted again — the naive response would be to force yet another plan, and potentially flip back and forth indefinitely as conditions change. The autonomous system enforces a cooldown: once a plan is forced, no further forcing action is taken for that query for a minimum window (typically one hour), and if a second regression is detected within 24 hours of a prior force, the action escalates to human review instead of forcing again automatically. Two autonomous corrections in one day on the same query is treated as evidence that the underlying cause is not a simple plan flip but something the decision policy doesn't understand yet.</p>
 
 <p class="text-gray-300 leading-relaxed">The feedback mechanism records every rollback's outcome — did execution time actually return to baseline after the force? — back into the audit log. This closes the loop: a decision engine that forces a plan and never checks whether it worked is not meaningfully different from a human who guesses and walks away.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Plan instability falls into three distinguishable categories — regression, parameter sensitivity, and optimizer-version regression — and the observability layer must capture enough plan-level detail (via Query Store on SQL Server, or `auto_explain`/plan-tracking extensions on PostgreSQL) to tell them apart before any automated action fires.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> A plan baseline store with an explicit state machine (candidate → accepted → pinned) prevents the system from forcing a plan that was only ever observed once under favorable conditions; SQL Server implements forcing natively via Query Store, PostgreSQL requires `pg_hint_plan` and a custom hint-table overlay.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Plan instability falls into three distinguishable categories — regression, parameter sensitivity, and optimizer-version regression — and the observability layer must capture enough plan-level detail (via Query Store) to tell them apart before any automated action fires.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> A plan baseline store with an explicit state machine (candidate → accepted → pinned) prevents the system from forcing a plan that was only ever observed once under favorable conditions; forcing is implemented natively via Query Store's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sp_query_store_force_plan</code>.</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> The decision engine's policy rules must be explicit, ordered, and auditable — regression detection, instability capture, pre-promotion validation, and escalation thresholds for high-frequency or structurally complex queries — because implicit logic cannot be reviewed or trusted in production.</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> No candidate plan should be promoted without shadow validation against production-representative data and a real statistical test (not just an eyeballed percentage difference); a plan that is merely equivalent to the current one should be rejected, since any plan change carries operational risk without corresponding benefit.</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Rollback automation needs its own safeguard against oscillation: a cooldown window after forcing a plan, and escalation to human review if the same query regresses again shortly after a prior autonomous correction, rather than repeatedly re-forcing plans in response to a cause the system doesn't understand.</li>

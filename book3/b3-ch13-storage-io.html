@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Chapter 13: Self-Optimizing Storage and I/O — The ADE Handbook</title>
-  <meta name="description" content="The ADE Handbook Chapter 13: Self-Optimizing Storage and I/O. Autonomous database engineering for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
+  <meta name="description" content="The ADE Handbook Chapter 13: Self-Optimizing Storage and I/O. Autonomous database engineering for SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
   <script type="module">
     import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
@@ -45,11 +45,9 @@
 
 <p class="text-gray-300 leading-relaxed">Storage is where autonomous database engineering gets physical. Query optimizers, connection poolers, and caching layers all operate in memory and CPU — but eventually, every read and write touches a storage medium, and the behavior of that medium under load determines whether your system survives a crisis or collapses under it. The systems examined in this chapter don't wait for a storage bottleneck to appear on a dashboard. They continuously monitor I/O saturation, file system layout, tablespace utilization, buffer hit ratios, and write amplification — then act. They move hot data closer to compute, tier cold data to cheaper media, rebalance writes across devices, and restructure on-disk layout without a human ever opening a terminal. This is autonomous storage management: a discipline that sits at the intersection of operating system I/O scheduling, database internals, and feedback-driven automation.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Instrumentation Architecture: Building the I/O Observability Layer</h3>
 
-<p class="text-gray-300 leading-relaxed">No autonomous action is sound without high-fidelity data. Before a system can self-optimize storage, it must build a complete picture of where I/O time is actually going — across PostgreSQL's background writer, checkpointer, and WAL writer, or SQL Server's I/O completion ports, VDI subsystem, and filegroup allocation patterns.</p>
+<p class="text-gray-300 leading-relaxed">No autonomous action is sound without high-fidelity data. Before a system can self-optimize storage, it must build a complete picture of where I/O time is actually going — across SQL Server's I/O completion ports, VDI subsystem, and filegroup allocation patterns.</p>
 
 <p class="text-gray-300 leading-relaxed">The observability layer must collect at three levels simultaneously: the OS block device level, the database engine level, and the logical object level. Conflating these three creates misleading signals. A table with poor sequential scan performance might be fine at the block device level but suffering from heap fragmentation. A WAL device might show 95% utilization while the data device sits idle — indicating checkpoint tuning as the correct intervention, not storage provisioning.</p>
 
@@ -80,51 +78,72 @@ ORDER BY vfs.io_stall DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">These queries feed a time-series collection loop. In production, a Python agent runs on each database host at 15-second intervals, writing delta values (not cumulative totals) to a Prometheus Pushgateway. The delta calculation is important — raw cumulative counters are useless for detecting transient I/O spikes that resolve within a scrape window.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import psycopg2
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import pyodbc
 import time
 import requests
-from datetime import datetime
 
 PUSHGATEWAY_URL = "http://prometheus-pushgateway:9091"
 SCRAPE_INTERVAL = 15  # seconds
+MSSQL_DSN = (
+    "DRIVER={ODBC Driver 18 for SQL Server};"
+    "SERVER=sql-primary;DATABASE=master;Trusted_Connection=yes;"
+)
 
 def collect_io_deltas(conn, prev_snapshot):
     cursor = conn.cursor()
     cursor.execute("""
-        SELECT relid, relname, heap_blks_read, heap_blks_hit,
-               idx_blks_read, idx_blks_hit
-        FROM pg_statio_user_tables
+        SELECT
+            DB_NAME(vfs.database_id) AS database_name,
+            mf.physical_name,
+            vfs.num_of_reads,
+            vfs.num_of_writes,
+            vfs.num_of_bytes_read,
+            vfs.num_of_bytes_written,
+            vfs.io_stall_read_ms,
+            vfs.io_stall_write_ms
+        FROM sys.dm_io_virtual_file_stats(NULL, NULL) vfs
+        JOIN sys.master_files mf
+            ON vfs.database_id = mf.database_id
+           AND vfs.file_id     = mf.file_id
     """)
-    current = {row[0]: row for row in cursor.fetchall()}
+    current = {(row[0], row[1]): row for row in cursor.fetchall()}
 
     metrics = []
-    for relid, row in current.items():
-        if relid in prev_snapshot:
-            prev = prev_snapshot[relid]
-            delta_reads = row[2] - prev[2]
-            delta_hits  = row[3] - prev[3]
-            if delta_reads + delta_hits &gt; 0:
-                hit_ratio = delta_hits / (delta_reads + delta_hits)
+    for key, row in current.items():
+        if key in prev_snapshot:
+            prev = prev_snapshot[key]
+            delta_reads  = row[2] - prev[2]
+            delta_writes = row[3] - prev[3]
+            delta_stall  = (row[6] + row[7]) - (prev[6] + prev[7])
+            total_io = delta_reads + delta_writes
+            if total_io &gt; 0:
+                db, phys = key
+                avg_stall = delta_stall / total_io
                 metrics.append(
-                    f'pg_table_buffer_hit_ratio{{relation="{row[1]}"}} {hit_ratio:.4f}'
+                    f'sqlserver_file_io_ops{{database="{db}",file="{phys}"}} {total_io}'
                 )
                 metrics.append(
-                    f'pg_table_blks_read_delta{{relation="{row[1]}"}} {delta_reads}'
+                    f'sqlserver_file_io_stall_ms{{database="{db}",file="{phys}"}} {delta_stall:.0f}'
+                )
+                metrics.append(
+                    f'sqlserver_file_avg_stall_ms{{database="{db}",file="{phys}"}} {avg_stall:.2f}'
                 )
 
     push_metrics(metrics)
     return current
 
 def push_metrics(metrics):
-    payload = "\n".join(metrics) + "\n"
+    payload = "
+".join(metrics) + "
+"
     requests.post(
-        f"{PUSHGATEWAY_URL}/metrics/job/pg_io_agent",
+        f"{PUSHGATEWAY_URL}/metrics/job/sqlserver_io_agent",
         data=payload,
         headers={"Content-Type": "text/plain"}
     )
 
 def run_collector():
-    conn = psycopg2.connect("dbname=postgres user=monitor")
+    conn = pyodbc.connect(MSSQL_DSN)
     snapshot = {}
     while True:
         snapshot = collect_io_deltas(conn, snapshot)
@@ -135,13 +154,11 @@ if __name__ == "__main__":
 
 <p class="text-gray-300 leading-relaxed">At the OS level, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">iostat -x</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">blktrace</code>, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">nvme smart-log</code> provide device-level saturation metrics. These are collected separately and joined to database-level metrics in Grafana using host labels. The full picture — object-level, engine-level, and device-level — is what allows the autonomous decision engine to distinguish between a bad query plan, a full checkpoint storm, and a failing NVMe drive.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">Autonomous Tablespace and Filegroup Rebalancing</h3>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Autonomous Filegroup Rebalancing</h3>
 
 <p class="text-gray-300 leading-relaxed">Once instrumentation is in place, the first class of autonomous action involves routing data to the right storage tier. Production environments routinely have heterogeneous storage: a fast NVMe tier for active working data, a mid-tier SAS or network-attached volume for warm data, and object storage or compressed block storage for cold or archival data. Manual tiering policies degrade over time because access patterns shift — yesterday's cold archive becomes today's compliance reporting target. Autonomous tiering systems react to this drift continuously.</p>
 
-<p class="text-gray-300 leading-relaxed">In PostgreSQL, tablespace-based tiering is the mechanism. Each tablespace maps to a directory on a specific mount point. Tables and indexes can be moved between tablespaces online using <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALTER TABLE ... SET TABLESPACE</code>, which PostgreSQL executes with an <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ACCESS EXCLUSIVE</code> lock — a hard constraint that autonomous systems must work around using maintenance windows or live partition swapping.</p>
+<p class="text-gray-300 leading-relaxed">In SQL Server, filegroup-based tiering is the mechanism. Each filegroup maps to one or more files on specific mount points. Tables and indexes can be moved between filegroups online using <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE INDEX ... WITH (DROP_EXISTING = ON) ON [ColdFilegroup]</code> for clustered indexes, or partition switching for partitioned tables — operations the autonomous system schedules during low-traffic windows when they would contend with active workloads.</p>
 
 <p class="text-gray-300 leading-relaxed">The tiering decision logic follows a straightforward heat score model. For each relation, the system computes a heat score based on recent access frequency, write volume, and age of last modification:</p>
 
@@ -173,110 +190,91 @@ ORDER BY avg_stall_ms_per_op DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The rebalancing agent runs as a Kubernetes CronJob with a configurable schedule. It pulls the heat score analysis from the metrics database, generates a list of recommended moves, applies a safety budget (maximum N GB of data movement per execution window), and issues the appropriate DDL. Completion is logged to an audit table, and the metrics pipeline recalculates heat scores in the next collection cycle.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Checkpoint and Write Amplification Control in SQL Server</h3>
 
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">Checkpoint and Write Amplification Control in PostgreSQL</h3>
+<p class="text-gray-300 leading-relaxed">SQL Server's write path is dominated by the checkpoint process and the lazy writer. Checkpoints flush dirty pages to disk; under automatic checkpoints their frequency is driven by log activity since the last checkpoint, while indirect checkpoints bound recovery time through the per-database target recovery time setting. When checkpoints fire too aggressively, they produce write amplification — the same data being written to disk multiple times unnecessarily — or checkpoint storms: sudden bursts of dirty page flushes that saturate the I/O subsystem and spike latency for every concurrent query.</p>
 
-<p class="text-gray-300 leading-relaxed">PostgreSQL's write path is dominated by three background processes: the WAL writer, the background writer (bgwriter), and the checkpointer. Each of these has tunable parameters that, when set incorrectly, produce write amplification — the same data being written to disk multiple times unnecessarily — or checkpoint storms: sudden bursts of dirty page flushes that saturate the I/O subsystem and spike latency for every concurrent query.</p>
+<p class="text-gray-300 leading-relaxed">An autonomous checkpoint controller observes <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_os_performance_counters</code> (checkpoint pages/sec) and per-database recovery settings continuously, and tunes <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">TARGET_RECOVERY_TIME</code> based on current write load and observed checkpoint duration. The key signal is checkpoint write volume versus I/O stall time from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_io_virtual_file_stats</code>. When checkpoint I/O dominates total write I/O during burst windows, the I/O subsystem is being asked to flush dirty buffers faster than it comfortably can. The correct autonomous response is to raise <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">TARGET_RECOVERY_TIME</code> — spreading dirty-page flushes over a longer interval and trading a bounded increase in recovery time for smoother I/O.</p>
 
-<p class="text-gray-300 leading-relaxed">An autonomous checkpoint controller observes <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_bgwriter</code> continuously and adjusts <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">checkpoint_completion_target</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">bgwriter_lru_maxpages</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">bgwriter_delay</code>, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_wal_size</code> based on current write load and observed checkpoint duration. The key signal is <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">checkpoint_write_time</code> versus <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">checkpoint_sync_time</code>. When sync time dominates, the checkpoint is being forced to fsync pages too quickly — the I/O subsystem is being asked to flush dirty buffers faster than it can. The correct autonomous response is to increase <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">checkpoint_completion_target</code> (spread the writes over more of the checkpoint interval) and increase <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_wal_size</code> (allow more WAL to accumulate before forcing a checkpoint).</p>
+<p class="text-gray-300 leading-relaxed">When dirty pages accumulate faster than checkpoints drain them — visible as a rising checkpoint pages/sec rate alongside growing lazy-writes pressure — the buffer pool is holding too many modified pages between checkpoints. The correct response is to lower <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">TARGET_RECOVERY_TIME</code> so checkpoints fire more frequently and keep the dirty-page backlog bounded.</p>
 
-<p class="text-gray-300 leading-relaxed">When write time dominates but sync time is low, the shared_buffers pool contains too many dirty pages and the bgwriter is not proactively cleaning them. The correct response is to increase <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">bgwriter_lru_maxpages</code> and decrease <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">bgwriter_delay</code>.</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import psycopg2
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import pyodbc
 import logging
 
 THRESHOLDS = {
-    "checkpoint_sync_dominance_ratio": 0.70,  # sync_time / total_time
-    "buffers_checkpoint_rate": 500,           # buffers written per checkpoint on average
-    "checkpoint_too_frequent_secs": 180,      # checkpoint interval below this is risky
+    "checkpoint_io_share":     0.60,  # checkpoint writes / total writes during burst
+    "checkpoint_stall_ms":     20.0,  # avg write stall ms that signals I/O pressure
 }
 
-ADJUSTMENTS = {
-    "checkpoint_completion_target": {"min": 0.5, "max": 0.95, "step": 0.05},
-    "max_wal_size":                 {"min": "1GB", "max": "16GB", "step_gb": 1},
-    "bgwriter_lru_maxpages":        {"min": 100, "max": 1000, "step": 100},
-    "bgwriter_delay":               {"min": 50, "max": 500, "step": 50},
-}
+# target_recovery_time bounds, in seconds (SQL Server default is 60)
+RECOVERY_TIME_BOUNDS = {"min": 30, "max": 600, "step": 30}
 
-def analyze_bgwriter(conn):
+def analyze_checkpoints(conn):
     cur = conn.cursor()
     cur.execute("""
-        SELECT
-            checkpoints_timed,
-            checkpoints_req,
-            checkpoint_write_time,
-            checkpoint_sync_time,
-            buffers_checkpoint,
-            buffers_clean,
-            maxwritten_clean,
-            buffers_backend,
-            stats_reset
-        FROM pg_stat_bgwriter
+        SELECT DB_NAME(vfs.database_id) AS database_name,
+               SUM(vfs.num_of_bytes_written) AS bytes_written,
+               SUM(vfs.io_stall_write_ms)    AS write_stall_ms,
+               SUM(vfs.num_of_writes)        AS writes
+        FROM sys.dm_io_virtual_file_stats(NULL, NULL) vfs
+        GROUP BY vfs.database_id
     """)
-    return dict(zip([d[0] for d in cur.description], cur.fetchone()))
+    io_by_db = {row[0]: row for row in cur.fetchall()}
 
-def recommend_adjustments(stats):
+    cur.execute("""
+        SELECT name, target_recovery_time_in_seconds
+        FROM sys.databases
+        WHERE database_id &gt; 4
+    """)
+    recovery_targets = {row[0]: row[1] for row in cur.fetchall()}
+    return io_by_db, recovery_targets
+
+def recommend_adjustments(io_by_db, recovery_targets, prev_io_by_db):
     recommendations = []
-    total_checkpoints = stats["checkpoints_timed"] + stats["checkpoints_req"]
-    if total_checkpoints == 0:
-        return recommendations
-
-    total_cp_time = stats["checkpoint_write_time"] + stats["checkpoint_sync_time"]
-    if total_cp_time &gt; 0:
-        sync_ratio = stats["checkpoint_sync_time"] / total_cp_time
-        if sync_ratio &gt; THRESHOLDS["checkpoint_sync_dominance_ratio"]:
+    for db, row in io_by_db.items():
+        if db not in prev_io_by_db:
+            continue
+        prev = prev_io_by_db[db]
+        delta_writes = row[3] - prev[3]
+        delta_stall  = row[2] - prev[2]
+        if delta_writes == 0:
+            continue
+        avg_stall = delta_stall / delta_writes
+        current_target = recovery_targets.get(db, 60)
+        # High average write stall during a write burst = checkpoint pressure.
+        # Raising target_recovery_time spreads checkpoint flushes out.
+        if (avg_stall &gt; THRESHOLDS["checkpoint_stall_ms"]
+                and current_target &lt; RECOVERY_TIME_BOUNDS["max"]):
             recommendations.append({
-                "parameter": "checkpoint_completion_target",
+                "database": db,
+                "parameter": "target_recovery_time",
                 "direction": "increase",
-                "reason": f"sync_ratio={sync_ratio:.2f} exceeds threshold"
+                "reason": f"avg_write_stall={avg_stall:.1f}ms exceeds threshold",
             })
-            recommendations.append({
-                "parameter": "max_wal_size",
-                "direction": "increase",
-                "reason": "Reduce checkpoint frequency to lower sync pressure"
-            })
-
-    avg_buffers_per_checkpoint = stats["buffers_checkpoint"] / total_checkpoints
-    if avg_buffers_per_checkpoint &gt; THRESHOLDS["buffers_checkpoint_rate"]:
-        recommendations.append({
-            "parameter": "bgwriter_lru_maxpages",
-            "direction": "increase",
-            "reason": f"avg_buffers_per_cp={avg_buffers_per_checkpoint:.0f}, bgwriter not cleaning proactively"
-        })
-
-    if stats["maxwritten_clean"] &gt; 0:
-        recommendations.append({
-            "parameter": "bgwriter_delay",
-            "direction": "decrease",
-            "reason": "maxwritten_clean hits suggest bgwriter is throttled — run more frequently"
-        })
-
     return recommendations
 
-def apply_adjustment(conn, parameter, direction, current_values):
-    cfg = ADJUSTMENTS.get(parameter)
-    if not cfg:
-        logging.warning(f"No adjustment config for {parameter}")
-        return
-
+def apply_adjustment(conn, database, direction):
     cur = conn.cursor()
-    cur.execute(f"SHOW {parameter}")
-    current_raw = cur.fetchone()[0]
-    logging.info(f"Adjusting {parameter}: current={current_raw}, direction={direction}")
-    # In production: parse current value, apply step in correct direction,
-    # clamp to min/max, then issue ALTER SYSTEM SET ... and pg_reload_conf()
+    cur.execute(
+        "SELECT target_recovery_time_in_seconds FROM sys.databases WHERE name = ?",
+        (database,),
+    )
+    current = cur.fetchone()[0]
+    step = RECOVERY_TIME_BOUNDS["step"]
+    new_value = current + step if direction == "increase" else current - step
+    new_value = max(RECOVERY_TIME_BOUNDS["min"],
+                    min(RECOVERY_TIME_BOUNDS["max"], new_value))
+    logging.info(f"Adjusting {database}: target_recovery_time {current}s -&gt; {new_value}s")
+    # In production: ALTER DATABASE [db] SET TARGET_RECOVERY_TIME = new_value SECONDS
     # Omitted here for brevity — see the configuration management module.</code></pre>
 
-<p class="text-gray-300 leading-relaxed">The autonomous controller does not apply all recommendations simultaneously. It implements a one-parameter-per-cycle rule: change one variable, wait two checkpoint cycles, observe the new <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">checkpoint_sync_time</code> / <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">checkpoint_write_time</code> ratio, and decide whether to apply the next recommendation. This is a primitive form of causal isolation — changing one parameter at a time and waiting for the system to reach steady state before making another change. Violating this principle produces configuration drift where the cause of a performance improvement or regression is impossible to identify.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
+<p class="text-gray-300 leading-relaxed">The autonomous controller does not apply all recommendations simultaneously. It implements a one-parameter-per-cycle rule: change one variable, wait two checkpoint cycles, observe the new checkpoint pages/sec rate and I/O stall trend, and decide whether to apply the next recommendation. This is a primitive form of causal isolation — changing one parameter at a time and waiting for the system to reach steady state before making another change. Violating this principle produces configuration drift where the cause of a performance improvement or regression is impossible to identify.</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Autonomous Index Storage Reorganization and Bloat Remediation</h3>
 
-<p class="text-gray-300 leading-relaxed">Index and table bloat is one of the most predictable sources of I/O waste in long-running PostgreSQL and SQL Server deployments. Deleted and updated rows leave dead space in heap pages. Index entries accumulate for rows that no longer exist. Over time, a table that logically contains 10 million rows may span pages containing 40 million row slots — 75% of every I/O operation retrieves garbage that the visibility map has marked as dead.</p>
+<p class="text-gray-300 leading-relaxed">Index and table bloat is one of the most predictable sources of I/O waste in long-running SQL Server deployments. Deleted rows leave ghost records in pages. Index entries accumulate for rows that no longer exist. Over time, a table that logically contains 10 million rows may span pages sized for far more — and a large share of every I/O operation retrieves ghost records that the cleanup task has not yet reclaimed.</p>
 
-<p class="text-gray-300 leading-relaxed">Autonomous bloat remediation differs from scheduled VACUUM in a critical way: it is reactive to measured waste, not a calendar. The system continuously estimates bloat using the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pgstattuple</code> extension in PostgreSQL or the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_db_index_physical_stats</code> DMV in SQL Server, and it acts when waste crosses a defined threshold relative to the cost of remediation.</p>
+<p class="text-gray-300 leading-relaxed">Autonomous bloat remediation differs from a fixed maintenance schedule in a critical way: it is reactive to measured waste, not a calendar. The system continuously estimates waste using the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_db_index_physical_stats</code> DMV, and it acts when waste crosses a defined threshold relative to the cost of remediation.</p>
 
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify indexes with significant fragmentation eligible for autonomous rebuild or reorganize
@@ -304,13 +302,11 @@ WHERE ips.page_count &gt; 1000
   AND ips.avg_fragmentation_in_percent &gt; 10
 ORDER BY ips.avg_fragmentation_in_percent DESC;</code></pre>
 
-<p class="text-gray-300 leading-relaxed">The remediation decision tree is more nuanced than fragmentation percentage alone. For PostgreSQL, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VACUUM</code> is the first-line response — it recovers dead tuple space for reuse without requiring a table lock. <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VACUUM FULL</code> or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_repack</code> (which reorganizes without an exclusive lock) are second-line responses reserved for cases where bloat has grown so severe that page count has expanded significantly beyond the logical data size. The autonomous agent calculates a bloat ratio: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">(total_pages * block_size) / (live_tuple_count * avg_tuple_width)</code>. When this ratio exceeds 2.0 and standard autovacuum has not reduced it within a configured window, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_repack</code> is scheduled.</p>
+<p class="text-gray-300 leading-relaxed">The remediation decision tree is more nuanced than fragmentation percentage alone. <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALTER INDEX ... REORGANIZE</code> is the first-line response — it compacts pages and reclaims ghost records without requiring an offline window. <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALTER INDEX ... REBUILD WITH (ONLINE = ON)</code> is the second-line response, reserved for cases where fragmentation has grown so severe that page count has expanded significantly beyond the logical data size. The autonomous agent calculates a waste ratio: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">(page_count * 8KB) / (record_count * avg_record_size_in_bytes)</code>. When this ratio exceeds 2.0 and REORGANIZE has not reduced it within a configured window, an online REBUILD is scheduled.</p>
 
 <p class="text-gray-300 leading-relaxed">For SQL Server, the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">REORGANIZE</code> vs <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">REBUILD</code> decision is made per-index based on fragmentation percentage and whether the index supports online rebuild. The autonomous agent constructs and executes the appropriate DDL, wrapped in a resource governor classification that limits I/O to a configurable percentage of device throughput during execution, preventing remediation from becoming its own source of I/O saturation.</p>
 
 <p class="text-gray-300 leading-relaxed">A safety interlock prevents the autonomous bloat remediation system from executing during periods of high I/O utilization. The agent checks <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">iostat</code> device utilization and waits if any data device exceeds 70% utilization — using an exponential backoff with a maximum wait of 4 hours before escalating to an alert.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Partition-Based I/O Shaping and Autonomous Data Lifecycle Management</h3>
 
@@ -318,7 +314,7 @@ ORDER BY ips.avg_fragmentation_in_percent DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The lifecycle engine manages five partition states: <strong class="text-white">active</strong> (receiving writes and serving reads), <strong class="text-white">warm</strong> (serving reads, no writes), <strong class="text-white">cold</strong> (rarely accessed, eligible for compression), <strong class="text-white">archived</strong> (moved to cold tablespace or object storage), and <strong class="text-white">detached</strong> (removed from the partition tree, accessible only via direct query).</p>
 
-<p class="text-gray-300 leading-relaxed">Autonomous partition creation is the most time-sensitive operation. A system that allows a partition to be missing during a high-write period will route all writes to the default partition (PostgreSQL) or fail (SQL Server with partition scheme exhaustion). The creation agent runs hourly and ensures partitions exist for the current period plus two future periods.</p>
+<p class="text-gray-300 leading-relaxed">Autonomous partition creation is the most time-sensitive operation. A system that allows a partition to be missing during a high-write period will fail with partition scheme exhaustion. The creation agent runs hourly and ensures partitions exist for the current period plus two future periods.</p>
 
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Extend a partition scheme to accommodate future periods
@@ -345,91 +341,111 @@ BEGIN
     SET @d = DATEADD(DAY, 1, @d);
 END</code></pre>
 
-<p class="text-gray-300 leading-relaxed">The partition lifecycle agent also handles the opposite end of the spectrum: identifying partitions that have transitioned from warm to cold based on observed access counts, and triggering compression or tablespace migration. In PostgreSQL, this means running <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALTER TABLE partition_name SET TABLESPACE cold_sata</code> and optionally enabling <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">toast</code> compression or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_compress</code> via a foreign data wrapper to object storage. In SQL Server, it means switching the partition out to a staging table on the cold filegroup and applying <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DATA_COMPRESSION = PAGE</code> before switching it back in.</p>
+<p class="text-gray-300 leading-relaxed">The partition lifecycle agent also handles the opposite end of the spectrum: identifying partitions that have transitioned from warm to cold based on observed access counts, and triggering compression or tablespace migration. This means switching the partition out to a staging table on the cold filegroup and applying <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DATA_COMPRESSION = PAGE</code> before switching it back in.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import psycopg2
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import pyodbc
 from datetime import datetime, timedelta
 import logging
 
 COLD_THRESHOLD_DAYS = 30       # partitions older than this are candidates for cold tier
 ACCESS_THRESHOLD = 10          # avg reads per collection interval below which = cold
-COLD_TABLESPACE = "cold_sata"
-HOT_TABLESPACE  = "hot_nvme"
+COLD_FILEGROUP = "ColdFG"
+HOT_FILEGROUP  = "HotFG"
 
-def get_partition_access_stats(conn, parent_table: str, schema: str = "public"):
-    """Return recent I/O stats for each child partition of parent_table."""
+def get_partition_access_stats(conn, partitioned_table: str, schema: str = "dbo"):
+    """Return recent I/O stats for each partition of a partitioned table."""
     cur = conn.cursor()
     cur.execute("""
         SELECT
-            child.relname                           AS partition_name,
-            child.oid                               AS partition_oid,
-            ts.spcname                              AS current_tablespace,
-            COALESCE(AVG(m.heap_blks_read_delta), 0) AS avg_reads,
-            MAX(m.collected_at)                      AS last_access
-        FROM pg_inherits inh
-        JOIN pg_class parent ON parent.oid = inh.inhparent
-        JOIN pg_namespace ns   ON ns.oid = parent.relnamespace
-        JOIN pg_class child    ON child.oid = inh.inhrelid
-        LEFT JOIN pg_tablespace ts ON ts.oid = child.reltablespace
-        LEFT JOIN io_metrics_history m ON m.relation_name = child.relname
-            AND m.collected_at &gt;= NOW() - INTERVAL '7 days'
-        WHERE parent.relname = %s
-          AND ns.nspname    = %s
-        GROUP BY child.relname, child.oid, ts.spcname
-    """, (parent_table, schema))
+            p.partition_number,
+            fg.name AS current_filegroup,
+            COALESCE(AVG(m.reads_delta), 0) AS avg_reads,
+            MAX(m.collected_at)             AS last_access
+        FROM sys.partitions p
+        JOIN sys.indexes i
+            ON i.object_id = p.object_id AND i.index_id = p.index_id
+        JOIN sys.partition_schemes ps
+            ON ps.data_space_id = i.data_space_id
+        JOIN sys.destination_data_spaces dds
+            ON dds.partition_scheme_id = ps.data_space_id
+           AND dds.destination_id = p.partition_number
+        JOIN sys.filegroups fg
+            ON fg.data_space_id = dds.data_space_id
+        JOIN sys.tables t ON t.object_id = p.object_id
+        JOIN sys.schemas s ON s.schema_id = t.schema_id
+        LEFT JOIN io_metrics_history m
+            ON m.partition_number = p.partition_number
+           AND m.collected_at &gt;= DATEADD(DAY, -7, SYSUTCDATETIME())
+        WHERE t.name = ? AND s.name = ?
+          AND i.index_id IN (0, 1)
+        GROUP BY p.partition_number, fg.name
+    """, (partitioned_table, schema))
     return cur.fetchall()
 
-def demote_cold_partitions(conn, parent_table: str, schema: str = "public", dry_run: bool = True):
-    rows = get_partition_access_stats(conn, parent_table, schema)
-    cur  = conn.cursor()
+def demote_cold_partitions(conn, partitioned_table: str, schema: str = "dbo",
+                           dry_run: bool = True):
+    rows = get_partition_access_stats(conn, partitioned_table, schema)
+    cur = conn.cursor()
 
-    for partition_name, partition_oid, current_ts, avg_reads, last_access in rows:
-        # Determine partition age from name suffix (expects _YYYY_MM_DD convention)
-        try:
-            date_suffix = partition_name.split("_")[-3:]
-            partition_date = datetime.strptime("_".join(date_suffix), "%Y_%m_%d").date()
-        except (ValueError, IndexError):
-            logging.warning(f"Cannot parse date from partition name: {partition_name}")
+    for partition_number, current_fg, avg_reads, last_access in rows:
+        # Partition age is derived from the boundary values of the partition function
+        cur.execute("""
+            SELECT CAST(rv.value AS DATE)
+            FROM sys.partition_range_values rv
+            JOIN sys.partition_functions pf ON pf.function_id = rv.function_id
+            JOIN sys.indexes i ON i.data_space_id IN (
+                SELECT ps.data_space_id FROM sys.partition_schemes ps
+            )
+            WHERE i.object_id = OBJECT_ID(?, 'U')
+              AND rv.boundary_id = ?
+        """, (f"{schema}.{partitioned_table}", partition_number))
+        brow = cur.fetchone()
+        if not brow:
             continue
-
-        age_days = (datetime.utcnow().date() - partition_date).days
+        age_days = (datetime.utcnow().date() - brow[0]).days
 
         if age_days &gt;= COLD_THRESHOLD_DAYS and avg_reads &lt; ACCESS_THRESHOLD:
-            if current_ts == HOT_TABLESPACE or current_ts is None:
+            if current_fg == HOT_FILEGROUP:
                 logging.info(
-                    f"Demoting {partition_name}: age={age_days}d, avg_reads={avg_reads:.1f}"
+                    f"Demoting partition {partition_number}: "
+                    f"age={age_days}d, avg_reads={avg_reads:.1f}"
                 )
                 if not dry_run:
+                    # SWITCH out to a staging table on the cold filegroup,
+                    # apply PAGE compression, SWITCH back in.
                     cur.execute(
-                        f"ALTER TABLE {schema}.{partition_name} SET TABLESPACE {COLD_TABLESPACE}"
+                        f"ALTER TABLE {schema}.{partitioned_table} "
+                        f"SWITCH PARTITION {partition_number} "
+                        f"TO {schema}.{partitioned_table}_cold_stage "
+                        f"PARTITION {partition_number}"
+                    )
+                    cur.execute(
+                        f"ALTER INDEX ALL ON {schema}.{partitioned_table}_cold_stage "
+                        "REBUILD PARTITION = ALL "
+                        f"WITH (DATA_COMPRESSION = PAGE) ON [{COLD_FILEGROUP}]"
                     )
                     conn.commit()
-                    logging.info(f"Moved {partition_name} to {COLD_TABLESPACE}")
+                    logging.info(f"Moved partition {partition_number} to {COLD_FILEGROUP}")
             else:
-                logging.debug(f"{partition_name} already on non-hot tablespace: {current_ts}")
+                logging.debug(f"Partition {partition_number} already on {current_fg}")
         else:
             logging.debug(
-                f"{partition_name}: age={age_days}d, avg_reads={avg_reads:.1f} — no action"
+                f"Partition {partition_number}: age={age_days}d, "
+                f"avg_reads={avg_reads:.1f} — no action"
             )</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The combination of forward partition creation and backward partition demotion forms a complete data lifecycle pipeline. The system maintains a predictable working set on fast storage, prevents partition exhaustion failures, and continuously reclaims expensive NVMe capacity by moving dormant data to cheaper tiers — all without human scheduling.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Autonomous Buffer Pool Management and Prefetch Tuning</h3>
 
-<p class="text-gray-300 leading-relaxed">The database buffer pool is the primary mechanism for keeping frequently accessed pages in memory and avoiding physical I/O. Both PostgreSQL's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">shared_buffers</code> and SQL Server's buffer pool operate on an LRU-variant eviction policy, but neither engine ships with the ability to dynamically resize the buffer pool in response to changing workload characteristics. Autonomous buffer pool management bridges this gap.</p>
+<p class="text-gray-300 leading-relaxed">The database buffer pool is the primary mechanism for keeping frequently accessed pages in memory and avoiding physical I/O. SQL Server's buffer pool operates on an LRU-K-variant eviction policy. The engine already resizes the buffer pool dynamically within the max server memory bound, so autonomous buffer pool management focuses on shaping what competes for that memory. Autonomous buffer pool management bridges this gap.</p>
 
-<p class="text-gray-300 leading-relaxed">In PostgreSQL, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">shared_buffers</code> is a static allocation set at startup. The autonomous layer cannot resize it without a restart, but it can do the next best thing: tune <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">effective_cache_size</code> (which influences the query planner's willingness to choose index scans over sequential scans), manage <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">work_mem</code> dynamically per session role, and use <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_prewarm</code> to proactively load hot pages after a restart or partition migration.</p>
+<p class="text-gray-300 leading-relaxed">In SQL Server, the buffer pool is managed dynamically by SQLOS within the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max server memory</code> bound. The autonomous layer adjusts max server memory within guardrails in response to page life expectancy trends and memory grant pressure, configures Buffer Pool Extension on fast SSD tiers as a second-level cache, and uses Resource Governor memory limits to keep runaway workloads from monopolizing the buffer pool.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: Prewarm a table's buffer pages after partition migration to hot tablespace
-SELECT pg_prewarm(
-    'public.orders_2024_11_15',  -- newly promoted partition
-    'buffer',                    -- load into shared_buffers, not OS cache
-    'main',                      -- fork: main heap
-    NULL,                        -- first_block: NULL = start from beginning
-    NULL                         -- last_block: NULL = read to end
-);</code></pre>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: warm the buffer pool after a partition migration by scanning
+-- the newly promoted partition into memory ahead of the workload
+SELECT COUNT_BIG(*)
+FROM dbo.Orders_2024_11_15 WITH (INDEX(1));  -- clustered scan pulls pages into the buffer pool</code></pre>
 
 <p class="text-gray-300 leading-relaxed">In SQL Server, the buffer pool is managed dynamically by the memory manager (SQLOS), and the autonomous layer can influence it through Resource Governor memory limits, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max server memory</code> adjustments, and Buffer Pool Extension (BPE) configuration on systems with fast SSD tiers. The more powerful lever in SQL Server is identifying which buffer pages are being evicted and why, using <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_os_buffer_descriptors</code>.</p>
 
@@ -462,32 +478,36 @@ ORDER BY pages_in_buffer DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The autonomous prefetch tuner operates at a different level. Rather than reacting to buffer pool contents, it predicts which pages will be needed and initiates reads before the query arrives. This is useful for scheduled workloads with known access patterns — nightly reporting jobs that always scan the same partition ranges, or ETL pipelines that process data in a known order.</p>
 
-<p class="text-gray-300 leading-relaxed">The prefetch system maintains a workload schedule: a table of recurring queries with their historical execution start times, observed I/O patterns (which table and partition ranges they read), and typical page counts. Before a scheduled job runs, the prefetch agent calls <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_prewarm</code> on the expected page ranges, or in SQL Server issues a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DBCC PINTABLE</code> equivalent using Resource Governor to prioritize those pages against eviction.</p>
+<p class="text-gray-300 leading-relaxed">The prefetch system maintains a workload schedule: a table of recurring queries with their historical execution start times, observed I/O patterns (which table and partition ranges they read), and typical page counts. Before a scheduled job runs, the prefetch agent issues covering scans over the expected partition ranges ahead of the job, pulling pages into the buffer pool before the workload arrives.</p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>from datetime import datetime, timedelta
-import psycopg2
+import pyodbc
 import schedule
 import time
 import logging
 
 PREWARM_LEAD_TIME_MINUTES = 10
+MSSQL_DSN = (
+    "DRIVER={ODBC Driver 18 for SQL Server};"
+    "SERVER=sql-primary;DATABASE=Sales;Trusted_Connection=yes;"
+)
 
 WORKLOAD_SCHEDULE = [
     {
         "name": "nightly_revenue_report",
         "cron_time": "02:00",
         "tables_to_prewarm": [
-            "public.orders_2024_11_14",
-            "public.orders_2024_11_15",
-            "public.orders_2024_11_16",
+            "dbo.Orders_2024_11_14",
+            "dbo.Orders_2024_11_15",
+            "dbo.Orders_2024_11_16",
         ],
     },
     {
         "name": "weekly_churn_analysis",
         "cron_time": "03:30",
         "tables_to_prewarm": [
-            "public.customer_events_2024_10",
-            "public.customer_events_2024_11",
+            "dbo.CustomerEvents_2024_10",
+            "dbo.CustomerEvents_2024_11",
         ],
     },
 ]
@@ -496,10 +516,11 @@ def prewarm_tables(conn, tables):
     cur = conn.cursor()
     for table in tables:
         try:
-            cur.execute("SELECT pg_prewarm(%s, 'buffer', 'main')", (table,))
-            blocks_loaded = cur.fetchone()[0]
+            # Covering scan pulls the table's pages into the buffer pool
+            cur.execute(f"SELECT COUNT_BIG(*) FROM {table} WITH (INDEX(1))")
+            pages = cur.fetchone()[0]
             conn.commit()
-            logging.info(f"Prewarmed {table}: {blocks_loaded} blocks loaded")
+            logging.info(f"Prewarmed {table}: scan touched {pages} rows")
         except Exception as e:
             conn.rollback()
             logging.error(f"Failed to prewarm {table}: {e}")
@@ -520,7 +541,7 @@ def schedule_prewarm_jobs(conn):
         )
 
 def run():
-    conn = psycopg2.connect("dbname=postgres user=monitor")
+    conn = pyodbc.connect(MSSQL_DSN)
     schedule_prewarm_jobs(conn)
     while True:
         schedule.run_pending()
@@ -529,38 +550,37 @@ def run():
 if __name__ == "__main__":
     run()</code></pre>
 
-<p class="text-gray-300 leading-relaxed">This predictive prefetch approach reduces the latency spike that occurs when a large reporting job starts cold. Instead of spending the first several minutes of execution time loading pages from disk, the job finds its data already resident in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">shared_buffers</code> and begins processing at full speed.</p>
+<p class="text-gray-300 leading-relaxed">This predictive prefetch approach reduces the latency spike that occurs when a large reporting job starts cold. Instead of spending the first several minutes of execution time loading pages from disk, the job finds its data already resident in the buffer pool and begins processing at full speed.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Transaction Log I/O Optimization</h3>
 
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">WAL and Transaction Log I/O Optimization</h3>
+<p class="text-gray-300 leading-relaxed">The transaction log is the highest-priority I/O path in SQL Server. Every committed transaction must have its log record durably written before the commit acknowledgment is returned to the client. Any contention, latency spike, or device saturation on the log device directly increases transaction commit latency for every session simultaneously.</p>
 
-<p class="text-gray-300 leading-relaxed">The write-ahead log is the highest-priority I/O path in both PostgreSQL and SQL Server. Every committed transaction must have its WAL record durably written before the commit acknowledgment is returned to the client. Any contention, latency spike, or device saturation on the WAL device directly increases transaction commit latency for every session simultaneously.</p>
+<p class="text-gray-300 leading-relaxed">Autonomous log optimization has three concerns: device placement, write batching behavior, and log size management.</p>
 
-<p class="text-gray-300 leading-relaxed">Autonomous WAL optimization has three concerns: device placement, write batching behavior, and log size management.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Device placement</strong> is handled at the infrastructure level: The log should live on a dedicated device separate from data files, ideally one optimized for sequential write throughput rather than random read IOPS. The autonomous agent validates this configuration by checking the mount point of the log files via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.master_files</code> against the list of known device paths and their I/O characteristics. When log and data share a device, an alert is raised and, if a suitable dedicated device is available in the device inventory, an automated migration is initiated.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Device placement</strong> is handled at the infrastructure level: WAL should live on a dedicated device separate from data files, ideally one optimized for sequential write throughput rather than random read IOPS. The autonomous agent validates this configuration by checking the mount point of the WAL directory (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_wal</code> in PostgreSQL, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.master_files</code> for log files in SQL Server) against the list of known device paths and their I/O characteristics. When WAL and data share a device, an alert is raised and, if a suitable dedicated device is available in the device inventory, an automated migration is initiated.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Write batching</strong> in SQL Server is controlled by delayed durability. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DELAYED_DURABILITY = ALLOWED</code> database option lets transactions return before their log records are flushed — a group-commit pattern that batches multiple commits into a single log flush. The autonomous controller enables delayed durability selectively for non-critical workloads based on observed <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WRITELOG</code> wait time in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_os_wait_stats</code> and the ratio of active sessions to commits per second.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Write batching</strong> in PostgreSQL is controlled by <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">wal_writer_delay</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">commit_delay</code> / <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">commit_siblings</code>. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">commit_delay</code> parameter introduces a deliberate pause before flushing a commit, allowing other concurrent transactions to add their WAL records to the same flush — a group commit pattern. The autonomous controller adjusts these parameters based on observed <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">wal_buffers_full</code> events in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_wal</code> and the ratio of active sessions to commits per second.</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL 14+: pg_stat_wal provides WAL I/O telemetry
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: transaction log I/O telemetry per database
 SELECT
-    wal_records,
-    wal_fpi,                    -- full page images written (write amplification indicator)
-    wal_bytes,
-    wal_buffers_full,           -- times WAL writer was forced due to full buffers
-    wal_write,
-    wal_sync,
-    wal_write_time,
-    wal_sync_time,
-    stats_reset
-FROM pg_stat_wal;</code></pre>
+    DB_NAME(vfs.database_id)              AS database_name,
+    vfs.num_of_bytes_written              AS log_bytes_written,
+    vfs.io_stall_write_ms                 AS log_write_stall_ms,
+    CASE WHEN vfs.num_of_writes = 0 THEN 0
+         ELSE vfs.io_stall_write_ms * 1.0 / vfs.num_of_writes END AS avg_write_stall_ms,
+    lu.used_log_space_pct                 AS used_log_space_pct
+FROM sys.dm_io_virtual_file_stats(NULL, NULL) vfs
+JOIN sys.master_files mf
+    ON vfs.database_id = mf.database_id AND vfs.file_id = mf.file_id
+JOIN sys.dm_db_log_space_usage lu ON lu.database_id = vfs.database_id
+WHERE mf.type_desc = 'LOG';</code></pre>
 
-<p class="text-gray-300 leading-relaxed">When <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">wal_buffers_full</code> is non-zero and growing, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">wal_buffers</code> is undersized. When <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">wal_sync_time</code> dominates <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">wal_write_time</code>, the underlying device cannot sustain the sync rate — the correct intervention is either device upgrade or, as a temporary measure, switching <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">synchronous_commit</code> to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">local</code> for non-critical workloads. The autonomous system never changes <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">synchronous_commit</code> to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">off</code> without explicit operator permission, since this sacrifices crash safety. The decision is encoded as a policy flag:</p>
+<p class="text-gray-300 leading-relaxed">When <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WRITELOG</code> waits dominate <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_os_wait_stats</code> and average log write stall climbs, the underlying device cannot sustain the flush rate — the correct intervention is either device upgrade or, as a temporary measure, enabling delayed durability for non-critical workloads. The autonomous system never sets <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DELAYED_DURABILITY = FORCED</code> without explicit operator permission, since this sacrifices crash safety. The decision is encoded as a policy flag:</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>SYNCHRONOUS_COMMIT_POLICY = {
-    "allow_local":  True,   # may reduce to 'local' for replica-only durability
-    "allow_off":    False,  # never disable synchronous commit without human approval
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>DELAYED_DURABILITY_POLICY = {
+    "allow_delayed": True,   # may enable delayed durability for non-critical workloads
+    "allow_forced":  False,  # never force delayed durability without human approval
 }</code></pre>
 
 <p class="text-gray-300 leading-relaxed">In SQL Server, the transaction log is managed through VLF (virtual log file) architecture. A log file that has been grown many times in small increments accumulates hundreds of small VLFs, which degrades log scan performance during recovery. The autonomous agent monitors VLF count using <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DBCC LOGINFO</code> and proactively grows the log in larger increments to consolidate VLFs when the count exceeds a configurable threshold.</p>
@@ -594,21 +614,19 @@ DROP TABLE #vlf_info;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">When VLF count exceeds the threshold (commonly set to 200 for databases under 100GB), the remediation path is to shrink the log file to minimum size (which forces VLF consolidation), then immediately grow it in a single large allocation. This is a brief operation that causes no data loss but does require the log to not be actively written — the agent schedules it during the low-traffic window identified by the I/O utilization monitor.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Integrating Storage Autonomy with the Broader Control Loop</h3>
 
 <p class="text-gray-300 leading-relaxed">Each of the subsystems described in this chapter — I/O instrumentation, tablespace tiering, checkpoint control, bloat remediation, partition lifecycle management, buffer pool prefetch, and WAL optimization — can function independently. But maximum effectiveness comes from integration: a shared signal bus where each subsystem both reads from and writes to a common state model.</p>
 
-<p class="text-gray-300 leading-relaxed">The integration point is the <strong class="text-white">storage control plane</strong>: a lightweight service that aggregates signals from all subsystems and arbitrates competing actions. Without arbitration, subsystems can conflict. A bloat remediation job and a tablespace migration might both attempt to acquire an <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ACCESS EXCLUSIVE</code> lock on the same table simultaneously. A checkpoint control adjustment that increases <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_wal_size</code> might interact adversely with a WAL device migration in progress. A partition prewarm job might run during peak I/O utilization and compete with active queries.</p>
+<p class="text-gray-300 leading-relaxed">The integration point is the <strong class="text-white">storage control plane</strong>: a lightweight service that aggregates signals from all subsystems and arbitrates competing actions. Without arbitration, subsystems can conflict. An index rebuild and a filegroup migration might both attempt to take conflicting locks on the same table simultaneously. A checkpoint control adjustment that increases <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">TARGET_RECOVERY_TIME</code> might interact adversely with a log device migration in progress. A partition prewarm job might run during peak I/O utilization and compete with active queries.</p>
 
 <div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
-    A[Tablespace Tiering] -->|register intent| G[Storage Control Plane]
+    A[Filegroup Tiering] -->|register intent| G[Storage Control Plane]
     B[Bloat Remediation] -->|register intent| G
     C[Checkpoint Control] -->|register intent| G
     D[Partition Lifecycle] -->|register intent| G
     E[Buffer Pool / Prefetch] -->|register intent| G
-    F[WAL Optimization] -->|register intent| G
+    F[Log Optimization] -->|register intent| G
     G -->|conflict check + I/O budget check| H{Grant or Defer}
     H -->|granted| I[Action Executes]
     H -->|denied: object locked or budget exceeded| J[Deferred / Retried Next Cycle]
@@ -625,12 +643,12 @@ from typing import Dict, Optional
 from enum import Enum
 
 class ActionType(Enum):
-    TABLESPACE_MOVE   = "tablespace_move"
+    FILEGROUP_MOVE    = "filegroup_move"
     BLOAT_REMEDIATION = "bloat_remediation"
     PARTITION_CREATE  = "partition_create"
     PARTITION_DEMOTE  = "partition_demote"
     CHECKPOINT_TUNE   = "checkpoint_tune"
-    WAL_TUNE          = "wal_tune"
+    LOG_TUNE          = "log_tune"
     PREWARM           = "prewarm"
 
 @dataclass
@@ -692,19 +710,17 @@ class StorageControlPlane:
 
 <p class="text-gray-300 leading-relaxed">The control plane also serves as the audit log entry point. Every granted and denied action is written to a structured log that the observability layer reads for post-hoc analysis. When storage performance degrades unexpectedly, the audit log shows precisely which autonomous operations were active at the time, making root cause analysis tractable rather than speculative.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Observability at three levels is non-negotiable**: object-level, engine-level, and block-device-level I/O metrics must be collected simultaneously and at sub-minute granularity. Conflating these three levels produces misleading signals that drive incorrect autonomous actions.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Observability at three levels is non-negotiable</strong>: object-level, engine-level, and block-device-level I/O metrics must be collected simultaneously and at sub-minute granularity. Conflating these three levels produces misleading signals that drive incorrect autonomous actions.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Tiering decisions must be based on measured heat scores, not age alone**: access frequency, write volume, and recency of modification together determine whether a relation belongs on fast NVMe or cold-tier storage. Age-based policies fail when access patterns shift and yesterday's archive becomes today's active dataset.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Tiering decisions must be based on measured heat scores, not age alone</strong>: access frequency, write volume, and recency of modification together determine whether a relation belongs on fast NVMe or cold-tier storage. Age-based policies fail when access patterns shift and yesterday's archive becomes today's active dataset.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Checkpoint and WAL tuning must follow a one-parameter-per-cycle discipline**: changing `checkpoint_completion_target`, `max_wal_size`, `bgwriter_lru_maxpages`, and `bgwriter_delay` simultaneously makes causal attribution impossible. Autonomous controllers must change one variable, observe two full checkpoint cycles, and evaluate before proceeding.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Checkpoint and log tuning must follow a one-parameter-per-cycle discipline</strong>: changing <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">TARGET_RECOVERY_TIME</code> and related settings simultaneously makes causal attribution impossible. Autonomous controllers must change one variable, observe two full checkpoint cycles, and evaluate before proceeding.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Partition lifecycle automation closes the gap between theoretical tiering policy and operational reality**: forward partition creation prevents exhaustion failures; backward partition demotion continuously reclaims fast-tier capacity. Neither is sufficient without the other, and both must integrate with the broader I/O control plane to avoid lock conflicts and bandwidth saturation.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Partition lifecycle automation closes the gap between theoretical tiering policy and operational reality</strong>: forward partition creation prevents exhaustion failures; backward partition demotion continuously reclaims fast-tier capacity. Neither is sufficient without the other, and both must integrate with the broader I/O control plane to avoid lock conflicts and bandwidth saturation.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **A storage control plane with I/O budgeting and object-level conflict detection is required before deploying multiple autonomous storage subsystems concurrently**: without arbitration, independent subsystems will schedule conflicting operations, exhaust I/O bandwidth, and create the exact instability they were designed to prevent.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">A storage control plane with I/O budgeting and object-level conflict detection is required before deploying multiple autonomous storage subsystems concurrently</strong>: without arbitration, independent subsystems will schedule conflicting operations, exhaust I/O bandwidth, and create the exact instability they were designed to prevent.</li>
     </div>
     <div class="mt-14 bg-emerald-950/40 border border-emerald-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">

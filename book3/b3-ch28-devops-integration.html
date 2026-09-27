@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Chapter 28: Integrating Autonomous Systems with DevOps — The ADE Handbook</title>
-  <meta name="description" content="The ADE Handbook Chapter 28: Integrating Autonomous Systems with DevOps. Autonomous database engineering for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
+  <meta name="description" content="The ADE Handbook Chapter 28: Integrating Autonomous Systems with DevOps. Autonomous database engineering for SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
   <script type="module">
     import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
@@ -45,17 +45,15 @@
 
 <p class="text-gray-300 leading-relaxed">Autonomous database systems do not operate in isolation — they live inside CI/CD pipelines, Kubernetes clusters, Terraform workflows, and GitOps repositories. The gap between a self-managing database engine and the surrounding DevOps machinery is where most autonomous initiatives quietly fail: the database detects a problem and responds correctly, but the action conflicts with an in-flight deployment, overwrites a configuration managed by Terraform, or triggers a failover during a maintenance window that the orchestration layer was never told about. This chapter addresses the full integration surface between autonomous database behavior and the DevOps ecosystem, covering pipeline awareness, infrastructure-as-code contracts, operator-based autonomy in Kubernetes, and the feedback loops that allow autonomous database decisions to be auditable, reversible, and coordinated with the rest of the platform.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Establishing the Autonomy Contract: What Databases Can Change Unilaterally and What They Cannot</h3>
 
 <p class="text-gray-300 leading-relaxed">Before writing a single line of integration code, an ADE team must define an explicit <strong class="text-white">autonomy contract</strong> — a formal boundary that specifies which database behaviors are self-sovereign (the system acts without external coordination) and which require coordination locks with the DevOps layer. Without this contract, autonomous systems and deployment pipelines will eventually collide.</p>
 
 <p class="text-gray-300 leading-relaxed">The contract has three zones:</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Zone 1 — Fully Autonomous (no coordination required):</strong> Query plan cache invalidation, index creation on non-primary replicas, connection pool rebalancing, vacuum scheduling, statistics refresh, in-memory cache eviction policy adjustment.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Zone 1 — Fully Autonomous (no coordination required):</strong> Query plan cache invalidation, index creation on non-primary replicas, connection pool rebalancing, index maintenance scheduling, statistics refresh, in-memory cache eviction policy adjustment.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Zone 2 — Coordinated Autonomous (system acts but notifies):</strong> Autovacuum cost delay tuning, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">work_mem</code> session-level adjustments, read replica promotion under transient primary degradation, partition pruning policy changes.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Zone 2 — Coordinated Autonomous (system acts but notifies):</strong> Index maintenance throttling, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">MAXDOP</code> session-level adjustments, read replica promotion under transient primary degradation, partition pruning policy changes.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Zone 3 — Gated (system proposes, pipeline approves):</strong> Schema migrations, primary failover in production, storage tier changes, major version upgrades, index drops on primary.</p>
 
@@ -64,13 +62,13 @@
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># autonomy-contract.yaml
 zones:
   fully_autonomous:
-    - vacuum_scheduling
+    - index_maintenance_scheduling
     - connection_pool_rebalancing
     - index_creation_replica
     - statistics_refresh
   coordinated_autonomous:
-    - work_mem_adjustment
-    - autovacuum_cost_tuning
+    - maxdop_adjustment
+    - index_maintenance_throttling
     - read_replica_promotion
   gated:
     - schema_migration
@@ -104,13 +102,11 @@ CREATE INDEX IX_ActionLog_Zone_Initiated
 
 <p class="text-gray-300 leading-relaxed">The log is the immutable audit trail. Every autonomous action — regardless of zone — writes a record here before and after execution. This single table becomes the integration point for compliance, rollback automation, and pipeline conflict detection.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Pipeline-Aware Autonomy: Teaching the Database to Respect Deployment Windows</h3>
 
-<p class="text-gray-300 leading-relaxed">A deployment pipeline has state: a release is staging, deploying, validating, or complete. An autonomous database system that ignores pipeline state will take actions at the worst possible moments — resetting <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">shared_buffers</code> mid-migration, dropping a replica connection pool during blue-green cutover, or triggering autovacuum on a heavily written table during the load test phase of a canary release.</p>
+<p class="text-gray-300 leading-relaxed">A deployment pipeline has state: a release is staging, deploying, validating, or complete. An autonomous database system that ignores pipeline state will take actions at the worst possible moments — changing <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max server memory</code> mid-migration, dropping a replica connection pool during blue-green cutover, or triggering index maintenance on a heavily written table during the load test phase of a canary release.</p>
 
-<p class="text-gray-300 leading-relaxed">The solution is a <strong class="text-white">deployment state bus</strong> — a lightweight API that the CI/CD system writes to and the autonomous database agents read from. GitHub Actions, GitLab CI, and Jenkins all support webhook mechanisms that can push deployment state into a Redis key, a Postgres table, or a dedicated HTTP endpoint.</p>
+<p class="text-gray-300 leading-relaxed">The solution is a <strong class="text-white">deployment state bus</strong> — a lightweight API that the CI/CD system writes to and the autonomous database agents read from. GitHub Actions, GitLab CI, and Jenkins all support webhook mechanisms that can push deployment state into a Redis key, a SQL Server table, or a dedicated HTTP endpoint.</p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># deployment_state_publisher.py
 # Called by GitHub Actions at each pipeline stage transition
@@ -183,30 +179,28 @@ class DeploymentWindowConflict(Exception):
 
 # Usage on any autonomous action:
 @respect_deployment_window(zone="coordinated_autonomous")
-def adjust_work_mem(session_id: str, new_value_mb: int):
-    # ... execute SET work_mem
+def adjust_maxdop(new_value: int):
+    # ... execute ALTER DATABASE SCOPED CONFIGURATION SET MAXDOP
     pass</code></pre>
 
 <p class="text-gray-300 leading-relaxed">This pattern means the database's autonomous layer and the CI/CD system share a coordination protocol without tight coupling. The pipeline does not need to know anything about the database's internal decision logic — it simply publishes state transitions. The database agents consume that state and self-throttle.</p>
 
 <p class="text-gray-300 leading-relaxed">When a deployment completes or rolls back, the pipeline publishes <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">complete</code> or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">rolled_back</code>, and the autonomous agents resume normal operation. Any actions that were queued during the lock are replayed in order, with a jitter to avoid a thundering herd of deferred autonomous operations executing simultaneously.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Infrastructure-as-Code Contracts: Preventing Terraform from Overwriting Autonomous Decisions</h3>
 
-<p class="text-gray-300 leading-relaxed">Autonomous systems modify configuration at runtime — they adjust <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_connections</code>, tune <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">checkpoint_completion_target</code>, resize connection pools, or promote replicas. Terraform, applied on a schedule or triggered by a pipeline, reads desired state from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">.tf</code> files and reconciles it against actual infrastructure. If Terraform's desired state encodes the pre-autonomous values, every <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">terraform apply</code> undoes what the autonomous system just tuned.</p>
+<p class="text-gray-300 leading-relaxed">Autonomous systems modify configuration at runtime — they adjust <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max degree of parallelism</code>, tune <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">cost threshold for parallelism</code>, resize connection pools, or promote replicas. Terraform, applied on a schedule or triggered by a pipeline, reads desired state from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">.tf</code> files and reconciles it against actual infrastructure. If Terraform's desired state encodes the pre-autonomous values, every <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">terraform apply</code> undoes what the autonomous system just tuned.</p>
 
 <p class="text-gray-300 leading-relaxed">This is the <strong class="text-white">autonomous/IaC drift problem</strong>, and it requires a deliberate reconciliation architecture.</p>
 
 <p class="text-gray-300 leading-relaxed">The correct pattern is a <strong class="text-white">configuration ownership registry</strong> — a metadata store that Terraform reads before applying, which tells it which parameters are currently owned by the autonomous layer and should not be touched. Terraform data sources or external data providers can query this registry and exclude owned parameters from the apply plan.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># terraform/modules/postgres_config/main.tf
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># terraform/modules/sqlserver_config/main.tf
 
 data "http" "autonomy_owned_params" {
   url = "https://autonomy-api.internal/v1/owned-parameters?instance=${var.instance_id}"
   request_headers = {
-    Authorization = "Bearer ${var.autonomy_api_token}"
+Authorization=<redacted>
   }
 }
 
@@ -214,26 +208,28 @@ locals {
   # Parameters currently managed by autonomous agents — exclude from Terraform apply
   autonomy_owned = toset(jsondecode(data.http.autonomy_owned_params.response_body).owned_parameters)
 
-  # Base configuration from IaC
-  base_pg_config = {
-    max_connections              = 200
-    shared_buffers               = "4GB"
-    checkpoint_completion_target = 0.9
-    work_mem                     = "64MB"
-    autovacuum_vacuum_cost_delay = "2ms"
+  # Base configuration from IaC (sp_configure names)
+  base_sql_config = {
+    'max degree of parallelism'      = 8
+    'max server memory (MB)'         = 65536
+    'cost threshold for parallelism' = 50
+    'fill factor (%)'                = 90
   }
 
   # Only apply parameters NOT owned by the autonomous layer
-  applied_pg_config = {
-    for k, v in local.base_pg_config :
+  applied_sql_config = {
+    for k, v in local.base_sql_config :
     k =&gt; v if !contains(local.autonomy_owned, k)
   }
 }
 
-resource "postgresql_configuration" "pg_settings" {
-  for_each = local.applied_pg_config
-  name     = each.key
-  value    = each.value
+# Apply each remaining parameter via sp_configure through sqlcmd
+resource "terraform_data" "sqlserver_config" {
+  for_each = local.applied_sql_config
+
+  provisioner "local-exec" {
+    command = "sqlcmd -S ${var.server_fqdn} -U ${var.admin_login} -P ${var.admin_password} -Q \"EXEC sp_configure '${each.key}', ${each.value}; RECONFIGURE;\""
+  }
 }</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The autonomy API endpoint powering this data source stores ownership records:</p>
@@ -268,13 +264,11 @@ WHEN NOT MATCHED THEN
 
 <p class="text-gray-300 leading-relaxed">This creates a dynamic equilibrium: IaC owns the baseline, autonomous agents own the tuning space, and the boundary between them shifts based on runtime conditions.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Kubernetes Operator Patterns for Autonomous Database Lifecycle Management</h3>
 
 <p class="text-gray-300 leading-relaxed">In Kubernetes environments, the canonical integration point between autonomous database behavior and the DevOps layer is the <strong class="text-white">operator pattern</strong>. A database operator encodes operational knowledge as a control loop: it watches Custom Resources (CRDs), reconciles observed state against desired state, and issues corrective actions. For autonomous systems, the operator becomes the execution arm of the database's decision layer — the agent that decides, and the operator that acts on behalf of Kubernetes.</p>
 
-<p class="text-gray-300 leading-relaxed">Production-grade operators for PostgreSQL include CloudNativePG, Crunchy PGO, and Stackgres. For SQL Server, the MSSQL Operator for Kubernetes (part of SQL Server 2022 and later) handles availability group management within pods. The ADE's role is to extend these operators with autonomous decision hooks rather than replacing them.</p>
+<p class="text-gray-300 leading-relaxed">For SQL Server, the MSSQL Operator for Kubernetes (part of SQL Server 2022 and later) handles availability group management within pods. The ADE's role is to extend these operators with autonomous decision hooks rather than replacing them.</p>
 
 <p class="text-gray-300 leading-relaxed">The integration architecture looks like this:</p>
 
@@ -283,7 +277,7 @@ WHEN NOT MATCHED THEN
 <p class="text-gray-300 leading-relaxed">The autonomous decision engine does not call <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">kubectl</code> directly — it patches Custom Resource objects, and the operator's reconciler loop responds to those patches. This keeps all mutations inside the Kubernetes API server audit log and respects the operator's own safety checks.</p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># autonomous_k8s_decision.py
-# The autonomous engine patches a PostgresCluster CRD based on load metrics
+# The autonomous engine patches a SqlAvailabilityGroup CRD based on load metrics
 
 from kubernetes import client, config
 import json
@@ -291,56 +285,59 @@ import json
 config.load_incluster_config()  # running inside the cluster
 custom_api = client.CustomObjectsApi()
 
-def scale_read_replicas(cluster_name: str, namespace: str, new_replica_count: int, reason: str):
+def adjust_read_routing(ag_name: str, namespace: str, weights: dict, reason: str):
     """
-    Autonomous decision: scale read replicas based on observed read QPS and replica lag.
-    Patches the CloudNativePG PostgresCluster CRD — the operator reconciler executes the change.
+    Autonomous decision: shift read routing weights based on observed
+    batch request rate and replica lag.
+    Patches the SQL Server operator SqlAvailabilityGroup CRD — the
+    operator reconciler executes the change.
     """
     patch_body = {
         "spec": {
-            "instances": new_replica_count
+            "readableSecondaries": [
+                {"name": name, "readRoutingWeight": w}
+                for name, w in weights.items()
+            ]
         },
         "metadata": {
             "annotations": {
-                "autonomous.db/last-scale-reason": reason,
-                "autonomous.db/last-scale-timestamp": "2024-01-15T14:32:00Z",
-                "autonomous.db/previous-replica-count": str(new_replica_count - 1)
+                "autonomous.db/last-routing-reason": reason,
+                "autonomous.db/last-routing-timestamp": "2024-01-15T14:32:00Z",
             }
         }
     }
 
     custom_api.patch_namespaced_custom_object(
-        group="postgresql.cnpg.io",
+        group="sql.microsoft.com",
         version="v1",
         namespace=namespace,
-        plural="clusters",
-        name=cluster_name,
+        plural="sqlavailabilitygroups",
+        name=ag_name,
         body=patch_body
     )
-    print(f"[Autonomous] Scaled {cluster_name} to {new_replica_count} instances. Reason: {reason}")
+    print(f"[Autonomous] Adjusted read routing for {ag_name}. Reason: {reason}")
 
 
-def autonomous_replica_scaling_loop(metrics_client, cluster_name: str, namespace: str):
+def autonomous_read_routing_loop(metrics_client, ag_name: str, namespace: str):
     """
-    Decision logic: scale up when read QPS &gt; 50k AND replica lag &gt; 500ms on any replica.
-    Scale down when read QPS &lt; 15k for 10 consecutive minutes AND lag &lt; 50ms.
+    Decision logic: shift reads to secondaries when primary batch
+    requests/sec &gt; 50k AND replica lag &gt; 500ms on any replica.
+    Shift back when load &lt; 15k for 10 consecutive minutes AND lag &lt; 50ms.
     """
-    read_qps = metrics_client.query("rate(pg_stat_statements_calls_total[5m])")
-    max_lag_ms = metrics_client.query("max(pg_replication_lag_seconds) * 1000")
+    batch_rps = metrics_client.query("rate(sqlserver_batch_requests[5m])")
+    max_lag_ms = metrics_client.query("max(sqlserver_ag_replica_lag_seconds) * 1000")
 
-    current_instances = get_current_instance_count(cluster_name, namespace)
-
-    if read_qps &gt; 50_000 and max_lag_ms &gt; 500 and current_instances &lt; 6:
-        scale_read_replicas(
-            cluster_name, namespace,
-            new_replica_count=min(current_instances + 1, 6),
-            reason=f"read_qps={read_qps:.0f} lag_ms={max_lag_ms:.0f}"
+    if batch_rps &gt; 50_000 and max_lag_ms &gt; 500:
+        adjust_read_routing(
+            ag_name, namespace,
+            weights={"replica-1": 60, "replica-2": 40},
+            reason=f"batch_rps={batch_rps:.0f} lag_ms={max_lag_ms:.0f}"
         )
-    elif read_qps &lt; 15_000 and max_lag_ms &lt; 50 and current_instances &gt; 2:
-        scale_read_replicas(
-            cluster_name, namespace,
-            new_replica_count=max(current_instances - 1, 2),
-            reason=f"scale_down: read_qps={read_qps:.0f} sustained_low=10m"
+    elif batch_rps &lt; 15_000 and max_lag_ms &lt; 50:
+        adjust_read_routing(
+            ag_name, namespace,
+            weights={"replica-1": 50, "replica-2": 50},
+            reason=f"scale_down: batch_rps={batch_rps:.0f} sustained_low=10m"
         )</code></pre>
 
 <p class="text-gray-300 leading-relaxed">For SQL Server on Kubernetes, the autonomous layer interacts with the SQL Server Operator's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SqlAvailabilityGroup</code> CRD to manage replica reads and failover priorities:</p>
@@ -365,8 +362,6 @@ spec:
 
 <p class="text-gray-300 leading-relaxed">For teams using Helm for release management alongside operators, the autonomous layer must be registered as a Helm hook consumer — specifically, it must receive <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pre-upgrade</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">post-upgrade</code> signals to pause and resume autonomous behavior during Helm-managed releases.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Closing the Loop: Autonomous Feedback into GitOps and Observability Pipelines</h3>
 
 <p class="text-gray-300 leading-relaxed">An autonomous system that acts without feedback is opaque. The ADE standard requires that every autonomous decision be visible in three places simultaneously: the observability stack (Prometheus/Grafana), the GitOps repository (as a configuration commit or PR), and the incident management system (PagerDuty or equivalent). This trinity of feedback is what makes autonomous behavior trustworthy at the organizational level.</p>
@@ -385,8 +380,11 @@ spec:
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># autonomous_metrics_exporter.py
 from prometheus_client import Counter, Histogram, Gauge, start_http_server
-import psycopg2
+import pyodbc
 import time
+import os
+
+CONN_STR = os.environ["MSSQL_CONN_STRING"]
 
 AUTONOMOUS_ACTIONS = Counter(
     'autonomous_db_actions_total',
@@ -407,23 +405,24 @@ GATED_QUEUE_DEPTH = Gauge(
     ['database']
 )
 
-def collect_and_export(pg_conn_string: str):
-    conn = psycopg2.connect(pg_conn_string)
-    with conn.cursor() as cur:
+def collect_and_export():
+    conn = pyodbc.connect(CONN_STR)
+    cur = conn.cursor()
+    try:
         # Actions completed in last scrape interval
         cur.execute("""
             SELECT action_type, zone, outcome,
                    COUNT(*),
-                   AVG(EXTRACT(EPOCH FROM (executed_at - initiated_at)))
+                   AVG(CAST(DATEDIFF(MILLISECOND, initiated_at, executed_at) AS FLOAT) / 1000.0)
             FROM autonomous_action_log
-            WHERE executed_at &gt; now() - INTERVAL '1 minute'
+            WHERE executed_at &gt; DATEADD(MINUTE, -1, SYSUTCDATETIME())
             GROUP BY action_type, zone, outcome
         """)
         for row in cur.fetchall():
             action_type, zone, outcome, count, avg_duration = row
             AUTONOMOUS_ACTIONS.labels(
                 action_type=action_type, zone=zone,
-                outcome=outcome or 'unknown', database='postgresql'
+                outcome=outcome or 'unknown', database='sqlserver'
             ).inc(count)
             if avg_duration:
                 AUTONOMOUS_LATENCY.labels(
@@ -436,11 +435,13 @@ def collect_and_export(pg_conn_string: str):
             WHERE zone = 'gated' AND approved_at IS NULL AND executed_at IS NULL
         """)
         pending = cur.fetchone()[0]
-        GATED_QUEUE_DEPTH.labels(database='postgresql').set(pending)
+        GATED_QUEUE_DEPTH.labels(database='sqlserver').set(pending)
+    finally:
+        conn.close()
 
 start_http_server(9190)
 while True:
-    collect_and_export(os.environ["PG_CONN_STRING"])
+    collect_and_export()
     time.sleep(30)</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">GitOps feedback:</strong> When the autonomous system makes a structural change — one that has configuration implications — it opens a pull request or pushes a commit to the configuration repository. This is not bureaucracy; it is the mechanism by which autonomous changes become reviewable, revertible, and part of the team's knowledge base.</p>
@@ -468,7 +469,7 @@ def commit_autonomous_config_change(parameter: str, old_value: str, new_value: s
     }
 
     # Read current file
-    file_path = "config/postgres/autonomous-runtime.json"
+    file_path = "config/sqlserver/autonomous-runtime.json"
     get_resp = requests.get(
         f"https://api.github.com/repos/{REPO}/contents/{file_path}",
         headers=headers
@@ -581,8 +582,6 @@ def fire_autonomous_event(action_type: str, zone: str, outcome: str,
 
 <p class="text-gray-300 leading-relaxed">The three feedback channels — metrics, GitOps PRs, and incident events — give a complete picture to three distinct audiences: the SRE team watching dashboards, the platform engineers reviewing configuration history, and the on-call engineer triaging alerts. Autonomous behavior stops being a black box and becomes a first-class participant in the team's operational processes.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Rollback Architecture: Making Every Autonomous Decision Reversible</h3>
 
 <p class="text-gray-300 leading-relaxed">Autonomy without reversibility is recklessness dressed as intelligence. Every autonomous action must have a defined rollback path, and the rollback must be executable without human reconstruction of what the system did. This means the rollback SQL or rollback operator patch is generated and stored before the action executes, not after.</p>
@@ -639,8 +638,6 @@ END;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The rollback store is not just a safety net — it becomes the foundation for automated regression detection. If the autonomous system's observability layer detects that a recent action correlated with a performance degradation (query latency increased after index creation, for example, due to increased planner overhead on writes), the rollback daemon can be triggered automatically within the evaluation window, executing the stored rollback SQL without human involvement.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Multi-Environment Promotion: Autonomous Behavior Across Dev, Staging, and Production</h3>
 
 <p class="text-gray-300 leading-relaxed">Autonomous system behavior should not be identical across all environments. In development, the autonomy contract should be maximally permissive — let the system try everything, including gated actions, to build a behavioral record. In staging, gated actions require approval but coordinated-autonomous actions execute freely. In production, the full contract applies.</p>
@@ -673,13 +670,11 @@ change_freeze_calendar: "pagerduty_schedule_id_xyz"</code></pre>
 
 <p class="text-gray-300 leading-relaxed">When a behavioral pattern learned in dev or staging is ready to promote to production — for example, a new autonomous tuning rule that proved effective in staging — the promotion follows the same GitOps PR workflow as any other configuration change. The PR includes evidence: a summary of actions taken in staging, their outcomes, and the performance delta observed. Human reviewers approve the promotion with full context rather than blindly enabling new autonomous behavior in production.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Security Boundaries: Least-Privilege Autonomous Agents</h3>
 
 <p class="text-gray-300 leading-relaxed">Autonomous database agents require credentials to act — and credentials are the primary attack surface if an autonomous system is compromised. The architecture must enforce least-privilege at every layer.</p>
 
-<p class="text-gray-300 leading-relaxed">Each autonomous agent role should have exactly the permissions required for its specific action set and nothing more. The vacuum optimization agent needs <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_signal_backend</code> and the ability to alter autovacuum storage parameters; it does not need <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SUPERUSER</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATEDB</code>, or access to application schema tables.</p>
+<p class="text-gray-300 leading-relaxed">Each autonomous agent role should have exactly the permissions required for its specific action set and nothing more. The index maintenance agent needs <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALTER</code> permission on indexes and the ability to run <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALTER INDEX ... REBUILD</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">UPDATE STATISTICS</code>; it does not need <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sysadmin</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CONTROL SERVER</code>, or access to application data tables.</p>
 
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Least-privilege login for the index advisor agent
@@ -699,9 +694,7 @@ GRANT SELECT ON dbo.AutonomousParameterOwnership TO AutonomousIndexAgent;</code>
 
 <p class="text-gray-300 leading-relaxed">Credentials for autonomous agents should never be static. Integration with HashiCorp Vault's database secrets engine, AWS IAM authentication for RDS, or Azure Managed Identity for Azure SQL means credentials are short-lived and automatically rotated. If an autonomous agent is compromised, its credential expires before a lateral movement attack can leverage it.</p>
 
-<p class="text-gray-300 leading-relaxed">The autonomous action log itself should be protected against tampering. In PostgreSQL, this means the agent role can <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">INSERT</code> and perform limited <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">UPDATE</code> (to set <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">executed_at</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">outcome</code>) but cannot <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DELETE</code> or perform arbitrary <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">UPDATE</code>. In SQL Server, row-level security or column-level permissions accomplish the same constraint. For high-assurance environments, the action log can be replicated to an immutable audit sink — an append-only S3 bucket with object lock, or Azure Immutable Blob Storage — where even a compromised database cannot alter the historical record.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
+<p class="text-gray-300 leading-relaxed">The autonomous action log itself should be protected against tampering. In SQL Server, this means the agent role is granted <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">INSERT</code> only on the action log table, with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">UPDATE</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DELETE</code> explicitly denied; row-level security or column-level permissions accomplish finer constraints where needed. For high-assurance environments, the action log can be replicated to an immutable audit sink — an append-only S3 bucket with object lock, or Azure Immutable Blob Storage — where even a compromised database cannot alter the historical record.</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Observability at the Integration Layer: What to Instrument</h3>
 
@@ -722,19 +715,17 @@ GRANT SELECT ON dbo.AutonomousParameterOwnership TO AutonomousIndexAgent;</code>
 
 <p class="text-gray-300 leading-relaxed">The single most important signal in this set is <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">autonomous_rollback_rate</code>. A system that is rolling back more than a small fraction of its own decisions is learning poorly or acting on bad signal. An elevated rollback rate is the early warning that the autonomous system's decision models need retraining, its action thresholds need adjustment, or its observability inputs are feeding it corrupted data. This metric should never be absent from a production autonomy deployment.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Define an explicit autonomy contract before writing integration code.** Classify every autonomous behavior into fully autonomous, coordinated autonomous, or gated zones, and store the contract as a versioned artifact in your GitOps repository. The contract is the foundation on which all pipeline integration is built.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Define an explicit autonomy contract before writing integration code.</strong> Classify every autonomous behavior into fully autonomous, coordinated autonomous, or gated zones, and store the contract as a versioned artifact in your GitOps repository. The contract is the foundation on which all pipeline integration is built.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Teach autonomous agents to read deployment state.** A lightweight deployment state bus — written by the CI/CD pipeline and read by autonomous agents — prevents autonomous actions from colliding with in-flight deployments. Agents should self-throttle during deploying and validating states without requiring tight coupling to the pipeline.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Teach autonomous agents to read deployment state.</strong> A lightweight deployment state bus — written by the CI/CD pipeline and read by autonomous agents — prevents autonomous actions from colliding with in-flight deployments. Agents should self-throttle during deploying and validating states without requiring tight coupling to the pipeline.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Use a configuration ownership registry to resolve IaC/autonomy drift.** Autonomous agents claim ownership of parameters they tune, and Terraform reads that registry before applying — skipping parameters currently managed by the autonomous layer. Ownership release conditions should be explicit and machine-readable.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Use a configuration ownership registry to resolve IaC/autonomy drift.</strong> Autonomous agents claim ownership of parameters they tune, and Terraform reads that registry before applying — skipping parameters currently managed by the autonomous layer. Ownership release conditions should be explicit and machine-readable.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **In Kubernetes environments, route all autonomous decisions through operator CRD patches.** Autonomous agents should never call `kubectl` directly or bypass the operator's reconciliation loop. Every autonomous action expressed as a CRD patch inherits Kubernetes API audit logging, admission controller validation, and the operator's own safety checks at no additional cost.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">In Kubernetes environments, route all autonomous decisions through operator CRD patches.</strong> Autonomous agents should never call <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">kubectl</code> directly or bypass the operator's reconciliation loop. Every autonomous action expressed as a CRD patch inherits Kubernetes API audit logging, admission controller validation, and the operator's own safety checks at no additional cost.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The rollback SQL must be generated and stored before the action executes, not after.** An autonomous system that cannot cleanly reverse its own decisions is not ready for production. Combined with an elevated rollback rate metric as a leading indicator of model degradation, pre-stored rollback SQL transforms autonomous reversibility from a manual recovery exercise into an automated feedback loop.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">The rollback SQL must be generated and stored before the action executes, not after.</strong> An autonomous system that cannot cleanly reverse its own decisions is not ready for production. Combined with an elevated rollback rate metric as a leading indicator of model degradation, pre-stored rollback SQL transforms autonomous reversibility from a manual recovery exercise into an automated feedback loop.</li>
     </div>
     <div class="mt-14 bg-emerald-950/40 border border-emerald-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">

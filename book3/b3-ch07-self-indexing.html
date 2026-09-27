@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Chapter 7: Self-Indexing and Schema Adaptation — The ADE Handbook</title>
-  <meta name="description" content="The ADE Handbook Chapter 7: Self-Indexing and Schema Adaptation. Autonomous database engineering for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
+  <meta name="description" content="The ADE Handbook Chapter 7: Self-Indexing and Schema Adaptation. Autonomous database engineering for SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
   <script type="module">
     import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
@@ -43,14 +43,12 @@
     <div class="space-y-4 text-sm">
 <h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 7: Self-Indexing and Schema Adaptation</h2>
 
-<p class="text-gray-300 leading-relaxed">Schema and index management represent two of the most labor-intensive responsibilities in traditional database operations — and two of the highest-leverage targets for autonomous systems. A DBA who manually reviews missing-index DMVs or watches <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_user_indexes</code> for bloat is performing work that a well-designed autonomous layer can execute continuously, with finer granularity and faster response time than any human rotation schedule allows. This chapter builds the full architecture: how autonomous systems observe workload patterns, infer optimal index structures, apply changes safely under live traffic, and adapt the physical schema as access patterns evolve — without waiting for a human to file a ticket.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
+<p class="text-gray-300 leading-relaxed">Schema and index management represent two of the most labor-intensive responsibilities in traditional database operations — and two of the highest-leverage targets for autonomous systems. A DBA who manually reviews missing-index DMVs or watches <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_db_index_usage_stats</code> for unused indexes and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_db_index_physical_stats</code> for fragmentation is performing work that a well-designed autonomous layer can execute continuously, with finer granularity and faster response time than any human rotation schedule allows. This chapter builds the full architecture: how autonomous systems observe workload patterns, infer optimal index structures, apply changes safely under live traffic, and adapt the physical schema as access patterns evolve — without waiting for a human to file a ticket.</p>
 
 <div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph LR
-    A[Observe<br/>pg_stat_statements / missing-index DMVs] --> B[Score & Recommend<br/>confidence + risk tier]
+    A[Observe<br/>Query Store / missing-index DMVs] --> B[Score & Recommend<br/>confidence + risk tier]
     B --> C{Governance Gate}
-    C -->|score >= 0.70| D[Auto-apply<br/>CONCURRENTLY / ONLINE=ON]
+    C -->|score >= 0.70| D[Auto-apply<br/>ONLINE=ON]
     C -->|0.40-0.70| H[Human review]
     H -->|approved| D
     D --> F[Monitor usage stats]
@@ -61,7 +59,7 @@
 
 <p class="text-gray-300 leading-relaxed">Autonomous index management lives or dies on the quality of its input signal. Before any decision logic can fire, the system must continuously capture what queries are running, how often, at what cost, and which predicates drive the most scan overhead. This is not a once-a-day snapshot job — it is a streaming observation pipeline.</p>
 
-<p class="text-gray-300 leading-relaxed">On PostgreSQL, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> is the foundation. It records normalized query text, execution count, total and mean planning and execution time, shared block reads and hits, and row estimates vs. actuals. However, raw <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> is insufficient on its own. For index inference, you need predicate-level visibility — which columns appear in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WHERE</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">JOIN ON</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ORDER BY</code>, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">GROUP BY</code> clauses — and that requires either query log parsing or the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">auto_explain</code> extension with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">log_analyze</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">log_buffers</code> enabled.</p>
+<p class="text-gray-300 leading-relaxed">On SQL Server, Query Store is the foundation. It records query text, plans, execution count, duration, logical reads, and estimated vs. actual rows per plan. However, raw Query Store data is insufficient on its own for index inference For index inference, you need predicate-level visibility — which columns appear in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WHERE</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">JOIN ON</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ORDER BY</code>, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">GROUP BY</code> clauses — and that requires parsing query text or capturing actual execution plans via Extended Events with the query plan profile action enabled.</p>
 
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Query the plan cache DMVs for sequential scan and high-cost query signals
@@ -86,7 +84,7 @@ ORDER BY avg_logical_reads DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">On SQL Server, the Missing Index DMVs provide a pre-computed signal layer that should be consumed directly. <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_db_missing_index_details</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_db_missing_index_groups</code>, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_db_missing_index_group_stats</code> together give you column-level index recommendations weighted by estimated impact. The critical discipline is interpreting these signals correctly rather than naively applying everything the engine suggests — the DMVs do not account for write amplification, duplicate near-miss indexes, or the cost of maintaining a large index catalog on write-heavy tables.</p>
 
-<p class="text-gray-300 leading-relaxed">The observation pipeline feeds a structured fact store — a dedicated schema, typically in a monitoring database or a time-series store like TimescaleDB on the PostgreSQL side, that retains:</p>
+<p class="text-gray-300 leading-relaxed">The observation pipeline feeds a structured fact store — a dedicated schema, typically in a monitoring database or a columnstore staging database, that retains:</p>
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Query fingerprint (normalized hash)</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Predicate columns and their selectivity estimates</li>
@@ -96,8 +94,6 @@ ORDER BY avg_logical_reads DESC;</code></pre>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Block I/O cost</li>
 
 <p class="text-gray-300 leading-relaxed">This fact store is the working memory of your autonomous index advisor. Without retention and trend analysis, the system cannot distinguish a transient spike from a structural workload shift — and those two cases demand completely different responses.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">7.2 Index Recommendation Logic: From Raw Signal to Actionable Proposals</h3>
 
@@ -112,8 +108,7 @@ ORDER BY avg_logical_reads DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The scoring function used in production at several platform teams looks roughly like this:</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import psycopg2
-import hashlib
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import hashlib
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -166,7 +161,7 @@ def score_index_proposal(
 
     return proposal.confidence_score</code></pre>
 
-<p class="text-gray-300 leading-relaxed">SQL Server, unlike PostgreSQL with HypoPG, has no supported, native mechanism for testing a hypothetical index against the optimizer without actually building it. The Database Engine Tuning Advisor performs a related workload analysis internally, but it is a separate tool, not an API the autonomous layer calls inline. In practice, teams get most of the same signal from the missing-index DMVs' pre-computed cost and impact estimates (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_db_missing_index_group_stats</code>), combined with creating updated column statistics to sharpen cardinality estimates before deciding whether a proposal is worth a real, concurrently-built index. Creating a statistics object alone does not make the optimizer generate a plan against an index that doesn't exist — it only improves the estimates the optimizer uses for the indexes and access paths that are actually present. Genuine validation of a candidate index on SQL Server means building it, typically first in a staging environment or during a low-traffic window, and measuring the real effect.</p>
+<p class="text-gray-300 leading-relaxed">SQL Server has no supported, documented mechanism for testing a hypothetical index against the optimizer without actually building it (the undocumented AUTOPILOT commands from Chapter 6 are not production-safe). The Database Engine Tuning Advisor performs a related workload analysis internally, but it is a separate tool, not an API the autonomous layer calls inline. In practice, teams get most of the same signal from the missing-index DMVs' pre-computed cost and impact estimates (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_db_missing_index_group_stats</code>), combined with creating updated column statistics to sharpen cardinality estimates before deciding whether a proposal is worth a real, online-built index. Creating a statistics object alone does not make the optimizer generate a plan against an index that doesn't exist — it only improves the estimates the optimizer uses for the indexes and access paths that are actually present. Genuine validation of a candidate index on SQL Server means building it, typically first in a staging environment or during a low-traffic window, and measuring the real effect.</p>
 
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Refresh statistics to sharpen cardinality estimates before deciding
@@ -184,13 +179,11 @@ SET STATISTICS IO OFF;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The recommendation engine should also integrate with the LLM layer introduced in Book 2's AIOps patterns. When a proposal's confidence score falls in the 0.40–0.70 range, routing the query workload context, current table statistics, and the proposal details to an OpenAI or Claude API call can generate a human-readable risk summary and a recommendation to approve or defer — without requiring a DBA to perform the analysis manually. The autonomous system isn't guessing blindly; it's delegating ambiguous cases to a reasoning layer that produces auditable output.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">7.3 Zero-Downtime Index Application and the Concurrent Build Safety Net</h3>
 
 <p class="text-gray-300 leading-relaxed">Generating a good index recommendation is straightforward relative to applying it safely under production load. Index creation on large tables is a blocking operation in its default form — and on a system processing thousands of transactions per second, even a one-second lock on a critical table triggers cascading timeouts. The autonomous apply layer must enforce non-blocking build patterns as an absolute invariant.</p>
 
-<p class="text-gray-300 leading-relaxed">PostgreSQL's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE INDEX CONCURRENTLY</code> is the mechanism. It performs two full sequential scans of the table with only brief ShareUpdateExclusiveLock acquisitions, allowing reads and writes to continue throughout the build. The cost is a longer build time and the possibility of a failed build (which leaves an invalid index behind that must be cleaned up). The autonomous apply layer handles both.</p>
+<p class="text-gray-300 leading-relaxed">SQL Server's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE INDEX ... WITH (ONLINE = ON)</code> is the mechanism. It builds the index while holding only brief locks at the start and end of the operation, allowing reads and writes to continue throughout. The cost is higher resource consumption, and on Standard Edition online index operations are unavailable — the autonomous apply layer checks edition support and falls back to an offline build inside a maintenance window when online is not available.</p>
 
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Non-blocking index creation with ONLINE = ON
@@ -214,15 +207,13 @@ WITH (
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Rollback via drop</strong>: If a build completes but query performance does not improve (measured by comparing the rolling average execution time of affected queries before and after), the system drops the index automatically. This is the index equivalent of a feature flag rollback — and it requires retaining the pre-build query timing baseline in the fact store.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Locking circuit breaker</strong>: The autonomous apply script must monitor <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_activity</code> (PostgreSQL) or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_requests</code> (SQL Server) before and during the build for blocked sessions accumulating against the target table. If the blocker count exceeds a threshold — typically three or more sessions blocked for more than five seconds — the build is aborted and rescheduled.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Locking circuit breaker</strong>: The autonomous apply script must monitor <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_requests</code> before and during the build for blocked sessions accumulating against the target table. If the blocker count exceeds a threshold — typically three or more sessions blocked for more than five seconds — the build is aborted and rescheduled.</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">7.4 Autonomous Index Retirement: Detecting and Removing the Dead Weight</h3>
 
 <p class="text-gray-300 leading-relaxed">Every team builds indexes they later forget about. The autonomous system that only adds indexes without retiring unused ones eventually produces the opposite of its intended effect: a swollen index catalog that adds write overhead on every INSERT, UPDATE, and DELETE with no corresponding read benefit. Index retirement is not a nice-to-have — it is a necessary counterbalance to the recommendation engine.</p>
 
-<p class="text-gray-300 leading-relaxed">Unused index detection relies on usage statistics reset cycles. PostgreSQL accumulates index scan counts in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_user_indexes</code> but resets them on server restart. SQL Server's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_db_index_usage_stats</code> resets on service restart. For reliable detection, usage data must be persisted externally across restarts — another function of the observation fact store.</p>
+<p class="text-gray-300 leading-relaxed">Unused index detection relies on usage statistics reset cycles. SQL Server accumulates index usage counts in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_db_index_usage_stats</code>, which resets on service restart. For reliable detection, usage data must be persisted externally across restarts — another function of the observation fact store.</p>
 
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify unused indexes with write cost visibility
@@ -265,11 +256,9 @@ ORDER BY index_size_mb DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Observation</strong>: Index has zero reads for 14+ consecutive days across at least three stat-reset cycles (confirmed via the external fact store).</p>
 <p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Disable</strong> (SQL Server only): <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALTER INDEX idx_name ON table DISABLE</code> — a reversible operation that drops the index pages but retains the metadata. If workload changes cause a performance regression within 72 hours, re-enable without a full rebuild.</p>
-<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Invisible Index Testing</strong> (PostgreSQL): PostgreSQL has no native "invisible index" feature like some other engines, but the same effect can be approximated by directly marking the index unusable by the planner: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'idx_name'::regclass</code>. Monitor for 24 hours. This is a low-level catalog operation with real risk (it bypasses normal DDL locking and validity guarantees) and should only be used in controlled staging scenarios — in production, proceed directly to DROP after the observation window.</p>
-<p class="text-gray-300 leading-relaxed">4. <strong class="text-white">Drop</strong>: Issue the DROP with concurrent semantics on PostgreSQL, or a standard DROP after confirming no blocking sessions on SQL Server.</p>
+<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Index disable testing</strong>: SQL Server supports <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALTER INDEX ... DISABLE</code>, which keeps the index definition while making it invisible to the optimizer. Disable the candidate and monitor for 24 hours — if no query regresses, proceed to DROP; if something breaks, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">REBUILD</code> brings it back instantly. This is the safest production validation path for index removal.</p>
+<p class="text-gray-300 leading-relaxed">4. <strong class="text-white">Drop</strong>: Issue the DROP after confirming no blocking sessions and that the observation hold period has elapsed.</p>
 <p class="text-gray-300 leading-relaxed">5. <strong class="text-white">Post-drop monitoring</strong>: Retain a suppression record in the fact store so the recommendation engine does not immediately propose recreating the same index without evidence of workload change.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">7.5 Schema Adaptation Pipelines: Aligning Physical Structure to Evolving Access Patterns</h3>
 
@@ -278,7 +267,7 @@ ORDER BY index_size_mb DESC;</code></pre>
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Partition boundary adaptation</strong> is the most mature use case. On a time-series table partitioned by month, if the system detects that 80% of queries land on the last two partitions while earlier partitions are accessed only by archival processes, the schema adaptation layer should:</p>
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Verify the partition access distribution using execution plan analysis</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Compress or archive cold partitions automatically (PostgreSQL tablespace reassignment; SQL Server partition switching to a compressed filegroup)</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Compress or archive cold partitions automatically (SQL Server partition switching to a compressed filegroup or archive table)</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Pre-create future partitions on a rolling schedule without DBA intervention</li>
 
 
@@ -289,11 +278,9 @@ ORDER BY index_size_mb DESC;</code></pre>
 <p class="text-gray-300 leading-relaxed">3. Update the application's index bindings to reference the new column.</p>
 <p class="text-gray-300 leading-relaxed">4. Swap column names (or update application queries) and drop the old column.</p>
 
-<p class="text-gray-300 leading-relaxed">This pattern is implemented in tools like <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pgroll</code> (PostgreSQL) and integrated into CI/CD pipelines, but the autonomous layer can initiate the sequence when it detects a persistent type mismatch penalty in execution plans — without waiting for a developer to file a migration ticket.</p>
+<p class="text-gray-300 leading-relaxed">This pattern is implemented in expand/contract migration frameworks and integrated into CI/CD pipelines, but the autonomous layer can initiate the sequence when it detects a persistent type mismatch penalty in execution plans — without waiting for a developer to file a migration ticket.</p>
 
-<p class="text-gray-300 leading-relaxed">The schema adaptation pipeline also governs <strong class="text-white">statistics freshness</strong>. Stale statistics produce incorrect cardinality estimates, which produce bad plans, which look to the observation layer like unindexed queries — generating false positive index proposals. The autonomous system avoids this by monitoring the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">n_mod_since_analyze</code> counter on PostgreSQL and the statistics update date via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.stats</code> on SQL Server, triggering <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ANALYZE</code> or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">UPDATE STATISTICS</code> when modification thresholds are breached rather than relying on autovacuum's schedule alone.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
+<p class="text-gray-300 leading-relaxed">The schema adaptation pipeline also governs <strong class="text-white">statistics freshness</strong>. Stale statistics produce incorrect cardinality estimates, which produce bad plans, which look to the observation layer like unindexed queries — generating false positive index proposals. The autonomous system avoids this by monitoring the statistics modification counter and update date via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.stats</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">STATS_DATE()</code>, triggering <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">UPDATE STATISTICS</code> when modification thresholds are breached rather than relying on the auto-update schedule alone.</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">7.6 Governance, Auditability, and the Human Override Layer</h3>
 
@@ -312,14 +299,12 @@ ORDER BY index_size_mb DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The broader principle underlying this chapter is that self-indexing and schema adaptation are not about removing humans from the loop — they are about moving humans from the execution path to the policy-design path. The DBA who once ran <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE INDEX</code> manually now defines the scoring thresholds, the freeze conditions, and the escalation rules that govern when the system may act on its own. That is a higher-leverage use of expertise, and it is also the only way index and schema management can keep pace with workloads that change faster than any manual review cadence could track.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Autonomous index management requires a persistent observation fact store — query fingerprints, predicate columns, execution frequency, and plan type over time — because a single point-in-time snapshot cannot distinguish a transient spike from a structural workload shift.</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> A sound recommendation engine enforces hard constraints before surfacing a proposal: duplicate suppression, write-cost penalties on high-insert tables, partial-index preference for low-selectivity predicates, and consolidation of overlapping column sets into covering indexes.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Index creation must default to non-blocking mechanisms — `CREATE INDEX CONCURRENTLY` on PostgreSQL, `WITH (ONLINE = ON)` on SQL Server — with automated validity checks, a locking circuit breaker, and a rollback-via-drop path when a build does not improve the queries it targeted.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Index retirement is a necessary counterbalance to index creation: usage statistics reset on restart on both platforms, so reliable dead-index detection requires persisting usage data externally across multiple observation windows before acting.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Index creation must default to non-blocking mechanisms — <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WITH (ONLINE = ON)</code> on SQL Server — with automated validity checks, a locking circuit breaker, and a rollback-via-drop path when a build does not improve the queries it targeted.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Index retirement is a necessary counterbalance to index creation: usage statistics reset on service restart, so reliable dead-index detection requires persisting usage data externally across multiple observation windows before acting.</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Schema adaptation — partition pre-creation, cold-partition archival, and expand/contract type migrations — extends the same observe-score-apply-verify discipline beyond indexes, but destructive phases (column removal, boundary changes affecting in-flight transactions) should remain human-approved regardless of confidence score.</li>
     </div>
     <div class="mt-14 bg-emerald-950/40 border border-emerald-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">

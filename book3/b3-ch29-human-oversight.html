@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Chapter 29: Human Oversight in Autonomous DBA Systems — The ADE Handbook</title>
-  <meta name="description" content="The ADE Handbook Chapter 29: Human Oversight in Autonomous DBA Systems. Autonomous database engineering for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
+  <meta name="description" content="The ADE Handbook Chapter 29: Human Oversight in Autonomous DBA Systems. Autonomous database engineering for SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
   <script type="module">
     import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
@@ -45,21 +45,23 @@
 
 <p class="text-gray-300 leading-relaxed">Autonomous database systems that observe, decide, and act without human intervention represent a genuine operational leap — but the engineering discipline surrounding when and how humans remain in the loop is equally important as the automation itself. A system that acts too freely without audit trails, escalation gates, or override mechanisms is not autonomous; it is reckless. This chapter examines the architecture of human oversight for autonomous database platforms: how to design approval workflows that do not become bottlenecks, how to build explainability layers so operators understand what the system did and why, how to define trust boundaries that expand over time as the system earns confidence, and how to construct override and rollback mechanisms that restore human control in seconds when needed. The goal is not to constrain autonomy — it is to make autonomy trustworthy at production scale.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Designing the Oversight Spectrum: From Full Automation to Human-in-the-Loop Gates</h3>
 
 <p class="text-gray-300 leading-relaxed">Autonomous database systems do not operate at a single level of autonomy. Different classes of actions carry different risk profiles, and a mature ADE architecture segments those classes explicitly, applying oversight proportional to the potential blast radius of each decision.</p>
 
 <p class="text-gray-300 leading-relaxed">The oversight spectrum can be modeled as five tiers:</p>
 
-<p class="text-gray-300 leading-relaxed">| Tier | Action Class | Oversight Model | Example |</p>
-<p class="text-gray-300 leading-relaxed">|------|-------------|-----------------|---------|</p>
-<p class="text-gray-300 leading-relaxed">| 0 | Fully automated, no notification | Execute immediately | Query plan cache invalidation, statistics refresh |</p>
-<p class="text-gray-300 leading-relaxed">| 1 | Automated with async audit log | Execute, then log | Connection pool tuning, minor work_mem adjustment |</p>
-<p class="text-gray-300 leading-relaxed">| 2 | Automated with real-time notification | Execute, then alert | Index creation on non-production, failover to hot standby |</p>
-<p class="text-gray-300 leading-relaxed">| 3 | Proposed, human approval required | Queue, wait, execute | Schema migration, partition pruning, major parameter changes |</p>
-<p class="text-gray-300 leading-relaxed">| 4 | Human-initiated only | System proposes, human acts | DROP TABLE, replication topology changes, cross-region failover |</p>
+<div class="my-6 overflow-x-auto"><table class="w-full text-sm text-left text-gray-300">
+<thead><tr class="text-white border-b border-gray-700">
+<th class="py-2 pr-4">Tier</th><th class="py-2 pr-4">Action Class</th><th class="py-2 pr-4">Oversight Model</th><th class="py-2">Example</th>
+</tr></thead>
+<tbody>
+<tr class="border-b border-gray-800"><td class="py-2 pr-4">0</td><td class="py-2 pr-4">Fully automated, no notification</td><td class="py-2 pr-4">Execute immediately</td><td class="py-2">Query plan cache invalidation, statistics refresh</td></tr>
+<tr class="border-b border-gray-800"><td class="py-2 pr-4">1</td><td class="py-2 pr-4">Automated with async audit log</td><td class="py-2 pr-4">Execute, then log</td><td class="py-2">Connection pool tuning, minor MAXDOP adjustment</td></tr>
+<tr class="border-b border-gray-800"><td class="py-2 pr-4">2</td><td class="py-2 pr-4">Automated with real-time notification</td><td class="py-2 pr-4">Execute, then alert</td><td class="py-2">Index creation on non-production, failover to secondary replica</td></tr>
+<tr class="border-b border-gray-800"><td class="py-2 pr-4">3</td><td class="py-2 pr-4">Proposed, human approval required</td><td class="py-2 pr-4">Queue, wait, execute</td><td class="py-2">Schema migration, partition pruning, major parameter changes</td></tr>
+<tr><td class="py-2 pr-4">4</td><td class="py-2 pr-4">Human-initiated only</td><td class="py-2 pr-4">System proposes, human acts</td><td class="py-2">DROP TABLE, replication topology changes, cross-region failover</td></tr>
+</tbody></table></div>
 
 <p class="text-gray-300 leading-relaxed">The tiering logic is enforced programmatically. Every autonomous action emitted by the decision engine carries a classification tag. A policy engine evaluates that tag against the current environment context — production vs. staging, business hours vs. maintenance window, incident state vs. steady state — and routes accordingly.</p>
 
@@ -131,8 +133,6 @@ def resolve_tier(base_tier: OversightTier, ctx: ActionContext) -&gt; OversightTi
 
 <p class="text-gray-300 leading-relaxed">*The tier-resolution flow: signals feed a decision engine, the policy engine adjusts for context, and the resolved tier routes the action through the appropriate oversight gate before feeding outcomes back into trust evaluation.*</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Approval Workflow Architecture That Does Not Create Bottlenecks</h3>
 
 <p class="text-gray-300 leading-relaxed">The failure mode of human-in-the-loop systems is the approval queue becoming a graveyard. When Tier 3 actions pile up waiting for human review, the autonomous system's value proposition collapses — operators spend more time clicking approve than they saved by having the system propose actions. Avoiding this failure requires deliberate workflow architecture.</p>
@@ -177,67 +177,66 @@ CREATE INDEX IX_Proposals_Status_Expires
 <p class="text-gray-300 leading-relaxed">A background process runs every minute, scanning for expired proposals and for proposals that have been sitting in pending status long enough to trigger urgency escalation:</p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Approval watchdog: escalation and expiry enforcement
-import psycopg2
+import pyodbc
 import requests
 from datetime import datetime, timezone
 
 def process_expired_and_escalate(conn_str: str, slack_webhook: str):
-    with psycopg2.connect(conn_str) as conn:
-        with conn.cursor() as cur:
-            # Expire stale proposals
+    with pyodbc.connect(conn_str) as conn:
+        cur = conn.cursor()
+        # Expire stale proposals
+        cur.execute("""
+            UPDATE autonomous_action_proposals
+            SET status = 'expired'
+            OUTPUT INSERTED.proposal_id, INSERTED.action_class,
+                   INSERTED.target_database
+            WHERE status = 'pending'
+              AND expires_at &lt; SYSUTCDATETIME()
+        """)
+        expired = cur.fetchall()
+
+        # Find proposals eligible for auto-escalation
+        # Criteria: pending &gt; 15 minutes, confidence &gt;= 0.85, tier = 3
+        cur.execute("""
+            SELECT proposal_id, action_class, target_database,
+                   proposed_sql, confidence_score, projected_outcome
+            FROM autonomous_action_proposals
+            WHERE status = 'pending'
+              AND oversight_tier = 3
+              AND confidence_score &gt;= 0.85
+              AND proposed_at &lt; DATEADD(MINUTE, -15, SYSUTCDATETIME())
+              AND auto_escalated = 0
+              AND expires_at &gt; SYSUTCDATETIME()
+        """)
+        candidates = cur.fetchall()
+
+        for row in candidates:
+            proposal_id, action_class, db, sql, score, outcome = row
+            # Promote to tier 2 (execute-notify) and flag escalated
             cur.execute("""
                 UPDATE autonomous_action_proposals
-                SET status = 'expired'
-                WHERE status = 'pending'
-                  AND expires_at &lt; now()
-                RETURNING proposal_id, action_class, target_database
-            """)
-            expired = cur.fetchall()
+                SET oversight_tier = 2,
+                    auto_escalated = 1,
+                    status = 'approved',
+                    approved_by = 'system:auto_escalation',
+                    approved_at = SYSUTCDATETIME()
+                WHERE proposal_id = ?
+            """, (proposal_id,))
 
-            # Find proposals eligible for auto-escalation
-            # Criteria: pending &gt; 15 minutes, confidence &gt;= 0.85, tier = 3
-            cur.execute("""
-                SELECT proposal_id, action_class, target_database,
-                       proposed_sql, confidence_score, projected_outcome
-                FROM autonomous_action_proposals
-                WHERE status = 'pending'
-                  AND oversight_tier = 3
-                  AND confidence_score &gt;= 0.85
-                  AND proposed_at &lt; now() - INTERVAL '15 minutes'
-                  AND auto_escalated = FALSE
-                  AND expires_at &gt; now()
-            """)
-            candidates = cur.fetchall()
-
-            for row in candidates:
-                proposal_id, action_class, db, sql, score, outcome = row
-                # Promote to tier 2 (execute-notify) and flag escalated
-                cur.execute("""
-                    UPDATE autonomous_action_proposals
-                    SET oversight_tier = 2,
-                        auto_escalated = TRUE,
-                        status = 'approved',
-                        approved_by = 'system:auto_escalation',
-                        approved_at = now()
-                    WHERE proposal_id = %s
-                """, (proposal_id,))
-
-                # Notify via Slack
-                payload = {
-                    "text": (
-                        f":warning: *Auto-escalated proposal* approved after 15min timeout\n"
-                        f"*Action:* `{action_class}` on `{db}`\n"
-                        f"*Confidence:* {score:.1%} | *Outcome:* {outcome}\n"
-                        f"*Proposal ID:* `{proposal_id}`"
-                    )
-                }
-                requests.post(slack_webhook, json=payload, timeout=5)
+            # Notify via Slack
+            payload = {
+                "text": (
+                    f":warning: *Auto-escalated proposal* approved after 15min timeout\n"
+                    f"*Action:* `{action_class}` on `{db}`\n"
+                    f"*Confidence:* {score:.1%} | *Outcome:* {outcome}\n"
+                    f"*Proposal ID:* `{proposal_id}`"
+                )
+            }
+            requests.post(slack_webhook, json=payload, timeout=5)
 
         conn.commit()</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The auto-escalation path is itself a policy decision that must be explicitly configured per action class and environment. It is never a default-on feature. For environments where no auto-escalation is acceptable — regulated industries, for example — the watchdog simply expires proposals and generates a fresh proposal for the next opportunity.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Explainability Layers: Making Autonomous Decisions Auditable and Contestable</h3>
 
@@ -255,22 +254,22 @@ def process_expired_and_escalate(conn_str: str, slack_webhook: str):
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Narrative generation for completed actions
 import anthropic
 import json
-import psycopg2
+import pyodbc
 
 def generate_action_narrative(audit_id: str, conn_str: str, anthropic_api_key: str):
     client = anthropic.Anthropic(api_key=anthropic_api_key)
 
-    with psycopg2.connect(conn_str) as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT a.signals_observed, a.rules_fired, a.alternatives_considered,
-                       a.final_action, a.execution_result, a.outcome_signals,
-                       a.llm_reasoning_chain, p.target_database, p.projected_outcome
-                FROM autonomous_action_audit a
-                JOIN autonomous_action_proposals p ON p.proposal_id = a.proposal_id
-                WHERE a.audit_id = %s
-            """, (audit_id,))
-            row = cur.fetchone()
+    with pyodbc.connect(conn_str) as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT a.signals_observed, a.rules_fired, a.alternatives_considered,
+                   a.final_action, a.execution_result, a.outcome_signals,
+                   a.llm_reasoning_chain, p.target_database, p.projected_outcome
+            FROM autonomous_action_audit a
+            JOIN autonomous_action_proposals p ON p.proposal_id = a.proposal_id
+            WHERE a.audit_id = ?
+        """, (audit_id,))
+        row = cur.fetchone()
 
     if not row:
         return
@@ -302,13 +301,15 @@ the projection. Be specific about metric values. Do not use filler language.
 
     narrative = message.content[0].text
 
-    with psycopg2.connect(conn_str) as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                UPDATE autonomous_action_audit
-                SET execution_result = execution_result || E'\n\n--- NARRATIVE ---\n' || %s
-                WHERE audit_id = %s
-            """, (narrative, audit_id))
+    with pyodbc.connect(conn_str) as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE autonomous_action_audit
+            SET execution_result = CONCAT(execution_result,
+                CHAR(13) + CHAR(10) + CHAR(13) + CHAR(10)
+                + '--- NARRATIVE ---' + CHAR(13) + CHAR(10) + ?)
+            WHERE audit_id = ?
+        """, (narrative, audit_id))
         conn.commit()</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Structured audit trail queries allow operators to investigate patterns over time — which action classes fire most frequently, which confidence scores correlate with poor outcomes, which databases generate the most auto-escalations. These are operational intelligence queries, not forensic queries. Building a Grafana dashboard on top of the audit tables turns the oversight infrastructure into a continuous improvement signal.</p>
@@ -332,8 +333,6 @@ GROUP BY p.ActionClass, p.TargetEnvironment
 ORDER BY TotalProposals DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The contestability dimension of explainability is often overlooked. Operators must be able to dispute a completed autonomous action — not to reverse it necessarily, but to flag that the decision was wrong even if the outcome was acceptable, so that the policy engine can be recalibrated. This requires a feedback mechanism in the audit interface where a DBA can annotate an action with "outcome correct but reasoning flawed" or "action unnecessary given context." Those annotations feed directly into confidence model training.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Override Architecture: Restoring Human Control in Under Sixty Seconds</h3>
 
@@ -414,7 +413,7 @@ WHERE session_id = 87;</code></pre>
 <p class="text-gray-300 leading-relaxed">For Scenario 3, rollback is pre-planned. Every autonomous action that modifies state must have its rollback procedure defined before execution begins. The rollback procedure is stored in the audit record at proposal time, not at execution time — because by execution time, the state that makes the rollback deterministic may have changed. For index operations, rollbacks are straightforward: drop the index. For configuration parameter changes, rollbacks restore the prior value. For data-affecting operations — statistics updates, for example — rollbacks may require restoring from a pre-action snapshot if the operation is non-reversible by SQL alone.</p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Rollback executor: retrieves and applies stored rollback procedure
-import psycopg2
+import pyodbc
 import logging
 from datetime import datetime, timezone
 
@@ -425,16 +424,16 @@ def execute_rollback(proposal_id: str, operator: str, conn_str: str) -&gt; dict:
     Retrieves the pre-stored rollback procedure for a proposal and executes it.
     Returns a result dict with success status and details.
     """
-    with psycopg2.connect(conn_str) as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT p.proposal_id, p.rollback_procedure, p.proposed_sql,
-                       p.target_database, p.status, a.audit_id
-                FROM autonomous_action_proposals p
-                LEFT JOIN autonomous_action_audit a ON a.proposal_id = p.proposal_id
-                WHERE p.proposal_id = %s
-            """, (proposal_id,))
-            row = cur.fetchone()
+    with pyodbc.connect(conn_str) as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT p.proposal_id, p.rollback_procedure, p.proposed_sql,
+                   p.target_database, p.status, a.audit_id
+            FROM autonomous_action_proposals p
+            LEFT JOIN autonomous_action_audit a ON a.proposal_id = p.proposal_id
+            WHERE p.proposal_id = ?
+        """, (proposal_id,))
+        row = cur.fetchone()
 
     if not row:
         return {"success": False, "error": f"Proposal {proposal_id} not found"}
@@ -456,33 +455,32 @@ def execute_rollback(proposal_id: str, operator: str, conn_str: str) -&gt; dict:
     rollback_start = datetime.now(timezone.utc)
 
     try:
-        with psycopg2.connect(conn_str) as conn:
-            with conn.cursor() as cur:
-                cur.execute(rollback_sql)
-            conn.commit()
+        with pyodbc.connect(conn_str, autocommit=True) as conn:
+            cur = conn.cursor()
+            cur.execute(rollback_sql)
 
         rollback_duration_ms = int(
             (datetime.now(timezone.utc) - rollback_start).total_seconds() * 1000
         )
 
         # Update proposal status and audit record
-        with psycopg2.connect(conn_str) as conn:
-            with conn.cursor() as cur:
+        with pyodbc.connect(conn_str) as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                UPDATE autonomous_action_proposals
+                SET status = 'rolled_back'
+                WHERE proposal_id = ?
+            """, (proposal_id,))
+            if audit_id:
                 cur.execute("""
-                    UPDATE autonomous_action_proposals
-                    SET status = 'rolled_back'
-                    WHERE proposal_id = %s
-                """, (proposal_id,))
-                if audit_id:
-                    cur.execute("""
-                        UPDATE autonomous_action_audit
-                        SET execution_result = execution_result
-                                || E'\n\n--- ROLLBACK ---\n'
-                                || %s
-                                || ' by ' || %s
-                                || ' at ' || now()::text
-                        WHERE audit_id = %s
-                    """, (rollback_sql, operator, audit_id))
+                    UPDATE autonomous_action_audit
+                    SET execution_result = CONCAT(execution_result,
+                        CHAR(13) + CHAR(10) + CHAR(13) + CHAR(10)
+                        + '--- ROLLBACK ---' + CHAR(13) + CHAR(10)
+                        + ?, ' by ' + ?, ' at '
+                        + CONVERT(NVARCHAR(30), SYSUTCDATETIME(), 126))
+                    WHERE audit_id = ?
+                """, (rollback_sql, operator, audit_id))
             conn.commit()
 
         logger.info(
@@ -520,13 +518,11 @@ END</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The naming convention — embedding <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">_ade_</code> and a datestamp in the index name — is not cosmetic. It is what makes rollback queries unambiguous and auditable without needing to cross-reference a separate data store.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Trust Boundary Expansion: How Autonomy Earns Its Own Latitude</h3>
 
 <p class="text-gray-300 leading-relaxed">The oversight tier assignments described in the opening section are not static configuration. A healthy autonomous database system earns expanded latitude over time by demonstrating reliable performance. Conversely, it should lose latitude automatically when it produces poor outcomes. This feedback loop — trust earned through demonstrated behavior, revoked by demonstrated failure — is what separates a mature ADE deployment from an automation script that happens to be running unattended.</p>
 
-<p class="text-gray-300 leading-relaxed">Trust expansion operates at the action class level, not at the system level. The system might earn Tier 1 autonomy for autovacuum tuning while remaining at Tier 3 for partition management, because the execution history for each class is independent.</p>
+<p class="text-gray-300 leading-relaxed">Trust expansion operates at the action class level, not at the system level. The system might earn Tier 1 autonomy for index maintenance tuning while remaining at Tier 3 for partition management, because the execution history for each class is independent.</p>
 
 <p class="text-gray-300 leading-relaxed">The trust model requires three inputs for each action class and environment pair:</p>
 
@@ -537,7 +533,7 @@ END</code></pre>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Trust model: automated tier downgrade evaluation
 from dataclasses import dataclass
 from typing import Optional
-import psycopg2
+import pyodbc
 
 @dataclass
 class TrustEvaluation:
@@ -556,27 +552,27 @@ def evaluate_trust(
     min_executions: int = 20
 ) -&gt; TrustEvaluation:
 
-    with psycopg2.connect(conn_str) as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT
-                    COUNT(*)                                            AS total,
-                    SUM(CASE WHEN p.status = 'executed'
-                             THEN 1 ELSE 0 END)                        AS executed,
-                    SUM(CASE WHEN p.status = 'rolled_back'
-                             THEN 1 ELSE 0 END)                        AS rolled_back,
-                    SUM(CASE WHEN a.outcome_verified = TRUE
-                             THEN 1 ELSE 0 END)                        AS verified_success,
-                    AVG(p.confidence_score)                            AS avg_confidence,
-                    MAX(p.oversight_tier)                              AS current_tier
-                FROM autonomous_action_proposals p
-                LEFT JOIN autonomous_action_audit a
-                       ON a.proposal_id = p.proposal_id
-                WHERE p.action_class = %s
-                  AND p.target_environment = %s
-                  AND p.proposed_at &gt;= now() - (%s || ' days')::INTERVAL
-            """, (action_class, environment, str(lookback_days)))
-            row = cur.fetchone()
+    with pyodbc.connect(conn_str) as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT
+                COUNT(*)                                            AS total,
+                SUM(CASE WHEN p.status = 'executed'
+                         THEN 1 ELSE 0 END)                        AS executed,
+                SUM(CASE WHEN p.status = 'rolled_back'
+                         THEN 1 ELSE 0 END)                        AS rolled_back,
+                SUM(CASE WHEN a.outcome_verified = 1
+                         THEN 1 ELSE 0 END)                        AS verified_success,
+                AVG(p.confidence_score)                            AS avg_confidence,
+                MAX(p.oversight_tier)                              AS current_tier
+            FROM autonomous_action_proposals p
+            LEFT JOIN autonomous_action_audit a
+                   ON a.proposal_id = p.proposal_id
+            WHERE p.action_class = ?
+              AND p.target_environment = ?
+              AND p.proposed_at &gt;= DATEADD(DAY, -?, SYSUTCDATETIME())
+        """, (action_class, environment, lookback_days))
+        row = cur.fetchone()
 
     total, executed, rolled_back, verified, avg_confidence, current_tier = row
 
@@ -631,8 +627,6 @@ def evaluate_trust(
 
 <p class="text-gray-300 leading-relaxed">Trust revocation, by contrast, can be automatic and immediate. A rollback event on a production database triggers an instant tier escalation for that action class in that environment, and that escalation holds until the trust evaluation explicitly recommends a reduction. This asymmetry — slow to grant, fast to revoke — reflects sound risk management for systems that operate at database layer.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Operator Interfaces: Designing for Clarity Under Pressure</h3>
 
 <p class="text-gray-300 leading-relaxed">Humans interacting with autonomous systems in production do so under cognitive load — during incidents, during on-call rotations, during post-mortems. The operator interface must be designed for those conditions, not for the calm of a product demonstration. Clarity under pressure is an engineering requirement, not a UX aspiration.</p>
@@ -645,11 +639,11 @@ def evaluate_trust(
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>🔧 *Autonomous Action Proposal* — Approval Required
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-*Database:*   prod-orders-pg01  (production)
-*Action:*     CREATE INDEX CONCURRENTLY on orders(customer_id, created_at)
+*Database:*   prod-orders-sql01  (production)
+*Action:*     CREATE INDEX ... WITH (ONLINE = ON) on Orders(CustomerId, CreatedAt)
 *Why:*        Seq scan rate on orders increased 340% over 4h; 
               query P99 latency 8.2s, threshold 2.0s
-*If approved:* Index build ~18 min (CONCURRENT, no lock). 
+*If approved:* Index build ~18 min (ONLINE = ON, minimal locking). 
               P99 latency projected to drop to 0.9s.
 *If rejected:* No action taken. Re-proposed in 6h if condition persists.
 *Rollback:*   DROP INDEX available; estimated 45s to execute.
@@ -667,27 +661,8 @@ def evaluate_trust(
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Incident view.</strong> When an autonomous action is suspected of contributing to a production incident, the operator needs a single view that shows: what actions executed in the preceding hour, in chronological order, with their full audit trails inline. The incident view is a time-scoped audit log with narrative summaries promoted to the primary display.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: incident retrospective query
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: incident retrospective query
 -- Returns all actions executed in a time window with narrative summaries
-SELECT
-    p.proposed_at,
-    p.action_class,
-    p.target_database,
-    p.proposed_sql,
-    p.confidence_score,
-    p.status,
-    a.executed_at,
-    a.execution_duration_ms,
-    a.outcome_verified,
-    a.outcome_signals,
-    a.execution_result       -- includes LLM narrative if generated
-FROM autonomous_action_proposals p
-JOIN autonomous_action_audit a ON a.proposal_id = p.proposal_id
-WHERE p.target_database = $1
-  AND a.executed_at BETWEEN $2 AND $3
-ORDER BY a.executed_at ASC;</code></pre>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server equivalent
 SELECT
     p.ProposedAt,
     p.ActionClass,
@@ -707,8 +682,6 @@ WHERE p.TargetDatabase = @TargetDatabase
 ORDER BY a.ExecutedAt ASC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The incident view is also where the contestability mechanism described earlier should be accessible. A button or command alongside each action row that lets the operator flag the decision as flawed — even if the outcome was technically acceptable — is what closes the feedback loop from production operations into the trust model.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Compliance, Regulatory, and Change Management Integration</h3>
 
@@ -783,44 +756,30 @@ def create_servicenow_change_request(
 
 <p class="text-gray-300 leading-relaxed">Periodic evidence exports — for SOC 2 auditors, for example — can be generated directly from these tables:</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: SOC 2 evidence export for a given audit period
-COPY (
-    SELECT
-        p.proposal_id,
-        p.action_class,
-        p.target_database,
-        p.target_environment,
-        p.proposed_sql,
-        p.confidence_score,
-        p.oversight_tier,
-        p.approved_by,
-        p.approved_at,
-        p.status,
-        a.executed_at,
-        a.outcome_verified,
-        a.execution_result
-    FROM autonomous_action_proposals p
-    LEFT JOIN autonomous_action_audit a ON a.proposal_id = p.proposal_id
-    WHERE p.target_environment = 'production'
-      AND p.proposed_at BETWEEN '2024-01-01' AND '2024-03-31'
-    ORDER BY p.proposed_at
-) TO '/tmp/ade_audit_Q1_2024.csv' WITH CSV HEADER;</code></pre>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: SOC 2 evidence export for a given audit period via bcp
+bcp "SELECT
+    p.proposal_id, p.action_class, p.target_database, p.target_environment,
+    p.proposed_sql, p.confidence_score, p.oversight_tier, p.approved_by,
+    p.approved_at, p.status, a.executed_at, a.outcome_verified, a.execution_result
+FROM dbo.autonomous_action_proposals p
+LEFT JOIN dbo.autonomous_action_audit a ON a.proposal_id = p.proposal_id
+WHERE p.target_environment = 'production'
+  AND p.proposed_at BETWEEN '2024-01-01' AND '2024-03-31'
+ORDER BY p.proposed_at" queryout "ade_audit_Q1_2024.csv" -S $DB_SERVER -d $DB_NAME -T -c -t, -r\n</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The export is not the audit. The export is the artifact that demonstrates the audit trail exists and is complete. The underlying tables are the system of record, and their integrity — ensured by the append-only audit pattern and the foreign key relationships — is what gives the export evidentiary weight.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Autonomy without oversight tiers is reckless automation.** Every autonomous action must carry a risk classification that routes it through an appropriate oversight model — from silent execution to human-only initiation — with escalation logic that responds to context: incident state, confidence score, and environmental boundaries.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Autonomy without oversight tiers is reckless automation.</strong> Every autonomous action must carry a risk classification that routes it through an appropriate oversight model — from silent execution to human-only initiation — with escalation logic that responds to context: incident state, confidence score, and environmental boundaries.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Approval workflows that block are worse than no automation.** Proposal expiry timestamps, differentiated notification channels, and carefully gated auto-escalation paths ensure that human review remains meaningful without becoming a bottleneck that negates the system's operational value.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Approval workflows that block are worse than no automation.</strong> Proposal expiry timestamps, differentiated notification channels, and carefully gated auto-escalation paths ensure that human review remains meaningful without becoming a bottleneck that negates the system's operational value.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Explainability is a first-class engineering output, not a logging afterthought.** Decision-time rationale capture, LLM-generated narrative summaries, and structured audit trail queries allow operators to understand, contest, and learn from autonomous decisions — and that contestability loop feeds directly into the confidence model's continuous improvement.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Explainability is a first-class engineering output, not a logging afterthought.</strong> Decision-time rationale capture, LLM-generated narrative summaries, and structured audit trail queries allow operators to understand, contest, and learn from autonomous decisions — and that contestability loop feeds directly into the confidence model's continuous improvement.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Override and rollback infrastructure must be pre-built and exercised, not assembled under pressure.** A single-command autonomy halt via Redis, database-native session termination for in-progress actions, and pre-stored rollback SQL defined at proposal time are the three layers that allow human control to be restored in under sixty seconds regardless of what the system was doing.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Override and rollback infrastructure must be pre-built and exercised, not assembled under pressure.</strong> A single-command autonomy halt via Redis, database-native session termination for in-progress actions, and pre-stored rollback SQL defined at proposal time are the three layers that allow human control to be restored in under sixty seconds regardless of what the system was doing.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Trust is earned action-class by action-class through measured outcomes, and revoked instantly on failure.** The oversight tier for a given action class drifts downward only after a human reviews a quantitative trust evaluation meeting verified-success and confidence thresholds; it escalates automatically and immediately on any rollback event, creating an asymmetry that keeps the system conservatively bounded as it earns expanded autonomy.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Trust is earned action-class by action-class through measured outcomes, and revoked instantly on failure.</strong> The oversight tier for a given action class drifts downward only after a human reviews a quantitative trust evaluation meeting verified-success and confidence thresholds; it escalates automatically and immediately on any rollback event, creating an asymmetry that keeps the system conservatively bounded as it earns expanded autonomy.</li>
     </div>
     <div class="mt-14 bg-emerald-950/40 border border-emerald-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">

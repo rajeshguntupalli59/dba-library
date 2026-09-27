@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Chapter 26: Autonomous Data Lifecycle Management — The ADE Handbook</title>
-  <meta name="description" content="The ADE Handbook Chapter 26: Autonomous Data Lifecycle Management. Autonomous database engineering for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
+  <meta name="description" content="The ADE Handbook Chapter 26: Autonomous Data Lifecycle Management. Autonomous database engineering for SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
   <script type="module">
     import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
@@ -43,9 +43,7 @@
     <div class="space-y-4 text-sm">
 <h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 26: Autonomous Data Lifecycle Management</h2>
 
-<p class="text-gray-300 leading-relaxed">Data lifecycle management has always been a DBA's responsibility, but in traditional environments it lived entirely in documentation, calendar reminders, and ad hoc scripts run by someone who remembered the retention policy. In an autonomous system, lifecycle management is policy-as-code: the database platform observes its own data, classifies it by temperature and regulatory standing, and executes retention, archival, compression, tiering, and deletion decisions continuously — without a human initiating the workflow. This chapter builds that system from policy definition through execution engines, covering both PostgreSQL and SQL Server with production-grade automation patterns.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
+<p class="text-gray-300 leading-relaxed">Data lifecycle management has always been a DBA's responsibility, but in traditional environments it lived entirely in documentation, calendar reminders, and ad hoc scripts run by someone who remembered the retention policy. In an autonomous system, lifecycle management is policy-as-code: the database platform observes its own data, classifies it by temperature and regulatory standing, and executes retention, archival, compression, tiering, and deletion decisions continuously — without a human initiating the workflow. This chapter builds that system from policy definition through execution engines, covering SQL Server with production-grade automation patterns.</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Defining Data Temperature and Policy as Machine-Readable Contracts</h3>
 
@@ -95,11 +93,9 @@ GO</code></pre>
 
 <p class="text-gray-300 leading-relaxed">With policy stored in schema, the automation layer has a single source of truth. When a GDPR request arrives demanding a shorter retention window for a specific table, one UPDATE to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">lifecycle.policy</code> propagates to all downstream automation at next evaluation. This is the foundational shift: the human edits a contract, and the system executes the consequences.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Autonomous Partition Lifecycle: Rolling Windows and Automated Detach/Attach</h3>
 
-<p class="text-gray-300 leading-relaxed">Partitioning is the mechanical prerequisite for autonomous lifecycle management at scale. Without partition boundaries that map to time ranges, the engine cannot act on lifecycle stages without expensive full-table scans and row-by-row deletions. Both PostgreSQL declarative partitioning and SQL Server partition switching give the autonomous engine atomic, low-lock operations on complete data segments.</p>
+<p class="text-gray-300 leading-relaxed">Partitioning is the mechanical prerequisite for autonomous lifecycle management at scale. Without partition boundaries that map to time ranges, the engine cannot act on lifecycle stages without expensive full-table scans and row-by-row deletions. SQL Server partition switching gives the autonomous engine atomic, low-lock operations on complete data segments.</p>
 
 <p class="text-gray-300 leading-relaxed">The autonomous partition manager has three jobs running continuously: <strong class="text-white">proactive creation</strong> (ensure future partitions exist before they're needed), <strong class="text-white">lifecycle transition</strong> (move partitions to warm/cold storage based on policy), and <strong class="text-white">expiry processing</strong> (detach and drop partitions that have crossed their retention ceiling).</p>
 
@@ -111,7 +107,7 @@ GO</code></pre>
     Gate[IO headroom gate] -. defers heavy ops .-> C</pre></div>
 <p class="text-gray-300 leading-relaxed">*Every partition moves through the same policy-driven stages; a late write re-heats it back to hot, and the IO headroom gate can hold a partition at its current stage rather than risk a heavy operation under load.*</p>
 
-<p class="text-gray-300 leading-relaxed">In PostgreSQL, partition maintenance uses <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_partman</code> as the underlying engine, with the autonomous layer sitting above it as a policy executor:</p>
+<p class="text-gray-300 leading-relaxed">In SQL Server, partition functions and partition schemes are the underlying engine, with the autonomous layer sitting above them as a policy executor that splits ranges, switches partitions to staging tables, and merges boundaries on schedule:</p>
 
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: identify partition ranges and lifecycle stage
@@ -193,21 +189,21 @@ ORDER BY TableName, partition_number;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The Python orchestrator consumes these queries, builds an execution plan, and dispatches actions. The key engineering decision is <strong class="text-white">serialization</strong>: lifecycle operations against large partitions are expensive, so the orchestrator must rate-limit itself against observed I/O headroom, never initiating a cold-tier operation during peak traffic windows.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">The Autonomous Archival Engine: Tiered Storage Without Human Scheduling</h3>
 
 <p class="text-gray-300 leading-relaxed">Archival in an autonomous system is not a monthly job — it's a continuous pipeline triggered by policy evaluation. When a partition crosses into the "cold" stage, the archival engine extracts it to object storage (S3, Azure Blob, GCS), optionally compresses it with Parquet or columnar format, records the archive manifest, and either drops the partition or replaces it with a foreign table wrapper pointing at the archived location.</p>
 
-<p class="text-gray-300 leading-relaxed">The following Python engine handles the full archival workflow for PostgreSQL. It reads from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">lifecycle.policy</code>, queries the partition inventory, and dispatches archival operations with controlled concurrency:</p>
+<p class="text-gray-300 leading-relaxed">The following Python engine handles the full archival workflow for SQL Server. It reads from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">lifecycle.Policy</code>, queries the partition inventory, and dispatches archival operations with controlled concurrency:</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import psycopg2
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import pyodbc
 import boto3
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import logging
 import time
+import tempfile
+import os
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from typing import Optional
@@ -216,56 +212,61 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 logger = logging.getLogger("lifecycle.archival")
 
+CONN_STR = ("DRIVER={ODBC Driver 18 for SQL Server};SERVER=localhost;"
+            "DATABASE=prod;UID=lifecycle_svc;PWD=*******;")
+
 @dataclass
 class ArchivalTask:
     policy_id: int
     schema_name: str
     table_name: str
-    partition_name: str
+    partition_number: int
     range_start: datetime
     size_bytes: int
     action: str
     anonymize: bool
 
 class AutonomousArchivalEngine:
-    def __init__(self, pg_dsn: str, s3_bucket: str, s3_prefix: str,
+    def __init__(self, s3_bucket: str, s3_prefix: str,
                  max_workers: int = 3, io_headroom_pct: float = 0.30):
-        self.pg_dsn = pg_dsn
         self.s3_bucket = s3_bucket
         self.s3_prefix = s3_prefix
         self.max_workers = max_workers
         self.io_headroom_pct = io_headroom_pct
         self.s3 = boto3.client("s3")
 
-    def _get_pending_tasks(self, conn) -&gt; list[ArchivalTask]:
+    def _connect(self):
+        return pyodbc.connect(CONN_STR)
+
+    def _get_pending_tasks(self, conn) -&gt; list:
         """Query the lifecycle engine view for cold/expired partitions needing action."""
         cur = conn.cursor()
         cur.execute("""
             SELECT
-                lp.policy_id,
-                lp.schema_name,
-                lp.table_name,
-                pi.partition_name,
-                pi.range_start,
-                pi.size_bytes,
+                lp.PolicyId,
+                lp.SchemaName,
+                lp.TableName,
+                pi.partition_number,
+                pi.RangeStart,
+                pi.SizeBytes,
                 CASE
-                    WHEN pi.lifecycle_stage = 'expired' THEN lp.action_expire
-                    WHEN pi.lifecycle_stage = 'cold'    THEN lp.action_cold
-                    ELSE lp.action_warm
+                    WHEN pi.LifecycleStage = 'expired' THEN lp.ActionExpire
+                    WHEN pi.LifecycleStage = 'cold'    THEN lp.ActionCold
+                    ELSE lp.ActionWarm
                 END AS action,
-                lp.anonymize_before_delete
-            FROM lifecycle.partition_lifecycle_view pi
-            JOIN lifecycle.policy lp
-                ON lp.schema_name = pi.schema_name
-                AND lp.table_name = pi.parent_table
-            WHERE pi.lifecycle_stage IN ('cold', 'expired')
-              AND lp.enabled = TRUE
+                lp.AnonymizeBeforeDelete
+            FROM lifecycle.PartitionLifecycleView pi
+            JOIN lifecycle.Policy lp
+                ON lp.SchemaName = pi.SchemaName
+                AND lp.TableName = pi.TableName
+            WHERE pi.LifecycleStage IN ('cold', 'expired')
+              AND lp.Enabled = 1
               AND NOT EXISTS (
-                  SELECT 1 FROM lifecycle.archival_log al
-                  WHERE al.partition_name = pi.partition_name
-                    AND al.status = 'completed'
+                  SELECT 1 FROM lifecycle.ArchivalLog al
+                  WHERE al.PartitionNumber = pi.partition_number
+                    AND al.Status = 'completed'
               )
-            ORDER BY pi.size_bytes ASC  -- smallest first to validate before large ops
+            ORDER BY pi.SizeBytes ASC  -- smallest first to validate before large ops
         """)
         rows = cur.fetchall()
         return [ArchivalTask(*r) for r in rows]
@@ -274,93 +275,112 @@ class AutonomousArchivalEngine:
         """Gate archival operations on current I/O utilization."""
         cur = conn.cursor()
         cur.execute("""
-            SELECT
-                ROUND(
-                    100.0 * SUM(blks_hit) /
-                    NULLIF(SUM(blks_hit) + SUM(blks_read), 0),
-                2) AS cache_hit_ratio
-            FROM pg_stat_database
-            WHERE datname = current_database()
+            SELECT CAST(cntr_value AS FLOAT)
+            FROM sys.dm_os_performance_counters
+            WHERE counter_name = 'Buffer cache hit ratio'
+              AND object_name LIKE '%Buffer Manager%'
         """)
         row = cur.fetchone()
         cache_hit_ratio = row[0] or 0
         # Low cache hit ratio signals heavy disk I/O — defer archival
-        if cache_hit_ratio &lt; 0.90:
-            logger.warning("Cache hit ratio %.2f%% below threshold — deferring archival", cache_hit_ratio)
+        if cache_hit_ratio &lt; 90.0:
+            logger.warning("Cache hit ratio %.2f below threshold — deferring archival", cache_hit_ratio)
             return False
         return True
 
     def _export_partition_to_parquet(self, conn, task: ArchivalTask) -&gt; str:
         """Stream partition data to S3 as Parquet."""
         cur = conn.cursor()
-        anonymize_clause = ""
+        select_list = "*"
         if task.anonymize:
             # Anonymize known PII columns before export — column list from metadata
             cur.execute("""
-                SELECT column_name FROM lifecycle.pii_columns
-                WHERE schema_name = %s AND table_name = %s
+                SELECT ColumnName FROM lifecycle.PiiColumns
+                WHERE SchemaName = ? AND TableName = ?
             """, (task.schema_name, task.table_name))
-            pii_cols = [r[0] for r in cur.fetchall()]
-            anonymize_clause = ", ".join(
-                f"md5({col}::text) AS {col}" for col in pii_cols
+            pii_cols = {r[0] for r in cur.fetchall()}
+            cur.execute("""
+                SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS
+                WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
+                ORDER BY ORDINAL_POSITION
+            """, (task.schema_name, task.table_name))
+            all_cols = [r[0] for r in cur.fetchall()]
+            select_list = ", ".join(
+                (f"HASHBYTES('SHA2_256', CAST([{c}] AS NVARCHAR(MAX))) AS [{c}]"
+                 if c in pii_cols else f"[{c}]")
+                for c in all_cols
             )
 
         query = f"""
-            SELECT * FROM {task.partition_name}
-        """ if not anonymize_clause else f"""
-            SELECT *, {anonymize_clause} FROM {task.partition_name}
+            SELECT {select_list}
+            FROM [{task.schema_name}].[{task.table_name}]
+            WHERE $PARTITION.[{task.table_name}_pf]([CreatedAt]) = {task.partition_number}
         """
 
         df = pd.read_sql(query, conn)
-        local_path = f"/tmp/{task.partition_name.replace('.', '_')}.parquet"
+        local_path = os.path.join(tempfile.gettempdir(),
+                                f"{task.schema_name}_{task.table_name}_p{task.partition_number}.parquet")
         s3_key = (
             f"{self.s3_prefix}/{task.schema_name}/{task.table_name}/"
             f"{task.range_start.strftime('%Y/%m/%d')}/"
-            f"{task.partition_name}.parquet"
+            f"partition_{task.partition_number}.parquet"
         )
 
         table = pa.Table.from_pandas(df)
         pq.write_table(table, local_path, compression='snappy')
         self.s3.upload_file(local_path, self.s3_bucket, s3_key)
-        logger.info("Archived %s → s3://%s/%s (%d rows)",
-                    task.partition_name, self.s3_bucket, s3_key, len(df))
+        logger.info("Archived %s.%s partition %d → s3://%s/%s (%d rows)",
+                    task.schema_name, task.table_name, task.partition_number,
+                    self.s3_bucket, s3_key, len(df))
         return s3_key
 
     def _record_archival(self, conn, task: ArchivalTask, s3_key: str, status: str):
         cur = conn.cursor()
         cur.execute("""
-            INSERT INTO lifecycle.archival_log
-                (policy_id, schema_name, table_name, partition_name,
-                 range_start, s3_key, status, archived_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
-            ON CONFLICT (partition_name) DO UPDATE
-                SET status = EXCLUDED.status,
-                    archived_at = EXCLUDED.archived_at
-        """, (task.policy_id, task.schema_name, task.table_name,
-              task.partition_name, task.range_start, s3_key, status))
+            MERGE lifecycle.ArchivalLog AS target
+            USING (SELECT ? AS PolicyId, ? AS PartitionNumber) AS src
+            ON target.PolicyId = src.PolicyId
+               AND target.PartitionNumber = src.PartitionNumber
+            WHEN MATCHED THEN
+                UPDATE SET Status = ?, ArchivedAt = SYSUTCDATETIME(), S3Key = ?
+            WHEN NOT MATCHED THEN
+                INSERT (PolicyId, SchemaName, TableName, PartitionNumber,
+                        RangeStart, S3Key, Status, ArchivedAt)
+                VALUES (?, ?, ?, ?, ?, ?, ?, SYSUTCDATETIME());
+        """, (task.policy_id, task.partition_number, status, s3_key,
+              task.policy_id, task.schema_name, task.table_name,
+              task.partition_number, task.range_start, s3_key, status))
         conn.commit()
 
-    def _drop_partition(self, conn, task: ArchivalTask):
+    def _switch_out_partition(self, conn, task: ArchivalTask):
+        # Atomic partition SWITCH to a staging table, then drop staging
         cur = conn.cursor()
-        cur.execute(f"DROP TABLE IF EXISTS {task.partition_name}")
+        staging = f"[{task.schema_name}].[staging_{task.table_name}]"
+        cur.execute(f"""
+            ALTER TABLE [{task.schema_name}].[{task.table_name}]
+            SWITCH PARTITION {task.partition_number} TO {staging}
+        """)
+        cur.execute(f"DROP TABLE {staging}")
         conn.commit()
-        logger.info("Dropped partition %s after successful archival", task.partition_name)
+        logger.info("Switched out and dropped partition %d of %s.%s after archival",
+                    task.partition_number, task.schema_name, task.table_name)
 
     def _process_task(self, task: ArchivalTask):
-        conn = psycopg2.connect(self.pg_dsn)
+        conn = self._connect()
         try:
             s3_key = self._export_partition_to_parquet(conn, task)
             self._record_archival(conn, task, s3_key, "completed")
             if task.action in ("archive_to_s3", "delete"):
-                self._drop_partition(conn, task)
+                self._switch_out_partition(conn, task)
         except Exception as e:
-            logger.error("Archival failed for %s: %s", task.partition_name, e)
+            logger.error("Archival failed for %s partition %d: %s",
+                         task.table_name, task.partition_number, e)
             self._record_archival(conn, task, "", "failed")
         finally:
             conn.close()
 
     def run_cycle(self):
-        conn = psycopg2.connect(self.pg_dsn)
+        conn = self._connect()
         try:
             if not self._check_io_headroom(conn):
                 return
@@ -376,13 +396,12 @@ class AutonomousArchivalEngine:
                 try:
                     future.result()
                 except Exception as e:
-                    logger.error("Unhandled error processing %s: %s", task.partition_name, e)
+                    logger.error("Unhandled error processing %s: %s", task.table_name, e)
 
 if __name__ == "__main__":
     engine = AutonomousArchivalEngine(
-        pg_dsn="host=pgprimary dbname=production user=lifecycle_svc password=...",
         s3_bucket="company-db-archives",
-        s3_prefix="postgres/lifecycle",
+        s3_prefix="sqlserver/lifecycle",
         max_workers=3
     )
     while True:
@@ -391,9 +410,7 @@ if __name__ == "__main__":
 
 <p class="text-gray-300 leading-relaxed">The archival engine's IO gate is the key autonomous safeguard: it reads live cache hit ratio and defers all archival operations when the database is under storage pressure. This prevents the lifecycle engine itself from becoming a production incident. More sophisticated implementations replace the cache hit ratio check with a Prometheus query against <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">node_disk_io_time_seconds_total</code> to get true disk saturation metrics, and factor in replication lag to avoid running archival operations when replicas are already falling behind.</p>
 
-<p class="text-gray-300 leading-relaxed">For SQL Server, the equivalent cold-tiering uses stretch database's successor pattern — partition switching to a staging table, followed by BCP export to Azure Blob Storage via SQL Server Agent or an Azure Data Factory pipeline triggered from T-SQL through <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sp_invoke_external_rest_endpoint</code>.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
+<p class="text-gray-300 leading-relaxed">For SQL Server, cold-tiering uses partition switching to a staging table, followed by BCP export to Azure Blob Storage via SQL Server Agent or an Azure Data Factory pipeline triggered from T-SQL through <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sp_invoke_external_rest_endpoint</code>.</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Autonomous PII Anonymization and Compliance Enforcement at Lifecycle Boundaries</h3>
 
@@ -549,8 +566,6 @@ GO</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The attestation record is the audit artifact that satisfies regulatory review. When a data protection authority asks "prove that this user's data was anonymized before archival," the compliance team queries <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">lifecycle.compliance_attestation</code> or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">lifecycle.ComplianceAttestation</code> for the affected table, finds the attestation with its checksum, and can demonstrate that the operation was performed by the lifecycle service account at a specific timestamp before archival. The checksum is not a cryptographic proof of data content — it proves that the system recorded the operation atomically within the same transaction as the archival log entry.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Autonomous Retention Enforcement: Preventing Both Over-Retention and Under-Retention</h3>
 
 <p class="text-gray-300 leading-relaxed">Retention violations come in two directions. Under-retention deletes data before the regulatory floor is met, creating evidence destruction liability. Over-retention keeps PII or financial data beyond what policies permit, creating privacy liability and expanding breach impact radius. An autonomous system must enforce both bounds with equal vigilance.</p>
@@ -654,75 +669,82 @@ BEGIN
 END;
 GO</code></pre>
 
-<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_notify</code> channel in the PostgreSQL implementation is the real-time escalation path: the Python orchestrator listens on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">lifecycle_critical</code> and can preempt its normal hourly cycle to immediately process a critical over-retention violation. This event-driven escalation is what distinguishes an autonomous system from a scheduled batch job — the system reacts to its own compliance state in near real time rather than waiting for the next cron window.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
+<p class="text-gray-300 leading-relaxed">A Service Broker queue is the real-time escalation path: the Python orchestrator polls the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">lifecycle_critical</code> queue and can preempt its normal hourly cycle to immediately process a critical over-retention violation. This event-driven escalation is what distinguishes an autonomous system from a scheduled batch job — the system reacts to its own compliance state in near real time rather than waiting for the next cron window.</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Data Temperature Monitoring and Automatic Compression</h3>
 
 <p class="text-gray-300 leading-relaxed">Compression decisions in most databases are made once at table creation and then forgotten. In an autonomous system, compression is adaptive: it monitors actual access patterns, identifies warm data that has crossed into low-access territory, and applies compression autonomously without rebuilding entire tables.</p>
 
-<p class="text-gray-300 leading-relaxed">PostgreSQL uses table-level storage parameters and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_toast</code> behavior, but for serious compression autonomy the engine works with partition-level <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CLUSTER</code> operations and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_column_size</code> analytics. SQL Server's columnstore index promotion is the production mechanism on that platform.</p>
+<p class="text-gray-300 leading-relaxed">SQL Server's data compression (row and page) and clustered columnstore index promotion are the production mechanisms for compression autonomy. The engine works with partition-level rebuilds and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_db_index_usage_stats</code> access analytics.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL — access pattern monitoring for compression decisions:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Track per-partition access frequency using pg_stat_user_tables
-CREATE TABLE lifecycle.access_temperature_log (
-    log_id          BIGSERIAL PRIMARY KEY,
-    schema_name     TEXT NOT NULL,
-    table_name      TEXT NOT NULL,
-    seq_scan        BIGINT,
-    idx_scan        BIGINT,
-    n_tup_hot_upd   BIGINT,
-    snapshot_time   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server — access pattern monitoring for compression decisions:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Track per-partition access frequency using index usage stats
+CREATE TABLE lifecycle.AccessTemperatureLog (
+    LogId           BIGINT IDENTITY(1,1) PRIMARY KEY,
+    SchemaName      SYSNAME NOT NULL,
+    TableName       SYSNAME NOT NULL,
+    PartitionNumber INT NOT NULL,
+    UserSeeks       BIGINT,
+    UserScans       BIGINT,
+    UserLookups     BIGINT,
+    SnapshotTime    DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
 );
 
 -- Periodic snapshot (called every 6 hours by lifecycle daemon)
-CREATE OR REPLACE FUNCTION lifecycle.snapshot_access_temperature()
-RETURNS VOID
-LANGUAGE sql
-AS $$
-    INSERT INTO lifecycle.access_temperature_log
-        (schema_name, table_name, seq_scan, idx_scan, n_tup_hot_upd)
+CREATE OR ALTER PROCEDURE lifecycle.SnapshotAccessTemperature
+AS
+BEGIN
+    SET NOCOUNT ON;
+    INSERT INTO lifecycle.AccessTemperatureLog
+        (SchemaName, TableName, PartitionNumber, UserSeeks, UserScans, UserLookups)
     SELECT
-        schemaname,
-        relname,
-        COALESCE(seq_scan, 0),
-        COALESCE(idx_scan, 0),
-        COALESCE(n_tup_hot_upd, 0)
-    FROM pg_stat_user_tables
-    WHERE schemaname NOT IN ('pg_catalog', 'information_schema', 'lifecycle');
-$$;
+        OBJECT_SCHEMA_NAME(i.object_id),
+        OBJECT_NAME(i.object_id),
+        p.partition_number,
+        SUM(ISNULL(ios.user_seeks, 0)),
+        SUM(ISNULL(ios.user_scans, 0)),
+        SUM(ISNULL(ios.user_lookups, 0))
+    FROM sys.indexes i
+    JOIN sys.partitions p ON p.object_id = i.object_id AND p.index_id = i.index_id
+    LEFT JOIN sys.dm_db_index_usage_stats ios
+        ON ios.object_id = i.object_id AND ios.index_id = i.index_id
+       AND ios.database_id = DB_ID()
+    WHERE i.object_id IN (SELECT object_id FROM lifecycle.PolicyTables)
+    GROUP BY i.object_id, p.partition_number;
+END;
+GO
 
 -- Compression candidate detection: partitions with no reads in 14 days
-CREATE OR REPLACE VIEW lifecycle.compression_candidates AS
-WITH recent_activity AS (
+CREATE OR ALTER VIEW lifecycle.CompressionCandidates AS
+WITH RecentActivity AS (
     SELECT
-        schema_name,
-        table_name,
-        SUM(seq_scan + idx_scan) AS total_scans,
-        MAX(snapshot_time)       AS last_snapshot
-    FROM lifecycle.access_temperature_log
-    WHERE snapshot_time &gt; NOW() - INTERVAL '14 days'
-    GROUP BY schema_name, table_name
+        SchemaName,
+        TableName,
+        PartitionNumber,
+        SUM(UserSeeks + UserScans + UserLookups) AS TotalAccesses,
+        MAX(SnapshotTime) AS LastSnapshot
+    FROM lifecycle.AccessTemperatureLog
+    WHERE SnapshotTime &gt; DATEADD(DAY, -14, SYSUTCDATETIME())
+    GROUP BY SchemaName, TableName, PartitionNumber
 )
 SELECT
-    pi.partition_name,
-    pi.schema_name,
-    pi.parent_table AS table_name,
-    pg_size_pretty(pi.size_bytes) AS current_size,
-    COALESCE(ra.total_scans, 0)   AS scans_14d,
-    pi.lifecycle_stage
-FROM lifecycle.partition_lifecycle_view pi
-LEFT JOIN recent_activity ra
-    ON ra.schema_name = pi.schema_name
-    AND ra.table_name = pi.parent_table
-JOIN lifecycle.policy lp
-    ON lp.schema_name = pi.schema_name
-    AND lp.table_name = pi.parent_table
-WHERE COALESCE(ra.total_scans, 0) = 0
-  AND pi.lifecycle_stage IN ('warm', 'cold')
-  AND lp.action_warm = 'compress'
-  AND lp.enabled = TRUE;</code></pre>
+    pl.SchemaName,
+    pl.TableName,
+    pl.PartitionNumber,
+    COALESCE(ra.TotalAccesses, 0) AS Accesses14d,
+    pl.LifecycleStage
+FROM lifecycle.PartitionLifecycleView pl
+LEFT JOIN RecentActivity ra
+    ON ra.SchemaName = pl.SchemaName
+   AND ra.TableName = pl.TableName
+   AND ra.PartitionNumber = pl.PartitionNumber
+JOIN lifecycle.Policy lp
+    ON lp.SchemaName = pl.SchemaName
+   AND lp.TableName = pl.TableName
+WHERE COALESCE(ra.TotalAccesses, 0) = 0
+  AND pl.LifecycleStage IN ('warm', 'cold')
+  AND lp.ActionWarm = 'compress'
+  AND lp.Enabled = 1;</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server — autonomous columnstore promotion for cold partitions:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Columnstore promotion candidates: partitions with no seeks/scans in 14 days
@@ -817,26 +839,24 @@ GO</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">COLUMNSTORE_ARCHIVE</code> compression mode in SQL Server applies XPRESS compression on top of the columnstore encoding, providing substantially higher compression ratios than standard columnstore for data that is rarely accessed — the ideal disposition for cold lifecycle partitions that must be retained but are almost never queried.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Building the Lifecycle Orchestration Daemon</h3>
 
 <p class="text-gray-300 leading-relaxed">All the components above — policy evaluation, archival, anonymization, retention enforcement, and compression promotion — need a coordinating process that runs continuously, sequences operations safely, and exposes its own health for monitoring. The lifecycle daemon is a long-running Python process with a state machine per table, a work queue, and a watchdog that reports its heartbeat to the database itself:</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import psycopg2
-import psycopg2.extensions
-import select
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import pyodbc
 import time
 import logging
 import threading
 import signal
-import sys
 from datetime import datetime, timezone
 from enum import Enum
 from dataclasses import dataclass, field
 from typing import Callable
 
 logger = logging.getLogger("lifecycle.daemon")
+
+CONN_STR = ("DRIVER={ODBC Driver 18 for SQL Server};SERVER=localhost;"
+            "DATABASE=prod;UID=lifecycle_svc;PWD=*******;")
 
 class LifecycleAction(Enum):
     SNAPSHOT_TEMPERATURE    = "snapshot_temperature"
@@ -860,11 +880,9 @@ class ScheduledTask:
         self.last_run = time.monotonic()
 
 class LifecycleDaemon:
-    def __init__(self, pg_dsn: str, archival_engine):
-        self.pg_dsn = pg_dsn
+    def __init__(self, archival_engine):
         self.archival_engine = archival_engine
         self._stop = threading.Event()
-        self._listen_conn = None
 
         self.tasks = [
             ScheduledTask(LifecycleAction.HEARTBEAT,            60,    handler=self._heartbeat),
@@ -876,35 +894,39 @@ class LifecycleDaemon:
         ]
 
     def _connect(self):
-        return psycopg2.connect(self.pg_dsn)
+        return pyodbc.connect(CONN_STR)
 
     def _heartbeat(self):
         with self._connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO lifecycle.daemon_heartbeat (daemon_id, heartbeat_at)
-                    VALUES (inet_server_addr()::text || ':lifecycle', NOW())
-                    ON CONFLICT (daemon_id) DO UPDATE
-                        SET heartbeat_at = EXCLUDED.heartbeat_at
-                """)
+            cur = conn.cursor()
+            cur.execute("""
+                MERGE lifecycle.DaemonHeartbeat AS target
+                USING (SELECT @@SERVERNAME + ':lifecycle' AS daemon_id) AS src
+                ON target.DaemonId = src.daemon_id
+                WHEN MATCHED THEN
+                    UPDATE SET HeartbeatAt = SYSUTCDATETIME()
+                WHEN NOT MATCHED THEN
+                    INSERT (DaemonId, HeartbeatAt)
+                    VALUES (src.daemon_id, SYSUTCDATETIME());
+            """)
             conn.commit()
         logger.debug("Heartbeat recorded")
 
     def _snapshot_temperature(self):
         with self._connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT lifecycle.snapshot_access_temperature()")
+            cur = conn.cursor()
+            cur.execute("EXEC lifecycle.SnapshotAccessTemperature")
             conn.commit()
         logger.info("Access temperature snapshot complete")
 
     def _evaluate_partitions(self):
         with self._connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    UPDATE lifecycle.policy
-                    SET last_evaluated = NOW()
-                    WHERE enabled = TRUE
-                """)
+            cur = conn.cursor()
+            cur.execute("""
+                UPDATE lifecycle.Policy
+                SET LastEvaluated = SYSUTCDATETIME()
+                WHERE Enabled = 1
+            """)
             conn.commit()
         logger.info("Partition lifecycle evaluation cycle complete")
 
@@ -916,53 +938,56 @@ class LifecycleDaemon:
 
     def _enforce_retention(self):
         with self._connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT lifecycle.enforce_retention()")
+            cur = conn.cursor()
+            cur.execute("EXEC lifecycle.EnforceRetention")
             conn.commit()
         logger.info("Retention enforcement cycle complete")
 
     def _promote_compression(self):
         with self._connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT partition_name
-                    FROM lifecycle.compression_candidates
-                    LIMIT 10
-                """)
-                candidates = [row[0] for row in cur.fetchall()]
-        for partition in candidates:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT TOP 10 SchemaName, TableName, PartitionNumber
+                FROM lifecycle.CompressionCandidates
+            """)
+            candidates = cur.fetchall()
+        for schema_name, table_name, partition_number in candidates:
             try:
                 with self._connect() as conn:
-                    with conn.cursor() as cur:
-                        # CLUSTER rewrites the partition in physical order; use with care
-                        cur.execute(f"VACUUM FULL ANALYZE {partition}")
+                    cur = conn.cursor()
+                    # Page compression via partition-level rebuild
+                    cur.execute(f"""
+                        ALTER INDEX ALL ON [{schema_name}].[{table_name}]
+                        REBUILD PARTITION = {partition_number}
+                        WITH (DATA_COMPRESSION = PAGE)
+                    """)
                     conn.commit()
-                logger.info("Compression applied to partition %s", partition)
+                logger.info("Compression applied to %s.%s partition %d",
+                            schema_name, table_name, partition_number)
             except Exception as e:
-                logger.error("Compression failed for %s: %s", partition, e)
-
-    def _setup_listen(self):
-        """Open a persistent connection to receive pg_notify alerts."""
-        self._listen_conn = psycopg2.connect(self.pg_dsn)
-        self._listen_conn.set_isolation_level(
-            psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT
-        )
-        cur = self._listen_conn.cursor()
-        cur.execute("LISTEN lifecycle_critical;")
-        logger.info("Listening on lifecycle_critical channel")
+                logger.error("Compression failed for %s.%s partition %d: %s",
+                             schema_name, table_name, partition_number, e)
 
     def _drain_notifications(self):
-        """Non-blocking poll for pg_notify messages; act immediately on critical alerts."""
-        if self._listen_conn is None:
-            return
-        r, _, _ = select.select([self._listen_conn], [], [], 0)
-        if r:
-            self._listen_conn.poll()
-            while self._listen_conn.notifies:
-                notify = self._listen_conn.notifies.pop(0)
-                logger.warning("Critical lifecycle alert received: %s", notify.payload)
-                # Preempt the normal archival schedule
-                self._run_archival()
+        """Non-blocking poll of the Service Broker critical-alert queue.
+        Preempts the normal schedule when a critical violation arrives."""
+        with self._connect() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                RECEIVE TOP (1) message_body
+                FROM dbo.LifecycleCriticalQueue;
+            """)
+            row = cur.fetchone()
+            if row is None:
+                conn.rollback()
+                return
+            payload = row[0]
+            if isinstance(payload, bytes):
+                payload = payload.decode("utf-8", errors="replace")
+            conn.commit()  # acknowledge the message
+        logger.warning("Critical lifecycle alert received: %s", payload)
+        # Preempt the normal archival schedule
+        self._run_archival()
 
     def _handle_signal(self, signum, frame):
         logger.info("Shutdown signal received (%d), stopping daemon", signum)
@@ -972,7 +997,6 @@ class LifecycleDaemon:
         signal.signal(signal.SIGTERM, self._handle_signal)
         signal.signal(signal.SIGINT,  self._handle_signal)
 
-        self._setup_listen()
         logger.info("Lifecycle daemon started")
 
         while not self._stop.is_set():
@@ -989,101 +1013,36 @@ class LifecycleDaemon:
 
             time.sleep(5)  # main loop granularity: 5-second tick
 
-        if self._listen_conn:
-            self._listen_conn.close()
         logger.info("Lifecycle daemon stopped cleanly")</code></pre>
 
-<p class="text-gray-300 leading-relaxed">The daemon's architecture has three important properties. First, every task is independently scheduled with its own interval so that a slow archival run does not delay the heartbeat or the retention enforcement check. Second, the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_notify</code> listener runs on a separate autocommit connection with a non-blocking <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">select()</code> poll on each main loop tick, so the daemon can react to critical alerts within five seconds without spawning threads for the listener. Third, the shutdown path is clean: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SIGTERM</code> sets the stop event and the daemon finishes its current task before exiting, avoiding interrupted mid-partition operations.</p>
+<p class="text-gray-300 leading-relaxed">The daemon's architecture has three important properties. First, every task is independently scheduled with its own interval so that a slow archival run does not delay the heartbeat or the retention enforcement check. Second, the Service Broker queue poll runs a non-blocking <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">RECEIVE</code> on each main loop tick, so the daemon can react to critical alerts within five seconds without spawning threads for the listener. Third, the shutdown path is clean: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SIGTERM</code> sets the stop event and the daemon finishes its current task before exiting, avoiding interrupted mid-partition operations.</p>
 
 <p class="text-gray-300 leading-relaxed">The supporting heartbeat table allows external monitoring systems to detect a dead lifecycle daemon:</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL
-CREATE TABLE lifecycle.daemon_heartbeat (
-    daemon_id       TEXT PRIMARY KEY,
-    heartbeat_at    TIMESTAMPTZ NOT NULL
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server daemon heartbeat
+CREATE TABLE lifecycle.DaemonHeartbeat (
+    DaemonId    NVARCHAR(200) PRIMARY KEY,
+    HeartbeatAt DATETIME2 NOT NULL
 );
 
 -- Alert query: daemon dead if heartbeat older than 5 minutes
 SELECT
-    daemon_id,
-    heartbeat_at,
-    EXTRACT(EPOCH FROM NOW() - heartbeat_at) / 60 AS minutes_since_heartbeat
-FROM lifecycle.daemon_heartbeat
-WHERE heartbeat_at &lt; NOW() - INTERVAL '5 minutes';</code></pre>
+    DaemonId,
+    HeartbeatAt,
+    DATEDIFF(SECOND, HeartbeatAt, SYSUTCDATETIME()) / 60.0 AS MinutesSinceHeartbeat
+FROM lifecycle.DaemonHeartbeat
+WHERE HeartbeatAt &lt; DATEADD(MINUTE, -5, SYSUTCDATETIME());</code></pre>
 
-<p class="text-gray-300 leading-relaxed">A Prometheus alert rule consuming this query via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">postgres_exporter</code> fires a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">LifecycleDaemonDead</code> alert if any daemon has missed more than three heartbeats, paging the on-call engineer before a retention violation window opens.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
+<p class="text-gray-300 leading-relaxed">A Prometheus alert rule consuming this query via a SQL Server metrics exporter fires a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">LifecycleDaemonDead</code> alert if any daemon has missed more than three heartbeats, paging the on-call engineer before a retention violation window opens.</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Lifecycle Audit Reporting and Dashboarding</h3>
 
 <p class="text-gray-300 leading-relaxed">An autonomous lifecycle system that does not expose its activity in human-readable form is a black box that auditors and compliance teams cannot trust. The audit layer produces two categories of output: <strong class="text-white">operational reports</strong> (what did the system do, what is its current state) and <strong class="text-white">compliance reports</strong> (provable evidence that policies were enforced).</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL — monthly lifecycle activity summary:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE OR REPLACE FUNCTION lifecycle.monthly_activity_report(
-    p_year  INTEGER,
-    p_month INTEGER
-)
-RETURNS TABLE (
-    table_name          TEXT,
-    partitions_archived INTEGER,
-    bytes_archived      BIGINT,
-    partitions_dropped  INTEGER,
-    rows_anonymized     BIGINT,
-    compliance_events   INTEGER,
-    critical_violations INTEGER
-)
-LANGUAGE sql
-STABLE
-AS $$
-    WITH date_range AS (
-        SELECT
-            make_date(p_year, p_month, 1)::timestamptz            AS period_start,
-            (make_date(p_year, p_month, 1) + INTERVAL '1 month')::timestamptz AS period_end
-    ),
-    archival_summary AS (
-        SELECT
-            al.table_name,
-            COUNT(*)                         AS partitions_archived,
-            0::BIGINT                        AS bytes_archived  -- extend with size tracking
-        FROM lifecycle.archival_log al, date_range dr
-        WHERE al.archived_at BETWEEN dr.period_start AND dr.period_end
-          AND al.status = 'completed'
-        GROUP BY al.table_name
-    ),
-    anonymization_summary AS (
-        SELECT
-            ca.table_name,
-            SUM(ca.row_count)               AS rows_anonymized
-        FROM lifecycle.compliance_attestation ca, date_range dr
-        WHERE ca.performed_at BETWEEN dr.period_start AND dr.period_end
-          AND ca.operation = 'anonymize_before_archive'
-        GROUP BY ca.table_name
-    ),
-    event_summary AS (
-        SELECT
-            ce.table_name,
-            COUNT(*)                                             AS compliance_events,
-            COUNT(*) FILTER (WHERE ce.severity = 'critical')    AS critical_violations
-        FROM lifecycle.compliance_event ce, date_range dr
-        WHERE ce.detected_at BETWEEN dr.period_start AND dr.period_end
-        GROUP BY ce.table_name
-    )
-    SELECT
-        COALESCE(ar.table_name, anon.table_name, ev.table_name) AS table_name,
-        COALESCE(ar.partitions_archived, 0)  AS partitions_archived,
-        COALESCE(ar.bytes_archived, 0)       AS bytes_archived,
-        0                                    AS partitions_dropped,
-        COALESCE(anon.rows_anonymized, 0)    AS rows_anonymized,
-        COALESCE(ev.compliance_events, 0)    AS compliance_events,
-        COALESCE(ev.critical_violations, 0)  AS critical_violations
-    FROM archival_summary ar
-    FULL OUTER JOIN anonymization_summary anon ON anon.table_name = ar.table_name
-    FULL OUTER JOIN event_summary         ev   ON ev.table_name   = COALESCE(ar.table_name, anon.table_name)
-    ORDER BY 1;
-$$;</code></pre>
+<p class="text-gray-300 leading-relaxed"></p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server — equivalent report as a stored procedure:</strong></p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Monthly lifecycle activity summary as a stored procedure:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE OR ALTER PROCEDURE lifecycle.MonthlyActivityReport
     @Year  INT,
     @Month INT
@@ -1137,62 +1096,60 @@ BEGIN
 END;
 GO</code></pre>
 
-<p class="text-gray-300 leading-relaxed">These reports feed directly into Grafana dashboards via the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">postgres_exporter</code> query collector or a custom SQL Server datasource plugin. The standard operational dashboard has five panels: partitions per lifecycle stage (stacked bar, rolling 30 days), bytes archived per day (time series), retention violation count by severity (gauge), anonymization operations per table (heat map), and daemon heartbeat status (single-stat green/red). When the compliance team needs to produce evidence for an audit, they run the monthly report and the attestation query for the specific date range, export as PDF, and attach to the audit file.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
+<p class="text-gray-300 leading-relaxed">These reports feed directly into Grafana dashboards via a SQL Server datasource plugin. The standard operational dashboard has five panels: partitions per lifecycle stage (stacked bar, rolling 30 days), bytes archived per day (time series), retention violation count by severity (gauge), anonymization operations per table (heat map), and daemon heartbeat status (single-stat green/red). When the compliance team needs to produce evidence for an audit, they run the monthly report and the attestation query for the specific date range, export as PDF, and attach to the audit file.</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Handling Edge Cases: Hotspots, Late Arrivals, and Policy Conflicts</h3>
 
 <p class="text-gray-300 leading-relaxed">A production lifecycle system encounters data that does not behave according to policy assumptions. Three edge cases require explicit handling.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Late-arriving data</strong> — a partition classified as "cold" (no reads, no writes) suddenly receives an INSERT for a row with a historical timestamp. The autonomous system must detect this and re-heat the partition before any archival or compression operation begins. The detection mechanism uses a logical replication slot or table trigger that updates a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">last_write_at</code> column in the partition inventory:</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Late-arriving data</strong> — a partition classified as "cold" (no reads, no writes) suddenly receives an INSERT for a row with a historical timestamp. The autonomous system must detect this and re-heat the partition before any archival or compression operation begins. The detection mechanism uses a table trigger that updates a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">last_write_at</code> column in the partition inventory:</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: trigger to update last-write timestamp on any partition write
-CREATE OR REPLACE FUNCTION lifecycle.update_last_write()
-RETURNS TRIGGER
-LANGUAGE plpgsql
-AS $$
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: trigger to update last-write timestamp on any partition write
+CREATE OR ALTER TRIGGER lifecycle.trg_UpdateLastWrite
+ON lifecycle.PartitionWriteLog
+AFTER INSERT, UPDATE
+AS
 BEGIN
-    UPDATE lifecycle.partition_write_log
-    SET last_write_at = NOW()
-    WHERE schema_name = TG_TABLE_SCHEMA
-      AND table_name  = TG_TABLE_NAME;
-    RETURN NEW;
+    SET NOCOUNT ON;
+    UPDATE lifecycle.PartitionWriteLog
+    SET LastWriteAt = SYSUTCDATETIME()
+    FROM lifecycle.PartitionWriteLog w
+    JOIN inserted i
+        ON i.SchemaName = w.SchemaName
+       AND i.TableName  = w.TableName;
 END;
-$$;</code></pre>
+GO</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The archival engine checks <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">last_write_at</code> before processing any partition and skips any partition written to within the past 24 hours, regardless of its classified lifecycle stage.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Policy conflicts</strong> — two policies accidentally match the same table (a data class policy and a table-specific override). The system resolves conflicts by preferring the more restrictive retention floor and the shorter retention ceiling, recording the conflict in the audit log:</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: detect policy conflicts
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: detect policy conflicts
 SELECT
-    schema_name,
-    table_name,
-    COUNT(*) AS policy_count,
-    MIN(retain_min_days)    AS effective_min,
-    MIN(retain_max_days)    AS effective_max,
-    ARRAY_AGG(policy_id)    AS conflicting_policies
-FROM lifecycle.policy
-WHERE enabled = TRUE
-GROUP BY schema_name, table_name
+    SchemaName,
+    TableName,
+    COUNT(*) AS PolicyCount,
+    MIN(RetainMinDays) AS EffectiveMin,
+    MIN(RetainMaxDays) AS EffectiveMax,
+    STRING_AGG(CAST(PolicyId AS NVARCHAR(20)), ',') AS ConflictingPolicies
+FROM lifecycle.Policy
+WHERE Enabled = 1
+GROUP BY SchemaName, TableName
 HAVING COUNT(*) &gt; 1;</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Access pattern hotspots</strong> — a table classified as "warm" suddenly shows a ten-fold increase in read access (a batch analytics job scanning historical data). The autonomous system should detect this via the temperature snapshot and temporarily suppress any compression or archival operations until the access pattern normalizes. The temperature log's 14-day rolling window naturally handles this: a sudden spike in scans over the window will exclude the partition from the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">compression_candidates</code> view without any special-case code.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Policy as a first-class schema object** removes lifecycle logic from ad hoc scripts and centralizes it into a contract that the automation reads at runtime; a single UPDATE to the policy table propagates to all downstream lifecycle decisions at the next evaluation cycle.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Policy as a first-class schema object</strong> removes lifecycle logic from ad hoc scripts and centralizes it into a contract that the automation reads at runtime; a single UPDATE to the policy table propagates to all downstream lifecycle decisions at the next evaluation cycle.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Partition-aligned lifecycle operations** are the mechanical prerequisite for autonomous data management at scale — atomic detach/attach and switch operations on complete time-range segments avoid expensive row-by-row processing and allow the system to tier, compress, or delete entire data segments with minimal locking impact on the hot data layer.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Partition-aligned lifecycle operations</strong> are the mechanical prerequisite for autonomous data management at scale — atomic detach/attach and switch operations on complete time-range segments avoid expensive row-by-row processing and allow the system to tier, compress, or delete entire data segments with minimal locking impact on the hot data layer.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Compliance attestation records are not optional metadata** — they are the auditable proof that regulatory obligations were satisfied at the exact moment of archival or deletion, and the checksum-plus-timestamp pattern ensures the attestation cannot be trivially backdated without database-level access that itself would be logged.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Compliance attestation records are not optional metadata</strong> — they are the auditable proof that regulatory obligations were satisfied at the exact moment of archival or deletion, and the checksum-plus-timestamp pattern ensures the attestation cannot be trivially backdated without database-level access that itself would be logged.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The IO headroom gate and late-arrival detection** prevent the lifecycle engine from becoming a production incident: the archival engine defers all heavy operations when the database is under storage pressure, and any partition that receives a write is held back from compression or archival for a configurable cooling window regardless of its classified lifecycle stage.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">The IO headroom gate and late-arrival detection</strong> prevent the lifecycle engine from becoming a production incident: the archival engine defers all heavy operations when the database is under storage pressure, and any partition that receives a write is held back from compression or archival for a configurable cooling window regardless of its classified lifecycle stage.</li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The orchestration daemon's event-driven escalation path** — `pg_notify` on PostgreSQL, SQL Agent alerts on SQL Server — means critical retention violations surface within seconds rather than waiting for the next scheduled evaluation window, giving operations teams time to respond before a regulatory deadline is breached.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">The orchestration daemon's event-driven escalation path</strong> — Service Broker queue messages consumed on every loop tick — means critical retention violations surface within seconds rather than waiting for the next scheduled evaluation window, giving operations teams time to respond before a regulatory deadline is breached.</li>
     </div>
     <div class="mt-14 bg-emerald-950/40 border border-emerald-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">

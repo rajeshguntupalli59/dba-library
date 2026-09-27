@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Chapter 18: Autonomous Disaster Recovery — The ADE Handbook</title>
-  <meta name="description" content="The ADE Handbook Chapter 18: Autonomous Disaster Recovery. Autonomous database engineering for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
+  <meta name="description" content="The ADE Handbook Chapter 18: Autonomous Disaster Recovery. Autonomous database engineering for SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
   <script type="module">
     import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
@@ -43,9 +43,7 @@
     <div class="space-y-4 text-sm">
 <h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 18: Autonomous Disaster Recovery</h2>
 
-<p class="text-gray-300 leading-relaxed">Disaster recovery has always been the discipline where human judgment mattered most — the 3 a.m. call, the war-room decision, the tense minutes choosing between data loss and extended downtime. Autonomous systems change that contract entirely. When your DR pipeline self-monitors replication health, self-diagnoses failure mode, self-selects a recovery path, and self-executes a tested runbook without waiting for a human to wake up, your RTO shrinks from hours to seconds and your RPO approaches zero. This chapter covers the architecture and implementation of fully autonomous DR systems for PostgreSQL and SQL Server — systems that observe failure signals at the infrastructure layer, reason about failure type and blast radius, execute tiered recovery actions with circuit breakers, and validate recovery integrity before re-admitting traffic, all without manual intervention.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
+<p class="text-gray-300 leading-relaxed">Disaster recovery has always been the discipline where human judgment mattered most — the 3 a.m. call, the war-room decision, the tense minutes choosing between data loss and extended downtime. Autonomous systems change that contract entirely. When your DR pipeline self-monitors replication health, self-diagnoses failure mode, self-selects a recovery path, and self-executes a tested runbook without waiting for a human to wake up, your RTO shrinks from hours to seconds and your RPO approaches zero. This chapter covers the architecture and implementation of fully autonomous DR systems for SQL Server — systems that observe failure signals at the infrastructure layer, reason about failure type and blast radius, execute tiered recovery actions with circuit breakers, and validate recovery integrity before re-admitting traffic, all without manual intervention.</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Failure Taxonomy and Autonomous Signal Acquisition</h3>
 
@@ -59,7 +57,7 @@
 <p class="text-gray-300 leading-relaxed">4. <strong class="text-white">Data corruption</strong> — block-level, page-level, or logical corruption on disk or in transit</p>
 <p class="text-gray-300 leading-relaxed">5. <strong class="text-white">Region/AZ failure</strong> — an entire failure domain becomes unavailable</p>
 
-<p class="text-gray-300 leading-relaxed">Signal acquisition for each class requires distinct sensor types. For node loss, TCP health checks and PostgreSQL <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_isready</code> / SQL Server <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">@@SERVERNAME</code> reachability form the first layer. For replication lag, you instrument the replication stream directly.</p>
+<p class="text-gray-300 leading-relaxed">Signal acquisition for each class requires distinct sensor types. For node loss, TCP health checks and SQL Server <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">@@SERVERNAME</code> reachability form the first layer. For replication lag, you instrument the replication stream directly.</p>
 
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Replication lag sensor for Always On AG
@@ -151,102 +149,56 @@ class FailureClassifier:
 
 <p class="text-gray-300 leading-relaxed">The classifier only fires a recovery action when confidence exceeds 70% within the vote window. This is not a soft threshold — it is a hard gate. Below 70%, the system escalates to a human via PagerDuty while continuing to collect signals. Above 70%, the recovery pipeline fires autonomously.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Autonomous Failover Architecture: WSFC Quorum and SQL Server Always On</h3>
 
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">Autonomous Failover Architecture: Patroni, pg_auto_failover, and SQL Server Always On</h3>
+<p class="text-gray-300 leading-relaxed">Once failure is classified and confidence is sufficient, the autonomous system hands off to the failover execution layer. For SQL Server, <strong class="text-white">Always On Availability Groups</strong> with the Windows Server Failover Cluster on Windows or a Pacemaker cluster on Linux provide the failover substrate. Two quorum architectures represent distinct operational philosophies: <strong class="text-white">WSFC quorum</strong> (vote-based, witness-backed) and <strong class="text-white">Pacemaker</strong> (resource-agent-based, common on Linux).</p>
 
-<p class="text-gray-300 leading-relaxed">Once failure is classified and confidence is sufficient, the autonomous system hands off to the failover execution layer. For PostgreSQL, two production-grade tools represent distinct architectural philosophies: <strong class="text-white">Patroni</strong> (consensus-based, etcd/Consul/ZooKeeper-backed) and <strong class="text-white">pg_auto_failover</strong> (coordinator-based, simpler operationally). For SQL Server, <strong class="text-white">Always On Availability Groups</strong> with the Windows Server Failover Cluster or a Pacemaker equivalent on Linux provide the failover substrate.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">WSFC Quorum: Consensus-Driven Autonomous Failover</strong></p>
 
-<p class="text-gray-300 leading-relaxed">#### Patroni: Consensus-Driven Autonomous Failover</p>
+<p class="text-gray-300 leading-relaxed">WSFC uses a vote-based quorum as its consensus layer. Each node holds a vote, and an optional witness (file share, disk, or cloud witness) breaks ties. The cluster stays online only while it holds a majority of votes; when the primary's side loses majority, resources — including the availability group — go offline there rather than risking split-brain. For fully autonomous operation, the key configuration parameters are:</p>
 
-<p class="text-gray-300 leading-relaxed">Patroni uses a distributed configuration store (etcd by default) as its consensus layer. The leader key in etcd has a TTL; when the primary fails to renew it, a candidate replica wins the election and promotes itself. For fully autonomous operation, the key configuration parameters are:</p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># PowerShell — production autonomous quorum configuration
+# Review current quorum votes
+Get-ClusterNode | Format-Table Name, NodeWeight, DynamicWeight
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># patroni.yml — production autonomous configuration
-name: pg-primary-az1
+# Set a file-share witness (even-node clusters)
+Set-ClusterQuorum -NodeAndFileShareMajority '\\fileserver\quorum$'
 
-restapi:
-  listen: 0.0.0.0:8008
-  connect_address: 10.0.1.10:8008
+# Or a cloud witness (Azure-hosted clusters)
+Set-ClusterQuorum -NodeAndCloudMajority -AccountName 'quorumstore'
 
-etcd3:
-  hosts: 10.0.0.1:2379,10.0.0.2:2379,10.0.0.3:2379
+# Verify the effective vote count still yields a strict majority
+# after every topology change
+Test-Cluster -Node sql-primary, sql-secondary, sql-replica1</code></pre>
 
-bootstrap:
-  dcs:
-    ttl: 30
-    loop_wait: 10
-    retry_timeout: 30
-    maximum_lag_on_failover: 1048576      # 1 MB — RPO gate
-    master_start_timeout: 300
-    synchronous_mode: true                # enforce sync replication
-    synchronous_mode_strict: false        # allow async fallback if sync replica lost
-    postgresql:
-      use_pg_rewind: true
-      use_slots: true
-      parameters:
-        wal_level: replica
-        hot_standby: "on"
-        max_wal_senders: 10
-        max_replication_slots: 10
-        wal_log_hints: "on"
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">REQUIRED_SYNCHRONIZED_SECONDARIES_TO_COMMIT = 1</code> setting on the availability group is your RPO gate. If a candidate secondary has not hardened the transaction log, the commit does not succeed — preventing an autonomous failover that would lose committed data. Combined with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SYNCHRONOUS_COMMIT</code> availability mode, the AG ensures at least one secondary is always synchronous, so automatic failover never loses acknowledged writes.</p>
 
-postgresql:
-  listen: 0.0.0.0:5432
-  connect_address: 10.0.1.10:5432
-  data_dir: /data/postgresql/14/main
-  pgpass: /tmp/pgpass0
-  authentication:
-    replication:
-      username: replicator
-      password: "${REPLICATION_PASSWORD}"
-    superuser:
-      username: postgres
-      password: "${POSTGRES_PASSWORD}"
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Pacemaker on Linux: Resource-Agent-Based Simplicity</strong></p>
 
-tags:
-  nofailover: false
-  noloadbalance: false
-  clonefrom: false
-  nosync: false</code></pre>
+<p class="text-gray-300 leading-relaxed">For SQL Server on Linux, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Pacemaker</code> provides cluster management with less operational overhead than a full WSFC deployment. The availability group is managed as a Pacemaker resource via the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ocf:mssql:ag</code> resource agent:</p>
 
-<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">maximum_lag_on_failover: 1048576</code> parameter is your RPO gate. If a candidate replica is more than 1 MB behind the last known primary LSN, Patroni will not promote it — preventing an autonomous failover that would lose unacceptable data. Combined with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">synchronous_mode: true</code>, Patroni ensures at least one replica is always synchronous, making the 1 MB threshold meaningful primarily for asynchronous replicas in multi-replica topologies.</p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Create the AG cluster resource on each Linux node
+sudo pcs resource create ag_production ocf:mssql:ag \
+    ag_name=AG_Production \
+    meta failure-timeout=60s \
+    op start timeout=60s \
+    op stop timeout=60s \
+    op promote timeout=60s \
+    op demote timeout=60s \
+    op monitor timeout=60s interval=10s
 
-<p class="text-gray-300 leading-relaxed">#### pg_auto_failover: Coordinator-Based Simplicity</p>
+# Constrain the virtual IP to follow the primary
+sudo pcs resource create virtualip ocf:heartbeat:IPaddr2 \
+    ip=10.0.1.50 cidr_netmask=24
 
-<p class="text-gray-300 leading-relaxed">For teams running smaller topologies (2–3 nodes), <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_auto_failover</code> provides a monitor-based approach with less operational overhead than Patroni's etcd dependency:</p>
+sudo pcs constraint colocation add virtualip ag_production-master \
+    INFINITY with-rsc-role=Master</code></pre>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Initialize the monitor node (runs on a dedicated host)
-pg_autoctl create monitor \
-  --pgdata /data/pg_auto_failover/monitor \
-  --pgport 5500 \
-  --hostname monitor.internal.example.com \
-  --auth trust \
-  --ssl-self-signed
+<p class="text-gray-300 leading-relaxed">The resource agent runs a monitor operation every 10 seconds against the AG DMVs. When the primary node stops responding and the standby's data movement is healthy, Pacemaker promotes the standby and moves the virtual IP with it — autonomously. No human action required.</p>
 
-# Register the primary
-pg_autoctl create postgres \
-  --pgdata /data/postgresql/main \
-  --pgport 5432 \
-  --hostname primary.internal.example.com \
-  --name pg-primary \
-  --monitor postgres://autoctl_node@monitor.internal.example.com:5500/pg_auto_failover \
-  --pg-hba-lan
+<p class="text-gray-300 leading-relaxed">When the monitor operation fails for the primary node across consecutive intervals and the standby's data movement is healthy, Pacemaker transitions the standby's role to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Master</code> autonomously. No human action required.</p>
 
-# Register the standby
-pg_autoctl create postgres \
-  --pgdata /data/postgresql/main \
-  --pgport 5432 \
-  --hostname standby.internal.example.com \
-  --name pg-standby \
-  --monitor postgres://autoctl_node@monitor.internal.example.com:5500/pg_auto_failover \
-  --pg-hba-lan</code></pre>
-
-<p class="text-gray-300 leading-relaxed">The monitor runs a finite state machine. You can query its current state directly:</p>
-
-
-<p class="text-gray-300 leading-relaxed">When <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">seconds_since_report</code> exceeds the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">health-check-period</code> (default 5 seconds) for the primary node and the standby is within <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">replication_quorum</code>, the monitor transitions the standby's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">goalstate</code> to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">primary</code> autonomously. No human action required.</p>
-
-<p class="text-gray-300 leading-relaxed">#### SQL Server Always On with Automatic Failover</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server Always On with Automatic Failover</strong></p>
 
 <p class="text-gray-300 leading-relaxed">SQL Server AG automatic failover requires WSFC quorum on Windows or Pacemaker on Linux. The key autonomous configuration is the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">FAILOVER_MODE = AUTOMATIC</code> clause combined with health check thresholds:</p>
 
@@ -287,16 +239,13 @@ ALTER AVAILABILITY GROUP [AG_Production]
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Connection string design matters enormously for autonomous failover.</strong> Applications must use the AG listener, not the instance name, and must set <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">MultiSubnetFailover=True</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ConnectRetryCount=3</code> to survive the ~15–30 second WSFC transition window without returning errors to the application layer.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">RPO-Aware Autonomous Recovery Decision Engine</h3>
 
-<p class="text-gray-300 leading-relaxed">Automatic failover tools (Patroni, AG automatic failover) handle the happy path — clean primary failure, healthy synchronous replica, quorum intact. Production disasters rarely follow this path. Your autonomous system needs a decision engine that reasons about recovery options when conditions are degraded: the synchronous replica is also down, the lag breach is severe, the DCS is unreachable, or you face a true split-brain.</p>
+<p class="text-gray-300 leading-relaxed">Automatic failover tools (AG automatic failover) handle the happy path — clean primary failure, healthy synchronous replica, quorum intact. Production disasters rarely follow this path. Your autonomous system needs a decision engine that reasons about recovery options when conditions are degraded: the synchronous replica is also down, the lag breach is severe, quorum is lost, or you face a true split-brain.</p>
 
 <p class="text-gray-300 leading-relaxed">The recovery decision engine is a state machine that maps (failure class, current topology state) → recovery action. The topology state is pulled from the cluster's own metadata store:</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import psycopg2
-import pyodbc
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import pyodbc
 import subprocess
 import logging
 from enum import Enum
@@ -317,7 +266,7 @@ class TopologyState(NamedTuple):
     sync_replica_lag_bytes: int
     async_replica_available: bool
     async_replica_lag_bytes: int
-    dcs_quorum_healthy: bool
+    cluster_quorum_healthy: bool
     old_primary_network_reachable: bool
     rpo_bytes: int    # configured RPO converted to bytes
 
@@ -330,9 +279,9 @@ class RecoveryDecisionEngine:
                 return RecoveryAction.FENCE_OLD_PRIMARY
             return RecoveryAction.ESCALATE_TO_HUMAN
 
-        # Primary lost, DCS unhealthy — can't safely elect
-        if not topo.dcs_quorum_healthy:
-            logger.warning("DCS quorum unhealthy — cannot safely elect new primary")
+        # Primary lost, cluster quorum unhealthy — can't safely elect
+        if not topo.cluster_quorum_healthy:
+            logger.warning("Cluster quorum unhealthy — cannot safely elect new primary")
             return RecoveryAction.ESCALATE_TO_HUMAN
 
         # Primary lost, sync replica available and within RPO
@@ -371,7 +320,7 @@ class RecoveryDecisionEngine:
     A[Failure classified] --> B{split_brain?}
     B -->|reachable| C[FENCE_OLD_PRIMARY]
     B -->|unreachable| H[ESCALATE_TO_HUMAN]
-    B -->|no| D{DCS quorum healthy?}
+    B -->|no| D{cluster quorum healthy?}
     D -->|no| H
     D -->|yes| E{sync replica available<br/>and within RPO?}
     E -->|yes| F[PROMOTE_SYNC_REPLICA]
@@ -415,93 +364,15 @@ def fence_ec2_instance(instance_id: str, region: str) -&gt; bool:
 
 <p class="text-gray-300 leading-relaxed">If the fence fails, promotion must not proceed. A failed fence is an escalation event.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Automated Backup Validation and Point-in-Time Recovery Pipelines</h3>
 
 <p class="text-gray-300 leading-relaxed">Autonomous DR is only as strong as the backups it can restore from. Most organizations discover their backups are corrupted or incomplete during the actual disaster, not before. The autonomous pattern inverts this: <strong class="text-white">restores are executed continuously in a shadow environment, and any failure in shadow restoration is treated as a current-severity alert.</strong></p>
 
 <p class="text-gray-300 leading-relaxed">The continuous restore pipeline operates on a schedule (typically every 4–8 hours for production databases) and validates three properties: restore completeness, data integrity, and RPO alignment.</p>
 
-<p class="text-gray-300 leading-relaxed">For PostgreSQL with pgBackRest, the autonomous validation pipeline looks like:</p>
+<p class="text-gray-300 leading-relaxed">For SQL Server, the autonomous validation pipeline runs on an isolated restore host every 6 hours (SQL Agent job or Kubernetes CronJob). Every backup cycle starts with rapid <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">RESTORE VERIFYONLY</code> verification; on a scheduled basis the pipeline performs a full shadow restore, replays the log chain, validates row counts, and pushes duration/RPO metrics to Prometheus:</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/bin/bash
-# Autonomous backup validation script — runs on isolated restore host
-# Triggered by cron or Kubernetes CronJob every 6 hours
-
-set -euo pipefail
-
-RESTORE_TARGET_HOST="restore-validator.internal"
-RESTORE_DATA_DIR="/data/restore-validate"
-STANZA="pg-production"
-ALERT_WEBHOOK="${PAGERDUTY_WEBHOOK_URL}"
-SLACK_WEBHOOK="${SLACK_OPS_WEBHOOK}"
-
-log() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*"; }
-
-# Step 1: Clean restore target
-log "Clearing previous restore at ${RESTORE_DATA_DIR}"
-rm -rf "${RESTORE_DATA_DIR}"
-mkdir -p "${RESTORE_DATA_DIR}"
-
-# Step 2: Restore latest backup
-log "Starting pgBackRest restore for stanza ${STANZA}"
-RESTORE_START=$(date +%s)
-
-pgbackrest restore \
-  --stanza="${STANZA}" \
-  --pg1-path="${RESTORE_DATA_DIR}" \
-  --type=default \
-  --log-level-console=info \
-  --process-max=4 \
-  --recovery-option="recovery_target_action=promote"
-
-RESTORE_END=$(date +%s)
-RESTORE_DURATION=$((RESTORE_END - RESTORE_START))
-log "Restore completed in ${RESTORE_DURATION} seconds"
-
-# Step 3: Start PostgreSQL on restore host (non-production port)
-pg_ctl -D "${RESTORE_DATA_DIR}" -o "-p 5433" start
-sleep 10   # allow startup
-
-# Step 4: Validate integrity
-PSQL="psql -h localhost -p 5433 -U postgres"
-
-CHECKSUM_RESULT=$($PSQL -c "SELECT pg_catalog.pg_verify_checksums('${RESTORE_DATA_DIR}');" -t 2&gt;&1 || echo "FAILED")
-TABLE_COUNT=$($PSQL -c "SELECT count(*) FROM information_schema.tables WHERE table_schema='public';" -t 2&gt;&1)
-
-# Step 5: Validate RPO — how old is the restored data?
-LATEST_LSN=$($PSQL -c "SELECT pg_current_wal_lsn();" -t)
-DB_TIME=$($PSQL -c "SELECT now();" -t)
-CURRENT_TIME=$(date -u +%s)
-DB_EPOCH=$($PSQL -c "SELECT EXTRACT(EPOCH FROM now())::bigint;" -t)
-RPO_SECONDS=$((CURRENT_TIME - DB_EPOCH))
-
-log "Restore validation: checksum=${CHECKSUM_RESULT}, tables=${TABLE_COUNT}, RPO_seconds=${RPO_SECONDS}"
-
-# Step 6: Emit metrics to Prometheus pushgateway
-cat &lt;&lt;EOF | curl --data-binary @- http://pushgateway.internal:9091/metrics/job/backup_validation
-# TYPE backup_restore_duration_seconds gauge
-backup_restore_duration_seconds{stanza="${STANZA}"} ${RESTORE_DURATION}
-# TYPE backup_rpo_seconds gauge
-backup_rpo_seconds{stanza="${STANZA}"} ${RPO_SECONDS}
-# TYPE backup_validation_success gauge
-backup_validation_success{stanza="${STANZA}"} $([ "$CHECKSUM_RESULT" != "FAILED" ] && echo 1 || echo 0)
-EOF
-
-# Step 7: Alert if validation failed
-if [ "$CHECKSUM_RESULT" = "FAILED" ] || [ "$RPO_SECONDS" -gt 28800 ]; then
-    log "VALIDATION FAILED — alerting ops"
-    curl -s -X POST "${ALERT_WEBHOOK}" \
-      -H "Content-Type: application/json" \
-      -d "{\"severity\": \"critical\", \"summary\": \"Backup validation failed for stanza ${STANZA}\", \"rpo_seconds\": ${RPO_SECONDS}, \"checksum\": \"${CHECKSUM_RESULT}\"}"
-fi
-
-# Step 8: Shut down restore instance
-pg_ctl -D "${RESTORE_DATA_DIR}" stop -m fast
-log "Restore validation complete"</code></pre>
-
-<p class="text-gray-300 leading-relaxed">The SQL Server equivalent uses T-SQL's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">RESTORE VERIFYONLY</code> for rapid validation before committing to a full restore, then moves to a full shadow restore on a scheduled basis:</p>
+<p class="text-gray-300 leading-relaxed">Rapid backup file verification (run every backup cycle):</p>
 
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Rapid backup file verification (run every backup cycle)
@@ -548,112 +419,128 @@ ORDER BY p.rows DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The shadow restore must run on a separate isolated instance — not a test schema on the production server. Restoring to the same instance risks corrupting production configuration, and the performance overhead of a large restore can degrade production query throughput.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Point-in-Time Recovery Automation</h3>
 
 <p class="text-gray-300 leading-relaxed">When data corruption or logical error is detected, the recovery action from the decision engine is <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">RESTORE_FROM_BACKUP</code>. Autonomous PITR must select the correct recovery target — not simply "restore the latest backup" but "restore to the point immediately before the corruption event was first detected."</p>
 
 <p class="text-gray-300 leading-relaxed">The autonomous PITR pipeline needs three inputs:</p>
 <p class="text-gray-300 leading-relaxed">1. The corruption detection timestamp (from the monitoring system)</p>
-<p class="text-gray-300 leading-relaxed">2. The backup catalog (pgBackRest info or SQL Server msdb history)</p>
-<p class="text-gray-300 leading-relaxed">3. The WAL/log archive to replay forward from the backup</p>
+<p class="text-gray-300 leading-relaxed">2. The backup catalog (SQL Server msdb history)</p>
+<p class="text-gray-300 leading-relaxed">3. The log archive to replay forward from the backup</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL — Autonomous PITR selection:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import subprocess
-import json
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Autonomous PITR selection via msdb:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import pyodbc
 import datetime
 import logging
 
 logger = logging.getLogger("autonomous_pitr")
 
-def select_pitr_target(corruption_detected_at: datetime.datetime, stanza: str) -&gt; dict:
+MSSQL_DSN = (
+    "DRIVER={ODBC Driver 18 for SQL Server};"
+    "SERVER=sql-primary;DATABASE=msdb;Trusted_Connection=yes;"
+)
+
+def select_pitr_target(corruption_detected_at: datetime.datetime,
+                       database_name: str) -&gt; dict:
     """
-    Select the appropriate backup and PITR target for autonomous restoration.
-    Returns a dict with backup_label, recovery_target_time, and estimated_restore_minutes.
-    corruption_detected_at: timezone-aware datetime of first corruption signal
+    Select the backup chain and PITR target for autonomous restoration.
+    Restores to 5 minutes before detection to avoid already-corrupt data.
     """
     # Add safety margin — restore to 5 minutes before detection
-    # to avoid restoring to a point that might already contain corruption
     target_time = corruption_detected_at - datetime.timedelta(minutes=5)
 
-    # Query pgBackRest backup catalog
-    result = subprocess.run(
-        ["pgbackrest", "--stanza", stanza, "--output", "json", "info"],
-        capture_output=True, text=True, check=True
-    )
-    catalog = json.loads(result.stdout)
+    conn = pyodbc.connect(MSSQL_DSN)
+    cur = conn.cursor()
 
-    # Find the most recent full or differential backup before target_time
-    best_backup = None
-    for stanza_info in catalog:
-        if stanza_info["name"] != stanza:
-            continue
-        for backup in reversed(stanza_info.get("backup", [])):
-            backup_stop_time = datetime.datetime.fromisoformat(
-                backup["timestamp"]["stop"].replace("Z", "+00:00")
-            )
-            if backup_stop_time &lt;= target_time:
-                best_backup = backup
-                break
+    # Most recent full backup before the PITR target
+    cur.execute("""
+        SELECT TOP 1
+            bs.backup_set_id,
+            bs.backup_finish_date,
+            bmf.physical_device_name,
+            bs.compressed_backup_size,
+            bs.first_lsn,
+            bs.last_lsn
+        FROM dbo.backupset bs
+        JOIN dbo.backupmediafamily bmf
+            ON bs.media_set_id = bmf.media_set_id
+        WHERE bs.database_name = ?
+          AND bs.type = 'D'
+          AND bs.backup_finish_date &lt;= ?
+        ORDER BY bs.backup_finish_date DESC
+    """, database_name, target_time)
+    full = cur.fetchone()
+    if not full:
+        raise RuntimeError("No full backup found before PITR target")
 
-    if best_backup is None:
-        raise RuntimeError(
-            f"No backup found before corruption target {target_time.isoformat()} "
-            f"in stanza {stanza}"
-        )
+    # Differential + log chain after that full backup, up to the target
+    cur.execute("""
+        SELECT
+            bs.backup_set_id,
+            bs.type,
+            bs.backup_finish_date,
+            bmf.physical_device_name,
+            bs.first_lsn,
+            bs.last_lsn
+        FROM dbo.backupset bs
+        JOIN dbo.backupmediafamily bmf
+            ON bs.media_set_id = bmf.media_set_id
+        WHERE bs.database_name = ?
+          AND bs.type IN ('I', 'L')
+          AND bs.backup_finish_date &gt; ?
+          AND bs.backup_start_date &lt;= ?
+        ORDER BY bs.backup_start_date
+    """, database_name, full.backup_finish_date, target_time)
+    chain = cur.fetchall()
+    conn.close()
 
-    backup_size_gb = best_backup["info"]["size"] / (1024 ** 3)
-    # Estimate using a restore-throughput constant calibrated against your own
-    # storage tier — measure it during a real restore rather than assuming a figure
-    RESTORE_THROUGHPUT_MB_PER_SEC = 200
-    estimated_restore_minutes = (backup_size_gb * 1024) / (RESTORE_THROUGHPUT_MB_PER_SEC * 60)
-
-    logger.info(
-        "Selected backup %s (stopped at %s) for PITR target %s; "
-        "estimated restore time: %.1f minutes",
-        best_backup["label"],
-        best_backup["timestamp"]["stop"],
-        target_time.isoformat(),
-        estimated_restore_minutes
-    )
+    estimated_minutes = (full.compressed_backup_size or 0) / (1024**3) / 2.0
+    logger.info("PITR target %s: full backup %s + %d chain members",
+                target_time.isoformat(), full.backup_set_id, len(chain))
 
     return {
-        "backup_label": best_backup["label"],
-        "recovery_target_time": target_time.isoformat(),
-        "estimated_restore_minutes": estimated_restore_minutes,
-        "backup_size_gb": round(backup_size_gb, 2)
+        "pitr_target": target_time.isoformat(),
+        "full_backup_set_id": full.backup_set_id,
+        "chain_device_names": [row.physical_device_name for row in chain],
+        "estimated_restore_minutes": round(estimated_minutes, 1),
     }
 
 
-def execute_pitr(stanza: str, restore_data_dir: str, recovery_target_time: str) -&gt; bool:
+def execute_pitr(conn, database_name: str, pitr: dict) -&gt; bool:
     """
-    Execute pgBackRest PITR to a specific target time.
+    Execute the restore chain: full WITH NORECOVERY, then each chain
+    member WITH NORECOVERY, final log WITH RECOVERY, STOPAT = pitr_target.
     Returns True on success, False on failure.
     """
-    logger.info("Executing PITR to %s", recovery_target_time)
+    cur = conn.cursor()
     try:
-        subprocess.run(
-            [
-                "pgbackrest", "restore",
-                "--stanza", stanza,
-                "--pg1-path", restore_data_dir,
-                "--type", "time",
-                "--target", recovery_target_time,
-                "--target-action", "promote",
-                "--recovery-option", "recovery_target_inclusive=false",
-                "--process-max", "4",
-                "--log-level-console", "info"
-            ],
-            check=True
+        logger.info("Restoring full backup for %s", database_name)
+        cur.execute(
+            f"RESTORE DATABASE [{database_name}] FROM DISK = ? "
+            f"WITH NORECOVERY, STATS = 5",
+            pitr["full_device_name"],
         )
+        for device in pitr["chain_device_names"][:-1]:
+            logger.info("Applying chain member %s", device)
+            cur.execute(
+                f"RESTORE DATABASE [{database_name}] FROM DISK = ? "
+                f"WITH NORECOVERY, STATS = 5",
+                device,
+            )
+        logger.info("Applying final log to PITR target %s", pitr["pitr_target"])
+        cur.execute(
+            f"RESTORE DATABASE [{database_name}] FROM DISK = ? "
+            f"WITH RECOVERY, STOPAT = ?",
+            pitr["chain_device_names"][-1], pitr["pitr_target"],
+        )
+        conn.commit()
         logger.info("PITR restore completed successfully")
         return True
-    except subprocess.CalledProcessError as exc:
+    except pyodbc.Error as exc:
         logger.error("PITR restore failed: %s", exc)
         return False</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server — Autonomous PITR via msdb backup history:</strong></p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Backup chain identification in T-SQL:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify the correct backup set for autonomous PITR
 -- @corruption_time: the timestamp of first detected corruption
 DECLARE @corruption_time DATETIME2 = '2024-01-15T22:47:00';
@@ -706,8 +593,6 @@ WHERE bs.database_name = @database_name
 ORDER BY bs.backup_start_date;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Once the backup chain is identified, the automated restore script iterates through the results, issuing <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">RESTORE DATABASE ... WITH NORECOVERY</code> for each backup in the chain and a final <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">RESTORE DATABASE ... WITH RECOVERY, STOPAT = @pitr_target</code> for the last log backup.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Circuit Breakers and Recovery Runbook Orchestration</h3>
 
@@ -855,56 +740,13 @@ class RunbookOrchestrator:
 
 <p class="text-gray-300 leading-relaxed">Three failures within a 10-minute window opens the circuit breaker for 5 minutes. During that open window, the orchestrator blocks all autonomous actions and pages a human. This prevents the system from executing six failed promotions in a row while the on-call engineer is being woken up. Once the circuit re-enters Half-Open after 5 minutes, it permits one probe action; if that succeeds, the circuit closes and autonomous operation resumes.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Post-Recovery Integrity Validation</h3>
 
 <p class="text-gray-300 leading-relaxed">Completing a failover or restore is not recovery — validated recovery is recovery. Autonomous DR systems must execute a post-recovery validation suite before re-admitting application traffic. Traffic re-admission is gated on validation passing, not simply on the database process being reachable.</p>
 
 <p class="text-gray-300 leading-relaxed">The validation suite checks four categories: connectivity, data integrity, replication topology restoration, and application-level smoke tests.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL — Post-recovery validation:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- 1. Connectivity and role check — confirms this is now the primary
-SELECT
-    pg_is_in_recovery()          AS is_standby,
-    pg_postmaster_start_time()   AS postmaster_start,
-    current_setting('cluster_name') AS cluster_name,
-    pg_current_wal_lsn()         AS current_lsn;
--- is_standby must be FALSE after promotion
-
--- 2. Replication topology check — confirm new standby is connecting
-SELECT
-    application_name,
-    client_addr,
-    state,
-    sync_state,
-    (sent_lsn - replay_lsn) AS lag_bytes
-FROM pg_stat_replication;
--- Expect at least one row with state='streaming' within 60 seconds of promotion
-
--- 3. Data integrity spot check — verify critical tables accessible
-SELECT
-    schemaname,
-    tablename,
-    n_live_tup,
-    n_dead_tup,
-    last_autovacuum,
-    last_autoanalyze
-FROM pg_stat_user_tables
-WHERE schemaname = 'public'
-ORDER BY n_live_tup DESC
-LIMIT 20;
-
--- 4. Extension and sequence integrity
-SELECT
-    sequence_name,
-    last_value,
-    increment_by
-FROM information_schema.sequences
-WHERE sequence_schema = 'public'
-ORDER BY sequence_name;</code></pre>
-
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server — Post-recovery validation:</strong></p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Post-recovery validation:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- 1. AG health check after failover
 SELECT
     ag.name AS ag_name,
@@ -984,60 +826,40 @@ END</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The traffic admission gate is a separate component — typically a load balancer health check endpoint or a DNS TTL expiry — that the validation suite controls. Only when all four validation categories pass does the suite signal the load balancer to re-route connections to the new primary. In Kubernetes environments this is a readiness probe endpoint implemented in the database sidecar container; in traditional environments it is a script that updates a HAProxy backend weight or a Route 53 health check status.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Geo-Redundant and Multi-Region Autonomous DR</h3>
 
 <p class="text-gray-300 leading-relaxed">Single-region autonomous DR handles the majority of failure scenarios. Region-level failures — AZ outages, cloud region degradation, network backbone events — require a distinct architecture: geo-redundant replication with an autonomous cross-region election mechanism.</p>
 
 <p class="text-gray-300 leading-relaxed">The fundamental challenge with cross-region autonomous failover is network latency. Synchronous replication across regions introduces write latency equal to the round-trip time between regions. For most regions this is 20–80 ms, which is unacceptable for OLTP workloads with tight SLAs. The production pattern is therefore:</p>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Intra-region:** synchronous replication, automatic failover, RPO = 0</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Cross-region:** asynchronous replication, autonomous failover with explicit data-loss acknowledgment, RPO = replication lag at time of failure</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Intra-region:</strong> synchronous replication, automatic failover, RPO = 0</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Cross-region:</strong> asynchronous replication, autonomous failover with explicit data-loss acknowledgment, RPO = replication lag at time of failure</li>
 
 <p class="text-gray-300 leading-relaxed">This asymmetric replication design requires the recovery decision engine to know which tier it is operating in. A cross-region failover is always a data-loss event and must be logged as such in the audit trail.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL cross-region replication configuration:</strong></p>
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- On primary: create a cascading replication slot for the DR region
-SELECT pg_create_physical_replication_slot('dr_region_us_west_2', true, false);
+<p class="text-gray-300 leading-relaxed">One critical operational detail: an unreachable async secondary lets the log send queue grow on the primary — and a growing send queue can hold log truncation, filling the transaction log. Autonomous DR systems must monitor the send queue and, past a configured threshold, remove the stalled replica from the AG to release truncation:</p>
 
--- Verify slot state before relying on it
-SELECT
-    slot_name,
-    plugin,
-    slot_type,
-    active,
-    confirmed_flush_lsn,
-    (pg_current_wal_lsn() - confirmed_flush_lsn) AS lag_bytes,
-    pg_size_pretty(pg_current_wal_lsn() - confirmed_flush_lsn) AS lag_pretty
-FROM pg_replication_slots
-WHERE slot_name = 'dr_region_us_west_2';</code></pre>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Autonomous log send queue monitor — run every 5 minutes
+-- Removes a stalled async replica that is holding log truncation
+DECLARE @max_queue_kb BIGINT = 10485760;  -- 10 GB send queue limit
 
-<p class="text-gray-300 leading-relaxed">One critical operational detail: replication slots retain WAL segments on the primary until the replica confirms receipt. In a cross-region scenario, if the DR region becomes unreachable for an extended period, WAL accumulates on the primary and can exhaust disk space. Autonomous DR systems must monitor slot lag and automatically drop inactive slots that exceed a WAL accumulation threshold:</p>
-
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Autonomous slot health monitor
--- Run every 5 minutes; drop slots exceeding the WAL accumulation limit
-DO $$
-DECLARE
-    slot_rec RECORD;
-    max_lag_bytes BIGINT := 10737418240;  -- 10 GB WAL accumulation limit
-    lag BIGINT;
+IF EXISTS (
+    SELECT 1
+    FROM sys.dm_hadr_database_replica_states drs
+    JOIN sys.availability_replicas ar
+        ON drs.replica_id = ar.replica_id
+    WHERE ar.replica_server_name = N'sql-dr-west'
+      AND drs.is_local = 0
+      AND drs.log_send_queue_size &gt; @max_queue_kb
+      AND DATEDIFF(MINUTE, drs.last_commit_time, GETUTCDATE()) &gt; 30
+)
 BEGIN
-    FOR slot_rec IN
-        SELECT slot_name, active,
-               (pg_current_wal_lsn() - confirmed_flush_lsn) AS lag_bytes
-        FROM pg_replication_slots
-        WHERE slot_type = 'physical'
-    LOOP
-        IF NOT slot_rec.active AND slot_rec.lag_bytes &gt; max_lag_bytes THEN
-            RAISE WARNING 'Dropping inactive slot % with lag % bytes exceeding threshold',
-                slot_rec.slot_name, slot_rec.lag_bytes;
-            PERFORM pg_drop_replication_slot(slot_rec.slot_name);
-        END IF;
-    END LOOP;
-END $$;</code></pre>
+    RAISERROR('DR replica send queue exceeded limit — removing replica to release log truncation', 16, 1);
+    ALTER AVAILABILITY GROUP [AG_Production]
+        REMOVE REPLICA ON N'sql-dr-west';
+END</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server — Cross-region AG with asynchronous DR replica:</strong></p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Cross-region AG with asynchronous DR replica:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Add async DR replica to existing synchronous AG
 ALTER AVAILABILITY GROUP [AG_Production]
 ADD REPLICA ON N'sql-dr-west' WITH (
@@ -1100,8 +922,6 @@ EXEC xp_cmdshell 'powershell.exe -File C:\DR\update-dns-listener.ps1 -AgName AG_
 
 <p class="text-gray-300 leading-relaxed">The DNS update step after cross-region failover is frequently overlooked. AG listeners are cluster-aware within a WSFC; across regions they require a separate DNS entry or global load balancer update. The autonomous pipeline must handle this as part of the runbook, not as an afterthought.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Observability and the DR Simulation Framework</h3>
 
 <p class="text-gray-300 leading-relaxed">An autonomous DR system that has never been tested is a liability. The simulation framework executes DR scenarios against the production topology on a schedule — not against a separate test environment — but with application traffic isolated to a shadow copy. This is analogous to chaos engineering but with a specific DR focus.</p>
@@ -1123,7 +943,7 @@ class DRScenario:
 DR_SCENARIOS = [
     DRScenario(
         name="primary_process_kill",
-        description="Kill PostgreSQL process on primary — expect sync replica promotion within 30s",
+        description="Kill SQL Server process on primary — expect sync replica promotion within 30s",
         inject_fn=kill_primary_process,
         expected_recovery_action="promote_sync_replica",
         max_recovery_seconds=30,
@@ -1146,12 +966,12 @@ DR_SCENARIOS = [
         validation_fn=validate_pitr_data_integrity
     ),
     DRScenario(
-        name="replication_slot_bloat",
-        description="Pause DR replica for 30 minutes — expect slot drop at WAL accumulation limit",
+        name="log_send_queue_bloat",
+        description="Pause DR replica for 30 minutes — expect replica removal at send queue limit",
         inject_fn=pause_dr_replica_replication,
-        expected_recovery_action="slot_auto_drop",
+        expected_recovery_action="replica_auto_removed",
         max_recovery_seconds=300,
-        validation_fn=validate_slot_dropped_and_wal_space_recovered
+        validation_fn=validate_replica_removed_and_log_truncated
     ),
 ]</code></pre>
 
@@ -1159,27 +979,15 @@ DR_SCENARIOS = [
 
 <p class="text-gray-300 leading-relaxed">The observability layer for autonomous DR should expose the following metrics as a minimum:</p>
 
-<p class="text-gray-300 leading-relaxed">| Metric | Type | Purpose |</p>
-<p class="text-gray-300 leading-relaxed">|---|---|---|</p>
-<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dr_failover_total</code> | Counter | Count of autonomous failovers by type |</p>
-<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dr_failover_duration_seconds</code> | Histogram | Time from failure detection to traffic restored |</p>
-<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dr_classification_confidence</code> | Gauge | Current classifier confidence on active signal |</p>
-<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dr_circuit_breaker_state</code> | Gauge | 0=closed, 1=half-open, 2=open |</p>
-<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dr_backup_rpo_seconds</code> | Gauge | Age of most recently validated backup restore |</p>
-<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dr_replication_lag_bytes</code> | Gauge | Current replication lag per replica |</p>
-<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dr_simulation_last_pass_timestamp</code> | Gauge | Unix timestamp of last passing simulation run |</p>
-
-<p class="text-gray-300 leading-relaxed">When <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dr_simulation_last_pass_timestamp</code> has not updated in more than 7 days, the system automatically files an incident. A DR system that hasn't been validated recently is not a DR system you can trust for autonomous execution.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
+<div class="my-6 overflow-x-auto"><table class="w-full text-sm text-gray-300"><thead><tr class="border-b border-gray-700"><th class="text-left py-2 pr-4 text-white">Metric</th><th class="text-left py-2 pr-4 text-white">Type</th><th class="text-left py-2 text-white">Purpose</th></tr></thead><tbody><tr class="border-b border-gray-800"><td class="py-2 pr-4 font-medium text-white"><code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dr_failover_total</code></td><td class="py-2 pr-4">Counter</td><td class="py-2">Count of autonomous failovers by type</td></tr><tr class="border-b border-gray-800"><td class="py-2 pr-4 font-medium text-white"><code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dr_failover_duration_seconds</code></td><td class="py-2 pr-4">Histogram</td><td class="py-2">Time from failure detection to traffic restored</td></tr><tr class="border-b border-gray-800"><td class="py-2 pr-4 font-medium text-white"><code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dr_classification_confidence</code></td><td class="py-2 pr-4">Gauge</td><td class="py-2">Current classifier confidence on active signal</td></tr><tr class="border-b border-gray-800"><td class="py-2 pr-4 font-medium text-white"><code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dr_circuit_breaker_state</code></td><td class="py-2 pr-4">Gauge</td><td class="py-2">0=closed, 1=half-open, 2=open</td></tr><tr class="border-b border-gray-800"><td class="py-2 pr-4 font-medium text-white"><code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dr_backup_rpo_seconds</code></td><td class="py-2 pr-4">Gauge</td><td class="py-2">Age of most recently validated backup restore</td></tr><tr class="border-b border-gray-800"><td class="py-2 pr-4 font-medium text-white"><code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dr_replication_lag_bytes</code></td><td class="py-2 pr-4">Gauge</td><td class="py-2">Current replication lag per replica</td></tr><tr class="border-b border-gray-800"><td class="py-2 pr-4 font-medium text-white"><code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dr_simulation_last_pass_timestamp</code></td><td class="py-2 pr-4">Gauge</td><td class="py-2">Unix timestamp of last passing simulation run</td></tr></tbody></table></div><p class="text-gray-300 leading-relaxed">When <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dr_simulation_last_pass_timestamp</code> has not updated in more than 7 days, the system automatically files an incident. A DR system that hasn't been validated recently is not a DR system you can trust for autonomous execution.</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Failure classification precedes recovery action.** Treating all failures as "failover" produces wrong recovery paths; a voting-window classifier that waits 10–30 seconds for signal convergence prevents false positives and wrong-class recoveries while keeping RTO within SLO.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **RPO is an explicit gate in the decision engine, not an aspiration.** The recovery decision engine must compare actual replication lag bytes against the configured RPO threshold and refuse to promote replicas that exceed it without an explicit pre-authorized data-loss acknowledgment. This transforms RPO from a metric you measure after a disaster into a constraint you enforce before one occurs.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Circuit breakers prevent autonomous systems from deepening incidents.** Three failed recovery attempts within a rolling window should open the circuit breaker, block further autonomous action, and escalate to a human — stopping the system from executing a cascade of failed promotions while the on-call engineer is responding.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Continuous shadow restores are the only reliable backup validation.** Verifying backup files with checksums is necessary but not sufficient; only a full autonomous restore to an isolated instance, followed by integrity checks and RPO age measurement, can confirm that your backup chain is actually recoverable when the decision engine selects `RESTORE_FROM_BACKUP`.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Post-recovery validation gates traffic re-admission.** The database process being reachable is not recovery; validated recovery requires confirming primary role, replication topology restoration, data integrity spot checks, and application-level smoke tests — and only after all four pass should the load balancer or DNS be updated to re-admit production traffic.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Failure classification precedes recovery action.</strong> Treating all failures as "failover" produces wrong recovery paths; a voting-window classifier that waits 10–30 seconds for signal convergence prevents false positives and wrong-class recoveries while keeping RTO within SLO.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">RPO is an explicit gate in the decision engine, not an aspiration.</strong> The recovery decision engine must compare actual replication lag bytes against the configured RPO threshold and refuse to promote replicas that exceed it without an explicit pre-authorized data-loss acknowledgment. This transforms RPO from a metric you measure after a disaster into a constraint you enforce before one occurs.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Circuit breakers prevent autonomous systems from deepening incidents.</strong> Three failed recovery attempts within a rolling window should open the circuit breaker, block further autonomous action, and escalate to a human — stopping the system from executing a cascade of failed promotions while the on-call engineer is responding.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Continuous shadow restores are the only reliable backup validation.</strong> Verifying backup files with checksums is necessary but not sufficient; only a full autonomous restore to an isolated instance, followed by integrity checks and RPO age measurement, can confirm that your backup chain is actually recoverable when the decision engine selects <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">RESTORE_FROM_BACKUP</code>.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> <strong class="text-white">Post-recovery validation gates traffic re-admission.</strong> The database process being reachable is not recovery; validated recovery requires confirming primary role, replication topology restoration, data integrity spot checks, and application-level smoke tests — and only after all four pass should the load balancer or DNS be updated to re-admit production traffic.</li>
     </div>
     <div class="mt-14 bg-emerald-950/40 border border-emerald-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">

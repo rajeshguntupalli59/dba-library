@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Chapter 10: Automated Root Cause Analysis — The ADE Handbook</title>
-  <meta name="description" content="The ADE Handbook Chapter 10: Automated Root Cause Analysis. Autonomous database engineering for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
+  <meta name="description" content="The ADE Handbook Chapter 10: Automated Root Cause Analysis. Autonomous database engineering for SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
   <script type="module">
     import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
@@ -43,9 +43,7 @@
     <div class="space-y-4 text-sm">
 <h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 10: Automated Root Cause Analysis</h2>
 
-<p class="text-gray-300 leading-relaxed">When a production database degrades at 2 AM, the difference between a five-minute recovery and a two-hour war room comes down to one thing: how fast the system understands *why* something broke. Automated root cause analysis (ARCA) is the discipline of building systems that move from symptom detection to causal diagnosis without waiting for a human to open a terminal. At the ADE level, this means architecting a pipeline that ingests telemetry across multiple signal layers, applies causal reasoning models, generates testable hypotheses, and either acts autonomously or presents the on-call engineer with a ranked, evidence-backed cause list before they finish reading the alert. This chapter covers the signal taxonomy, correlation engine design, causal graph construction, LLM-augmented diagnosis, and the production patterns that make this work reliably across PostgreSQL and SQL Server environments.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
+<p class="text-gray-300 leading-relaxed">When a production database degrades at 2 AM, the difference between a five-minute recovery and a two-hour war room comes down to one thing: how fast the system understands <em>why</em> something broke. Automated root cause analysis (ARCA) is the discipline of building systems that move from symptom detection to causal diagnosis without waiting for a human to open a terminal. At the ADE level, this means architecting a pipeline that ingests telemetry across multiple signal layers, applies causal reasoning models, generates testable hypotheses, and either acts autonomously or presents the on-call engineer with a ranked, evidence-backed cause list before they finish reading the alert. This chapter covers the signal taxonomy, correlation engine design, causal graph construction, LLM-augmented diagnosis, and the production patterns that make this work reliably across SQL Server environments.</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Signal Taxonomy: Building the Evidence Hierarchy for Database Failures</h3>
 
@@ -55,17 +53,17 @@
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Layer 1 — User-visible symptoms:</strong> Query latency (p50/p95/p99), error rates, connection refusals, transaction throughput drops. These are what alerts fire on. They are never root causes.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Layer 2 — Database execution signals:</strong> Lock waits, blocked queries, plan cache invalidations, wait event distributions, temp disk spills, autovacuum contention (PostgreSQL), PAGELATCH/PAGEIOLATCH waits (SQL Server).</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Layer 2 — Database execution signals:</strong> Lock waits, blocked queries, plan cache invalidations, wait event distributions, tempdb spills, ghost cleanup backlog, PAGELATCH/PAGEIOLATCH waits.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Layer 3 — Resource signals:</strong> CPU saturation, IOPS ceiling, memory pressure, network bandwidth to storage, WAL write latency (PostgreSQL), VLF fragmentation or log growth (SQL Server).</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Layer 3 — Resource signals:</strong> CPU saturation, IOPS ceiling, memory pressure, network bandwidth to storage, log flush latency, VLF fragmentation, or log growth.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Layer 4 — Configuration and state signals:</strong> Parameter changes, pg_hba modifications, statistics staleness (n_live_tup vs n_dead_tup drift), index bloat ratio, autovacuum threshold crossings, AG synchronization lag (SQL Server), Patroni leader election history.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Layer 4 — Configuration and state signals:</strong> Parameter changes, endpoint and firewall modifications, statistics staleness (modification-counter drift), fragmentation ratio, ghost record accumulation, AG synchronization lag, WSFC quorum history.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Layer 5 — External causation signals:</strong> Deployment events, schema migrations, batch job start times, connection pool reconfiguration, upstream service traffic spikes, cloud provider maintenance windows.</p>
 
-<p class="text-gray-300 leading-relaxed">Each layer has different collection mechanisms and different temporal characteristics. Resource signals move in seconds. Configuration signals move in minutes to hours. Deployment signals are discrete events. A proper ARCA schema stores all five layers in a unified timeline, keyed to wall-clock time with enough resolution to establish sequence — because *sequence is the foundation of causation*.</p>
+<p class="text-gray-300 leading-relaxed">Each layer has different collection mechanisms and different temporal characteristics. Resource signals move in seconds. Configuration signals move in minutes to hours. Deployment signals are discrete events. A proper ARCA schema stores all five layers in a unified timeline, keyed to wall-clock time with enough resolution to establish sequence — because <em>sequence is the foundation of causation</em>.</p>
 
-<p class="text-gray-300 leading-relaxed">The collection architecture for PostgreSQL uses a combination of <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_activity</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_bgwriter</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_user_tables</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_locks</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_replication</code>, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_wait_sampling</code> (the extension, not the base view) for sub-second wait event sampling. SQL Server relies on DMVs: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_requests</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_os_wait_stats</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_query_stats</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_db_index_usage_stats</code>, and Extended Events sessions for high-resolution capture.</p>
+<p class="text-gray-300 leading-relaxed">The collection architecture relies on DMVs: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_requests</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_os_wait_stats</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_query_stats</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_db_index_usage_stats</code>, and Extended Events sessions for high-resolution capture.</p>
 
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Equivalent Layer 2 snapshot for SQL Server: active requests with blocking chain
@@ -97,18 +95,16 @@ OUTER APPLY sys.dm_exec_query_plan(r.plan_handle) qp
 WHERE r.session_id != @@SPID
 ORDER BY r.wait_time DESC;</code></pre>
 
-<p class="text-gray-300 leading-relaxed">Both snapshots are pushed into a TimescaleDB or InfluxDB hypertable by the collector, tagged with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db_host</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db_name</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">snapshot_ts</code>, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">collection_layer</code>. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">collection_layer</code> tag is what allows the correlation engine to traverse layers during causal chain reconstruction.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
+<p class="text-gray-300 leading-relaxed">Both snapshots are pushed into an InfluxDB measurement by the collector, tagged with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db_host</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db_name</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">snapshot_ts</code>, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">collection_layer</code>. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">collection_layer</code> tag is what allows the correlation engine to traverse layers during causal chain reconstruction.</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Causal Graph Construction: From Correlated Events to Directed Causation</h3>
 
-<p class="text-gray-300 leading-relaxed">Correlation is not causation — but in ARCA, correlation with correct temporal ordering and physical dependency modeling *is* strong evidence of causation. The architecture that makes this practical is a <strong class="text-white">causal graph</strong>: a directed acyclic graph (DAG) where nodes represent observable events and edges represent either known physical dependencies or statistically inferred temporal precedence.</p>
+<p class="text-gray-300 leading-relaxed">Correlation is not causation — but in ARCA, correlation with correct temporal ordering and physical dependency modeling <em>is</em> strong evidence of causation. The architecture that makes this practical is a <strong class="text-white">causal graph</strong>: a directed acyclic graph (DAG) where nodes represent observable events and edges represent either known physical dependencies or statistically inferred temporal precedence.</p>
 
 <p class="text-gray-300 leading-relaxed">Physical dependency edges are hardcoded from database internals knowledge:</p>
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Lock acquisition → lock wait → query timeout</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Autovacuum blocked by long transaction → table bloat → sequential scan preference → slow query</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Ghost cleanup blocked by long transaction → page density loss → scan amplification → slow query</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> WAL writer stall → replication lag → standby read query degradation</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Log file autogrowth event → I/O spike → all query latencies increase</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Plan cache eviction (SQL Server) → recompilation storm → CPU spike</li>
@@ -135,7 +131,7 @@ class CausalGraphBuilder:
     """
 
     PHYSICAL_DEPENDENCIES: List[Tuple[str, str, float]] = [
-        ("autovacuum_blocked",       "table_bloat_increase",      0.95),
+        ("ghost_cleanup_blocked",    "page_density_loss",         0.95),
         ("table_bloat_increase",     "seq_scan_preference",       0.80),
         ("seq_scan_preference",      "query_latency_spike",       0.85),
         ("lock_acquisition_spike",   "lock_wait_queue",           0.99),
@@ -237,7 +233,7 @@ class CausalGraphBuilder:
     SS --> PR[plan_regression]
     PR --> QL[query_latency_spike]
     PR --> CPU[cpu_spike]
-    AV[autovacuum_blocked] --> TB[table_bloat_increase]
+    AV[ghost_cleanup_blocked] --> TB[page_density_loss]
     TB --> SP[seq_scan_preference]
     SP --> QL
     LA[lock_acquisition_spike] --> LW[lock_wait_queue]
@@ -248,17 +244,15 @@ class CausalGraphBuilder:
 
 <p class="text-gray-300 leading-relaxed">This graph is rebuilt every 60 seconds during an active incident. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">compute_root_causes</code> method walks backwards from the observed symptom — say, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">query_latency_spike</code> — through every physical and statistical dependency edge, scoring each ancestor node by the cumulative product of edge weights along the causal path. The highest-scoring ancestor that has an observed event attached to it becomes the top root cause candidate.</p>
 
-<p class="text-gray-300 leading-relaxed">The key architectural decision is separating graph *topology* (which is pre-seeded from engine knowledge and updated slowly) from graph *node state* (which is populated in real time from live telemetry). This means the reasoning structure does not have to be re-derived during an incident — only the evidence layer changes.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
+<p class="text-gray-300 leading-relaxed">The key architectural decision is separating graph <em>topology</em> (which is pre-seeded from engine knowledge and updated slowly) from graph <em>node state</em> (which is populated in real time from live telemetry). This means the reasoning structure does not have to be re-derived during an incident — only the evidence layer changes.</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Wait Event Fingerprinting: Identifying Failure Modes from Execution Signatures</h3>
 
-<p class="text-gray-300 leading-relaxed">Wait event distributions are one of the most reliable fingerprints for database failure modes. Rather than treating a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">PAGELATCH_EX</code> wait or a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Lock:relation</code> wait as a single data point, an ARCA system learns the characteristic wait event *composition* of known failure modes and uses signature matching to accelerate diagnosis.</p>
+<p class="text-gray-300 leading-relaxed">Wait event distributions are one of the most reliable fingerprints for database failure modes. Rather than treating a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">PAGELATCH_EX</code> wait or a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Lock:relation</code> wait as a single data point, an ARCA system learns the characteristic wait event <em>composition</em> of known failure modes and uses signature matching to accelerate diagnosis.</p>
 
 <p class="text-gray-300 leading-relaxed">Each failure mode has a signature: a probability distribution over wait event types observed during confirmed incidents of that type. The ARCA engine maintains a library of these signatures, built from historical incidents and augmented with known database engine behavior.</p>
 
-<p class="text-gray-300 leading-relaxed">For example, the "missing index causing full table scan under load" failure mode in PostgreSQL shows a characteristic distribution: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Lock:relation</code> waits decrease, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">IO:DataFileRead</code> waits increase, autovacuum-related waits remain stable, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CPU</code> becomes the dominant non-wait state. SQL Server's equivalent shows <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">PAGEIOLATCH_SH</code> climbing while <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CXPACKET</code> (parallelism) waits either spike (if the planner attempts a parallel scan) or remain flat (if DOP is forced down by memory pressure).</p>
+<p class="text-gray-300 leading-relaxed">For example, the "missing index causing full table scan under load" failure mode shows a characteristic distribution: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">PAGEIOLATCH_SH</code> climbing while <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CXPACKET</code> (parallelism) waits either spike (if the optimizer attempts a parallel scan) or remain flat (if DOP is forced down by memory pressure).</p>
 
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Wait event distribution snapshot for SQL Server signature matching
@@ -304,11 +298,9 @@ ORDER BY wait_time_ms DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The signature library is self-expanding: every confirmed incident where a human DBA records the root cause is automatically converted into a new signature vector and merged into the library via a background reconciliation job. Over enough months of operation to accumulate a meaningful incident history, the hit rate against known failure-mode signatures rises and time-to-diagnosis for previously-seen incident types drops substantially — though the actual hit rate and diagnosis latency depend heavily on incident diversity in a given environment and should be measured locally rather than assumed from a generic figure.</p>
 
-<p class="text-gray-300 leading-relaxed">---</p>
-
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">LLM-Augmented Diagnosis: Structured Context Injection for Causal Reasoning</h3>
 
-<p class="text-gray-300 leading-relaxed">The causal graph and wait event fingerprinting handle the *known* failure space well. What they cannot handle is novel compound failures — situations where three events interact in a way that has never appeared in training data. This is where large language model integration provides genuine value, not as a replacement for structured analysis but as a reasoning layer over structured evidence.</p>
+<p class="text-gray-300 leading-relaxed">The causal graph and wait event fingerprinting handle the <em>known</em> failure space well. What they cannot handle is novel compound failures — situations where three events interact in a way that has never appeared in training data. This is where large language model integration provides genuine value, not as a replacement for structured analysis but as a reasoning layer over structured evidence.</p>
 
 <p class="text-gray-300 leading-relaxed">The pattern is <strong class="text-white">context injection with structured output enforcement</strong>. The ARCA pipeline constructs a detailed incident context object containing the ranked causal candidates from the graph engine, the top wait event signatures, recent configuration changes, active query plans for blocked sessions, and the relevant metric time series. This context is serialized into a structured prompt and submitted to an LLM — a current-generation, high-capability model from a provider like Anthropic or OpenAI is suitable for this pattern. The LLM is instructed to reason over the provided evidence, propose a root cause hypothesis, and return a structured JSON response — never free text.</p>
 
@@ -345,7 +337,7 @@ from typing import Optional
 
 @dataclass
 class IncidentContext:
-    db_type: str                    # "postgresql" | "sqlserver"
+    db_type: str                    # "sqlserver"
     db_host: str
     incident_start_utc: str
     symptom_description: str
@@ -409,8 +401,6 @@ def get_llm_diagnosis(ctx: IncidentContext,
     return diagnosis</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The LLM layer is not on the critical path. The causal graph and signature matching run synchronously and produce a diagnosis within the same collection interval that detected the symptom, so any autonomous low-risk action described earlier in this book can proceed without waiting on a network call to an external model. The LLM call is invoked asynchronously, alongside or immediately after the structured diagnosis, specifically for the residual class of incidents the structured methods could not confidently classify — and its output augments the on-call engineer's context rather than gating the system's fast-path response. This ordering matters: an architecture where autonomous remediation waits on an LLM response introduces both unnecessary latency and a new failure mode (a slow or unavailable model API stalling incident response) into what should be the fastest part of the system.</p>
-
-<p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
 
