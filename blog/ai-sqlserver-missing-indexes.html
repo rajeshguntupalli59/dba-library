@@ -1,10 +1,10 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>How to find missing indexes in PostgreSQL in 30 seconds — Rajesh Guntupalli</title>
-  <meta name="description" content="Stop guessing which indexes to add. Learn how to use live catalog data to find exactly what your queries are missing." />
+  <title>How to find missing indexes in SQL Server in 30 seconds — Rajesh Guntupalli</title>
+  <meta name="description" content="Stop guessing which indexes to add. Use SQL Server's missing-index DMVs to find exactly what your queries need — and get ready-to-copy CREATE INDEX statements." />
   <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
@@ -32,11 +32,11 @@
   <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
 
     <div class="flex gap-2 mb-5">
-      <span class="px-2 py-0.5 bg-blue-900/40 border border-blue-800/40 text-blue-300 text-xs rounded-full">PostgreSQL</span>
+      <span class="px-2 py-0.5 bg-blue-900/40 border border-blue-800/40 text-blue-300 text-xs rounded-full">SQL Server</span>
       <span class="px-2 py-0.5 bg-purple-900/40 border border-purple-800/40 text-purple-300 text-xs rounded-full">AI + Databases</span>
     </div>
 
-    <h1 class="text-4xl font-extrabold mb-4 leading-tight">How to find missing indexes in PostgreSQL in 30 seconds</h1>
+    <h1 class="text-4xl font-extrabold mb-4 leading-tight">How to find missing indexes in SQL Server in 30 seconds</h1>
 
     <div class="flex items-center gap-3 text-xs text-gray-500 mb-10 pb-8 border-b border-gray-800/60">
       <span>Rajesh Guntupalli</span>
@@ -48,59 +48,57 @@
 
     <div class="prose prose-invert max-w-none text-gray-300 leading-relaxed space-y-6 text-sm">
 
-      <p>Every PostgreSQL DBA has been there — a query that was fast last month is suddenly taking 10 seconds. You run <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">EXPLAIN ANALYZE</code>, stare at the output, and wonder where to start.</p>
+      <p>Every SQL Server DBA has been there — a query that was fast last month is suddenly taking 10 seconds. You run it with the actual execution plan turned on, stare at the output, and wonder where to start.</p>
 
-      <p>The raw output looks like this:</p>
+      <p>The plan looks something like this:</p>
 
-      <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto"><code>Seq Scan on orders  (cost=0.00..450.00 rows=2000 width=48)
-  Filter: (customer_id = 42)
-Planning Time: 0.5 ms
-Execution Time: 892.3 ms</code></pre>
+      <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto"><code>Clustered Index Scan on orders  (Cost: 92% of batch)
+  Predicate: [orders].[customer_id] = 42
+  Actual Rows: 2000    Actual Executions: 1
+  Logical Reads: 1,240</code></pre>
 
-      <p>You can see "Seq Scan" which sounds bad, and 892ms which definitely is bad. But what exactly do you do about it?</p>
+      <p>You can see "Clustered Index Scan" eating 92% of the batch, and 1,240 logical reads for 2,000 rows, which definitely is bad. But what exactly do you do about it?</p>
 
-      <h2 class="text-xl font-bold text-white mt-10 mb-4">The problem with manual EXPLAIN reading</h2>
+      <h2 class="text-xl font-bold text-white mt-10 mb-4">The problem with manual plan reading</h2>
 
-      <p>Reading EXPLAIN output well takes years of practice. You need to know that Seq Scan on a large table means no index is being used, that the cost numbers are estimates not milliseconds, and that the fix in this case is an index on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">customer_id</code>.</p>
+      <p>Reading execution plans well takes years of practice. You need to know that a Clustered Index Scan on a large table means no useful nonclustered index exists, that cost percentages are relative to the batch (not milliseconds), and that the fix in this case is an index on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">customer_id</code>.</p>
 
       <p>Most developers don't have that experience. And even experienced DBAs spend more time than necessary on this for every single slow query.</p>
 
-      <h2 class="text-xl font-bold text-white mt-10 mb-4">A faster way — let the catalog tell you</h2>
+      <h2 class="text-xl font-bold text-white mt-10 mb-4">A faster way — let the DMVs tell you</h2>
 
-      <p>PostgreSQL tracks which indexes exist and which columns your queries filter on. You can query <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_user_indexes</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">information_schema</code> directly to find columns that are heavily filtered but have no index.</p>
-
-      <p>The query looks something like this:</p>
+      <p>SQL Server tracks exactly which indexes the optimizer wished it had. The missing-index DMVs — <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_db_missing_index_details</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_db_missing_index_groups</code>, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_db_missing_index_group_stats</code> — record every query the optimizer planned without an ideal index, along with the estimated improvement:</p>
 
       <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto"><code>SELECT
-    t.relname AS table_name,
-    a.attname AS column_name,
-    n.nspname AS schema_name
-FROM pg_class t
-JOIN pg_attribute a ON a.attrelid = t.oid
-JOIN pg_namespace n ON n.oid = t.relnamespace
-WHERE t.relkind = 'r'
-  AND a.attnum > 0
-  AND NOT EXISTS (
-    SELECT 1 FROM pg_index i
-    JOIN pg_attribute ia ON ia.attrelid = i.indrelid
-      AND ia.attnum = ANY(i.indkey)
-    WHERE i.indrelid = t.oid
-      AND ia.attname = a.attname
-  );</code></pre>
+    migs.avg_total_user_cost * migs.avg_user_impact
+        * (migs.user_seeks + migs.user_scans) AS improvement_measure,
+    OBJECT_SCHEMA_NAME(mid.object_id) AS schema_name,
+    OBJECT_NAME(mid.object_id) AS table_name,
+    mid.equality_columns,
+    mid.inequality_columns,
+    mid.included_columns,
+    migs.user_seeks, migs.user_scans
+FROM sys.dm_db_missing_index_groups AS mig
+JOIN sys.dm_db_missing_index_group_stats AS migs
+    ON migs.group_handle = mig.index_group_handle
+JOIN sys.dm_db_missing_index_details AS mid
+    ON mid.index_handle = mig.index_handle
+WHERE migs.avg_user_impact > 50
+ORDER BY improvement_measure DESC;</code></pre>
 
-      <p>This returns every column with no index — a starting point. But you still need to cross-reference with your actual queries to know which ones matter.</p>
+      <p>Sort by <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">improvement_measure</code> and the top rows are the indexes that would help the most, across your entire workload — not just one query. Cross-reference the top candidates with Query Store to confirm the queries behind them actually matter before you create anything.</p>
 
       <h2 class="text-xl font-bold text-white mt-10 mb-4">The tool that does this automatically</h2>
 
       <p>I got tired of running this manually for every database I work on, so I built it into <a href="../products.html" class="text-blue-400 hover:underline">QueryOptimizer</a>.</p>
 
-      <p>You paste a SQL query. It checks the live catalog, identifies which columns in your WHERE clause have no supporting index, and gives you a prioritized list of recommendations — each with a ready-to-copy <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE INDEX</code> statement.</p>
+      <p>You paste a SQL query. It checks the live catalog and missing-index DMVs, identifies which columns in your WHERE clause have no supporting index, and gives you a prioritized list of recommendations — each with a ready-to-copy <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE INDEX</code> statement.</p>
 
       <p>For the query above, it immediately flags:</p>
 
       <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-green-300 overflow-x-auto"><code>CREATE INDEX idx_orders_customer_id ON orders (customer_id);</code></pre>
 
-      <p>And explains why — <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">orders.customer_id</code> is used in a WHERE clause on a table with 2,000 rows and no supporting index, causing a full sequential scan on every lookup.</p>
+      <p>And explains why — <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">orders.customer_id</code> is used in an equality predicate on a table with no supporting index, causing a full clustered index scan on every lookup.</p>
 
       <h2 class="text-xl font-bold text-white mt-10 mb-4">How AI makes this even better</h2>
 
@@ -117,7 +115,7 @@ cd queryoptimizer
 powershell -ExecutionPolicy Bypass -File setup.ps1   # Windows
 # or: chmod +x setup.sh && ./setup.sh               # Linux/macOS</code></pre>
 
-      <p>Open <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">http://localhost:3000</code> and connect your PostgreSQL database.</p>
+      <p>Open <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">http://localhost:3000</code> and connect your SQL Server database.</p>
 
     </div>
 

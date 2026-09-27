@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Reading SQL Server execution plans like a pro — Rajesh Guntupalli</title>
+  <meta name="description" content="A practical guide to reading actual execution plans — estimated vs actual rows, actual executions, logical reads, key lookups, and where to fix the query." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-blue-500 to-blue-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-blue-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"    class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"     class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Book</a>
+        <a href="index.html"       class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Blog</a>
+        <a href="../about.html"    class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
+           class="ml-2 px-4 py-1.5 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded-lg transition">Get Free Tools</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="flex gap-2 mb-5"><span class="px-2 py-0.5 bg-blue-900/40 border border-blue-800/40 text-blue-300 text-xs rounded-full">SQL Server</span><span class="px-2 py-0.5 bg-blue-900/40 border border-blue-800/40 text-blue-300 text-xs rounded-full">Performance</span></div>
+    <h1 class="text-4xl font-extrabold mb-4 leading-tight">Reading SQL Server execution plans like a pro</h1>
+    <div class="flex items-center gap-3 text-xs text-gray-500 mb-10 pb-8 border-b border-gray-800/60">
+      <span>Rajesh Guntupalli</span><span>·</span><span>May 2026</span><span>·</span><span>5 min read</span>
+    </div>
+    <div class="space-y-4 text-sm">
+
+<p class="text-gray-300 leading-relaxed">Every time I sit down to debug a slow query, the first thing I do is run it with the actual execution plan turned on (Ctrl+M in SSMS, or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SET STATISTICS PROFILE ON</code>). After years of doing this professionally, I've come to think of the plan as a conversation — SQL Server is telling you exactly what it did, how long it took, and where it struggled. Most people skim it. I want to help you actually read it.</p>
+
+<p class="text-gray-300 leading-relaxed">Let's dig in with a real example.</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">The basic setup</h2>
+
+<p class="text-gray-300 leading-relaxed">Always enable these when you're debugging:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>SET STATISTICS IO, TIME ON;
+
+SELECT o.id, o.created_at, c.name
+FROM orders o
+JOIN customers c ON c.id = o.customer_id
+WHERE o.status = 'pending'
+  AND o.created_at &gt; DATEADD(day, -30, GETDATE());</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">STATISTICS IO</code> output is the one I see people skip constantly. Don't skip it. It tells you how many pages SQL Server pulled from the buffer pool versus disk — which is often the difference between a 5ms query and a 500ms one.</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Anatomy of the plan</h2>
+
+<p class="text-gray-300 leading-relaxed">Here's the shape of a typical actual plan (I've trimmed it for readability):</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>Hash Match (Inner Join)  — Cost: 68% of batch
+  Estimated Rows: 3,200   Actual Rows: 3,187   Actual Executions: 1
+  |-- Clustered Index Scan (orders) — Cost: 24%
+  |     Predicate: [status] = 'pending' AND [created_at] &gt; ...
+  |     Estimated Rows: 3,200   Actual Rows: 3,187   Actual Executions: 1
+  |-- Clustered Index Scan (customers) — Cost: 8%
+        Estimated Rows: 20,000  Actual Rows: 20,000  Actual Executions: 1
+
+SQL Server Execution Times: CPU time = 62 ms, elapsed time = 68 ms.</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Let me walk through each piece.</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Estimated vs actual rows</h2>
+
+<p class="text-gray-300 leading-relaxed">Every operator shows an estimated row count (what the optimizer guessed) and, in an actual plan, the real row count. Here the estimate is <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">3,200</code> and the actual was <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">3,187</code>. That's a great estimate — the optimizer knew what it was dealing with. When estimated and actual rows diverge wildly (estimated 10, actual 90,000), you've got a statistics problem. Run <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">UPDATE STATISTICS orders;</code> and check <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_db_stats_properties</code> for that table.</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Actual executions</h2>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Actual Executions</code> value tells you how many times an operator ran. In a nested loops join, the inner side might show <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Actual Executions: 5,000</code> — meaning the seek on the inner table ran 5,000 times, once per outer row. The row counts shown are per execution, so multiply: an inner seek returning 10 rows at 5,000 executions is really 50,000 rows of work. This trips up even experienced engineers.</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Logical reads vs physical reads</h2>
+
+<p class="text-gray-300 leading-relaxed">This is gold. From <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SET STATISTICS IO</code> you'll see something like <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Table 'orders'. Scan count 1, logical reads 1423, physical reads 287</code>. Logical reads are pages served from the buffer pool (fast); physical reads went to disk (slow). In this example, about 17% of pages came from disk. If you're seeing high physical reads on a frequently-queried table, you may be under memory pressure — or, more often, a better index would reduce the number of pages touched altogether.</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Key lookups: the classic red flag</h2>
+
+<p class="text-gray-300 leading-relaxed">If you see an Index Seek paired with a Key Lookup (or RID Lookup on a heap), the index is almost good enough — the seek finds the rows, but then SQL Server has to jump back to the clustered index or heap for columns the index doesn't cover. A few lookups are fine; thousands mean the index needs <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">INCLUDE</code> columns to become a covering index.</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">What to fix in this specific query</h2>
+
+<p class="text-gray-300 leading-relaxed">Looking at our plan: a Clustered Index Scan reading the whole table to return 3,187 rows is a red flag. An index on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">(status, created_at)</code> would turn this into an index seek and likely cut the execution time by 80%.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE INDEX idx_orders_status_created
+ON orders (status, created_at DESC)
+WHERE status = 'pending'
+WITH (ONLINE = ON);</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WHERE status = 'pending'</code> makes it a filtered index — smaller, faster, and exactly targeted at this query pattern. <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ONLINE = ON</code> keeps the table available while it builds (Enterprise edition).</p>
+
+<p class="text-gray-300 leading-relaxed">After creating that index, re-run with the actual plan. The scan should become an Index Seek, logical reads should drop significantly, and you'll see the estimated row count match much earlier in the plan.</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Reading plans at scale</h2>
+
+<p class="text-gray-300 leading-relaxed">When I'm working with complex queries — 10+ joins, CTEs, subqueries — reading raw plan XML gets exhausting fast. I built [QueryOptimizer](https://rajeshguntupalli59.github.io/query-optimizer/) partly to solve this for myself. It's a self-hosted SQL performance workbench that visualizes SQL Server query plans, highlights expensive operators, and tracks plan changes over time. If you're spending serious time on query tuning, having a visual layer on top of raw plan output makes a real difference — especially when you're comparing before/after plans after adding an index. It's free, and you run it on your own infrastructure.</p>
+
+<p class="text-gray-300 leading-relaxed">But even without tooling, the fundamentals I've covered here — estimated vs actual rows, executions multiplication, logical vs physical reads, and spotting key lookups — will get you 90% of the way there on any slow query you encounter.</p>
+    </div>
+    <div class="mt-14 bg-blue-950/40 border border-blue-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">Execution plan visualizer · Index advisor · Slow query dashboard · SQL Server</p>
+      </div>
+      <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
+         class="shrink-0 px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded-xl text-sm transition">
+        Download Free
+      </a>
+    </div>
+    <div class="mt-8"><a href="index.html" class="text-xs text-gray-500 hover:text-gray-300 transition">← Back to all articles</a></div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli</div>
+  </footer>
+</body>
+</html>

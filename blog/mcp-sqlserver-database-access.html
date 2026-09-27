@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>MCP and PostgreSQL: giving your AI agent direct, safe database access — Rajesh Guntupalli</title>
-  <meta name="description" content="How to wire an AI agent to PostgreSQL via MCP without handing it your production credentials — read-only roles, row limits, statement timeouts, and audit logging." />
+  <title>MCP and SQL Server: giving your AI agent direct, safe database access — Rajesh Guntupalli</title>
+  <meta name="description" content="How to wire an AI agent to SQL Server via MCP without handing it your production credentials — least-privilege logins, resource limits, and audit logging." />
   <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
@@ -28,8 +28,8 @@
     </div>
   </nav>
   <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
-    <div class="flex gap-2 mb-5"><span class="px-2 py-0.5 bg-blue-900/40 border border-blue-800/40 text-blue-300 text-xs rounded-full">AI + Databases</span><span class="px-2 py-0.5 bg-blue-900/40 border border-blue-800/40 text-blue-300 text-xs rounded-full">PostgreSQL</span></div>
-    <h1 class="text-4xl font-extrabold mb-4 leading-tight">MCP and PostgreSQL: giving your AI agent direct, safe database access</h1>
+    <div class="flex gap-2 mb-5"><span class="px-2 py-0.5 bg-blue-900/40 border border-blue-800/40 text-blue-300 text-xs rounded-full">AI + Databases</span><span class="px-2 py-0.5 bg-blue-900/40 border border-blue-800/40 text-blue-300 text-xs rounded-full">SQL Server</span></div>
+    <h1 class="text-4xl font-extrabold mb-4 leading-tight">MCP and SQL Server: giving your AI agent direct, safe database access</h1>
     <div class="flex items-center gap-3 text-xs text-gray-500 mb-10 pb-8 border-b border-gray-800/60">
       <span>Rajesh Guntupalli</span><span>·</span><span>August 2026</span><span>·</span><span>6 min read</span>
     </div>
@@ -39,38 +39,40 @@
 
 <p class="text-gray-300 leading-relaxed">This post is the setup I've settled on after wiring MCP database access for three different teams — the goal is giving an agent enough access to be genuinely useful without giving it enough access to do damage, either by mistake or through a prompt injection attack embedded in data it reads.</p>
 
-<h2 class="text-xl font-bold text-white mt-10 mb-4">Start with a role, not a connection string</h2>
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Start with a login, not a connection string</h2>
 
-<p class="text-gray-300 leading-relaxed">The single most common mistake I see is pointing an MCP server at an application's existing database user — the one with full read/write, sometimes even superuser, because it was the connection string already sitting in an environment variable. Don't do this. Build a dedicated role for AI agent access, scoped to exactly what the agent needs:</p>
+<p class="text-gray-300 leading-relaxed">The single most common mistake I see is pointing an MCP server at an application's existing SQL login — the one with full read/write, sometimes even sysadmin, because it was the connection string already sitting in an environment variable. Don't do this. Build a dedicated login for AI agent access, scoped to exactly what the agent needs:</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE ROLE ai_agent_readonly WITH LOGIN PASSWORD '...';
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE LOGIN ai_agent_readonly WITH PASSWORD = '...';
+GO
+USE app_production;
+CREATE USER ai_agent_readonly FOR LOGIN ai_agent_readonly;
 
-GRANT CONNECT ON DATABASE app_production TO ai_agent_readonly;
-GRANT USAGE ON SCHEMA public TO ai_agent_readonly;
-GRANT SELECT ON ALL TABLES IN SCHEMA public TO ai_agent_readonly;
-
--- Keep it read-only for anything new too
-ALTER DEFAULT PRIVILEGES IN SCHEMA public
-  GRANT SELECT ON TABLES TO ai_agent_readonly;
+-- Read-only by default
+ALTER ROLE db_datareader ADD MEMBER ai_agent_readonly;
 
 -- Explicitly exclude tables the agent should never see
-REVOKE SELECT ON users_pii, payment_methods, api_credentials
-  FROM ai_agent_readonly;</code></pre>
+DENY SELECT ON dbo.users_pii TO ai_agent_readonly;
+DENY SELECT ON dbo.payment_methods TO ai_agent_readonly;
+DENY SELECT ON dbo.api_credentials TO ai_agent_readonly;</code></pre>
 
-<p class="text-gray-300 leading-relaxed">Read-only by default is the floor, not the finish line. If a specific workflow genuinely needs writes — an agent that maintains a scratch table of its own findings, say — grant that narrowly, to that table, not broadly to the schema.</p>
+<p class="text-gray-300 leading-relaxed">Read-only by default is the floor, not the finish line. If a specific workflow genuinely needs writes — an agent that maintains a scratch table of its own findings, say — grant that narrowly, to that table, not broadly to the database.</p>
 
 <h2 class="text-xl font-bold text-white mt-10 mb-4">Bound the blast radius of a single query</h2>
 
-<p class="text-gray-300 leading-relaxed">Read-only access still lets an agent run a query that scans 40M rows with no <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">LIMIT</code>, or one that holds a long-running transaction and blocks autovacuum. Agents are enthusiastic query writers and don't have the instinct a human DBA has for "this is going to hurt." Set hard limits at the role level so a bad query degrades gracefully instead of taking down the connection pool:</p>
+<p class="text-gray-300 leading-relaxed">Read-only access still lets an agent run a query that scans 40M rows with no <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">TOP</code>, or one that hogs CPU on a shared instance. Agents are enthusiastic query writers and don't have the instinct a human DBA has for "this is going to hurt." Put hard limits around the agent login so a bad query degrades gracefully instead of taking down the instance:</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>ALTER ROLE ai_agent_readonly SET statement_timeout = '5s';
-ALTER ROLE ai_agent_readonly SET idle_in_transaction_session_timeout = '10s';
-ALTER ROLE ai_agent_readonly SET work_mem = '32MB';
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Resource Governor: cap the agent's CPU and concurrency (Enterprise edition)
+CREATE RESOURCE POOL agent_pool WITH (MAX_CPU_PERCENT = 20);
+GO
+CREATE WORKLOAD GROUP agent_group
+WITH (GROUP_MAX_REQUESTS = 5, REQUEST_MAX_CPU_TIME_SEC = 5)
+USING agent_pool;
+GO
+-- Classify the agent login into this group via a classifier function
+-- so no single agent query runs longer than 5 seconds or hogs the box</code></pre>
 
--- Cap total concurrent connections from this role
-ALTER ROLE ai_agent_readonly CONNECTION LIMIT 5;</code></pre>
-
-<p class="text-gray-300 leading-relaxed">A five-second statement timeout feels aggressive until you remember what the agent is actually for: inspecting schema, sampling data, running targeted diagnostic queries. If a query needs longer than that, it's a query a human should review and run deliberately, not one an agent should fire off mid-conversation.</p>
+<p class="text-gray-300 leading-relaxed">A five-second query cap feels aggressive until you remember what the agent is actually for: inspecting schema, sampling data, running targeted diagnostic queries. If a query needs longer than that, it's a query a human should review and run deliberately, not one an agent should fire off mid-conversation. On Standard edition, the same idea applies with a pyodbc command timeout in the MCP server config and disciplined connection pooling.</p>
 
 <h2 class="text-xl font-bold text-white mt-10 mb-4">Treat query results as untrusted input</h2>
 
@@ -80,13 +82,22 @@ ALTER ROLE ai_agent_readonly CONNECTION LIMIT 5;</code></pre>
 
 <h2 class="text-xl font-bold text-white mt-10 mb-4">Log everything, and mean it</h2>
 
-<p class="text-gray-300 leading-relaxed">Every query the agent runs should be attributable and reviewable after the fact — not as a compliance checkbox, but because the first time an agent runs a query you didn't expect, you want to know exactly what it was and why. <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> gets you query shapes; for full text and parameters, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">log_statement = 'all'</code> scoped to just this role via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALTER ROLE ai_agent_readonly SET log_statement = 'all'</code> gives you a complete, isolated audit trail without drowning your normal application logs.</p>
+<p class="text-gray-300 leading-relaxed">Every query the agent runs should be attributable and reviewable after the fact — not as a compliance checkbox, but because the first time an agent runs a query you didn't expect, you want to know exactly what it was and why. Query Store gets you query shapes and runtime stats; for a full audit trail scoped to just this login, an Extended Events session filtered on the agent's session is the clean approach:</p>
 
-<p class="text-gray-300 leading-relaxed">I review this log weekly for the first month of any new agent integration, specifically looking for query patterns I didn't anticipate — not because I expect malice, but because agents are creative in ways that surface gaps in the role's permissions before those gaps become incidents.</p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE EVENT SESSION agent_audit ON SERVER
+ADD EVENT sqlserver.sql_statement_completed(
+    ACTION(sqlserver.client_app_name, sqlserver.username)
+    WHERE sqlserver.username = N'ai_agent_readonly')
+ADD TARGET package0.event_file(
+    SET filename = N'C:\Audit\agent_audit.xel');
+GO
+ALTER EVENT SESSION agent_audit ON SERVER STATE = START;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">This gives you a complete, isolated audit trail without drowning your normal application logs. I review this log weekly for the first month of any new agent integration, specifically looking for query patterns I didn't anticipate — not because I expect malice, but because agents are creative in ways that surface gaps in the login's permissions before those gaps become incidents.</p>
 
 <h2 class="text-xl font-bold text-white mt-10 mb-4">Where this actually pays off</h2>
 
-<p class="text-gray-300 leading-relaxed">Once the guardrails are in place, the value is real and immediate. An agent that can check <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">information_schema</code>, sample actual data, and verify its own assumptions against the live database writes noticeably better migrations, catches schema drift a human would have missed, and stops hallucinating column names that don't exist. The setup above took me about an hour per project the first few times; now it's a script I run once per new database. The hour is worth it — the alternative is either no agent database access (leaving real value on the table) or unrestricted access (leaving your production data exposed to a system that occasionally, confidently, does the wrong thing).</p>
+<p class="text-gray-300 leading-relaxed">Once the guardrails are in place, the value is real and immediate. An agent that can check the catalog views, sample actual data, and verify its own assumptions against the live database writes noticeably better migrations, catches schema drift a human would have missed, and stops hallucinating column names that don't exist. The setup above took me about an hour per project the first few times; now it's a script I run once per new database. The hour is worth it — the alternative is either no agent database access (leaving real value on the table) or unrestricted access (leaving your production data exposed to a system that occasionally, confidently, does the wrong thing).</p>
 
 <p class="text-gray-300 leading-relaxed">I cover the full production version of this setup — connection pooling for agent workloads, per-tool permission scoping, and patterns for giving agents safe write access when a workflow genuinely needs it — in <a href="../book6/index.html" class="text-blue-400 hover:text-blue-300 transition">AI-Native Apps on SQL Server</a>, free to read online.</p>
 
