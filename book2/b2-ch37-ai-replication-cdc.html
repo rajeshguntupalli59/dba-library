@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 37: AI for Replication and CDC Monitoring — The AI-Powered DBA</title>
+  <meta name="description" content="The AI-Powered DBA Chapter 37: AI for Replication and CDC Monitoring. AI and AIOps for SQL Server, by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script></head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-violet-500 to-violet-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-violet-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 2 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-violet-600 hover:bg-violet-500 text-white font-semibold rounded-xl text-sm transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6">
+      <a href="index.html" class="text-xs text-violet-400 hover:text-violet-300 transition">← All Chapters</a>
+    </div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-violet-900/40 border border-violet-800/40 text-violet-300 text-xs rounded-full font-medium">Chapter 37 of 40</span>
+    </div>
+    <div class="space-y-4 text-sm">
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 37: AI for Replication and CDC Monitoring</h2>
+
+<p class="text-gray-300 leading-relaxed">Replication and Change Data Capture are the circulatory systems of the modern SQL Server estate. Transactional replication feeds reporting servers and downstream applications. Change Data Capture powers ETL pipelines, audit trails, and event-driven architectures. Always On availability groups carry the disaster recovery promise. And every one of these systems fails in the same frustrating way: silently at first, then catastrophically. A log reader agent falls behind by minutes, then hours. A CDC capture job stalls on a long-running transaction and the transaction log starts growing. A secondary replica drifts out of sync and nobody notices until failover testing day.</p>
+
+<p class="text-gray-300 leading-relaxed">Traditional monitoring catches these problems with thresholds — alert when latency exceeds ten minutes, when undistributed commands exceed a million. Thresholds are better than nothing, but they miss the failure modes that matter: the latency that is normal at 2 PM but pathological at 2 AM, the gradual degradation that stays under the threshold for weeks while the backlog compounds, the correlated slowdown across three subscribers that points to a publisher-side problem. This chapter shows how to layer ML on top of SQL Server's replication and CDC telemetry so you detect the problems thresholds miss, predict the ones coming next, and remediate the routine ones automatically.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">The Telemetry Contract Your AI Layer Needs</h3>
+
+<p class="text-gray-300 leading-relaxed">The AI in this chapter does not replace replication monitoring — it reasons over it. That means the first deliverable is not a model but a telemetry contract: a scheduled collection job, every five minutes, snapshotting the latency, backlog, and agent-state signals that the anomaly models will learn from. ML models are only as good as their training data, and a year of five-minute replication latency samples is worth more than any clever algorithm. This section defines the minimum signal set; everything after it is what AI does with those signals.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Replication agent signal snapshot: every 5 min into dbo.repl_latency_history
+-- Execute in the distribution database
+SELECT
+    GETUTCDATE() AS snapshot_time,
+    a.name AS agent_name,
+    a.subscriber_db,
+    p.publication AS publication_name,
+    h.runstatus,          -- 1=start 2=succeed 3=in progress 4=idle 5=retry 6=fail
+    h.time AS last_run_time,
+    h.duration AS last_duration_sec,
+    h.delivery_rate AS commands_per_sec,
+    h.deliver_latency AS deliver_latency_ms,
+    LEFT(h.comments, 200) AS last_message
+FROM distribution.dbo.MSdistribution_agents a
+JOIN distribution.dbo.MSpublications p
+    ON p.publication_id = a.publication_id
+OUTER APPLY (
+    SELECT TOP 1 *
+    FROM distribution.dbo.MSdistribution_history hh
+    WHERE hh.agent_id = a.id
+    ORDER BY hh.time DESC
+) h;</code></pre>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- CDC capture signal snapshot: how far behind is the capture job?
+-- Execute in each CDC-enabled database
+SELECT
+    DB_NAME() AS database_name,
+    DATEDIFF(SECOND, MAX(tm.tran_end_time), GETUTCDATE()) AS capture_latency_seconds,
+    MAX(tm.tran_end_time) AS last_captured_tran_time,
+    d.log_reuse_wait_desc
+FROM cdc.lsn_time_mapping tm
+CROSS JOIN sys.databases d
+WHERE d.name = DB_NAME()
+GROUP BY d.log_reuse_wait_desc;
+
+-- CDC job state: is the capture job actually running?
+SELECT
+    j.name AS job_name,
+    CASE WHEN ja.job_id IS NOT NULL THEN 'Running' ELSE 'Not running' END AS job_state
+FROM msdb.dbo.sysjobs j
+LEFT JOIN msdb.dbo.sysjobactivity ja
+    ON ja.job_id = j.job_id AND ja.stop_execution_date IS NULL
+WHERE j.name LIKE 'cdc.%capture';</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Store both result sets in history tables with a clustered index on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">snapshot_time</code>, and add Always On replica lag from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_hadr_database_replica_states</code> (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">log_send_queue_size</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">redo_queue_size</code>) to the same pipeline. That is the entire input contract. The rest of this chapter is the AI reasoning layer that turns these signals into detection, prediction, localization, and action.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Detecting Latency Anomalies the Thresholds Miss</h3>
+
+<p class="text-gray-300 leading-relaxed">Replication latency has strong seasonality: batch loads at night, reporting bursts at 8 AM, quiet weekends. A static ten-minute threshold either pages you during every nightly batch or stays silent while a subscriber drifts forty minutes behind on a Sunday afternoon. The fix is a seasonal anomaly model — Prophet or a simple seasonal decomposition — trained per publication-subscriber pair on your latency history.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import pandas as pd
+import pyodbc
+from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import RobustScaler
+import numpy as np
+
+def train_latency_model(conn_str: str, publication: str, subscriber_db: str,
+                        lookback_days: int = 90):
+    """
+    Train a seasonal anomaly detector for one replication stream.
+    Features encode time-of-day and day-of-week so the model learns
+    what 'normal' latency looks like at 2 AM vs 2 PM.
+    """
+    conn = pyodbc.connect(conn_str)
+    df = pd.read_sql("""
+        SELECT snapshot_time, deliver_latency_ms, commands_per_sec,
+               last_duration_sec
+        FROM dbo.repl_latency_history
+        WHERE agent_name = ?
+          AND snapshot_time &gt; DATEADD(DAY, -?, GETUTCDATE())
+        ORDER BY snapshot_time
+    """, conn, params=(agent_name, lookback_days))
+    conn.close()
+
+    df['snapshot_time'] = pd.to_datetime(df['snapshot_time'])
+    df['hour'] = df['snapshot_time'].dt.hour
+    df['dow'] = df['snapshot_time'].dt.dayofweek
+    # Cyclical encoding: hour 23 is close to hour 0
+    df['hour_sin'] = np.sin(2 * np.pi * df['hour'] / 24)
+    df['hour_cos'] = np.cos(2 * np.pi * df['hour'] / 24)
+    df['dow_sin'] = np.sin(2 * np.pi * df['dow'] / 7)
+    df['dow_cos'] = np.cos(2 * np.pi * df['dow'] / 7)
+    # Trend features: is latency climbing and throughput falling vs recent baseline?
+    df['latency_1h_mean'] = df['deliver_latency_ms'].rolling(12, min_periods=1).mean()
+    df['latency_1h_max'] = df['deliver_latency_ms'].rolling(12, min_periods=1).max()
+    df['throughput_ratio'] = (df['commands_per_sec'] /
+                              df['commands_per_sec'].rolling(12, min_periods=1).mean()
+                              ).fillna(1.0)
+
+    features = ['hour_sin', 'hour_cos', 'dow_sin', 'dow_cos',
+                'deliver_latency_ms', 'latency_1h_mean', 'latency_1h_max',
+                'commands_per_sec', 'throughput_ratio', 'last_duration_sec']
+    X = df[features].fillna(0)
+
+    scaler = RobustScaler()
+    model = IsolationForest(n_estimators=200, contamination=0.02,
+                            random_state=42, n_jobs=-1)
+    model.fit(scaler.fit_transform(X))
+    return model, scaler, features</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The features that matter most are the <strong class="text-white">trend features</strong>: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">latency_1h_mean</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">throughput_ratio</code>. A latency spike during the nightly batch is seasonal and the model learns to ignore it; latency climbing across three consecutive five-minute windows while delivery throughput collapses relative to its recent baseline is the signature of a genuinely stuck distribution agent — and the model flags it hours before a static threshold would fire. Score each agent every five minutes, and route anomalies to your incident pipeline with the contributing features attached so the on-call engineer sees <em>why</em> it fired: "deliver latency 3.2x the seasonal baseline for this hour, throughput at 18% of the trailing mean."</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Predicting CDC Capture Lag Before the Log Fills</h3>
+
+<p class="text-gray-300 leading-relaxed">CDC's most dangerous failure mode is not slow delivery — it is a stalled capture job holding the transaction log hostage. The capture job reads from the log; if it stops advancing (blocked by a long-running transaction, a full tempdb, an agent crash), log truncation stalls and the log grows until the disk fills. By the time anyone notices, you are in a severity-1 incident.</p>
+
+<p class="text-gray-300 leading-relaxed">The leading indicator is the capture latency trend combined with log reuse wait state. Train a regression model on your CDC history to predict capture latency thirty minutes ahead, and pair the prediction with a log-space check:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Early warning: CDC capture lag vs. log truncation pressure
+DECLARE @latency_sec INT = (
+    SELECT DATEDIFF(SECOND, MAX(tran_end_time), GETUTCDATE())
+    FROM cdc.lsn_time_mapping
+);
+DECLARE @reuse_wait NVARCHAR(60) = (
+    SELECT log_reuse_wait_desc FROM sys.databases WHERE name = DB_NAME()
+);
+SELECT
+    @latency_sec AS capture_latency_seconds,
+    @reuse_wait AS log_reuse_wait_desc,
+    CASE
+        WHEN @reuse_wait = 'REPLICATION' AND @latency_sec &gt; 600
+            THEN 'CRITICAL: capture stalled, log cannot truncate'
+        WHEN @latency_sec &gt; 300
+            THEN 'WARNING: capture lag growing'
+        ELSE 'OK'
+    END AS cdc_health;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Feed the latency series into a gradient boosting regressor that predicts the thirty-minute-ahead value from recent lags, time-of-day features, and the current <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">log_reuse_wait_desc</code>. When the predicted latency crosses your warning threshold, trigger the remediation playbook <em>before</em> the log fills: check for blocking on the capture job's session via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_requests</code>, restart the CDC capture job if it is hung, and page if <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">log_reuse_wait_desc</code> shows <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">REPLICATION</code> with latency still climbing after the restart. The prediction buys you the thirty minutes that separate a routine job restart from a 3 AM disk-full page.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Correlating Failures Across the Topology</h3>
+
+<p class="text-gray-300 leading-relaxed">The hardest replication incidents are the ones where every individual stream looks borderline but the pattern across streams tells the real story. Three subscribers all degrading simultaneously is not three subscriber problems — it is one publisher or distributor problem. Five CDC-enabled databases stalling at once is not five CDC problems — it is a storage or log throughput problem.</p>
+
+<p class="text-gray-300 leading-relaxed">Build a correlation layer on top of your per-stream anomaly scores. Every five minutes, collect the anomaly score for every stream in the topology and compute the pairwise correlation of recent score series. When the mean pairwise correlation across streams sharing a publisher spikes, the diagnosis writes itself: the fault is upstream. This turns a flood of individual alerts into a single incident with a located cause — "distribution latency anomalous on 4 of 5 subscribers of publication Orders; publisher-side investigation indicated" — instead of four separate pages that each get acknowledged and ignored.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>def correlate_topology_anomalies(score_frame: pd.DataFrame,
+                                 topology: dict) -&gt; list[dict]:
+    """
+    score_frame: rows = 5-min buckets (last 2h), columns = stream names,
+                 values = anomaly scores (negative = more anomalous).
+    topology:    stream_name -&gt; {'publisher': ..., 'distributor': ...}
+    Returns candidate root-cause localizations.
+    """
+    findings = []
+    # Group streams by shared upstream component
+    by_publisher = {}
+    for stream, meta in topology.items():
+        by_publisher.setdefault(meta['publisher'], []).append(stream)
+
+    for publisher, streams in by_publisher.items():
+        if len(streams) &lt; 2:
+            continue
+        sub = score_frame[streams].dropna()
+        if sub.empty:
+            continue
+        # Mean pairwise correlation of anomaly scores
+        corr = sub.corr().values
+        n = len(streams)
+        mean_corr = (corr.sum() - n) / (n * (n - 1))  # exclude diagonal
+        anomalous_now = (sub.iloc[-1] &lt; -0.15).sum()
+
+        if mean_corr &gt; 0.6 and anomalous_now &gt;= 2:
+            findings.append({
+                'scope': 'publisher',
+                'component': publisher,
+                'affected_streams': streams,
+                'mean_correlation': round(float(mean_corr), 2),
+                'recommendation': (
+                    f"Investigate publisher '{publisher}' first: "
+                    f"{anomalous_now} streams anomalous with correlated "
+                    f"degradation (r={mean_corr:.2f}). Check log reader agent "
+                    f"throughput and publisher transaction log growth."
+                )
+            })
+    return findings</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The same correlation logic applies to Always On availability groups: when redo queue growth correlates across multiple secondaries, look at the primary's log send throughput and network path, not at the individual replicas. Topology-aware correlation is what separates an AI monitoring layer from a pile of independent threshold alerts.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Automated Remediation Playbooks</h3>
+
+<p class="text-gray-300 leading-relaxed">Detection without action is just expensive logging. The AI layer earns its keep when model outputs map to bounded remediation playbooks — and for replication and CDC, a small set of low-risk, reversible actions covers the majority of incidents. The intelligence is not in the restart command; it is in the decision logic that selects the playbook from the anomaly signature, checks the preconditions, and decides whether the action is safe to run autonomously or needs a human.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Playbook 1 — Restart a stuck distribution agent.</strong> Trigger: the seasonal model flags one agent with climbing deliver latency and collapsing throughput ratio while <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">runstatus</code> shows retry or fail. The topology correlator must confirm the fault is <em>not</em> upstream (single-stream scope) before this playbook is eligible — restarting an agent when the publisher is the real problem just adds churn.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Playbook 2 — Restart a stalled CDC capture job.</strong> Trigger: the thirty-minute lag forecast crosses the warning threshold. Precondition check: identify the capture session's blocker from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_requests</code>. If the blocker is a runaway ad-hoc query the classifier marks non-critical, kill it; if it is a business batch window, restart only the capture job and escalate. The model output selects the branch — the playbook never kills blindly.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Playbook 3 — Throttle the distributor during subscriber catch-up.</strong> Trigger: one subscriber far behind during a bulk load while siblings are healthy. This playbook is approval-gated, not autonomous: it changes production throughput characteristics. The AI contribution is the recommendation package — predicted catch-up time with and without throttling — so the approver decides on evidence, not gut feel.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import pyodbc
+
+def remediate_stuck_distribution_agent(conn_str: str, agent_job_name: str,
+                                       dry_run: bool = True) -&gt; dict:
+    """
+    Bounded remediation: restart a stuck distribution agent.
+    dry_run=True logs the intended action without executing (shadow mode).
+    """
+    result = {'agent': agent_job_name, 'dry_run': dry_run, 'steps': []}
+    conn = pyodbc.connect(conn_str, autocommit=True)
+    cur = conn.cursor()
+
+    # 1. Confirm the agent is actually stuck (not mid-retry of a transient error)
+    cur.execute("""
+        SELECT TOP 1 run_status, run_duration, message
+        FROM distribution.dbo.MSdistribution_history h
+        JOIN distribution.dbo.MSdistribution_agents a ON a.id = h.agent_id
+        WHERE a.name = ?
+        ORDER BY h.time DESC
+    """, (agent_job_name,))
+    row = cur.fetchone()
+    if row and row.run_status == 1:  # 1 = Start (in progress); give it time
+        result['steps'].append('agent shows active run; no action taken')
+        return result
+
+    # 2. Stop then start the agent job (idempotent restart)
+    steps = [
+        ("EXEC msdb.dbo.sp_stop_job @job_name = ?", (agent_job_name,)),
+        ("WAITFOR DELAY '00:00:30'", ()),
+        ("EXEC msdb.dbo.sp_start_job @job_name = ?", (agent_job_name,)),
+    ]
+    for sql, params in steps:
+        result['steps'].append(sql if dry_run else f"EXECUTED: {sql}")
+        if not dry_run:
+            cur.execute(sql, params) if params else cur.execute(sql)
+
+    # 3. Audit the remediation with context
+    cur.execute("""
+        INSERT INTO dbo.repl_remediation_log
+            (remediation_time, agent_name, action, dry_run)
+        VALUES (GETUTCDATE(), ?, 'restart_distribution_agent', ?)
+    """, (agent_job_name, 1 if dry_run else 0))
+    conn.close()
+    return result</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Run every playbook in shadow mode for the first month — log what <em>would</em> have been done and compare against what the on-call engineer actually did. Promote to autonomous execution only for playbooks where the shadow log shows the automation's decision matched the human's decision at least 90% of the time. The audit table <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dbo.repl_remediation_log</code> is your evidence trail for that promotion decision.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Detecting Data Drift in Downstream Consumers</h3>
+
+<p class="text-gray-300 leading-relaxed">Replication monitoring usually stops at "did the rows arrive." AI-assisted monitoring goes one level deeper: "do the rows still look like they used to?" Schema changes, application deployments, and upstream data quality regressions change the statistical shape of replicated data — a column that was 99% non-null drops to 60%, a status code distribution shifts overnight. Downstream ML models trained on the old distribution silently degrade.</p>
+
+<p class="text-gray-300 leading-relaxed">Build a drift monitor on your key replicated tables: daily, compute a profile (null rates, distinct counts, distribution histograms for numeric columns) on both the publisher and the subscriber, and compare. Divergence between publisher and subscriber profiles indicates replication data corruption or transformation bugs; divergence of the publisher profile from its own history indicates an upstream change worth investigating. A simple population stability index (PSI) per column, computed in T-SQL or Python, catches both. Alert when PSI exceeds 0.25 on any monitored column — the standard threshold for a significant distribution shift — and attach the before/after histograms to the alert so the data engineering team can see exactly what changed.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><figure class="my-8">
+  <img src="../images/arch-b2-ch37-repl-drift.webp" alt="Replication drift detection: publisher telemetry branches into anomaly detection and forecasting, converges on a correlator, passes a policy gate, and triggers an automated fix playbook." class="w-full rounded-2xl border border-gray-700" />
+  <figcaption class="mt-3 text-sm text-gray-400 leading-relaxed"><strong class="text-gray-200">Figure 37.1 — Replication drift detection.</strong> Publisher telemetry is anomaly-checked and forecasted, correlated across the topology, gated, and remediated by playbook.</figcaption>
+</figure>
+
+<p class="text-gray-300 leading-relaxed">The teal <strong class="text-white">Publisher</strong> streams metrics and logs into the blue <strong class="text-white">Telemetry</strong> collector, which fans out three ways: amber <strong class="text-white">Anomaly</strong> detection finds outlier drift, orange <strong class="text-white">Forecast</strong> predicts time-series behavior like CDC lag, and the middle arrow feeds both into the purple <strong class="text-white">Correlate</strong> stage — which determines whether the problem is localized to one stream or spans the publisher-subscriber topology. The red <strong class="text-white">Gate</strong> enforces policy and thresholds, and the green <strong class="text-white">Fix Playbook</strong> executes the automated remediation (agent restarts, job restarts, throttle adjustments). The flow's footer names the pattern: detection to prediction to correlation to gating to remediation — each stage narrowing what the next one must decide.</p></div>
+
+<p class="text-gray-300 leading-relaxed">*The AI-assisted replication monitoring stack: per-stream anomaly detection and CDC forecasting feed a topology correlator that localizes the fault, and bounded playbooks remediate — every step audited.*</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Build the telemetry contract first — five-minute agent and CDC signals are the training data.** Snapshot distribution agent latency and throughput, CDC capture latency, and AG redo queues into history tables; every model in this chapter learns from that dataset.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Seasonal anomaly models beat static thresholds for replication latency.** Encode time-of-day and day-of-week cyclically and add trend features like backlog growth, so the model learns that a 2 AM batch spike is normal but a Sunday afternoon climb is not.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Predict CDC capture lag thirty minutes ahead to protect the transaction log.** Combine the latency forecast with log_reuse_wait_desc monitoring — a stalled capture job holding the log is a disk-full incident in waiting, and the forecast buys you the window to restart the job first.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Correlate anomalies across the topology to localize the fault.** When multiple subscribers degrade together, the fault is upstream — compute pairwise correlation of per-stream anomaly scores grouped by publisher and turn four pages into one incident with a located cause.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Automate only the playbooks your shadow log validates.** Restart stuck agents and stalled capture jobs autonomously only after a month of shadow-mode logging shows the automation matching human decisions; keep throughput-throttling playbooks approval-gated.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Monitor data shape, not just data movement.** A daily PSI-based drift check on replicated tables catches the upstream changes and corruption that row counts miss — and protects the downstream ML models trained on that data.</li>
+    </div>
+    <div class="mt-14 bg-violet-950/40 border border-violet-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · SQL Server</p>
+      </div>
+      <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
+         class="shrink-0 px-6 py-3 bg-violet-600 hover:bg-violet-500 text-white font-semibold rounded-xl text-sm transition">
+        Download Free
+      </a>
+    </div>
+        <div class="mt-10 rounded-2xl border border-blue-900/40 bg-blue-950/20 p-5 flex flex-col sm:flex-row items-center justify-between gap-4">
+      <div>
+        <p class="font-semibold text-white text-sm">Test yourself on this chapter</p>
+        <p class="text-gray-400 text-xs mt-1">5 questions &middot; instant scoring &middot; explanations included</p>
+      </div>
+      <a href="../quiz.html?book=book2&ch=37"
+         class="shrink-0 px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white font-bold rounded-xl text-sm transition">Take the Quiz &rarr;</a>
+    </div>
+<div class="mt-8 flex justify-between text-xs">
+      <a href="b2-ch36-privacy-preserving-ml.html" class="text-gray-500 hover:text-gray-300 transition">← Previous Chapter</a>
+      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a>
+      <a href="b2-ch38-ai-ready-platform.html" class="text-violet-400 hover:text-violet-300 transition">Next Chapter →</a>
+    </div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · The AI-Powered DBA</div>
+  </footer>
+</body>
+</html>

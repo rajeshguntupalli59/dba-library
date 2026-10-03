@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 32: Prompt Engineering for DBA Workflows — The AI-Powered DBA</title>
+  <meta name="description" content="The AI-Powered DBA Chapter 32: Prompt Engineering for DBA Workflows. AI and AIOps for SQL Server, by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script></head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-violet-500 to-violet-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-violet-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 2 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-violet-600 hover:bg-violet-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6">
+      <a href="index.html" class="text-xs text-violet-400 hover:text-violet-300 transition">← All Chapters</a>
+    </div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-violet-900/40 border border-violet-800/40 text-violet-300 text-xs rounded-full font-medium">Chapter 32 of 40</span>
+    </div>
+    <div class="space-y-4 text-sm">
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 32: Prompt Engineering for DBA Workflows</h2>
+
+<p class="text-gray-300 leading-relaxed">The prompt is the API contract between your database context and the model's reasoning. Same model, same telemetry, same incident — a well-engineered prompt produces a correct, evidence-grounded diagnosis in a parseable schema; a sloppy one produces confident fiction in freeform prose that your executor cannot safely consume. In DBA automation, prompt quality is not a soft skill. It is the difference between a triage assistant your on-call team trusts and one they mute.</p>
+
+<p class="text-gray-300 leading-relaxed">This chapter is the DBA's prompt engineering playbook — not generic prompting advice, but the patterns that matter when the model is reasoning about SQL Server internals: how to pack DMV context so the model sees what a senior DBA would see, how to write system prompts that function as enforceable policy, how to teach T-SQL judgment with few-shot examples, how to demand structured output, and how to build guardrails so the model can never talk its way into running something destructive.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Context Packing: Feed the Model What a Senior DBA Would Look At</h3>
+
+<p class="text-gray-300 leading-relaxed">Model quality in DBA workflows is dominated by context quality. A senior DBA diagnosing slow queries does not stare at a single counter — they check wait deltas, active requests, blocking chains, memory grants, and recent plan changes, in that order. Your prompt context should mirror that investigation, pre-assembled. The rules for packing it:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Most-recent-first, capped rows.</strong> TOP 10–20 per section. A 400-row active-request dump wastes tokens and buries the one session that matters. Rank by wait time, age, or resource consumption before truncating.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Deltas, not absolutes.</strong> Cumulative <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_os_wait_stats</code> counters since last restart tell the model almost nothing. Capture two snapshots 60 seconds apart and send the delta — that is the signal.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Include baselines and units.</strong> "PLE is 42" is meaningless without "typical for this hour is 3,800" and the knowledge that the unit is seconds. Baselines turn numbers into deviations, and deviations are what the model reasons about.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Strip PII and literals.</strong> Parameterize query text before it enters the prompt. The model needs query shapes and wait profiles, not customer email addresses from a string literal.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Compact triage snapshot: the core of every DBA prompt context
+-- Run twice, 60s apart, and send the DELTA to the model
+WITH wait_delta AS (
+    SELECT
+        wait_type,
+        SUM(wait_time_ms) AS wait_ms,
+        SUM(waiting_tasks_count) AS waits
+    FROM sys.dm_os_wait_stats
+    WHERE wait_type NOT IN (
+        'SLEEP_TASK','BROKER_TO_FLUSH','BROKER_EVENTHANDLER','CHECKPOINT_QUEUE',
+        'DBMIRROR_EVENTS_QUEUE','SQLTRACE_BUFFER_FLUSH','CLR_AUTO_EVENT',
+        'DISPATCHER_QUEUE_SEMAPHORE','REQUEST_FOR_DEADLOCK_SEARCH','XE_TIMER_EVENT'
+    )
+    GROUP BY wait_type
+),
+top_requests AS (
+    SELECT TOP 10
+        r.session_id,
+        r.wait_type,
+        r.wait_time / 1000.0 AS wait_sec,
+        r.cpu_time,
+        r.logical_reads,
+        DATEDIFF(SECOND, r.start_time, GETUTCDATE()) AS age_sec,
+        LEFT(st.text, 250) AS query_shape
+    FROM sys.dm_exec_requests r
+    CROSS APPLY sys.dm_exec_sql_text(r.sql_handle) st
+    WHERE r.session_id &lt;&gt; @@SPID
+    ORDER BY r.wait_time DESC
+),
+memory_pressure AS (
+    SELECT
+        cntr_value AS memory_grants_pending
+    FROM sys.dm_os_performance_counters
+    WHERE object_name LIKE '%Memory Manager%'
+      AND counter_name = 'Memory Grants Pending'
+)
+SELECT
+    (SELECT wait_type, wait_ms, waits FROM wait_delta
+     ORDER BY wait_ms DESC FOR JSON PATH) AS wait_stats,
+    (SELECT * FROM top_requests FOR JSON PATH) AS top_waits,
+    (SELECT memory_grants_pending FROM memory_pressure
+     FOR JSON PATH, WITHOUT_ARRAY_WRAPPER) AS memory,
+    (SELECT cpu_count, physical_memory_kb / 1048576.0 AS memory_gb
+     FROM sys.dm_os_sys_info
+     FOR JSON PATH, WITHOUT_ARRAY_WRAPPER) AS instance;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Assemble this in Python, compute the wait delta between the two snapshots, attach the baseline ("PLE typical for this hour: 3,800; current: 42"), and you have a context payload the model can actually reason from. Every prompt in your automation should start from a builder like this — never from ad-hoc string concatenation scattered across scripts.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">System Prompts Are Policy, Not Suggestions</h3>
+
+<p class="text-gray-300 leading-relaxed">The system prompt is the one part of the prompt the end user (or the calling code) does not change per incident. Treat it as policy: role definition, platform constraints, output schema, the allowed action vocabulary, and explicit prohibitions. Here is a production-grade system prompt for a SQL Server triage assistant:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>TRIAGE_SYSTEM_PROMPT = """
+You are a SQL Server database reliability engineer performing incident triage.
+You diagnose; you do not execute. No action you recommend will run without
+a separate, human-approved execution step.
+
+PLATFORM CONSTRAINTS:
+- The database is Microsoft SQL Server. Reference only real SQL Server DMVs,
+  catalog views, and stored procedures. Never invent object names.
+- All T-SQL you quote must be valid T-SQL syntax.
+
+OUTPUT CONTRACT:
+- Respond with exactly one JSON object. No prose outside the JSON.
+- Schema:
+  {
+    "diagnosis": "&lt;one sentence: what is happening&gt;",
+    "evidence": ["&lt;metric or observation supporting the diagnosis&gt;", "..."],
+    "confidence": &lt;0.0-1.0&gt;,
+    "recommended_action": "&lt;one of the allowed actions below&gt;",
+    "action_parameters": {},
+    "next_diagnostic": "&lt;single query or check to confirm&gt;"
+  }
+
+ALLOWED ACTIONS:
+- KILL_IDLE_TRANSACTIONS, CANCEL_LONG_QUERIES, CHECKPOINT_IMMEDIATE,
+  UPDATE_STATISTICS_TABLE, FORCE_QUERY_STORE_PLAN, ALERT_HUMAN, NO_ACTION
+
+PROHIBITIONS:
+- Never recommend DROP, TRUNCATE, ALTER DATABASE, or DBCC SHRINK*.
+- Never recommend an action with confidence below 0.6; use ALERT_HUMAN instead.
+- Every claim in "evidence" must cite a value present in the input context.
+  If the context does not support a diagnosis, say so and use ALERT_HUMAN.
+"""</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Notice what this prompt does not contain: no pleasantries, no "you are a helpful assistant," no open-ended invitation to be creative. Every line either constrains the output shape, restricts the action space, or demands evidence grounding. The prohibitions section is the most important part — it converts "the model probably won't suggest dropping things" into "the model has an explicit rule against it," which your eval harness (Chapter 31) then verifies.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Few-Shot Examples That Teach T-SQL Judgment</h3>
+
+<p class="text-gray-300 leading-relaxed">System prompts set the rules; few-shot examples teach judgment. One or two worked examples in the prompt — input snapshot, correct JSON output — calibrate the model's sense of how confident to be, how specific the evidence should be, and which action fits which signature. Keep examples short and representative of your actual workload:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>FEW_SHOT_EXAMPLE = """
+EXAMPLE 1 — memory grant pressure:
+Input context:
+{
+  "wait_stats": [{"wait_type": "RESOURCE_SEMAPHORE", "wait_ms": 482000, "waits": 310}],
+  "memory": {"memory_grants_pending": 14},
+  "instance": {"memory_gb": 64.0},
+  "top_waits": [{"session_id": 87, "wait_type": "RESOURCE_SEMAPHORE",
+                 "wait_sec": 212.0, "query_shape": "SELECT ... GROUP BY ..."}]
+}
+Correct output:
+{
+  "diagnosis": "Memory grant pressure: 14 queries waiting for workspace memory, dominated by RESOURCE_SEMAPHORE waits.",
+  "evidence": ["RESOURCE_SEMAPHORE wait_ms=482000 over 60s (top wait by far)",
+               "memory_grants_pending=14 (baseline for this hour: 0)",
+               "session 87 waiting 212s on RESOURCE_SEMAPHORE"],
+  "confidence": 0.85,
+  "recommended_action": "ALERT_HUMAN",
+  "action_parameters": {"suspect_session": 87},
+  "next_diagnostic": "SELECT * FROM sys.dm_exec_query_memory_grants WHERE session_id = 87"
+}
+
+Note the judgment being taught: the model does NOT recommend killing session 87
+(a hash spill victim, not the cause) — it escalates with the right next diagnostic.
+"""</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The annotation at the end is deliberate: examples should teach not just the format but the <em>restraint</em>. Your few-shot set should include at least one case where the correct output is <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALERT_HUMAN</code> or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">NO_ACTION</code>. If every example ends in decisive action, the model learns that decisiveness is the pattern — and you get a trigger-happy triage bot.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Structured Output or It Didn't Happen</h3>
+
+<p class="text-gray-300 leading-relaxed">Freeform prose from a model cannot be safely consumed by automation. Every operational prompt must demand a machine-parseable contract — JSON with a fixed schema — and your code must validate the response against that schema before doing anything with it. The validation pattern:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import json
+
+REQUIRED_KEYS = {"diagnosis", "evidence", "confidence",
+                 "recommended_action", "action_parameters", "next_diagnostic"}
+ALLOWED_ACTIONS = {"KILL_IDLE_TRANSACTIONS", "CANCEL_LONG_QUERIES",
+                   "CHECKPOINT_IMMEDIATE", "UPDATE_STATISTICS_TABLE",
+                   "FORCE_QUERY_STORE_PLAN", "ALERT_HUMAN", "NO_ACTION"}
+
+def parse_triage_response(raw: str) -&gt; dict:
+    """
+    Parse and validate a triage model response. Raises on any contract
+    violation — the caller treats violations as ALERT_HUMAN.
+    """
+    try:
+        obj = json.loads(raw.strip())
+    except json.JSONDecodeError as e:
+        raise ValueError(f"triage response is not valid JSON: {e}")
+
+    missing = REQUIRED_KEYS - set(obj.keys())
+    if missing:
+        raise ValueError(f"triage response missing keys: {missing}")
+
+    if obj["recommended_action"] not in ALLOWED_ACTIONS:
+        raise ValueError(
+            f"action '{obj['recommended_action']}' not in allowed vocabulary"
+        )
+
+    conf = obj["confidence"]
+    if not isinstance(conf, (int, float)) or not 0.0 &lt;= conf &lt;= 1.0:
+        raise ValueError(f"confidence out of range: {conf}")
+
+    if not isinstance(obj["evidence"], list) or len(obj["evidence"]) == 0:
+        raise Value
+...[truncated 11759 bytes]<p class="text-gray-300 leading-relaxed">Set temperature low — 0.0 to 0.2 — for every operational prompt. Temperature controls randomness, and you want none of it when the output selects remediation actions. Higher temperatures are for brainstorming runbook prose, never for triage. And on parse failure, retry exactly once with a "your previous response was invalid JSON; respond with valid JSON only" nudge, then escalate to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALERT_HUMAN</code>. Never regex-scrape prose into a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">KILL</code> command — if the contract is broken, the output is unusable, full stop.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Guardrails: The Model Proposes, the Executor Disposes</h3>
+
+<p class="text-gray-300 leading-relaxed">Prompt engineering controls what the model <em>says</em>. Guardrails control what the system <em>does</em> with what the model says. Both are required; neither substitutes for the other. The guardrail set for DBA workflows:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Identifier allowlist validation.</strong> Any schema, table, index, or session ID the model names must be verified against the live catalog — <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.tables</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.indexes</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_sessions</code> — before execution. A hallucinated object name must fail closed at the executor, even if it slipped past the prompt.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Read-only versus write prompt separation.</strong> Diagnosis prompts and action prompts are different prompts with different system instructions. A diagnosis prompt should never contain action vocabulary at all — it outputs findings, and a separate, stricter planning prompt converts findings into actions. This separation means a compromised or confused diagnosis step cannot directly emit an executable command.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Destructive actions always require an approval token.</strong> No prompt, however well engineered, authorizes a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DROP</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">TRUNCATE</code>, failover, or configuration change. Those actions route through the human approval flow from Chapter 10 regardless of model confidence. The prompt can <em>recommend</em>; only a human approves.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Query text is data, never instructions.</strong> State this explicitly in the system prompt, and enforce it in the harness with adversarial cases (Chapter 31). Captured SQL containing "ignore previous instructions" must be treated as a string to analyze, not a command to obey.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Versioning and Regression-Testing Your Prompts</h3>
+
+<p class="text-gray-300 leading-relaxed">Prompts are code. Store them in version control, review changes like code, and run the Chapter 31 evaluation harness against the golden dataset on every prompt change. A one-word change to a system prompt ("recommend" to "execute") can silently alter model behavior across every incident — the eval suite is what catches that before production does.</p>
+
+<p class="text-gray-300 leading-relaxed">Log the prompt version alongside every model call in your audit trail. When a bad recommendation ships, the first question is "which prompt version produced this?" — and you need the answer in seconds, not after digging through deployment logs. Tag prompt versions semantically (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">triage-v3.2</code>) and keep a changelog: what changed, what the eval delta was, who approved it.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Decomposing Multi-Step Workflows</h3>
+
+<p class="text-gray-300 leading-relaxed">The final pattern: never ask one prompt to diagnose, plan, and execute. Decompose multi-step DBA workflows into separate prompts with verification between steps. A query-regression workflow becomes three prompts — <strong class="text-white">diagnose</strong> (is this a real regression? what changed?), <strong class="text-white">plan</strong> (which corrective action, with what parameters?), <strong class="text-white">verify</strong> (did the action resolve it?) — each with its own system prompt, its own output schema, and its own validation.</p>
+
+<p class="text-gray-300 leading-relaxed">Decomposition buys you three things. First, each step is independently evaluable — you can measure diagnosis accuracy separately from planning quality. Second, verification steps between prompts catch compounding errors: if the diagnosis prompt hallucinates, the planning prompt receives structured findings it can sanity-check rather than raw prose it must trust. Third, different steps can use different models — a cheap, fast model for the initial triage classification and a stronger model for the final planning step — optimizing the cost curve from Chapter 31.</p>
+
+<p class="text-gray-300 leading-relaxed">The orchestrator pattern is simple: each step's validated output becomes the next step's context, and any validation failure anywhere in the chain collapses to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALERT_HUMAN</code> with the partial results attached. Partial automation that fails loudly beats full automation that fails silently.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Pack context like a senior DBA investigates.** Capped, ranked rows; wait deltas not absolutes; baselines with units; PII stripped — context quality dominates model quality in DBA workflows.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Write system prompts as enforceable policy.** Platform constraints, a fixed JSON output contract, an allowed action vocabulary, and explicit prohibitions — every line should constrain shape, restrict actions, or demand evidence.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Teach restraint with few-shot examples.** Include cases where the correct output is ALERT_HUMAN or NO_ACTION, or the model learns that decisiveness is the pattern and becomes trigger-happy.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Structured output or it didn't happen.** Validate every response against the schema; retry once on parse failure, then escalate — never scrape prose into executable commands.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Prompts are versioned code with guardrails behind them.** Eval-harness every prompt change, log prompt versions in the audit trail, validate identifiers against the live catalog, and decompose multi-step workflows into separately verified prompts.</li>
+    </div>
+    <div class="mt-14 bg-violet-950/40 border border-violet-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · SQL Server</p>
+      </div>
+      <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
+         class="shrink-0 px-6 py-3 bg-violet-600 hover:bg-violet-500 text-white font-semibold rounded-xl text-sm transition">
+        Download Free
+      </a>
+    </div>
+        <div class="mt-10 rounded-2xl border border-blue-900/40 bg-blue-950/20 p-5 flex flex-col sm:flex-row items-center justify-between gap-4">
+      <div>
+        <p class="font-semibold text-white text-sm">Test yourself on this chapter</p>
+        <p class="text-gray-400 text-xs mt-1">5 questions &middot; instant scoring &middot; explanations included</p>
+      </div>
+      <a href="../quiz.html?book=book2&ch=32"
+         class="shrink-0 px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white font-bold rounded-xl text-sm transition">Take the Quiz &rarr;</a>
+    </div>
+<div class="mt-8 flex justify-between text-xs">
+      <a href="b2-ch31-evaluating-ai-models.html" class="text-gray-500 hover:text-gray-300 transition">← Previous Chapter</a>
+      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a>
+      <a href="b2-ch33-tempdb-memory-ai.html" class="text-violet-400 hover:text-violet-300 transition">Next Chapter →</a>
+    </div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · The AI-Powered DBA</div>
+  </footer>
+</body>
+</html>

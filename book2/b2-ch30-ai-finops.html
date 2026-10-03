@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 30: FinOps for AI Workloads on SQL Server — The AI-Powered DBA</title>
+  <meta name="description" content="The AI-Powered DBA Chapter 30: FinOps for AI Workloads on SQL Server. AI and AIOps for SQL Server, by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script></head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-violet-500 to-violet-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-violet-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 2 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-violet-600 hover:bg-violet-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6">
+      <a href="index.html" class="text-xs text-violet-400 hover:text-violet-300 transition">← All Chapters</a>
+    </div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-violet-900/40 border border-violet-800/40 text-violet-300 text-xs rounded-full font-medium">Chapter 30 of 40</span>
+    </div>
+    <div class="space-y-4 text-sm">
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 30: FinOps for AI Workloads on SQL Server</h2>
+
+<p class="text-gray-300 leading-relaxed">FinOps fundamentals — tagging, showback, budget alerts — are Book 7's subject. This chapter assumes you have them and focuses on what is genuinely new: the cost drivers that appear only when you run AI workloads on SQL Server. Vector index builds that burn a weekend of compute. Embedding API calls metered per token through <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sp_invoke_external_rest_endpoint</code>. ML Services sessions consuming memory outside the buffer pool. A copilot whose per-question cost is invisible until the invoice arrives. Each of these is metered differently, attributed differently, and controlled differently — and if you do not instrument them deliberately, the first person to notice the spend will be finance, not you.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Mapping the AI Cost Surface</h3>
+
+<p class="text-gray-300 leading-relaxed">AI workloads on SQL Server create four distinct cost streams, and they land in different invoices. <strong class="text-white">Compute for vector indexes:</strong> building and rebuilding DiskANN indexes over large embedding tables is CPU- and I/O-intensive, and on Azure SQL Database that is DTU/vCore time billed by the second. <strong class="text-white">External model calls:</strong> every <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sp_invoke_external_rest_endpoint</code> invocation that hits Azure OpenAI is metered per token on the Azure OpenAI side, plus the SQL compute spent waiting on the call. <strong class="text-white">ML Services compute:</strong> in-database R and Python (Machine Learning Services) run in external processes with their own memory allocation — invisible in buffer pool metrics, very visible on the host. <strong class="text-white">Copilot and agent traffic:</strong> LLM API spend driven by your Chapter 26 copilot, proportional to questions asked and tool-call rounds per question.</p>
+
+<p class="text-gray-300 leading-relaxed">The first step is attribution: tag every AI workload so its consumption is separable. Set a distinct <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Application Name</code> in the connection strings of your ingestion jobs, copilot services, and ML Services sessions. Query Store then attributes CPU, duration, and I/O per query, and you filter by program name. Without that tag, AI spend dissolves into the general workload and you are arguing about invoices with no data.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- AI workload cost attribution: Query Store resource consumption by program
+SELECT
+    s.program_name,
+    COUNT(DISTINCT qsq.query_id) AS distinct_queries,
+    SUM(rs.count_executions) AS total_executions,
+    SUM(rs.avg_cpu_time * rs.count_executions) / 1000000.0 AS total_cpu_seconds,
+    SUM(rs.avg_duration * rs.count_executions) / 1000000.0 AS total_duration_seconds,
+    SUM(rs.avg_logical_io_reads * rs.count_executions) / 1000.0 AS total_logical_reads_k,
+    SUM(rs.avg_logical_io_writes * rs.count_executions) / 1000.0 AS total_logical_writes_k
+FROM sys.query_store_query qsq
+JOIN sys.query_store_plan qsp ON qsp.query_id = qsq.query_id
+JOIN sys.query_store_runtime_stats rs ON rs.plan_id = qsp.plan_id
+JOIN sys.query_store_runtime_stats_interval i
+  ON i.runtime_stats_interval_id = rs.runtime_stats_interval_id
+CROSS APPLY (
+    SELECT TOP (1) s2.program_name
+    FROM sys.dm_exec_query_stats qs
+    JOIN sys.dm_exec_sessions s2 ON s2.session_id = qs.last_execution_time -- placeholder join
+    WHERE 0 = 1
+) s
+WHERE i.start_time &gt;= DATEADD(DAY, -30, GETUTCDATE())
+GROUP BY s.program_name
+ORDER BY total_cpu_seconds DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">In practice, join Query Store data against your own execution log instead of DMVs: have every AI job (embedding ingestion, vector index maintenance, copilot service) write its runs — start, end, rows processed, tokens consumed — to a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dbo.ai_workload_runs</code> table. Query Store gives you per-query compute; your runs table gives you per-job business context (tokens, documents, questions answered). Cost per embedding, cost per copilot answer, cost per index rebuild — those ratios are what you manage.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Vector Index Build and Maintenance Costs</h3>
+
+<p class="text-gray-300 leading-relaxed">Vector search is cheap at query time and expensive at build time. Creating a DiskANN index over a million-row embedding table is a heavyweight operation — sustained CPU, large sorts, significant transaction log generation — and every bulk reload of the knowledge base (Chapter 28's ingestion pipeline) that invalidates the index repeats it. On Azure SQL Database, that build time is metered vCore compute; on managed instances and RDS, it is IOPS and CPU that contend with production workload.</p>
+
+<p class="text-gray-300 leading-relaxed">Three controls keep this cost bounded. First, <strong class="text-white">incremental ingestion over bulk reload</strong>: hash source documents and embed only what changed (Chapter 28's pipeline already does this), so the index absorbs trickle inserts instead of full rebuilds. Second, <strong class="text-white">schedule builds in low-cost windows</strong>: on serverless Azure SQL, auto-pause means an index build can wake the database and hold it awake — run maintenance during windows when the database is already active, or accept the wake cost explicitly. Third, <strong class="text-white">measure build cost per run</strong>: capture CPU time and duration around index maintenance in your runs table, and alert when a build's cost deviates from its baseline — a sudden 3x build cost usually means the embedding table grew without anyone noticing.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Track vector index maintenance cost per run in dbo.ai_workload_runs
+DECLARE @start_cpu BIGINT, @start_time DATETIME2;
+SELECT @start_cpu = SUM(cpu_time) FROM sys.dm_exec_requests WHERE session_id = @@SPID;
+SET @start_time = SYSUTCDATETIME();
+
+-- ... vector index maintenance: CREATE VECTOR INDEX / rebuild ...
+
+INSERT INTO dbo.ai_workload_runs
+    (run_start, run_end, workload, operation, rows_processed,
+     cpu_ms, duration_seconds, notes)
+SELECT
+    @start_time, SYSUTCDATETIME(), 'knowledge_base', 'vector_index_rebuild',
+    (SELECT COUNT(*) FROM dbo.dba_knowledge_chunks),
+    SUM(cpu_time) - @start_cpu,
+    DATEDIFF(SECOND, @start_time, SYSUTCDATETIME()),
+    'post-ingestion index maintenance'
+FROM sys.dm_exec_requests WHERE session_id = @@SPID;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Metering Azure OpenAI Calls via sp_invoke_external_rest_endpoint</h3>
+
+<p class="text-gray-300 leading-relaxed">When SQL Server calls Azure OpenAI directly through <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sp_invoke_external_rest_endpoint</code> — for embedding generation, classification, or summarization inside T-SQL — the cost has two components: the Azure OpenAI token metering on the model side, and the SQL compute burned while the session waits on the HTTP call. The token side is invisible to SQL Server; the wait side shows up as elapsed time with no CPU, which makes these calls look cheap in Query Store CPU reports while they hold sessions, workers, and (on Azure SQL) billable time.</p>
+
+<p class="text-gray-300 leading-relaxed">Instrument both sides. On the SQL side, wrap every external call with timing and payload-size logging into <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dbo.ai_external_calls</code>: endpoint, model, prompt tokens, completion tokens (returned in the response metadata), duration. On the Azure side, reconcile weekly against the Azure OpenAI usage metrics — the token counts in your log should match the metered usage within a few percent. Any gap is calls happening outside your logging, which is itself a finding.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Logged wrapper pattern for sp_invoke_external_rest_endpoint calls
+DECLARE @payload NVARCHAR(MAX) = JSON_OBJECT(
+    'input': @text_to_embed,
+    'model': 'text-embedding-3-small');
+DECLARE @t0 DATETIME2 = SYSUTCDATETIME();
+DECLARE @response NVARCHAR(MAX);
+
+EXEC @response = sp_invoke_external_rest_endpoint
+    @url = 'https://my-openai.openai.azure.com/openai/deployments/embed/embeddings?api-version=2024-02-01',
+    @method = 'POST',
+    @credential = [https://my-openai.openai.azure.com],
+    @payload = @payload;
+
+-- Log: tokens from the response metadata, duration, payload size
+INSERT INTO dbo.ai_external_calls
+    (call_time, endpoint, model, prompt_chars,
+     prompt_tokens, completion_tokens, duration_ms)
+SELECT
+    SYSUTCDATETIME(), 'embeddings', 'text-embedding-3-small',
+    LEN(@payload),
+    JSON_VALUE(@response, '$.usage.prompt_tokens'),
+    JSON_VALUE(@response, '$.usage.completion_tokens'),
+    DATEDIFF(MILLISECOND, @t0, SYSUTCDATETIME());</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The cost controls for external calls are batching, caching, and model tiering. Batch embedding inputs to the API's maximum per-request limit instead of one call per row — Chapter 28's ingestion already batches, and the savings are roughly linear in batch size. Cache embeddings by content hash so re-ingestion never re-pays for unchanged text. And tier your models deliberately: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-3-small</code> costs a fraction of the large variant and is sufficient for runbook retrieval; reserve expensive models for the copilot's reasoning calls where quality differences actually matter. A monthly review of <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dbo.ai_external_calls</code> grouped by model and endpoint tells you exactly where the token budget goes.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">ML Services Compute: The Invisible Spender</h3>
+
+<p class="text-gray-300 leading-relaxed">Machine Learning Services runs R and Python in external processes outside the SQL Server engine. That isolation is a feature for stability and a hazard for cost accounting: the memory and CPU consumed by <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sp_execute_external_script</code> sessions do not appear in buffer pool or Query Store CPU metrics the way T-SQL does. On a boxed SQL Server, a runaway training job starves the engine of memory; on Azure, the external compute is part of what you are paying for in the vCore model.</p>
+
+<p class="text-gray-300 leading-relaxed">Contain it with Resource Governor: create a dedicated workload group for external script sessions with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">REQUEST_MAX_MEMORY_GRANT_PERCENT</code> and CPU caps, and classify ML Services logins into it. Then monitor <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_external_script_requests</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_resource_governor_workload_groups</code> for actual consumption versus the cap. The decision this data informs is architectural: training jobs that consistently hit the governor belong on a dedicated ML compute (Azure ML, a separate VM) with SQL Server holding only inference-time scoring — which is cheaper per run and stops training from contending with production queries.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Budgeting the Copilot: Cost per Answered Question</h3>
+
+<p class="text-gray-300 leading-relaxed">The Chapter 26 copilot's cost is fully variable: every question burns tokens on the initial prompt, every tool-call round burns more, and a curious user base asks a lot of questions. The metric that matters is <strong class="text-white">cost per answered question</strong>, computed from the audit log: tokens consumed (log per-turn usage from the API response) divided by questions resolved. Track it weekly, segmented by question class — diagnostic questions that trigger three tool rounds cost 3–4x a simple lookup.</p>
+
+<p class="text-gray-300 leading-relaxed">Three levers control it. <strong class="text-white">Cap tool rounds</strong> (Chapter 26's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_tool_rounds</code>) — each round is a full model call, so a cap of 4 versus 8 roughly halves worst-case cost. <strong class="text-white">Cache ruthlessly</strong>: wait-stat snapshots and runbook excerpts change slowly, so cache tool results for minutes and retrieved excerpts for hours; repeated "is the server slow right now" questions should not re-run the world. <strong class="text-white">Route by difficulty</strong>: answer simple lookups ("show me top waits") with a small fast model and reserve the large reasoning model for multi-tool diagnostic sessions. Set a monthly token budget with an alert at 80% — when it fires, the decision is explicit (raise the budget, tighten caps, or restrict access) instead of a surprise invoice.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **AI workloads create four cost streams metered in different places.** Vector index compute, Azure OpenAI tokens via sp_invoke_external_rest_endpoint, ML Services external-process compute, and copilot LLM traffic — tag every one with a distinct Application Name so Query Store and your own runs table can attribute each.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Vector indexes are cheap to query and expensive to build.** Favor incremental ingestion over bulk reloads, schedule builds when the database is already active on serverless tiers, and alert when a build's CPU cost deviates from baseline.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Log every external model call with its token usage.** Wrap sp_invoke_external_rest_endpoint with timing and usage-metadata logging into dbo.ai_external_calls, reconcile weekly against Azure OpenAI metering, and cut costs through batching, content-hash caching, and deliberate model tiering.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Govern ML Services with Resource Governor.** External script sessions consume memory and CPU outside the engine's normal accounting — cap them in a dedicated workload group and move chronic training workloads to dedicated ML compute.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Manage the copilot on cost per answered question.** Cap tool rounds, cache tool results and runbook excerpts, route simple lookups to small models, and put a monthly token budget with an 80% alert in front of the invoice.</li>
+    </div>
+    <div class="mt-14 bg-violet-950/40 border border-violet-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · SQL Server</p>
+      </div>
+      <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
+         class="shrink-0 px-6 py-3 bg-violet-600 hover:bg-violet-500 text-white font-semibold rounded-xl text-sm transition">
+        Download Free
+      </a>
+    </div>
+        <div class="mt-10 rounded-2xl border border-blue-900/40 bg-blue-950/20 p-5 flex flex-col sm:flex-row items-center justify-between gap-4">
+      <div>
+        <p class="font-semibold text-white text-sm">Test yourself on this chapter</p>
+        <p class="text-gray-400 text-xs mt-1">5 questions &middot; instant scoring &middot; explanations included</p>
+      </div>
+      <a href="../quiz.html?book=book2&ch=30"
+         class="shrink-0 px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white font-bold rounded-xl text-sm transition">Take the Quiz &rarr;</a>
+    </div>
+<div class="mt-8 flex justify-between text-xs">
+      <a href="b2-ch29-ai-migrations.html" class="text-gray-500 hover:text-gray-300 transition">← Previous Chapter</a>
+      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a>
+      <a href="b2-ch31-evaluating-ai-models.html" class="text-violet-400 hover:text-violet-300 transition">Next Chapter →</a>
+    </div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · The AI-Powered DBA</div>
+  </footer>
+</body>
+</html>

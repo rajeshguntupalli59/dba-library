@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 28: Vector Search for the DBA Knowledge Base — The AI-Powered DBA</title>
+  <meta name="description" content="The AI-Powered DBA Chapter 28: Vector Search for the DBA Knowledge Base. AI and AIOps for SQL Server, by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script></head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-violet-500 to-violet-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-violet-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 2 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-violet-600 hover:bg-violet-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6">
+      <a href="index.html" class="text-xs text-violet-400 hover:text-violet-300 transition">← All Chapters</a>
+    </div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-violet-900/40 border border-violet-800/40 text-violet-300 text-xs rounded-full font-medium">Chapter 28 of 40</span>
+    </div>
+    <div class="space-y-4 text-sm">
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 28: Vector Search for the DBA Knowledge Base</h2>
+
+<p class="text-gray-300 leading-relaxed">Chapter 26's copilot reasons over live telemetry. But the hardest DBA questions are not about what the server is doing right now — they are about what happened last time: "We saw this blocking pattern six months ago; what did we do?" "Which runbook covers a failed AG failover?" That knowledge lives in incident tickets, postmortems, runbook wikis, and the heads of senior engineers. Vector search turns that scattered history into a queryable memory. You embed every document as a numeric vector, store it in SQL Server alongside the text, and retrieve by semantic similarity — so "tempdb contention during month-end close" finds the incident titled "PAGELATCH_UP storm on 2:4:2, Jan close" even though the words barely overlap. This chapter builds that knowledge base natively in SQL Server.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">The 3 AM Vocabulary Problem</h3>
+
+<p class="text-gray-300 leading-relaxed">Full-text search fails on operational knowledge for a simple reason: the person writing the incident at 3 AM uses different words than the person searching for it at 3 PM. The ticket says "PAGELATCH_UP waits on tempdb data files, allocation bitmap contention"; the searcher types "tempdb slow during batch". Keyword overlap is near zero; the meaning is identical. Vector search closes that gap: each document chunk is stored with a numeric embedding, and a nearest-neighbor query surfaces the incident even though the words barely overlap. (How embeddings are produced and indexed is Book 4 territory; this chapter is only about pointing that capability at your runbooks, tickets, and incident history.)</p>
+
+<p class="text-gray-300 leading-relaxed">SQL Server 2025 and Azure SQL Database support this natively with a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR</code> type and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_DISTANCE</code> function. Your knowledge base lives in the same database as your telemetry — same backups, same security model, same audit tooling, no second database to operate.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Designing the Knowledge Base Schema</h3>
+
+<p class="text-gray-300 leading-relaxed">A DBA knowledge base has three document types: <strong class="text-white">runbooks</strong> (how to handle a known scenario), <strong class="text-white">incidents</strong> (what happened, what was done, what worked), and <strong class="text-white">decisions</strong> (why the architecture looks the way it does). One table holds them all, with metadata columns that make retrieval precise — because pure semantic search without metadata filtering is how you get a 2021 runbook for a decommissioned cluster ranked above last month's incident.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Knowledge base: one table, chunked documents, metadata for filtered retrieval
+CREATE TABLE dbo.dba_knowledge_chunks (
+    chunk_id        INT IDENTITY(1,1) PRIMARY KEY,
+    doc_id          NVARCHAR(100)  NOT NULL,   -- e.g. 'INC-2026-0413'
+    doc_type        NVARCHAR(20)   NOT NULL,   -- 'runbook' | 'incident' | 'decision'
+    title           NVARCHAR(300)  NOT NULL,
+    chunk_index     INT            NOT NULL,
+    chunk_text      NVARCHAR(MAX)  NOT NULL,
+    embedding       VECTOR(1536)   NOT NULL,   -- dimensions must match your model
+    system_name     NVARCHAR(100)  NULL,       -- which cluster/instance it applies to
+    doc_date        DATE           NOT NULL,   -- incident date or runbook last review
+    tags            NVARCHAR(500)  NULL,       -- comma-separated: 'tempdb,blocking,ag'
+    superseded_by   NVARCHAR(100)  NULL,       -- doc_id of the newer version, if any
+    CONSTRAINT UQ_dba_kb_chunk UNIQUE (doc_id, chunk_index)
+);
+
+-- Metadata + full-text support alongside vector search
+CREATE INDEX IX_dba_kb_doctype_date ON dbo.dba_knowledge_chunks (doc_type, doc_date DESC);
+CREATE FULLTEXT INDEX ON dbo.dba_knowledge_chunks (chunk_text, title)
+    KEY INDEX PK__dba_knowl__... ;  -- replace with your PK name</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Chunking deserves care. Split documents at section boundaries into 300–600 token chunks, and prepend each chunk with the document title and a one-line summary before embedding. A chunk that starts "INC-2026-0413 — TempDB PAGELATCH contention during month-end close: …" retrieves far better than a naked paragraph, because the embedding captures the context the chunk would otherwise lose. Store <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">superseded_by</code> religiously — when a runbook is rewritten, link the old version forward so retrieval can prefer the current one.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Turning Runbooks and Tickets into Searchable Chunks</h3>
+<figure class="my-8">
+  <img src="../images/arch-rag-knowledge-base.webp" alt="RAG pipeline diagram for a DBA knowledge base. Top indexing pipeline: runbooks, incident tickets, and KB articles flow through chunking and an embeddings model into a vector index, refreshed by a nightly re-index. Bottom query pipeline: a DBA question is embedded, matched against the vector index with top-K retrieval, passed to an LLM, and returned as a grounded answer with citations." class="w-full rounded-2xl border border-gray-700" />
+  <figcaption class="mt-3 text-sm text-gray-400 leading-relaxed"><strong class="text-gray-200">Figure 28.1 — Vector search over the DBA knowledge base.</strong> Two pipelines: indexing (top) turns runbooks and tickets into searchable vectors; querying (bottom) grounds every answer in retrieved excerpts, with citations.</figcaption>
+</figure>
+
+<p class="text-gray-300 leading-relaxed">The diagram shows the two halves of the system. The <strong class="text-white">indexing pipeline</strong> (top, blue-green) is a batch job: <strong class="text-white">Runbooks</strong>, <strong class="text-white">Incident Tickets</strong>, and <strong class="text-white">KB Articles</strong> are <strong class="text-white">chunked</strong> at section boundaries, passed through an <strong class="text-white">Embeddings Model</strong>, and stored in the <strong class="text-white">Vector Index</strong> — with a <strong class="text-white">nightly re-index</strong> (amber) keeping it fresh as runbooks change. The <strong class="text-white">query pipeline</strong> (bottom, purple) runs at question time: the <strong class="text-white">DBA's question</strong> is embedded with the same model, <strong class="text-white">top-K retrieval</strong> pulls the most similar chunks from the index, the <strong class="text-white">LLM</strong> drafts an answer strictly from those excerpts, and the DBA gets a <strong class="text-white">grounded answer with citations</strong> — every claim traceable to a runbook section or ticket. If the index is stale, the answers are stale: that dashed "Refresh" arrow is the operational heartbeat of the whole system.</p>
+
+<p class="text-gray-300 leading-relaxed">The ingestion job is straightforward ETL with one DBA-specific twist: the source material is messy. Incident tickets have stack traces and half-finished thoughts; runbooks in git have "TODO: verify" sections; wiki pages are stale. The pipeline pulls documents from your ticketing API, wiki export, and markdown runbooks, chunks them at section boundaries, and stores each chunk with its embedding. Run it on a schedule and on every runbook commit — and skip re-embedding unchanged documents by hashing the source text.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import pyodbc
+from openai import AzureOpenAI
+from datetime import date
+
+EMBEDDING_MODEL = "text-embedding-3-small"  # 1536 dimensions
+CHUNK_TOKENS = 500
+
+def chunk_markdown(title: str, summary: str, body: str) -&gt; list[str]:
+    """Split on section boundaries; prefix each chunk with title + summary."""
+    chunks, current = [], ""
+    header = f"{title}\n{summary}\n\n"
+    for section in body.split("\n## "):
+        candidate = current + ("\n## " if current else "") + section
+        if len(candidate) &gt; CHUNK_TOKENS * 4 and current:
+            chunks.append(header + current)
+            current = section
+        else:
+            current = candidate
+    if current:
+        chunks.append(header + current)
+    return chunks
+
+def ingest_runbook(conn, aoai: AzureOpenAI, doc_id: str, title: str,
+                   summary: str, body_markdown: str, system_name: str,
+                   tags: str, doc_date: date):
+    chunks = chunk_markdown(title, summary, body_markdown)
+    resp = aoai.embeddings.create(model=EMBEDDING_MODEL, input=chunks)
+    vectors = [d.embedding for d in resp.data]
+
+    with conn.cursor() as cur:
+        # Mark any previous version of this doc as superseded
+        cur.execute("""
+            UPDATE dbo.dba_knowledge_chunks
+            SET superseded_by = ?
+            WHERE doc_id = ? AND superseded_by IS NULL
+        """, (doc_id, doc_id))
+        for i, (text, vec) in enumerate(zip(chunks, vectors)):
+            vec_literal = "[" + ",".join(f"{x:.6f}" for x in vec) + "]"
+            cur.execute("""
+                INSERT INTO dbo.dba_knowledge_chunks
+                    (doc_id, doc_type, title, chunk_index, chunk_text,
+                     embedding, system_name, doc_date, tags)
+                VALUES (?, 'runbook', ?, ?, ?, CAST(? AS VECTOR(1536)), ?, ?, ?)
+            """, (doc_id, title, i, text, vec_literal, system_name, doc_date, tags))
+    conn.commit()
+    return len(chunks)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Two operational notes. First, embedding API calls cost money per token — batch chunks into single API requests (the code above already does) and skip re-embedding unchanged documents by hashing the source text and comparing against a stored hash. Second, treat the ingestion job like any ETL: log row counts, alert on zero-chunk runs, and keep the source documents in git so the knowledge base is rebuildable from scratch.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Semantic Retrieval with VECTOR_DISTANCE</h3>
+
+<p class="text-gray-300 leading-relaxed">Retrieval is a parameterized query: embed the user's question with the same model, then find the nearest chunks. The hybrid pattern — vector similarity plus metadata filters plus a full-text prefilter — consistently outperforms pure vector search for operational content, because it combines semantic matching ("this is about tempdb contention") with hard constraints ("only incidents from the last 18 months on the production cluster, excluding superseded runbooks").</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Hybrid retrieval: embed the question in Python, pass the vector as a parameter
+-- @qvec : the question embedding as a vector literal string
+-- Filters: recent, non-superseded, matching system; ranked by cosine distance
+SELECT TOP (5)
+    k.doc_id,
+    k.doc_type,
+    k.title,
+    k.chunk_index,
+    LEFT(k.chunk_text, 800) AS chunk_excerpt,
+    k.doc_date,
+    k.tags,
+    VECTOR_DISTANCE('cosine', k.embedding, CAST(? AS VECTOR(1536))) AS distance
+FROM dbo.dba_knowledge_chunks k
+WHERE k.superseded_by IS NULL
+  AND k.doc_date &gt;= DATEADD(MONTH, -18, CAST(GETUTCDATE() AS DATE))
+  AND (? = '' OR k.system_name = ? OR k.system_name IS NULL)
+  AND (
+        ? = ''
+        OR CONTAINS(k.chunk_text, ?)
+      )
+ORDER BY distance ASC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CONTAINS</code> clause is the full-text prefilter: when the question contains a distinctive keyword (an error number like 1205, a wait type like PAGELATCH_UP), requiring it focuses retrieval sharply. Pass an empty string to skip the prefilter for purely conceptual questions. For knowledge bases beyond a few hundred thousand chunks, add a DiskANN vector index so the nearest-neighbor scan stays fast — the distance function and the ORDER BY stay the same; the index just accelerates them.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Feeding Runbook Evidence to the Copilot</h3>
+
+<p class="text-gray-300 leading-relaxed">The payoff for all this curation is Chapter 26's copilot: retrieved chunks are injected into its context as quoted evidence, each with its document ID and date, so operational answers cite the runbook they came from. The retrieved excerpts are evidence, not orders — the copilot still grounds live claims in DMV data, and uses the knowledge base for "what did we do last time" context.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><figure class="my-8">
+  <img src="../images/arch-b2-ch28-evidence-loop.webp" alt="Copilot evidence loop: a question is embedded and hybrid-searched for top runbook chunks, the copilot combines them with live DMV telemetry and cited history into a grounded final answer." class="w-full rounded-2xl border border-gray-700" />
+  <figcaption class="mt-3 text-sm text-gray-400 leading-relaxed"><strong class="text-gray-200">Figure 28.2 — Copilot evidence loop.</strong> Every copilot answer fuses cited runbook history with live DMV data before it reaches the operator.</figcaption>
+</figure>
+
+<p class="text-gray-300 leading-relaxed">This loop is the runtime counterpart to the indexing pipeline in Figure 28.1. A blue <strong class="text-white">Question</strong> is <strong class="text-white">Embed</strong>ded (purple) and run through teal <strong class="text-white">Hybrid Search</strong> — vector similarity plus metadata filters — to surface amber <strong class="text-white">Top Chunks</strong> with their document IDs and dates. The violet <strong class="text-white">Copilot</strong> orchestrator then fans out: the green <strong class="text-white">Live DMVs</strong> branch pulls current wait stats, sessions, and Query Store data, while the orange <strong class="text-white">Cited History</strong> branch carries the retrieved runbook evidence. Both merge into the dark-green <strong class="text-white">Final Answer</strong>. The diagram's message: the copilot never answers from memory alone — every response is a fusion of what the database is doing right now and what the organization learned from past incidents.</p></div>
+
+<p class="text-gray-300 leading-relaxed">The failure mode to watch is stale-knowledge hallucination: the model presenting a 2022 workaround as current advice. Three defenses, all in the schema and prompt: the 18-month recency filter, the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">superseded_by</code> chain, and a prompt rule requiring the answer to include the source document's date whenever it cites one. A fourth defense is process: assign every runbook a review date, and let the ingestion job flag runbooks past their review date for a human to re-validate — retrieval quality is a curation problem, not just a search problem.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Measuring Retrieval Quality</h3>
+
+<p class="text-gray-300 leading-relaxed">Like the copilot's golden question set in Chapter 26, the knowledge base needs its own evaluation: 40–60 real questions paired with the document IDs that should be retrieved. Score recall@5 (is a relevant chunk in the top 5?) and precision@5 (how many of the top 5 are relevant?). When recall is low, the usual culprits are chunking (chunks too large, context stripped) or missing metadata (the right document exists but the system filter excluded it). When precision is low, tighten the prefilter or shorten the recency window.</p>
+
+<p class="text-gray-300 leading-relaxed">Log every production retrieval — question embedding ID, returned chunk IDs, and whether the user marked the answer helpful. That log is a relevance-feedback dataset: questions where users downvoted the answer usually trace to a retrieval miss, and each miss tells you exactly which document should have ranked higher. Feed those corrections back as boosted examples and your knowledge base compounds in value the way a wiki never does: it learns which of its own pages actually answer which questions.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Vector search bridges the 3 AM vocabulary gap.** Embeddings match "tempdb slow during batch" to the incident written as "PAGELATCH_UP allocation bitmap contention" — keyword search never makes that connection.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Keep the knowledge base in SQL Server.** The VECTOR type and VECTOR_DISTANCE function (SQL Server 2025 / Azure SQL Database) put embeddings under the same backups, security, and audit as your telemetry — no second database to operate.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Hybrid retrieval beats pure vector search for operations content.** Cosine distance for semantics, plus recency and system metadata filters, superseded_by chains, and a full-text prefilter for distinctive keywords like error numbers and wait types.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Chunk at section boundaries and prefix with title and summary.** A 300–600 token chunk that starts with its document context embeds and retrieves far better than a naked paragraph.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Retrieval quality is a curation problem.** Review dates on runbooks, superseded_by chains on rewrites, a golden retrieval-eval set, and relevance feedback from production answers — that is what keeps the knowledge base trustworthy as it grows.</li>
+    </div>
+    <div class="mt-14 bg-violet-950/40 border border-violet-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · SQL Server</p>
+      </div>
+      <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
+         class="shrink-0 px-6 py-3 bg-violet-600 hover:bg-violet-500 text-white font-semibold rounded-xl text-sm transition">
+        Download Free
+      </a>
+    </div>
+        <div class="mt-10 rounded-2xl border border-blue-900/40 bg-blue-950/20 p-5 flex flex-col sm:flex-row items-center justify-between gap-4">
+      <div>
+        <p class="font-semibold text-white text-sm">Test yourself on this chapter</p>
+        <p class="text-gray-400 text-xs mt-1">5 questions &middot; instant scoring &middot; explanations included</p>
+      </div>
+      <a href="../quiz.html?book=book2&ch=28"
+         class="shrink-0 px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white font-bold rounded-xl text-sm transition">Take the Quiz &rarr;</a>
+    </div>
+<div class="mt-8 flex justify-between text-xs">
+      <a href="b2-ch27-ai-data-quality.html" class="text-gray-500 hover:text-gray-300 transition">← Previous Chapter</a>
+      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a>
+      <a href="b2-ch29-ai-migrations.html" class="text-violet-400 hover:text-violet-300 transition">Next Chapter →</a>
+    </div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · The AI-Powered DBA</div>
+  </footer>
+</body>
+</html>

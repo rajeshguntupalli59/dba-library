@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 38: Building the AI-Ready Data Platform — The AI-Powered DBA</title>
+  <meta name="description" content="The AI-Powered DBA Chapter 38: Building the AI-Ready Data Platform. AI and AIOps for SQL Server, by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script></head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-violet-500 to-violet-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-violet-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 2 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-violet-600 hover:bg-violet-500 text-white font-semibold rounded-xl text-sm transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6">
+      <a href="index.html" class="text-xs text-violet-400 hover:text-violet-300 transition">← All Chapters</a>
+    </div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-violet-900/40 border border-violet-800/40 text-violet-300 text-xs rounded-full font-medium">Chapter 38 of 40</span>
+    </div>
+    <div class="space-y-4 text-sm">
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 38: Building the AI-Ready Data Platform</h2>
+
+<p class="text-gray-300 leading-relaxed">Every AI workflow in this book — anomaly detection, forecasting, LLM-assisted remediation, privacy-preserving training — runs on top of a data platform that was designed for transactions, not for machine learning. The gap shows up in predictable places: feature engineering queries that scan production tables and contend with the OLTP workload, embeddings with nowhere to live, models trained in notebooks that nobody can reproduce six months later, and inference calls that bypass every governance control the DBA built. "AI-ready" is the set of platform decisions that close that gap: where features live, where vectors live, where models live, and how data flows between those places without breaking the production database.</p>
+
+<p class="text-gray-300 leading-relaxed">This chapter is a decision guide for the DBA who owns that platform. It covers the feature store pattern on SQL Server, vector storage and semantic search, in-database and external model serving options, data quality gates that protect model inputs, and the MLOps lifecycle that keeps models trustworthy after deployment. The throughline is always the same: these are platform choices that exist because AI workloads have requirements — reproducibility, low-latency similarity search, governed inference — that transactional workloads never imposed.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">What "AI-Ready" Actually Requires</h3>
+
+<p class="text-gray-300 leading-relaxed">Strip away the marketing and an AI-ready SQL Server platform has five capabilities that a conventional OLTP platform lacks. <strong class="text-white">Curated feature storage</strong> — versioned, documented tables of model-ready features, separate from raw transactional tables, so training never scans production. <strong class="text-white">Vector storage and similarity search</strong> — a first-class home for embeddings, because RAG and semantic search are now standard DBA-adjacent workloads. <strong class="text-white">Model execution paths</strong> — sanctioned ways to run models against database data, in-database or via governed endpoints, instead of engineers exporting CSVs to laptops. <strong class="text-white">Input quality gates</strong> — automated checks that stop bad data from reaching models, because models fail silently on data they were never trained on. <strong class="text-white">Model lifecycle management</strong> — versioning, A/B comparison, and drift monitoring, because a deployed model is a production dependency with an SLA.</p>
+
+<p class="text-gray-300 leading-relaxed">Notice what is not on the list: bigger hardware, a data lake, a new database engine. AI-readiness is mostly an organizational pattern implemented with the SQL Server you already run. The rest of this chapter builds each capability.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">The Feature Store: Training Data as a Governed Product</h3>
+
+<p class="text-gray-300 leading-relaxed">The single highest-leverage decision is also the simplest: stop letting training pipelines query production tables directly. Every ad-hoc feature query against the OLTP database is ungoverned load, unversioned logic, and a privacy review that never happened. A feature store replaces that with curated, versioned feature tables in a dedicated database — computed on a schedule from production via CDC or replication, documented with extended properties, and access-controlled independently of the source system.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Feature store skeleton: versioned, documented, append-friendly
+CREATE SCHEMA ml AUTHORIZATION dbo;
+GO
+CREATE TABLE ml.customer_features_v3 (
+    customer_token   CHAR(32)      NOT NULL,  -- de-identified join key (Ch.36)
+    feature_date     DATE          NOT NULL,  -- point-in-time correctness
+    region           SYSNAME       NOT NULL,
+    orders_90d       INT           NOT NULL,
+    spend_90d        DECIMAL(18,2) NOT NULL,
+    avg_order_value  DECIMAL(18,2) NOT NULL,
+    days_since_order INT           NOT NULL,
+    support_tickets_90d INT        NOT NULL,
+    feature_version  TINYINT       NOT NULL DEFAULT 3,
+    computed_at      DATETIME2     NOT NULL DEFAULT SYSUTCDATETIME(),
+    CONSTRAINT PK_customer_features_v3 PRIMARY KEY (customer_token, feature_date)
+);
+GO
+-- Document every feature where the data scientists will actually find it
+EXEC sys.sp_addextendedproperty
+    @name = N'ML_Feature_Definition', @value = N'Count of completed orders in trailing 90 days. Excludes cancelled orders.',
+    @level0type = N'SCHEMA', @level0name = 'ml',
+    @level1type = N'TABLE',  @level1name = 'customer_features_v3',
+    @level2type = N'COLUMN', @level2name = 'orders_90d';
+GO
+-- Point-in-time correctness check: no feature may use data newer than its feature_date
+-- (prevents training-serving skew, the #1 silent killer of model quality)
+SELECT feature_date, COUNT(*) AS rows_computed,
+       MAX(computed_at) AS last_compute
+FROM ml.customer_features_v3
+GROUP BY feature_date
+ORDER BY feature_date DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Three design rules make a feature store AI-ready rather than just another mart. <strong class="text-white">Point-in-time correctness</strong>: every feature row is stamped with the as-of date its inputs were valid for, so training on historical data never accidentally uses information from the future — training-serving skew is the most common silent model killer, and this schema makes it structurally impossible. <strong class="text-white">Versioned definitions</strong>: when a feature's logic changes, you create <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">customer_features_v4</code>, never alter v3 in place, so models trained on v3 remain reproducible. <strong class="text-white">De-identified join keys</strong>: the store holds tokens, not raw identifiers (Chapter 36), so the feature store is safe to expose to the data science team under RLS without a separate privacy review per project.</p>
+
+<p class="text-gray-300 leading-relaxed">Populate the store from CDC change streams or a read replica, never from the primary — feature computation is batch analytical load and has no business contending with transactions. The DBA's job here is the pipeline that keeps features fresh, the retention policy that bounds storage growth, and the access grants that keep the science team productive without touching production.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Vector Storage and Semantic Search in SQL Server</h3>
+
+<p class="text-gray-300 leading-relaxed">Retrieval-augmented generation is the AI workload most likely to land on a DBA's desk next: "we need semantic search over our knowledge base / ticket history / documentation, and it has to live in SQL Server." SQL Server 2025's native <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">vector</code> data type plus the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_DISTANCE</code> function make this a database problem rather than a new-infrastructure problem — which means the DBA gets to keep governance, backup, and access control instead of standing up a separate vector database nobody owns.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Knowledge base embeddings: generated once by an embedding model,
+-- stored and searched natively in SQL Server 2025+
+CREATE TABLE ml.kb_embeddings (
+    doc_id       INT IDENTITY PRIMARY KEY,
+    source_table SYSNAME      NOT NULL,   -- where this chunk came from
+    source_key   NVARCHAR(200) NOT NULL,  -- PK of the source row
+    chunk_text   NVARCHAR(MAX) NOT NULL,  -- the embedded text, kept for grounding
+    embedding    VECTOR(1536) NOT NULL,   -- matches the embedding model dims
+    indexed_at   DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
+);
+GO
+-- Semantic search: nearest chunks to a query embedding
+-- (@q is the query text embedded by the same model, passed as a parameter)
+DECLARE @q VECTOR(1536) = CAST(@query_embedding_json AS VECTOR(1536));
+
+SELECT TOP 5
+    doc_id, source_table, source_key,
+    LEFT(chunk_text, 300) AS chunk_preview,
+    VECTOR_DISTANCE('cosine', embedding, @q) AS distance
+FROM ml.kb_embeddings
+ORDER BY VECTOR_DISTANCE('cosine', embedding, @q);
+-- Add: WHERE source_table IN (...) to scope search by tenant/region (RLS-friendly)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The DBA decisions that matter here are not about the embedding model — the data science team owns that. They are about <strong class="text-white">lifecycle and governance of the vectors</strong>: re-embedding policy when the source documents change (stale embeddings silently degrade RAG quality — schedule re-embedding off the same CDC stream that feeds the feature store), dimension discipline (every row in a table must use the same embedding model and dimension, enforced by the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR(1536)</code> declaration), and scoping (the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">source_table</code> column plus RLS ensures a tenant's semantic search never surfaces another tenant's documents — the vector equivalent of the row-level security from Chapter 36). Backups already cover the table; no new infrastructure to protect.</p>
+
+<p class="text-gray-300 leading-relaxed">For scale beyond what brute-force <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_DISTANCE</code> scans handle comfortably, partition the embeddings table by tenant or topic and keep hot partitions in memory — the same partitioning judgment you already apply to large tables, now serving an AI workload.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Model Serving: Where Inference Is Allowed to Happen</h3>
+
+<p class="text-gray-300 leading-relaxed">Once models exist, they need sanctioned execution paths. The failure mode you are preventing is the shadow pipeline: an engineer exports a table to CSV, scores it in a notebook, and emails predictions to the business — no audit trail, no version control, no monitoring. Give the organization two blessed paths and the shadow pipelines wither.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Path 1 — In-database scoring with PREDICT.</strong> For models that can be expressed as ONNX or native T-SQL, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">PREDICT</code> scores rows without data ever leaving SQL Server. This is the right path for operational models — churn scores refreshed nightly, fraud flags on new transactions — because it inherits the database's security, auditing, and scheduling. The DBA versions the model binary in a table alongside its training metadata, and swapping models is a metadata update, not a deployment.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Path 2 — Governed external endpoints.</strong> For models that cannot run in-database (LLMs, large ensembles), the sanctioned path is a model endpoint — Azure ML managed online endpoint or a containerized service — called from a controlled integration layer, never directly from ad-hoc queries. The DBA's contribution is the contract: which service principal may call the endpoint, what input data it may send (tokenized features from the store, never raw PII), and logging of every inference request for the audit trail.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Model registry: every deployed model versioned with its training lineage
+CREATE TABLE ml.model_registry (
+    model_name      SYSNAME       NOT NULL,
+    model_version   INT           NOT NULL,
+    feature_version TINYINT       NOT NULL,  -- which feature store version it trained on
+    training_cutoff DATE          NOT NULL,  -- last feature_date in training data
+    onnx_model      VARBINARY(MAX) NULL,     -- NULL for externally-hosted models
+    endpoint_url    NVARCHAR(500) NULL,      -- NULL for in-database models
+    deployed_at     DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+    deployed_by     SYSNAME   NOT NULL DEFAULT SUSER_SNAME(),
+    status          VARCHAR(20) NOT NULL DEFAULT 'staging'
+                    CHECK (status IN ('staging','production','retired')),
+    CONSTRAINT PK_model_registry PRIMARY KEY (model_name, model_version)
+);
+GO
+-- Promote a model: single audited statement, reversible
+UPDATE ml.model_registry SET status = 'retired'
+WHERE model_name = 'churn_v1' AND status = 'production';
+UPDATE ml.model_registry SET status = 'production'
+WHERE model_name = 'churn_v1' AND model_version = 4;
+
+-- Nightly in-database scoring against the feature store (Path 1)
+SELECT f.customer_token,
+       CAST(p.prediction AS FLOAT) AS churn_probability
+FROM ml.customer_features_v3 f
+CROSS APPLY (
+    SELECT * FROM PREDICT(
+        MODEL = (SELECT onnx_model FROM ml.model_registry
+                 WHERE model_name = 'churn_v1' AND status = 'production'),
+        DATA = (SELECT orders_90d, spend_90d, avg_order_value,
+                       days_since_order, support_tickets_90d)
+    )
+) p
+WHERE f.feature_date = CAST(GETUTCDATE() AS DATE);</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The registry is the artifact auditors and incident responders reach for first: which model version is in production, what feature version it trained on, what data cutoff it saw. When a model's predictions degrade, that lineage tells you whether the model changed, the features changed, or the world changed — and each points at a different fix.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Data Quality Gates: Protecting Model Inputs</h3>
+
+<p class="text-gray-300 leading-relaxed">Models fail silently on bad inputs. A feature pipeline that starts emitting nulls after an upstream schema change does not raise an error — it just feeds zeros into the model, and predictions drift for weeks before anyone notices. The AI-ready platform treats feature quality with the same seriousness as backup integrity: automated checks, on a schedule, with alerts.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Feature quality gate: runs after every feature computation batch
+-- Fails loudly (THROW) so the pipeline halts instead of poisoning the store
+DECLARE @feature_date DATE = CAST(GETUTCDATE() AS DATE);
+DECLARE @checks TABLE (check_name SYSNAME, passed BIT, detail NVARCHAR(500));
+
+INSERT @checks
+SELECT 'row_count_sanity', CASE WHEN COUNT(*) BETWEEN 1000 AND 10000000 THEN 1 ELSE 0 END,
+       'rows=' + CAST(COUNT(*) AS VARCHAR(20))
+FROM ml.customer_features_v3 WHERE feature_date = @feature_date;
+
+INSERT @checks
+SELECT 'null_rate_orders_90d', CASE WHEN AVG(CASE WHEN orders_90d IS NULL THEN 1.0 ELSE 0 END) &lt; 0.01 THEN 1 ELSE 0 END,
+       'null_rate=' + CAST(AVG(CASE WHEN orders_90d IS NULL THEN 1.0 ELSE 0 END) AS VARCHAR(20))
+FROM ml.customer_features_v3 WHERE feature_date = @feature_date;
+
+INSERT @checks
+SELECT 'distribution_drift_spend',
+       CASE WHEN ABS(AVG(spend_90d) - (SELECT AVG(spend_90d) FROM ml.customer_features_v3
+              WHERE feature_date = DATEADD(DAY, -7, @feature_date)))
+              / NULLIF((SELECT AVG(spend_90d) FROM ml.customer_features_v3
+              WHERE feature_date = DATEADD(DAY, -7, @feature_date)), 0) &lt; 0.25 THEN 1 ELSE 0 END,
+       'week_over_week_mean_shift_check'
+FROM ml.customer_features_v3 WHERE feature_date = @feature_date;
+
+-- Halt the pipeline on any failed check; log all results for the audit trail
+INSERT INTO ml.feature_quality_log (feature_date, check_name, passed, detail, checked_at)
+SELECT @feature_date, check_name, passed, detail, SYSUTCDATETIME() FROM @checks;
+
+IF EXISTS (SELECT 1 FROM @checks WHERE passed = 0)
+    THROW 50001, 'Feature quality gate failed: investigate before training or scoring.', 1;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Three check families cover the failure modes that matter for ML inputs: <strong class="text-white">sanity</strong> (row counts within expected bounds — catches truncated loads), <strong class="text-white">completeness</strong> (null rates below threshold — catches broken joins and dropped columns), and <strong class="text-white">stability</strong> (distribution shift within tolerance — catches upstream semantic changes). The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">THROW</code> is deliberate: a halted pipeline pages someone today; a poisoned feature store silently degrades every model trained on it for months. Log every check result to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ml.feature_quality_log</code> — when predictions drift, the first question is "did the inputs change," and this log answers it.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">MLOps Lifecycle: Keeping Deployed Models Honest</h3>
+
+<p class="text-gray-300 leading-relaxed">Deploying a model is the midpoint of its life, not the end. Data drifts, customer behavior changes, upstream systems get replaced — and the model's accuracy decays while its predictions keep flowing into business decisions. The DBA-owned MLOps lifecycle has four recurring jobs: <strong class="text-white">shadow evaluation</strong> of challenger models, <strong class="text-white">production monitoring</strong> of prediction distributions, <strong class="text-white">scheduled retraining</strong> triggers, and <strong class="text-white">rollback</strong> that works in minutes.</p>
+
+<p class="text-gray-300 leading-relaxed">Shadow evaluation is the pattern that prevents most bad deployments: the challenger model scores the same production features as the champion, but its predictions are logged, not acted on. After two to four weeks you compare — did the challenger actually beat the champion on recent data, or only on the historical test set? Promote only on production-observed evidence. Implement it as a second <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">PREDICT</code> call writing to a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ml.shadow_predictions</code> table with the model version stamped on every row.</p>
+
+<p class="text-gray-300 leading-relaxed">Production monitoring watches the prediction distribution, not just accuracy (ground truth often arrives weeks late — did the customer actually churn?). If the share of high-risk churn predictions doubles overnight, either the world changed or the inputs broke; the feature quality log distinguishes the two. Alert on prediction distribution shifts with the same PSI threshold from Chapter 37 — the technique transfers directly from replication drift to model drift.</p>
+
+<p class="text-gray-300 leading-relaxed">Retraining triggers should be event-driven, not calendar-driven. "Retrain monthly" retrains on schedule whether the model needs it or not; "retrain when prediction PSI exceeds 0.25 for two consecutive weeks or when a new feature version ships" retrains when the evidence says the model is stale. And rollback is a registry status flip — the same two UPDATE statements from the serving section, executable by the on-call DBA at 3 AM without a data scientist on the call.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><figure class="my-8">
+  <img src="../images/arch-b2-ch38-mlops.webp" alt="MLOps feature pipeline: SQL Server feeds features through a quality gate that either proceeds to training and scoring or halts, while embeddings flow into a vector store." class="w-full rounded-2xl border border-gray-700" />
+  <figcaption class="mt-3 text-sm text-gray-400 leading-relaxed"><strong class="text-gray-200">Figure 38.1 — MLOps feature pipeline.</strong> Features must clear a quality gate before training or scoring; embeddings flow separately into the vector store.</figcaption>
+</figure>
+
+<p class="text-gray-300 leading-relaxed">Teal <strong class="text-white">SQL Server</strong> is the source of both pipelines. The upper path builds blue <strong class="text-white">Features</strong>, which must clear the amber <strong class="text-white">Quality Gate</strong> — sanity, completeness, and stability checks. The green <strong class="text-white">Proceed</strong> arrow carries passing features to purple <strong class="text-white">Train</strong> and then green <strong class="text-white">Score</strong>; the red <strong class="text-white">Halt</strong> arrow stops the pipeline on failure and pages the team. The lower path is the document side: violet <strong class="text-white">Embeddings</strong> flow into the teal <strong class="text-white">Vector Store</strong>, re-embedded on every document change. The diagram's discipline: no feature reaches a model without passing the gate, and no stale embedding stays in the store — data quality is enforced before the model, not debugged after it.</p></div>
+
+<p class="text-gray-300 leading-relaxed">*The AI-ready platform: production data flows through CDC into governed feature and vector stores; quality gates protect every model input; the registry versions every model; prediction monitoring closes the loop back to retraining or rollback.*</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **AI-ready means five capabilities your OLTP platform lacks: curated features, vector storage, sanctioned model execution, input quality gates, and model lifecycle management.** Each is a DBA-owned pattern, not a new product to buy.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Build the feature store first — versioned, point-in-time-correct, tokenized.** Training pipelines never touch production tables directly; feature logic changes create new versions instead of altering history, so every model stays reproducible.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Keep vectors in SQL Server with the native vector type.** The DBA decisions are lifecycle and governance — re-embedding on source change, dimension discipline, RLS scoping by tenant — not the embedding model itself.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Give the organization two blessed inference paths or shadow pipelines will.** In-database PREDICT for operational models, governed external endpoints for everything else — both fed from the feature store, both logged, both versioned in the model registry.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Gate every feature batch on sanity, completeness, and stability — and halt loudly on failure.** A THROW that pages someone today beats months of silent prediction drift from a poisoned feature store.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Run MLOps as a DBA discipline: shadow evaluation, prediction monitoring, evidence-driven retraining, one-statement rollback.** The model registry's lineage columns are what let you answer "did the model, the features, or the world change" when predictions degrade.</li>
+    </div>
+    <div class="mt-14 bg-violet-950/40 border border-violet-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · SQL Server</p>
+      </div>
+      <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
+         class="shrink-0 px-6 py-3 bg-violet-600 hover:bg-violet-500 text-white font-semibold rounded-xl text-sm transition">
+        Download Free
+      </a>
+    </div>
+        <div class="mt-10 rounded-2xl border border-blue-900/40 bg-blue-950/20 p-5 flex flex-col sm:flex-row items-center justify-between gap-4">
+      <div>
+        <p class="font-semibold text-white text-sm">Test yourself on this chapter</p>
+        <p class="text-gray-400 text-xs mt-1">5 questions &middot; instant scoring &middot; explanations included</p>
+      </div>
+      <a href="../quiz.html?book=book2&ch=38"
+         class="shrink-0 px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white font-bold rounded-xl text-sm transition">Take the Quiz &rarr;</a>
+    </div>
+<div class="mt-8 flex justify-between text-xs">
+      <a href="b2-ch37-ai-replication-cdc.html" class="text-gray-500 hover:text-gray-300 transition">← Previous Chapter</a>
+      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a>
+      <a href="b2-ch39-responsible-ai.html" class="text-violet-400 hover:text-violet-300 transition">Next Chapter →</a>
+    </div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · The AI-Powered DBA</div>
+  </footer>
+</body>
+</html>

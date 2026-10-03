@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 27: AI for Data Quality and Master Data — The AI-Powered DBA</title>
+  <meta name="description" content="The AI-Powered DBA Chapter 27: AI for Data Quality and Master Data. AI and AIOps for SQL Server, by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script></head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-violet-500 to-violet-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-violet-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 2 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-violet-600 hover:bg-violet-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6">
+      <a href="index.html" class="text-xs text-violet-400 hover:text-violet-300 transition">← All Chapters</a>
+    </div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-violet-900/40 border border-violet-800/40 text-violet-300 text-xs rounded-full font-medium">Chapter 27 of 40</span>
+    </div>
+    <div class="space-y-4 text-sm">
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 27: AI for Data Quality and Master Data</h2>
+
+<p class="text-gray-300 leading-relaxed">DBAs own the storage, the backups, and the performance — but the data itself increasingly lands on their desk too. Duplicate customers breaking unique constraints, NULL rates creeping up after a vendor feed change, product codes that drifted out of the reference list months ago: these are data quality failures, and they surface as database incidents. Traditional data quality work is rule-based: hand-written checks, threshold alerts, periodic profiling reports nobody reads. AI changes the economics of this work. Statistical profiling catches drift without anyone writing a rule for it, ML-based entity resolution finds duplicates that exact matching misses, and anomaly detection on data distributions flags the vendor feed change the day it happens. This chapter builds an AI-assisted data quality practice on SQL Server, from profiling to master data governance.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Profiling at Scale with T-SQL</h3>
+
+<p class="text-gray-300 leading-relaxed">Every data quality program starts with profiling: what does this column actually contain? A profile is the statistical fingerprint of a column — NULL rate, distinct count, min/max, value distribution, pattern breakdown. On SQL Server, a single dynamic query can profile every column of a table and store the fingerprint in a history table. That history is the foundation everything else in this chapter builds on.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Column profile snapshot: run nightly, store in dbo.dq_column_profile_history
+DECLARE @schema sysname = 'dbo', @table sysname = 'Customers';
+DECLARE @sql NVARCHAR(MAX) = N'';
+
+SELECT @sql += N'
+INSERT INTO dbo.dq_column_profile_history
+    (profile_date, schema_name, table_name, column_name,
+     row_count, null_count, null_pct, distinct_count,
+     min_value, max_value, avg_length)
+SELECT
+    CAST(GETUTCDATE() AS DATE),
+    ''' + @schema + ''', ''' + @table + ''', ''' + c.name + ''',
+    COUNT(*),
+    SUM(CASE WHEN [' + c.name + '] IS NULL THEN 1 ELSE 0 END),
+    SUM(CASE WHEN [' + c.name + '] IS NULL THEN 1.0 ELSE 0 END) / COUNT(*),
+    COUNT(DISTINCT [' + c.name + ']),
+    CAST(MIN(CAST([' + c.name + '] AS NVARCHAR(4000))) AS NVARCHAR(4000)),
+    CAST(MAX(CAST([' + c.name + '] AS NVARCHAR(4000))) AS NVARCHAR(4000)),
+    AVG(CAST(LEN(CAST([' + c.name + '] AS NVARCHAR(4000))) AS FLOAT))
+FROM [' + @schema + '].[' + @table + '];'
+FROM sys.columns c
+JOIN sys.types t ON t.user_type_id = c.user_type_id
+WHERE c.object_id = OBJECT_ID(QUOTENAME(@schema) + '.' + QUOTENAME(@table))
+  AND t.name NOT IN ('image','varbinary','xml','geography','geometry');
+
+EXEC sp_executesql @sql;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Store every run. The profile of a single day is trivia; the time series of profiles is a quality signal. When the NULL rate on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">EmailAddress</code> jumps from 2% to 18% overnight, you do not need a business rule to know something broke — the distribution itself tells you. The next section turns that time series into automated detection.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Detecting Data Drift Without Hand-Written Rules</h3>
+
+<p class="text-gray-300 leading-relaxed">Rule-based checks fail the same way rule-based monitoring fails: someone has to anticipate every failure mode. Statistical drift detection inverts the problem. Instead of asserting "NULL rate must stay under 5%," you model each profiled metric's normal behavior and flag statistically significant deviations. A z-score over a rolling baseline catches the EmailAddress NULL spike, the sudden appearance of a new product code, or a value distribution that quietly shifted after a deployment — without a single threshold anyone had to guess.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import pandas as pd
+import numpy as np
+import pyodbc
+
+def detect_profile_drift(conn_string: str, baseline_days: int = 30,
+                         z_threshold: float = 4.0) -&gt; pd.DataFrame:
+    """
+    Compare the latest column profile snapshot against a rolling baseline.
+    Flags metrics whose z-score exceeds the threshold.
+    """
+    conn = pyodbc.connect(conn_string)
+    df = pd.read_sql("""
+        SELECT schema_name, table_name, column_name, profile_date,
+               null_pct, distinct_count, avg_length
+        FROM dbo.dq_column_profile_history
+        WHERE profile_date &gt;= DATEADD(DAY, -%d, CAST(GETUTCDATE() AS DATE))
+    """ % (baseline_days + 1), conn)
+    conn.close()
+
+    alerts = []
+    for (schema, table, col), g in df.groupby(['schema_name','table_name','column_name']):
+        g = g.sort_values('profile_date')
+        if len(g) &lt; 7:
+            continue  # need a week of history before judging
+        latest, baseline = g.iloc[-1], g.iloc[:-1]
+        for metric in ['null_pct', 'distinct_count', 'avg_length']:
+            mu, sigma = baseline[metric].mean(), baseline[metric].std()
+            if sigma == 0 or np.isnan(sigma):
+                continue
+            z = abs(latest[metric] - mu) / sigma
+            if z &gt;= z_threshold:
+                alerts.append({
+                    'table': f"{schema}.{table}",
+                    'column': col,
+                    'metric': metric,
+                    'baseline_mean': round(mu, 4),
+                    'latest_value': round(latest[metric], 4),
+                    'z_score': round(z, 2),
+                })
+    return pd.DataFrame(alerts).sort_values('z_score', ascending=False)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Run this as a SQL Agent job step every morning and write the alerts to a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dbo.dq_drift_alerts</code> table. The z-score threshold of 4.0 is deliberately conservative — profile metrics are noisy, and you want the first weeks of alerting to build trust, not fatigue. Tune it down once the team sees that every alert so far was a genuine data event. For categorical columns, extend the same idea to value-distribution drift: compare today's top-20 value frequencies against the baseline with a chi-squared test, and flag columns whose distribution shifted.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">ML-Based Deduplication and Entity Resolution</h3>
+
+<p class="text-gray-300 leading-relaxed">Duplicates are the data quality problem that exact matching cannot solve. "Acme Corp", "ACME Corporation", and "Acme Corp." are the same customer; no unique constraint catches that. SQL Server's built-in fuzzy functions — <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SOUNDEX()</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DIFFERENCE()</code> — handle phonetic similarity, but real entity resolution needs more: string distance across multiple fields, weighted by field importance, with a learned decision boundary instead of a guessed threshold.</p>
+
+<p class="text-gray-300 leading-relaxed">The practical architecture is blocking plus scoring. Blocking narrows the candidate pairs cheaply in T-SQL (same postal code, same SOUNDEX of last name) so you never compare every row to every other row. Scoring then computes similarity features per pair in Python and classifies them with a model trained on a few hundred hand-labeled pairs.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import pandas as pd
+import pyodbc
+from sklearn.ensemble import RandomForestClassifier
+from rapidfuzz import fuzz
+
+def candidate_pairs(conn) -&gt; pd.DataFrame:
+    """Blocking in T-SQL: only compare rows sharing a blocking key."""
+    return pd.read_sql("""
+        SELECT a.CustomerID AS id_a, b.CustomerID AS id_b,
+               a.CompanyName AS name_a, b.CompanyName AS name_b,
+               a.Email AS email_a, b.Email AS email_b,
+               a.PostalCode AS zip_a, b.PostalCode AS zip_b,
+               a.Phone AS phone_a, b.Phone AS phone_b
+        FROM dbo.Customers a
+        JOIN dbo.Customers b
+          ON a.CustomerID &lt; b.CustomerID
+         AND (
+               LEFT(a.PostalCode, 3) = LEFT(b.PostalCode, 3)   -- same zip prefix
+            OR SOUNDEX(a.CompanyName) = SOUNDEX(b.CompanyName) -- phonetic match
+         )
+    """, conn)
+
+def featurize(pairs: pd.DataFrame) -&gt; pd.DataFrame:
+    """Similarity features per candidate pair."""
+    f = pd.DataFrame()
+    f['name_ratio']  = pairs.apply(lambda r: fuzz.ratio(str(r.name_a), str(r.name_b)), axis=1) / 100
+    f['name_token']  = pairs.apply(lambda r: fuzz.token_set_ratio(str(r.name_a), str(r.name_b)), axis=1) / 100
+    f['email_exact'] = (pairs.email_a.str.lower() == pairs.email_b.str.lower()).astype(int)
+    f['email_ratio'] = pairs.apply(lambda r: fuzz.ratio(str(r.email_a), str(r.email_b)), axis=1) / 100
+    f['zip_exact']   = (pairs.zip_a == pairs.zip_b).astype(int)
+    f['phone_exact'] = (pairs.phone_a == pairs.phone_b).astype(int)
+    return f
+
+# Train once on hand-labeled pairs (1 = same entity, 0 = different)
+# labels.csv: id_a, id_b, is_duplicate  — 300-500 rows labeled by a data steward
+model = RandomForestClassifier(n_estimators=200, random_state=42, class_weight='balanced')
+train_pairs = pd.read_csv('labels.csv').merge(candidate_pairs(conn), on=['id_a','id_b'])
+model.fit(featurize(train_pairs), train_pairs['is_duplicate'])
+
+# Score all candidates; review band 0.4-0.7 goes to a steward, &gt;0.7 auto-flags
+pairs = candidate_pairs(conn)
+pairs['dup_probability'] = model.predict_proba(featurize(pairs))[:, 1]
+review = pairs[(pairs.dup_probability &gt;= 0.4) &amp; (pairs.dup_probability &lt; 0.7)]
+auto_flag = pairs[pairs.dup_probability &gt;= 0.7]</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The review band is the key operational detail. Pairs scoring above 0.7 are high-confidence duplicates — flag them for merge automatically or queue them for fast steward approval. Pairs in the 0.4–0.7 band go to a human data steward, and every steward decision becomes new training data. Retrain monthly; the model gets smarter exactly where your data is ambiguous, which is precisely where hand-written rules stay dumb forever.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Master Data Management with SQL Server MDS</h3>
+
+<p class="text-gray-300 leading-relaxed">Deduplication cleans up the past; Master Data Services (MDS) prevents the mess from recurring. MDS gives you a governed hub for reference and master entities — product codes, customer hierarchies, chart of accounts — with versioning, business rules, and steward workflows. The AI angle is using the drift detection and entity resolution from the previous sections as <em>feeds into</em> MDS rather than standalone tools.</p>
+
+<p class="text-gray-300 leading-relaxed">The pattern: your profiling pipeline flags a new, unseen product code appearing in the orders feed. Instead of just alerting, the pipeline stages the candidate value into an MDS staging table, where a business rule validates its format and a steward approves or rejects it. Approved values flow into the published master entity; subscribing systems pull the golden record instead of maintaining their own copies. The duplicate detector's high-confidence pairs feed the same staging flow as merge candidates. MDS becomes the system of record, and the ML pipelines become its intake sensors.</p>
+
+<p class="text-gray-300 leading-relaxed">For shops not running MDS, the same hub-and-spoke pattern works with a governed schema: a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">mdm</code> schema holding golden-record tables, a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">mdm_staging</code> schema for candidate intake, and stored procedures enforcing the approve/publish workflow. The tooling matters less than the discipline: one write path, one approval path, full history.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">The Data Quality Scorecard</h3>
+
+<p class="text-gray-300 leading-relaxed">Executives do not read drift alert tables. They read scorecards. Roll your profiling history, drift alerts, and duplicate counts into a single per-table DQ score, refreshed daily, and publish it where the business can see it. A useful score blends four dimensions: <strong class="text-white">completeness</strong> (1 − NULL rate on business-critical columns), <strong class="text-white">validity</strong> (share of values passing format/domain rules), <strong class="text-white">uniqueness</strong> (1 − duplicate rate), and <strong class="text-white">stability</strong> (1 − normalized drift alert count over 30 days).</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Daily DQ scorecard per table: 0-100 per dimension, weighted composite
+WITH latest_profiles AS (
+    SELECT schema_name, table_name,
+           AVG(null_pct) AS avg_null_pct,
+           SUM(CASE WHEN null_pct &gt; 0.05 THEN 1 ELSE 0 END) AS cols_high_null
+    FROM dbo.dq_column_profile_history
+    WHERE profile_date = CAST(GETUTCDATE() AS DATE)
+    GROUP BY schema_name, table_name
+),
+drift_30d AS (
+    SELECT table_name, COUNT(*) AS drift_alerts
+    FROM dbo.dq_drift_alerts
+    WHERE alert_date &gt;= DATEADD(DAY, -30, CAST(GETUTCDATE() AS DATE))
+    GROUP BY table_name
+),
+dup_rates AS (
+    SELECT 'dbo.Customers' AS table_name,
+           COUNT(*) * 1.0 / NULLIF((SELECT COUNT(*) FROM dbo.Customers), 0) AS dup_rate
+    FROM dbo.dq_duplicate_flags
+    WHERE flag_date = CAST(GETUTCDATE() AS DATE) AND status = 'confirmed'
+)
+SELECT
+    p.schema_name + '.' + p.table_name AS table_name,
+    CAST(100 * (1 - p.avg_null_pct) AS DECIMAL(5,1)) AS completeness_score,
+    CAST(100 * (1 - ISNULL(d.drift_alerts, 0) / 30.0) AS DECIMAL(5,1)) AS stability_score,
+    CAST(100 * (1 - ISNULL(u.dup_rate, 0)) AS DECIMAL(5,1)) AS uniqueness_score,
+    CAST(100 * (0.4 * (1 - p.avg_null_pct)
+              + 0.3 * (1 - ISNULL(d.drift_alerts, 0) / 30.0)
+              + 0.3 * (1 - ISNULL(u.dup_rate, 0))) AS DECIMAL(5,1)) AS dq_score
+FROM latest_profiles p
+LEFT JOIN drift_30d d ON d.table_name = p.schema_name + '.' + p.table_name
+LEFT JOIN dup_rates u ON u.table_name = p.schema_name + '.' + p.table_name
+ORDER BY dq_score;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Publish the scorecard to a dashboard and set one alert: any table dropping more than 10 points week over week pages the data owner. That single alert, backed by the drill-down from score to drift alert to profile history, is what turns data quality from a quarterly audit exercise into a daily operational metric — owned, measured, and improving.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Profile everything, store every run.** A nightly T-SQL column-profile snapshot written to a history table is cheap, and the time series of profiles is the raw material for every detection technique in this chapter.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Statistical drift detection replaces guessed thresholds.** A z-score against a rolling baseline flags NULL spikes, new codes, and distribution shifts without anyone writing a rule for each failure mode — start conservative at z ≥ 4.0 and tune down as trust builds.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Entity resolution is blocking plus learned scoring.** Cheap T-SQL blocking (zip prefix, SOUNDEX) narrows candidate pairs; a classifier trained on a few hundred steward-labeled pairs scores them, with a human review band in the middle that becomes retraining data.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Feed ML detections into your master data hub, not around it.** Drift alerts and duplicate candidates should stage into MDS (or a governed mdm schema) as intake — one write path, one approval path, full history.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Roll it up into a DQ scorecard the business reads.** Completeness, validity, uniqueness, and stability per table, one composite score, one alert on a 10-point weekly drop — that is what makes data quality an operational metric instead of an audit artifact.</li>
+    </div>
+    <div class="mt-14 bg-violet-950/40 border border-violet-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · SQL Server</p>
+      </div>
+      <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
+         class="shrink-0 px-6 py-3 bg-violet-600 hover:bg-violet-500 text-white font-semibold rounded-xl text-sm transition">
+        Download Free
+      </a>
+    </div>
+        <div class="mt-10 rounded-2xl border border-blue-900/40 bg-blue-950/20 p-5 flex flex-col sm:flex-row items-center justify-between gap-4">
+      <div>
+        <p class="font-semibold text-white text-sm">Test yourself on this chapter</p>
+        <p class="text-gray-400 text-xs mt-1">5 questions &middot; instant scoring &middot; explanations included</p>
+      </div>
+      <a href="../quiz.html?book=book2&ch=27"
+         class="shrink-0 px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white font-bold rounded-xl text-sm transition">Take the Quiz &rarr;</a>
+    </div>
+<div class="mt-8 flex justify-between text-xs">
+      <a href="b2-ch26-dba-copilot.html" class="text-gray-500 hover:text-gray-300 transition">← Previous Chapter</a>
+      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a>
+      <a href="b2-ch28-vector-knowledge-base.html" class="text-violet-400 hover:text-violet-300 transition">Next Chapter →</a>
+    </div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · The AI-Powered DBA</div>
+  </footer>
+</body>
+</html>

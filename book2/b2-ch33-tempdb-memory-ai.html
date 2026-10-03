@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 33: AI Diagnosis of TempDB and Memory Pressure — The AI-Powered DBA</title>
+  <meta name="description" content="The AI-Powered DBA Chapter 33: AI Diagnosis of TempDB and Memory Pressure. AI and AIOps for SQL Server, by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script></head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-violet-500 to-violet-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-violet-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 2 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-violet-600 hover:bg-violet-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6">
+      <a href="index.html" class="text-xs text-violet-400 hover:text-violet-300 transition">← All Chapters</a>
+    </div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-violet-900/40 border border-violet-800/40 text-violet-300 text-xs rounded-full font-medium">Chapter 33 of 40</span>
+    </div>
+    <div class="space-y-4 text-sm">
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 33: AI Diagnosis of TempDB and Memory Pressure</h2>
+
+<p class="text-gray-300 leading-relaxed">TempDB and memory pressure are the classic ambiguous emergencies: slow queries, timeouts, and a wait-stat profile that points everywhere and nowhere at once. Is it version-store bloat from a long-running snapshot transaction? Sort and hash spills from a bad plan? Genuine memory starvation? Allocation contention on tempdb data files? A human DBA answers these questions by correlating half a dozen DMVs against workload knowledge built over years — which is exactly why this is fertile ground for AI. This chapter is about the AI layer on top of tempdb and memory diagnostics: ML models that classify wait signatures into root causes, anomaly detectors that learn your workload's normal memory rhythms, and LLM triage that reads a diagnostic snapshot and narrows the field from "something is wrong" to "here is the specific mechanism" in minutes instead of hours.</p>
+
+<p class="text-gray-300 leading-relaxed">The base mechanics — how tempdb allocation works, what page life expectancy means — belong to the performance books. Here we assume you know the DMVs and focus on what changes when machine reasoning sits between the telemetry and the diagnosis.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Wait Signatures as Features, Not Just Symptoms</h3>
+
+<p class="text-gray-300 leading-relaxed">A DBA reads wait stats as symptoms and reasons backward to causes. A classifier does the same thing, except it learns the mapping from thousands of labeled examples instead of a career of incidents. The input is a <strong class="text-white">wait vector</strong> — the delta of <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_os_wait_stats</code> over a fixed window, normalized — and the output is a root-cause class:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Memory grant pressure:</strong> <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">RESOURCE_SEMAPHORE</code> dominant, often with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SOS_SCHEDULER_YIELD</code> rising as queries queue.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Tempdb allocation contention:</strong> <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">PAGELATCH_UP</code> / <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">PAGELATCH_EX</code> concentrated on tempdb pages (2:1:1, 2:1:3), with high allocation rates but modest version-store growth.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Version-store pressure:</strong> <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">IO_COMPLETION</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">PAGEIOLATCH_*</code> climbing alongside version-store space growth, frequently paired with long-running transactions under read-committed snapshot isolation.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Spill-driven tempdb growth:</strong> <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SOS_SCHEDULER_YIELD</code> plus internal-object allocation spikes correlated with specific query hashes — the signature of sort/hash spills from misestimated plans.</p>
+
+<p class="text-gray-300 leading-relaxed">The feature engineering matters more than the algorithm. Capture wait deltas on a fixed cadence, normalize each wait type by total waits in the window (so the model learns <em>shapes</em>, not magnitudes that shift with load), and append a few scalar features: memory grants pending, PLE, tempdb allocation rate. A gradient-boosted classifier or even multinomial logistic regression on these features routinely hits 85%+ accuracy on labeled incident data — because the wait signatures of these failure modes are genuinely distinct once you stop looking at single counters in isolation.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Capture a normalized wait vector for the classifier (run on a 5-minute cadence,
+-- store both snapshots, compute the delta in your collector)
+SELECT
+    wait_type,
+    wait_time_ms,
+    waiting_tasks_count,
+    CAST(wait_time_ms AS FLOAT)
+        / NULLIF(SUM(wait_time_ms) OVER (), 0) AS wait_share
+FROM sys.dm_os_wait_stats
+WHERE wait_type IN (
+    'RESOURCE_SEMAPHORE', 'RESOURCE_SEMAPHORE_QUERY_COMPILE',
+    'SOS_SCHEDULER_YIELD', 'PAGELATCH_UP', 'PAGELATCH_EX',
+    'PAGEIOLATCH_SH', 'PAGEIOLATCH_EX', 'IO_COMPLETION',
+    'CXPACKET', 'CXCONSUMER', 'LCK_M_X', 'LCK_M_S',
+    'WRITELOG', 'LOGBUFFER', 'THREADPOOL'
+)
+ORDER BY wait_share DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">TempDB Signals the Model Needs</h3>
+
+<p class="text-gray-300 leading-relaxed">Wait vectors get you the class; tempdb-specific DMVs give you the mechanism and the culprit. Three queries form the model's tempdb context:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- 1. What is consuming tempdb right now, by category
+SELECT
+    SUM(unallocated_extent_page_count) / 128.0 AS free_mb,
+    SUM(version_store_reserved_page_count) / 128.0 AS version_store_mb,
+    SUM(user_object_reserved_page_count) / 128.0 AS user_objects_mb,
+    SUM(internal_object_reserved_page_count) / 128.0 AS internal_objects_mb,
+    SUM(mixed_extent_page_count) / 128.0 AS mixed_extent_mb
+FROM tempdb.sys.dm_db_file_space_usage;
+
+-- 2. Who is allocating: top sessions by tempdb usage right now
+SELECT TOP 10
+    s.session_id,
+    s.login_name,
+    s.program_name,
+    (t.user_objects_alloc_page_count - t.user_objects_dealloc_page_count) / 128.0
+        AS user_objects_mb,
+    (t.internal_objects_alloc_page_count - t.internal_objects_dealloc_page_count) / 128.0
+        AS internal_objects_mb,
+    DATEDIFF(SECOND, s.last_request_start_time, GETUTCDATE()) AS request_age_sec,
+    LEFT(st.text, 200) AS query_shape
+FROM sys.dm_db_task_space_usage t
+JOIN sys.dm_exec_sessions s ON s.session_id = t.session_id
+OUTER APPLY sys.dm_exec_sql_text(s.sql_handle) st
+WHERE t.session_id &gt; 50
+ORDER BY (t.user_objects_alloc_page_count + t.internal_objects_alloc_page_count) DESC;
+
+-- 3. Version store: is an old snapshot transaction pinning cleanup?
+SELECT TOP 5
+    t.transaction_id,
+    t.transaction_sequence_num,
+    DATEDIFF(SECOND, t.transaction_begin_time, GETUTCDATE()) AS age_sec,
+    s.session_id,
+    s.program_name
+FROM sys.dm_tran_active_snapshot_database_transactions t
+LEFT JOIN sys.dm_exec_sessions s ON s.session_id = t.session_id
+ORDER BY t.transaction_begin_time;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The AI leverage here is twofold. First, <strong class="text-white">allocation-rate anomaly detection</strong>: a model trained on per-session allocation rates learns the difference between your steady-state ETL tempdb usage and a runaway spill — something no static threshold captures, because your normal varies by hour and by day. Second, <strong class="text-white">version-store aging analysis</strong>: the model correlates version-store growth with the oldest open snapshot transaction, so instead of "tempdb is growing," the diagnosis becomes "version store grew 18 GB in 40 minutes, pinned by transaction 98412 open for 52 minutes from the reporting job."</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Memory Signals the Model Needs</h3>
+
+<p class="text-gray-300 leading-relaxed">For memory pressure, the model's context comes from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_os_performance_counters</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_query_memory_grants</code>:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Memory pressure snapshot for the diagnostic model
+SELECT
+    counter_name,
+    cntr_value
+FROM sys.dm_os_performance_counters
+WHERE object_name LIKE '%Memory Manager%'
+  AND counter_name IN (
+      'Memory Grants Pending', 'Memory Grants Outstanding',
+      'Target Server Memory (KB)', 'Total Server Memory (KB)',
+      'Granted Workspace Memory (KB)', 'Maximum Workspace Memory (KB)'
+  )
+UNION ALL
+SELECT
+    'Page Life Expectancy' AS counter_name,
+    cntr_value
+FROM sys.dm_os_performance_counters
+WHERE object_name LIKE '%Buffer Manager%'
+  AND counter_name = 'Page life expectancy'
+UNION ALL
+SELECT
+    'Lazy Writes/sec' AS counter_name,
+    cntr_value
+FROM sys.dm_os_performance_counters
+WHERE object_name LIKE '%Buffer Manager%'
+  AND counter_name = 'Lazy writes/sec';
+
+-- Who is waiting for memory right now
+SELECT TOP 10
+    session_id,
+    requested_memory_kb / 1024.0 AS requested_mb,
+    granted_memory_kb / 1024.0 AS granted_mb,
+    required_memory_kb / 1024.0 AS required_mb,
+    wait_time_ms / 1000.0 AS wait_sec,
+    wait_order,
+    LEFT(st.text, 200) AS query_shape
+FROM sys.dm_exec_query_memory_grants
+OUTER APPLY sys.dm_exec_sql_text(sql_handle) st
+WHERE grant_time IS NULL          -- still waiting, not yet granted
+ORDER BY wait_time_ms DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The key AI contribution on memory is <strong class="text-white">learning your workload's normal rhythm</strong>. A static "page life expectancy below 300 seconds" rule pages you during every large batch load and stays silent during a genuine slow bleed at 3 AM. An anomaly model trained on PLE, lazy writes, and grants-pending histories learns that PLE craters every night at 1 AM during the ETL window (normal) but should never crater at 10 AM on a Tuesday (page someone). It also learns the <em>slope</em> signatures: a PLE cliff over 5 minutes means something very different from a PLE glide over 6 hours, and the model distinguishes them where a threshold cannot.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">LLM Triage: A Worked Diagnosis</h3>
+
+<p class="text-gray-300 leading-relaxed">The classifier gives you a root-cause class; the LLM triage step turns the class plus the raw evidence into an actionable diagnosis with a named culprit and a next step. The orchestrator feeds the model the wait vector, the tempdb breakdown, the top allocators, the memory-grant waiters, and instance config (max server memory, tempdb file count, MAXDOP) — using the context-packing and structured-output patterns from Chapter 32.</p>
+
+<p class="text-gray-300 leading-relaxed">Here is what distinguishes a good triage output from a generic one. Given version-store growth plus an old snapshot transaction, a weak model says "tempdb pressure detected, consider investigating long-running transactions." A well-prompted model says: "Version-store bloat: 18.4 GB version store (baseline 1.2 GB), pinned by transaction 98412 open 52 minutes from program 'NightlyReport'. Evidence: version_store_mb grew 16x in 40 min; oldest snapshot txn age 52 min; IO_COMPLETION waits up 9x. Recommended: ALERT_HUMAN with session kill candidate 214. Next diagnostic: check what NightlyReport session 214 is blocked on before killing."</p>
+
+<p class="text-gray-300 leading-relaxed">The critical judgment being encoded: the model identifies the <em>pinning transaction</em>, not just the symptom, and it recommends checking blockers before killing — because killing a session that holds a 52-minute transaction triggers a long rollback that makes everything worse. That "check before you kill" reasoning is exactly the kind of senior-DBA judgment that belongs in the few-shot examples from Chapter 32.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import json
+import pyodbc
+
+TEMPDB_TRIAGE_PROMPT = """
+You are a SQL Server tempdb and memory diagnostics expert. Classify the
+pressure mechanism and identify the culprit session or transaction if any.
+
+Mechanisms (choose exactly one):
+- VERSION_STORE_BLOAT, ALLOCATION_CONTENTION, SPILL_PRESSURE,
+  MEMORY_GRANT_STARVATION, BUFFER_POOL_PRESSURE, NO_PRESSURE
+
+Respond as JSON:
+{
+  "mechanism": "&lt;one of the above&gt;",
+  "culprit": "&lt;session_id, transaction_id, or null&gt;",
+  "evidence": ["&lt;observations citing input values&gt;"],
+  "confidence": &lt;0.0-1.0&gt;,
+  "recommended_action": "ALERT_HUMAN|KILL_CANDIDATE|NO_ACTION",
+  "kill_safety_note": "&lt;rollback risk assessment if KILL_CANDIDATE&gt;"
+}
+Always assess rollback risk before recommending KILL_CANDIDATE:
+a session with a long-running open transaction is dangerous to kill.
+"""
+
+def triage_tempdb_memory(snapshot: dict, llm_client) -&gt; dict:
+    response = llm_client.chat.completions.create(
+        model="gpt-4o",
+        response_format={"type": "json_object"},
+        temperature=0.1,
+        messages=[
+            {"role": "system", "content": TEMPDB_TRIAGE_PROMPT},
+            {"role": "user", "content": json.dumps(snapshot, indent=2)},
+        ],
+    )
+    return json.loads(response.choices[0].message.content)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">What AI May Recommend vs What Needs a Human</h3>
+
+<p class="text-gray-300 leading-relaxed">Tempdb and memory incidents tempt over-automation because the "fix" often looks like killing a session. The gate map must be explicit:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">AI may recommend (auto-execute at high confidence):</strong> identifying and reporting the culprit session with evidence; alerting with the full diagnostic bundle; updating statistics on a spill-heavy table (reversible, low risk).</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">AI recommends, human approves:</strong> killing a session — always, because rollback risk assessment is probabilistic and a wrong kill during a large transaction extends the outage by the rollback duration. The approval request must include the kill safety note: transaction age, estimated rollback cost.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Human decides, AI advises:</strong> adding memory, changing max server memory, adding tempdb data files, changing MAXDOP, enabling memory-optimized tempdb metadata. These are capacity and architecture decisions with cost and risk profiles the model cannot own.</p>
+
+<p class="text-gray-300 leading-relaxed">This tiering is the difference between AI-assisted diagnosis and AI-caused outages. The model's job is to compress hours of correlation into minutes and hand the human a decision-ready brief — not to make the irreversible call itself.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Building the Training Set from Your Incident History</h3>
+
+<p class="text-gray-300 leading-relaxed">None of this works without labeled data, and you already have most of it. Mine your ticketing system for past tempdb and memory incidents: for each, reconstruct the telemetry snapshot nearest the incident start (from your metrics history tables), and attach the root cause from the postmortem or resolution notes. Even 30–50 labeled incidents produce a classifier that beats generic heuristics, because it learns <em>your</em> workload's signatures.</p>
+
+<p class="text-gray-300 leading-relaxed">Operationalize it with a feature store: a scheduled job captures the wait vector, tempdb breakdown, and memory counters every 5 minutes into history tables. When an incident occurs, the labeling step is just "attach incident_id and root cause to these rows." Over a year, this becomes the highest-value dataset your DBA team owns — it trains the classifier, feeds the anomaly detector's baselines, and supplies golden cases for the Chapter 31 eval harness.</p>
+
+<p class="text-gray-300 leading-relaxed">Start before you need it: deploy the snapshot collector now, even before building any model. Six months of unlabeled telemetry becomes labeled the moment you have your next incident to anchor it to.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Treat wait deltas as classifier features, not just symptoms.** Normalized wait vectors map cleanly onto root-cause classes — memory grant pressure, allocation contention, version-store bloat, spill pressure — at 85%+ accuracy on labeled incident data.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Anomaly detection beats static thresholds for memory because it learns rhythm.** PLE cratering at 1 AM during ETL is normal; the same crater at 10 AM is a page — only a model trained on your history knows the difference.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Good triage names the mechanism and the culprit, with rollback risk assessed.** "Version-store bloat pinned by transaction 98412" plus a kill safety note is a decision-ready brief; "tempdb pressure detected" is noise.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Kills always need human approval; capacity decisions stay human entirely.** AI compresses hours of correlation into minutes, but rollback risk and architecture calls are judgments the model must not own.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Deploy the snapshot collector before you build any model.** Six months of wait vectors and tempdb breakdowns become a training set the moment your next incident gives you labels to attach.</li>
+    </div>
+    <div class="mt-14 bg-violet-950/40 border border-violet-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · SQL Server</p>
+      </div>
+      <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
+         class="shrink-0 px-6 py-3 bg-violet-600 hover:bg-violet-500 text-white font-semibold rounded-xl text-sm transition">
+        Download Free
+      </a>
+    </div>
+        <div class="mt-10 rounded-2xl border border-blue-900/40 bg-blue-950/20 p-5 flex flex-col sm:flex-row items-center justify-between gap-4">
+      <div>
+        <p class="font-semibold text-white text-sm">Test yourself on this chapter</p>
+        <p class="text-gray-400 text-xs mt-1">5 questions &middot; instant scoring &middot; explanations included</p>
+      </div>
+      <a href="../quiz.html?book=book2&ch=33"
+         class="shrink-0 px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white font-bold rounded-xl text-sm transition">Take the Quiz &rarr;</a>
+    </div>
+<div class="mt-8 flex justify-between text-xs">
+      <a href="b2-ch32-prompt-engineering-dba.html" class="text-gray-500 hover:text-gray-300 transition">← Previous Chapter</a>
+      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a>
+      <a href="b2-ch34-intelligent-alerting.html" class="text-violet-400 hover:text-violet-300 transition">Next Chapter →</a>
+    </div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · The AI-Powered DBA</div>
+  </footer>
+</body>
+</html>

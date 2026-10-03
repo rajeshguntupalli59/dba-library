@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 24: Intelligent Query Routing and Workload Management — The AI-Powered DBA</title>
+  <meta name="description" content="The AI-Powered DBA Chapter 24: Intelligent Query Routing and Workload Management. AI and AIOps for SQL Server, by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script></head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-violet-500 to-violet-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-violet-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 2 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-violet-600 hover:bg-violet-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6">
+      <a href="index.html" class="text-xs text-violet-400 hover:text-violet-300 transition">← All Chapters</a>
+    </div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-violet-900/40 border border-violet-800/40 text-violet-300 text-xs rounded-full font-medium">Chapter 24 of 40</span>
+    </div>
+    <div class="space-y-4 text-sm">
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 24: Intelligent Query Routing and Workload Management</h2>
+
+<p class="text-gray-300 leading-relaxed">The primary is at 92% CPU. The readable secondary sits at 11%. A reporting query that could run perfectly well on the secondary is hammering the primary — because the connection string says so, and connection strings do not think. Static routing (read-only routing lists, hardcoded connection strings per workload) was designed for a world where workloads were few and stable. In practice, workloads shift by the hour: the ETL window, the month-end close, the ad-hoc analyst surge after a product launch. The routing decision — <em>where should this query execute right now?</em> — depends on live replica lag, current load on each node, the query's own resource profile, and its tolerance for slightly stale data. That is a classification and optimization problem, and it is where AI earns its place in workload management. This chapter builds an intelligent routing layer: ML workload classification from Query Store telemetry, lag-aware replica selection, and Resource Governor integration that enforces the routing decisions the model makes.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Classifying Workloads from Query Store Telemetry</h3>
+
+<p class="text-gray-300 leading-relaxed">Intelligent routing starts with knowing what each query <em>is</em>. A query's routing suitability is determined by its resource profile and its data-freshness requirements — both inferable from Query Store history. The classification task: given a query's historical execution signature, assign it to a routing class.</p>
+
+<p class="text-gray-300 leading-relaxed">Four classes cover nearly every production workload:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">OLTP_SHORT</strong> — sub-second, high-frequency, latency-sensitive. Must stay on the primary; routing these to a secondary buys nothing and risks stale reads on data the application just wrote.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">ANALYTICAL</strong> — long-running, scan-heavy, latency-tolerant. The ideal secondary workload: it benefits most from isolation and tolerates seconds of replication lag.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">BATCH_ETL</strong> — very long-running, write-heavy or bulk operations. Primary-only (writes cannot go to secondaries), but schedulable: the model identifies them so the router can defer or throttle rather than route.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">MIXED_ADHOC</strong> — everything else: the analyst queries with unpredictable profiles. Routed dynamically based on current conditions.</p>
+
+<p class="text-gray-300 leading-relaxed">Query Store already records the features that separate these classes. Extract per-query signatures and train a classifier:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Per-query execution signatures: features for the workload classifier
+SELECT
+    qsq.query_id,
+    LEFT(qsqt.query_sql_text, 200) AS query_excerpt,
+    SUM(qsrs.count_executions) AS total_executions,
+    AVG(qsrs.avg_duration / 1000.0) AS avg_duration_ms,
+    AVG(qsrs.avg_cpu_time / 1000.0) AS avg_cpu_ms,
+    AVG(CAST(qsrs.avg_logical_io_reads AS FLOAT)) AS avg_logical_reads,
+    AVG(CAST(qsrs.avg_logical_io_writes AS FLOAT)) AS avg_logical_writes,
+    AVG(CAST(qsrs.avg_rowcount AS FLOAT)) AS avg_rowcount,
+    -- Write ratio: separates read-mostly analytics from write-heavy batch
+    AVG(CAST(qsrs.avg_logical_io_writes AS FLOAT))
+        / NULLIF(AVG(CAST(qsrs.avg_logical_io_reads AS FLOAT)), 0) AS write_read_ratio,
+    -- Execution regularity: scheduled batch vs. bursty ad-hoc
+    STDEV(qsrs.count_executions) / NULLIF(AVG(CAST(qsrs.count_executions AS FLOAT)), 0)
+        AS execution_cv,
+    MAX(qsrsi.end_time) AS last_seen
+FROM sys.query_store_query qsq
+JOIN sys.query_store_query_text qsqt ON qsqt.query_text_id = qsq.query_text_id
+JOIN sys.query_store_plan qsp ON qsp.query_id = qsq.query_id
+JOIN sys.query_store_runtime_stats qsrs ON qsrs.plan_id = qsp.plan_id
+JOIN sys.query_store_runtime_stats_interval qsrsi
+    ON qsrsi.runtime_stats_interval_id = qsrs.runtime_stats_interval_id
+WHERE qsrsi.start_time &gt; DATEADD(DAY, -14, GETUTCDATE())
+GROUP BY qsq.query_id, qsqt.query_sql_text
+HAVING SUM(qsrs.count_executions) &gt; 20;</code></pre>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import pandas as pd
+import numpy as np
+import pyodbc
+from sklearn.ensemble import RandomForestClassifier
+
+# Heuristic labeling function: bootstrap labels from domain rules,
+# then let the model generalize to the ambiguous middle.
+def heuristic_label(row) -&gt; str:
+    if row['avg_duration_ms'] &lt; 500 and row['total_executions'] &gt; 10000 \
+       and row['write_read_ratio'] &lt; 0.05:
+        return 'OLTP_SHORT'
+    if row['avg_duration_ms'] &gt; 30000 and row['write_read_ratio'] &lt; 0.01 \
+       and row['avg_logical_reads'] &gt; 100000:
+        return 'ANALYTICAL'
+    if row['write_read_ratio'] &gt; 0.2 and row['avg_duration_ms'] &gt; 60000:
+        return 'BATCH_ETL'
+    return 'MIXED_ADHOC'
+
+def train_workload_classifier(conn_str: str):
+    conn = pyodbc.connect(conn_str)
+    df = pd.read_sql("-- query above --", conn)
+    conn.close()
+
+    df['label'] = df.apply(heuristic_label, axis=1)
+    # Log-scale the heavy-tailed features before training
+    for col in ['avg_duration_ms', 'avg_cpu_ms', 'avg_logical_reads',
+                'avg_logical_writes', 'avg_rowcount', 'total_executions']:
+        df['log_' + col] = np.log1p(df[col].fillna(0))
+
+    feature_cols = (['log_' + c for c in
+                     ['avg_duration_ms', 'avg_cpu_ms', 'avg_logical_reads',
+                      'avg_logical_writes', 'avg_rowcount', 'total_executions']]
+                    + ['write_read_ratio', 'execution_cv'])
+    X = df[feature_cols].fillna(0)
+
+    model = RandomForestClassifier(
+        n_estimators=300, max_depth=10, class_weight='balanced',
+        random_state=42, n_jobs=-1)
+    model.fit(X, df['label'])
+    return model, feature_cols</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The heuristic labeling bootstrap is deliberate. Hand-labeling ten thousand queries is infeasible; pure unsupervised clustering produces classes that do not map to routing decisions. Domain-rule labels for the clear cases, plus a model that generalizes to the ambiguous middle, gives you a classifier whose classes mean something operationally. Retrain weekly — workload profiles drift as applications evolve, and a classifier trained on last quarter's signatures misroutes this quarter's new report.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Lag-Aware Replica Selection</h3>
+
+<p class="text-gray-300 leading-relaxed">Classifying a query as ANALYTICAL answers <em>whether</em> it can move. The next decision is <em>where</em> — and the answer changes minute to minute with replica lag and load. A secondary with a 4-minute redo queue is a fine target for yesterday's trend report and a terrible target for the "orders in the last 5 minutes" dashboard. The router needs two live inputs per replica: how stale it is, and how loaded it is.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Replica scorecard: staleness + load, refreshed by the router every 30 seconds
+SELECT
+    ar.replica_server_name,
+    ars.role_desc,
+    drs.synchronization_health_desc,
+    -- Staleness: seconds of data the replica is behind
+    CASE WHEN drs.redo_rate &gt; 0
+         THEN CAST(drs.redo_queue_size AS FLOAT) / drs.redo_rate
+         ELSE 9999 END AS staleness_seconds,
+    DATEDIFF(SECOND, drs.last_commit_time, SYSUTCDATETIME())
+        AS seconds_since_last_commit,
+    -- Load: active requests and recent CPU (from the replica's own DMVs
+    -- via linked server, or pushed by a per-replica collector agent)
+    r.load_active_requests,
+    r.load_cpu_percent
+FROM sys.dm_hadr_availability_replica_states ars
+JOIN sys.availability_replicas ar ON ar.replica_id = ars.replica_id
+JOIN sys.dm_hadr_database_replica_states drs ON drs.replica_id = ars.replica_id
+LEFT JOIN dba.replica_load_cache r
+    ON r.replica_server_name = ar.replica_server_name
+WHERE ars.role_desc = 'SECONDARY'
+  AND drs.is_local = 0;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The routing policy combines classification with the scorecard:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">OLTP_SHORT</strong> → primary, always. No model discretion; the staleness risk dominates.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">ANALYTICAL</strong> → the secondary minimizing a cost function: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">cost = α · staleness_seconds + β · load_cpu_percent</code>, restricted to replicas whose staleness is under the query's declared freshness tolerance. The freshness tolerance comes from the application: register it per report or per connection string label ("tolerance: 300s"), defaulting to a conservative 60 seconds.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">BATCH_ETL</strong> → primary, but the router signals the scheduler: this workload is deferrable. If primary CPU is above the contention threshold, the router returns "defer 15 minutes" instead of a connection — pushing back on the caller rather than piling onto an overloaded primary.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">MIXED_ADHOC</strong> → dynamic: route to a secondary when one satisfies the freshness tolerance <em>and</em> the primary is under pressure; otherwise primary. This is the class where the model's judgment matters most, because the right answer genuinely depends on current conditions.</p>
+
+<p class="text-gray-300 leading-relaxed">Tune α and β empirically: start with staleness weighted heavily (data correctness first), then shift weight toward load balancing as you gain confidence in the freshness-tolerance declarations. Every routing decision gets logged with its inputs — classification, scorecard snapshot, chosen target — so a wrong route is diagnosable rather than mysterious.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Enforcing Routing with Resource Governor</h3>
+
+<p class="text-gray-300 leading-relaxed">Routing decisions made in the application tier are advisory; a misconfigured connection string bypasses them silently. Resource Governor makes them enforceable inside the engine. The pattern: a classifier function that maps each session to a workload group based on the application's declared workload label (passed via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">APP_NAME()</code> or a session context value set at connect time), with each group carrying CPU, memory, and DOP caps appropriate to its class.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Workload groups: caps per routing class (create once)
+CREATE WORKLOAD GROUP rg_oltp
+    WITH (REQUEST_MAX_CPU_TIME_SEC = 30, REQUEST_MAX_MEMORY_GRANT_PERCENT = 10,
+          MAX_DOP = 4) USING [default];
+CREATE WORKLOAD GROUP rg_analytical
+    WITH (REQUEST_MAX_CPU_TIME_SEC = 3600, REQUEST_MAX_MEMORY_GRANT_PERCENT = 40,
+          MAX_DOP = 8) USING [default];
+CREATE WORKLOAD GROUP rg_batch
+    WITH (REQUEST_MAX_CPU_TIME_SEC = 14400, REQUEST_MAX_MEMORY_GRANT_PERCENT = 25,
+          MAX_DOP = 8) USING [default];
+GO
+
+-- Classifier: application declares its workload class at connect time
+-- via SESSION_CONTEXT (set by the router or the app's connection logic)
+CREATE FUNCTION dbo.rg_classifier()
+RETURNS SYSNAME WITH SCHEMABINDING AS
+BEGIN
+    DECLARE @class SYSNAME =
+        CAST(SESSION_CONTEXT(N'workload_class') AS SYSNAME);
+    RETURN CASE @class
+        WHEN N'OLTP_SHORT'  THEN N'rg_oltp'
+        WHEN N'ANALYTICAL'  THEN N'rg_analytical'
+        WHEN N'BATCH_ETL'   THEN N'rg_batch'
+        ELSE N'default'
+    END;
+END;
+GO
+ALTER RESOURCE GOVERNOR WITH (CLASSIFIER_FUNCTION = dbo.rg_classifier);
+ALTER RESOURCE GOVERNOR RECONFIGURE;
+GO</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The classifier closes the loop with the ML model: the router classifies the workload, sets <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SESSION_CONTEXT(N'workload_class')</code> on the connection it hands out, and Resource Governor enforces the resource envelope even if the query's actual behavior differs from its classification. An ANALYTICAL query that turns out to be pathologically expensive hits the group's memory grant cap instead of starving the OLTP workload sharing the instance. Monitor <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_resource_governor_workload_groups</code> for throttling events — a spike in throttled analytical queries is the signal to revisit either the classification or the caps.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">The Router Service: Architecture and Fallback</h3>
+<figure class="my-8"><img src="../images/arch-intelligent-query-routing.webp" alt="Intelligent query routing architecture: the router service classifies queries with a Query Store machine-learning model, scores read replicas on staleness plus load, applies the routing policy, and Resource Governor enforces resource caps; reads go to replicas, with fallback to the primary when inputs are uncertain or stale" class="w-full rounded-2xl border border-gray-700" loading="lazy"><figcaption class="text-sm text-gray-400 mt-3 text-center">Figure 24.1 — The intelligent query router: classify, score, route, enforce.</figcaption></figure>
+
+<p class="text-gray-300 leading-relaxed">How to read it: the application never talks to SQL Server directly — it calls <strong class="text-white">get_connection(hint, freshness)</strong>, and the <strong class="text-white">blue Router Service zone</strong> does the thinking. First it classifies the query (Query Store telemetry through a machine-learning model into OLTP_SHORT, ANALYTICAL, BATCH_ETL, or MIXED_ADHOC), then reads the <strong class="text-white">Replica Scorecard</strong> — each read replica ranked by staleness in seconds plus current load — then <strong class="text-white">Apply Routing Policy</strong> picks the cheapest replica that satisfies the query's freshness tolerance. The <strong class="text-white">purple Resource Governor Enforcement</strong> strip sets the session context on the connection it hands out, so even a misclassified query hits its memory-grant cap instead of starving OLTP. Reads land on replicas; writes and OLTP go to the <strong class="text-white">green Primary</strong>. The <strong class="text-white">orange fallback loop</strong> is the safety design: classifier uncertain, scorecard stale, or no replica fresh enough — route to the primary. The router earns trust by degrading to current behavior whenever its inputs are doubtful, which is why shadow mode is the only sane way to roll it out.</p>
+
+<p class="text-gray-300 leading-relaxed">In production, the routing logic lives in a small service (or a connection-proxy sidecar) between applications and SQL Server — not in application code, where it would be reimplemented inconsistently five times. The service exposes one operation: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">get_connection(workload_hint, freshness_tolerance_seconds)</code>. Internally it runs the pipeline from this chapter: classify the query (or accept the application's hint and verify it against the model's classification), read the replica scorecard, apply the routing policy, set the session context, and return a connection to the chosen node.</p>
+
+<p class="text-gray-300 leading-relaxed">The fallback behavior is what makes this safe to deploy. If the classifier is uncertain (low prediction confidence), if the scorecard is stale (collector lag &gt; 60 seconds), or if no secondary satisfies the freshness tolerance — route to the primary. The primary is always the safe default; intelligent routing is an optimization that earns trust by degrading to current behavior whenever its inputs are doubtful. Log every fallback with its reason. A rising fallback rate is the earliest signal that the classifier needs retraining or the telemetry pipeline needs attention.</p>
+
+<p class="text-gray-300 leading-relaxed">Roll out in shadow mode first: run the router alongside existing connection logic, log what it <em>would</em> have decided, and compare against actual performance. When the shadow decisions consistently beat the static routing — lower primary CPU during peak, no freshness violations — cut over one application at a time, starting with the reporting workload that has the most headroom in its freshness tolerance.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Classify workloads from Query Store before routing them.** A RandomForest model on per-query execution signatures (duration, CPU, logical reads/writes, write ratio, execution regularity) — bootstrapped with domain-rule labels — assigns each query to OLTP_SHORT, ANALYTICAL, BATCH_ETL, or MIXED_ADHOC. Retrain weekly as profiles drift.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Select replicas with a live staleness-plus-load scorecard.** Redo queue over redo rate gives staleness in seconds; combine with per-replica load in a cost function gated by each workload's declared freshness tolerance. Log every decision with its inputs.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Make routing enforceable with Resource Governor.** A classifier function mapping SESSION_CONTEXT workload labels to capped workload groups ensures a misclassified query hits a resource envelope instead of starving the primary's OLTP traffic.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The primary is always the safe fallback.** Uncertain classification, stale scorecards, or no fresh-enough secondary all degrade to current behavior — intelligent routing earns trust by failing back to what already works, with every fallback logged and counted.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Deploy in shadow mode and cut over per application.** Log what the router would have decided, verify it beats static routing on primary CPU and freshness compliance, then migrate reporting workloads first — they have the most freshness-tolerance headroom.</li>
+    </div>
+    <div class="mt-14 bg-violet-950/40 border border-violet-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · SQL Server</p>
+      </div>
+      <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
+         class="shrink-0 px-6 py-3 bg-violet-600 hover:bg-violet-500 text-white font-semibold rounded-xl text-sm transition">
+        Download Free
+      </a>
+    </div>
+        <div class="mt-10 rounded-2xl border border-blue-900/40 bg-blue-950/20 p-5 flex flex-col sm:flex-row items-center justify-between gap-4">
+      <div>
+        <p class="font-semibold text-white text-sm">Test yourself on this chapter</p>
+        <p class="text-gray-400 text-xs mt-1">5 questions &middot; instant scoring &middot; explanations included</p>
+      </div>
+      <a href="../quiz.html?book=book2&ch=24"
+         class="shrink-0 px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white font-bold rounded-xl text-sm transition">Take the Quiz &rarr;</a>
+    </div>
+<div class="mt-8 flex justify-between text-xs">
+      <a href="b2-ch23-ai-ha-dr.html" class="text-gray-500 hover:text-gray-300 transition">← Previous Chapter</a>
+      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a>
+      <a href="b2-ch25-ai-security-hardening.html" class="text-violet-400 hover:text-violet-300 transition">Next Chapter →</a>
+    </div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · The AI-Powered DBA</div>
+  </footer>
+</body>
+</html>

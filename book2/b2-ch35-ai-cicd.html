@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 35: AI in Database CI/CD Pipelines — The AI-Powered DBA</title>
+  <meta name="description" content="The AI-Powered DBA Chapter 35: AI in Database CI/CD Pipelines. AI and AIOps for SQL Server, by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script></head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-violet-500 to-violet-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-violet-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 2 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-violet-600 hover:bg-violet-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6">
+      <a href="index.html" class="text-xs text-violet-400 hover:text-violet-300 transition">← All Chapters</a>
+    </div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-violet-900/40 border border-violet-800/40 text-violet-300 text-xs rounded-full font-medium">Chapter 35 of 40</span>
+    </div>
+    <div class="space-y-4 text-sm">
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 35: AI in Database CI/CD Pipelines</h2>
+
+<p class="text-gray-300 leading-relaxed">Book 5 covers CI/CD mechanics for databases — pipeline structure, dacpac builds, migration runners, environment promotion. This chapter assumes that machinery exists and covers only where AI adds leverage inside it. The pipeline already knows <em>how</em> to deploy; AI helps it decide <em>whether this deploy is safe</em>, <em>draft the migration script</em> for human review, <em>detect drift</em> between environments with severity judgment, and <em>triage post-deploy regressions</em> without waking anyone. Four leverage points, each with a concrete pattern — no pipeline tutorials, just the intelligence layer.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Deployment Risk Scoring: A Go/No-Go Signal</h3>
+
+<p class="text-gray-300 leading-relaxed">Every deploy carries risk, but pipelines treat all deploys identically: same checks, same approvals, same anxiety. A risk-scoring model changes that by producing a per-deploy risk score from features the pipeline already has — the schema diff, the workload context, and the deploy's history:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Diff features:</strong> tables altered, columns added/dropped, indexes dropped or rebuilt, stored procedures changed. Dropped columns and offline index rebuilds score high; new stored procedures score low.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Hot-object overlap:</strong> does the diff touch objects in the top Query Store consumers? Altering a table that serves 40% of batch requests is riskier than altering a table nobody queries. This is the feature most teams miss — risk is not a property of the diff alone, but of the diff <em>intersected with production workload</em>:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Hot-object overlap: which changed tables are production-critical?
+-- Feed the deploy's changed-table list as a table variable
+DECLARE @changed_tables TABLE (schema_name sysname, table_name sysname);
+-- (populated by the pipeline from the schema diff)
+
+SELECT
+    c.schema_name,
+    c.table_name,
+    SUM(qsrs.count_executions) AS total_executions_7d,
+    SUM(qsrs.avg_duration * qsrs.count_executions) / 1000.0 AS total_duration_sec_7d,
+    COUNT(DISTINCT qsq.query_id) AS distinct_queries
+FROM @changed_tables c
+JOIN sys.tables t
+    ON t.name = c.table_name
+    AND t.schema_id = SCHEMA_ID(c.schema_name)
+-- Queries touching this table via Query Store plan references
+JOIN sys.query_store_plan qsp
+    ON qsp.query_plan LIKE '%Object="%' + c.schema_name + '.' + c.table_name + '%"%' ESCAPE '\'
+JOIN sys.query_store_query qsq ON qsq.query_id = qsp.query_id
+JOIN sys.query_store_runtime_stats qsrs ON qsrs.plan_id = qsp.plan_id
+JOIN sys.query_store_runtime_stats_interval qsrsi
+    ON qsrsi.runtime_stats_interval_id = qsrs.runtime_stats_interval_id
+WHERE qsrsi.start_time &gt; DATEADD(DAY, -7, GETUTCDATE())
+GROUP BY c.schema_name, c.table_name
+ORDER BY total_duration_sec_7d DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Lock-risk operations:</strong> schema changes that take restrictive locks (offline rebuilds, certain ALTER TABLE operations) during business hours score high; the same operations in a maintenance window score lower.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">History features:</strong> has this object been involved in a failed or rolled-back deploy before? Objects with incident history carry a multiplier.</p>
+
+<p class="text-gray-300 leading-relaxed">The model output drives a three-way gate: <strong class="text-white">auto-deploy</strong> (low risk — new procedures, additive changes on cold objects), <strong class="text-white">require approval</strong> (medium risk — hot-object overlap, index changes), <strong class="text-white">block</strong> (high risk — destructive operations, hot-table schema locks during business hours). Train the scorer on your deploy history: features from past diffs labeled with deploy outcome (clean, rolled back, incident). Even a simple logistic regression on a few dozen labeled deploys beats uniform treatment — because the current alternative is not a smarter gate, it is no gate at all.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">AI-Generated Migration Scripts — Generate, Then Verify</h3>
+
+<p class="text-gray-300 leading-relaxed">The highest-leverage AI use in the deploy path is drafting migration scripts from intent: "add a non-nullable <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CustomerTier</code> column to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Sales.Customers</code> with a default, backfill existing rows in batches." The model produces T-SQL; the pipeline then <em>proves</em> the script before any human reviews it. The order matters: generate, then verify, then human review. Never generate-and-apply.</p>
+
+<p class="text-gray-300 leading-relaxed">The generation prompt carries the schema context (table definition, row count from stats, existing indexes and constraints) plus hard constraints:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>MIGRATION_GEN_PROMPT = """
+You are a SQL Server migration script author. Draft a T-SQL migration script
+from the requested change and the schema context provided.
+
+HARD CONSTRAINTS:
+- Valid T-SQL only. Reference only objects present in the schema context.
+- Batch data modifications (TOP N loops) for tables over 1M rows; never a
+  single unbatched UPDATE on a large table.
+- Wrap in explicit transaction with TRY/CATCH and rollback on error.
+- Idempotent where possible: guard with IF NOT EXISTS / COL_LENGTH checks.
+- Never emit DROP TABLE, TRUNCATE TABLE, or data-loss column changes.
+  If the request implies data loss, refuse and explain why.
+
+OUTPUT: a single JSON object:
+{
+  "script": "&lt;the T-SQL script&gt;",
+  "risk_notes": ["&lt;locking, duration, or rollback considerations&gt;"],
+  "estimated_lock_impact": "low|medium|high",
+  "refused": &lt;boolean&gt;
+}
+"""</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The verification stage is what makes this safe enough for production pipelines. It runs automatically on every generated script:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">1. Parse and destructive-op scan.</strong> Parse the T-SQL and reject on any destructive statement the constraints forbid — defense in depth behind the prompt's own refusal rule.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">2. Dry-run on a restored clone.</strong> Restore last night's backup to an isolated instance, run the script, measure duration and log growth. A backfill the model estimated at "low impact" that takes 40 minutes on the clone gets flagged before it touches staging.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">3. Idempotency check.</strong> Run the script twice against the clone; the second run must be a clean no-op. Non-idempotent migrations are the classic cause of half-applied deploy retries.</p>
+
+<p class="text-gray-300 leading-relaxed">Only after all three verifications pass does the script reach human review — and the reviewer sees the script <em>plus</em> the verification report (dry-run duration, lock impact, idempotency result) <em>plus</em> the model's risk notes. The human approves a proven artifact, not a guess. The model proposes, the pipeline proves, the DBA approves.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Drift Detection with AI-Classified Severity</h3>
+
+<p class="text-gray-300 leading-relaxed">Environments drift: someone hotfixes production directly, a permission gets granted manually, an index gets dropped "temporarily" during an incident and never restored. Traditional drift detection diffs schema snapshots and reports everything — a hundred-line diff where one line matters. AI adds the missing layer: <strong class="text-white">severity classification</strong> of each drift item.</p>
+
+<p class="text-gray-300 leading-relaxed">The pipeline snapshots the catalog per environment on a schedule — sys.tables, sys.indexes, sys.sql_logins, sys.database_permissions, or a dacpac extract — and diffs them. Each diff item goes to a classifier with four severity classes:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Cosmetic:</strong> extended properties, description changes. Log only.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Expected:</strong> matches a known change ticket or deploy record. Auto-reconcile by updating the baseline snapshot.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Breaking:</strong> missing index, dropped column, changed data type, revoked permission that an application depends on. Generate a remediation script (recreate the index, re-grant the permission) for human review — this is the migration-generation pattern applied to drift.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Security-relevant:</strong> new login, elevated role membership, new permission grant outside the deploy pipeline. Page immediately — drift in the security surface is never auto-remediated.</p>
+
+<p class="text-gray-300 leading-relaxed">The classifier itself can be a rules-assisted model: deterministic rules catch the obvious cases (any <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sysadmin</code> role grant is security-relevant, full stop), and the model handles the ambiguous middle — is this missing index breaking or was it intentionally dropped as unused? It answers by checking <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_db_index_usage_stats</code>: an index with zero reads since the last restart that disappeared is probably intentional cleanup; one with heavy reads is a breaking regression someone needs to explain.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Drift triage helper: was a dropped index actually used?
+-- Run for each index present in baseline but missing in production
+SELECT
+    OBJECT_SCHEMA_NAME(i.object_id) AS schema_name,
+    OBJECT_NAME(i.object_id) AS table_name,
+    i.name AS index_name,
+    ius.user_seeks + ius.user_scans + ius.user_lookups AS total_reads,
+    ius.user_updates AS total_writes,
+    ius.last_user_seek,
+    ius.last_user_scan
+FROM sys.indexes i
+LEFT JOIN sys.dm_db_index_usage_stats ius
+    ON ius.object_id = i.object_id
+    AND ius.index_id = i.index_id
+    AND ius.database_id = DB_ID()
+WHERE i.object_id = OBJECT_ID(@schema_name + '.' + @table_name)
+  AND i.name = @index_name;
+-- total_reads = 0 since restart: likely intentional cleanup (Expected)
+-- total_reads high: breaking drift, generate remediation (Breaking)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Post-Deploy Verification the Pipeline Triages Itself</h3>
+
+<p class="text-gray-300 leading-relaxed">The deploy succeeded — but did it succeed <em>well</em>? Post-deploy verification watches Query Store for a window after each deploy, scoped to the changed objects, and the AI layer triages whatever it finds. Without scoping, post-deploy monitoring drowns in unrelated workload noise; without triage, every blip pages someone.</p>
+
+<p class="text-gray-300 leading-relaxed">The pattern: for N minutes after deploy completion (30–120 depending on deploy risk score), the pipeline compares per-query runtime stats for queries touching changed objects against their pre-deploy baseline from Query Store. Deltas get classified: <strong class="text-white">regression</strong> (statistically significant slowdown on a changed-object query — recommend plan investigation or stats update), <strong class="text-white">expected change</strong> (plan shape changed but performance neutral or better — log and close), <strong class="text-white">noise</strong> (within normal variance — suppress).</p>
+
+<p class="text-gray-300 leading-relaxed">For genuine regressions, the pipeline reuses the self-healing loop from Chapter 10 — LLM analysis of the regressed query recommending statistics refresh, plan force via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sp_query_store_force_plan</code>, or escalation — but scoped to the deploy's blast radius and time-boxed to the verification window. If the regression is severe (say, 3x slowdown on a top-10 query) and confidence is high, the pipeline raises a <strong class="text-white">rollback recommendation</strong>: not an automatic rollback, but a paged recommendation with the evidence attached, so the human decision takes seconds instead of an hour of forensics.</p>
+
+<p class="text-gray-300 leading-relaxed">This closes the CI/CD intelligence loop: risk scoring gates the deploy going in, verification watches it coming out, and both feed the same deploy-history dataset that trains the next risk model. Every deploy makes the next deploy's risk score smarter.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><figure class="my-8">
+  <img src="../images/arch-b2-ch35-ai-cicd.webp" alt="AI-assisted database CI/CD pipeline: schema diff flows through risk scoring, migration drafting, verification, human review, deployment, and a post-deploy watch that branches to triage or done." class="w-full rounded-2xl border border-gray-700" />
+  <figcaption class="mt-3 text-sm text-gray-400 leading-relaxed"><strong class="text-gray-200">Figure 35.1 — AI-assisted database CI/CD.</strong> From schema diff to post-deploy watch, the pipeline scores risk, drafts migrations, verifies, and triages regressions on its own.</figcaption>
+</figure>
+
+<p class="text-gray-300 leading-relaxed">Seven stages run left to right. Blue <strong class="text-white">Diff</strong> detects the schema change; amber <strong class="text-white">Risk Score</strong> classifies it as auto, approve, or block. Purple <strong class="text-white">Draft</strong> generates the migration script from the stated intent; teal <strong class="text-white">Verify</strong> runs parse scans, clone dry-runs, and idempotency checks. Orange <strong class="text-white">Review</strong> is the human approval of script plus verification report; green <strong class="text-white">Deploy</strong> applies it; and violet <strong class="text-white">Watch</strong> monitors Query Store scoped to the changed objects. If the watch detects a regression, the red <strong class="text-white">Triage</strong> stage investigates (statistics, forced plans); otherwise the dark-green <strong class="text-white">Done</strong> stage closes it out. The pipeline's ambition: the database change triages itself, and the human reviews evidence instead of writing scripts.</p></div>
+
+<p class="text-gray-300 leading-relaxed">*The CI/CD intelligence loop: risk scoring gates entry, verification watches exit, drift detection feeds remediation drafts, and every outcome trains the next risk score.*</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Guardrails for AI in the Deploy Path</h3>
+
+<p class="text-gray-300 leading-relaxed">AI in the deploy path earns trust through constraints, not capabilities. The guardrail set:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Policy as prompt, enforced as code.</strong> The migration prompt's prohibitions are re-checked by the verification stage's destructive-op scan. Prompt rules without code enforcement are suggestions; code without prompt guidance produces false rejections. You need both.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Blast-radius limits.</strong> AI-generated scripts deploy to one database per run, with canary environments first. A script that passes verification on the clone still meets staging before production — the pipeline stages do not collapse just because a model wrote the script.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Destructive operations are never AI-authorized.</strong> Any diff containing drops, truncates, or data-loss column changes routes to mandatory human review regardless of risk score. The model may draft the script; it may never approve its own blast radius.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Full audit of model-generated artifacts.</strong> Log the prompt version, model version, generated script, verification report, reviewer identity, and deploy outcome together. When a generated migration causes an incident six months later, this record is the difference between "we don't know what happened" and a precise postmortem.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Rollback plan before execution.</strong> No AI-generated script runs without a documented rollback — the inverse script or a restore point — attached to the same change record. Generation is cheap; reversibility is what makes it safe.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Score deploy risk from diff intersected with workload.** Hot-object overlap via Query Store, lock-risk operations, and incident history drive a three-way gate — auto-deploy, require approval, or block — instead of treating every deploy identically.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The model proposes, the pipeline proves, the DBA approves.** AI-drafted migrations pass parse scans, clone dry-runs, and idempotency checks before human review — the reviewer approves a proven artifact, not a guess.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Classify drift by severity, not just detect it.** Cosmetic, expected, breaking, and security-relevant drift get different handling — and usage stats tell you whether a missing index was intentional cleanup or a breaking regression.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Scope post-deploy verification to changed objects and triage the deltas.** Query Store regression watch on the deploy's blast radius, with rollback recommendations — not automatic rollbacks — for severe, high-confidence regressions.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Constrain AI in the deploy path harder than anywhere else.** Blast-radius limits, mandatory human review for destructive ops, full artifact audit, and a rollback plan attached before any generated script executes.</li>
+    </div>
+    <div class="mt-14 bg-violet-950/40 border border-violet-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · SQL Server</p>
+      </div>
+      <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
+         class="shrink-0 px-6 py-3 bg-violet-600 hover:bg-violet-500 text-white font-semibold rounded-xl text-sm transition">
+        Download Free
+      </a>
+    </div>
+        <div class="mt-10 rounded-2xl border border-blue-900/40 bg-blue-950/20 p-5 flex flex-col sm:flex-row items-center justify-between gap-4">
+      <div>
+        <p class="font-semibold text-white text-sm">Test yourself on this chapter</p>
+        <p class="text-gray-400 text-xs mt-1">5 questions &middot; instant scoring &middot; explanations included</p>
+      </div>
+      <a href="../quiz.html?book=book2&ch=35"
+         class="shrink-0 px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white font-bold rounded-xl text-sm transition">Take the Quiz &rarr;</a>
+    </div>
+<div class="mt-8 flex justify-between text-xs">
+      <a href="b2-ch34-intelligent-alerting.html" class="text-gray-500 hover:text-gray-300 transition">← Previous Chapter</a>
+      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a>
+      <a href="b2-ch36-privacy-preserving-ml.html" class="text-violet-400 hover:text-violet-300 transition">Next Chapter →</a>
+    </div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · The AI-Powered DBA</div>
+  </footer>
+</body>
+</html>

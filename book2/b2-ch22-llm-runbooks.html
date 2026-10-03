@@ -1,0 +1,349 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 22: LLM-Powered Runbook Generation and Documentation — The AI-Powered DBA</title>
+  <meta name="description" content="The AI-Powered DBA Chapter 22: LLM-Powered Runbook Generation and Documentation. AI and AIOps for SQL Server, by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script></head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-violet-500 to-violet-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-violet-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 2 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-violet-600 hover:bg-violet-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6">
+      <a href="index.html" class="text-xs text-violet-400 hover:text-violet-300 transition">← All Chapters</a>
+    </div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-violet-900/40 border border-violet-800/40 text-violet-300 text-xs rounded-full font-medium">Chapter 22 of 40</span>
+    </div>
+    <div class="space-y-4 text-sm">
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 22: LLM-Powered Runbook Generation and Documentation</h2>
+
+<p class="text-gray-300 leading-relaxed">Runbooks die the day after they are written. Everyone who has worked operations has seen it: a beautifully documented failover procedure, written during a calm sprint, that is dangerously wrong eighteen months later when the 3 AM page arrives — because the job steps changed, the server names changed, the escalation contacts changed, and nobody updated the document. The traditional answer is discipline: "keep the runbooks current." Discipline does not scale across hundreds of SQL Agent jobs, dozens of maintenance plans, and a rotating cast of DBAs. The scalable answer is generation: derive runbooks from the live system instead of writing them from memory, and use LLMs to turn raw configuration into human-readable procedures. When the system changes, you regenerate. The document can never be stale, because it is a projection of the current state — annotated, explained, and structured by a model that never gets tired of writing documentation.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">The Source of Truth Is msdb, Not Confluence</h3>
+
+<p class="text-gray-300 leading-relaxed">A runbook that describes what a job is <em>supposed</em> to do is fiction. A runbook generated from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">msdb</code> — the actual job definitions, step commands, schedules, and execution history — is evidence. SQL Server already stores nearly everything a runbook needs: what each job does (step commands), when it runs (schedules), what it depends on (step flow logic with on-success/on-failure actions), who gets notified (operators), and how it has behaved recently (run history with durations and outcomes).</p>
+
+<p class="text-gray-300 leading-relaxed">The extraction query below pulls the complete operational picture for every enabled job on an instance. This is the raw material the LLM will turn into documentation:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Full job inventory: definitions, steps, schedules, operators, recent history
+SELECT
+    j.name AS job_name,
+    j.description AS job_description,
+    j.enabled AS job_enabled,
+    SUSER_SNAME(j.owner_sid) AS job_owner,
+    js.step_id,
+    js.step_name,
+    js.subsystem AS step_type,           -- TSQL, CmdExec, PowerShell, SSIS...
+    LEFT(js.command, 4000) AS step_command,
+    js.on_success_action,
+    js.on_fail_action,
+    js.retry_attempts,
+    js.retry_interval AS retry_interval_minutes,
+    sch.name AS schedule_name,
+    CASE sch.freq_type
+        WHEN 4 THEN 'Daily'
+        WHEN 8 THEN 'Weekly'
+        WHEN 16 THEN 'Monthly'
+        WHEN 64 THEN 'On SQL Agent startup'
+        ELSE 'Other (' + CAST(sch.freq_type AS VARCHAR(10)) + ')'
+    END AS schedule_type,
+    STUFF(STUFF(RIGHT('000000' + CAST(sch.active_start_time AS VARCHAR(6)), 6), 3, 0, ':'), 6, 0, ':') AS start_time_hhmmss,
+    op.name AS notify_operator,
+    j.notify_level_email,
+    -- Recent execution behavior: last 30 days
+    h.recent_runs,
+    h.failed_runs,
+    ROUND(h.avg_duration_seconds, 1) AS avg_duration_seconds,
+    h.last_run_outcome
+FROM msdb.dbo.sysjobs j
+JOIN msdb.dbo.sysjobsteps js ON js.job_id = j.job_id
+LEFT JOIN msdb.dbo.sysjobschedules jsch ON jsch.job_id = j.job_id
+LEFT JOIN msdb.dbo.sysschedules sch ON sch.schedule_id = jsch.schedule_id
+LEFT JOIN msdb.dbo.sysoperators op ON op.id = j.notify_email_operator_id
+OUTER APPLY (
+    SELECT
+        COUNT(*) AS recent_runs,
+        SUM(CASE WHEN jh.run_status = 0 THEN 1 ELSE 0 END) AS failed_runs,
+        AVG(CAST(
+            ((jh.run_duration / 1000000) * 3600)
+          + (((jh.run_duration / 10000) % 100) * 60)
+          + ((jh.run_duration / 100) % 100)
+          + ((jh.run_duration % 100) / 100.0)
+        AS FLOAT)) AS avg_duration_seconds,
+        MAX(CASE jh.run_status
+            WHEN 1 THEN 'Succeeded' WHEN 0 THEN 'Failed'
+            WHEN 2 THEN 'Retry' WHEN 3 THEN 'Cancelled' END) AS last_run_outcome
+    FROM msdb.dbo.sysjobhistory jh
+    WHERE jh.job_id = j.job_id
+      AND jh.step_id = 0  -- job-level outcome rows
+      AND msdb.dbo.agent_datetime(jh.run_date, jh.run_time)
+          &gt; DATEADD(DAY, -30, GETDATE())
+) h
+WHERE j.enabled = 1
+ORDER BY j.name, js.step_id;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Notice the history rollup: average duration, failure counts, and last outcome over the trailing 30 days. A runbook that says "this backup job usually takes 42 minutes and failed twice last month" is operationally useful in a way that a static description never is. It tells the on-call engineer what "normal" looks like before they have to decide whether the current run is abnormal.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">The Generation Pipeline</h3>
+
+<p class="text-gray-300 leading-relaxed">The pipeline has three stages: <strong class="text-white">extract</strong> (the query above, plus incident ticket exports if you have them), <strong class="text-white">generate</strong> (LLM turns structured job data into a runbook document following your template), and <strong class="text-white">publish</strong> (write to your docs site, wiki, or a versioned Markdown repository). Regeneration runs on a schedule — weekly is typical — and on every deployment that touches jobs.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import pyodbc
+import json
+from datetime import datetime
+from openai import OpenAI
+
+RUNBOOK_SYSTEM_PROMPT = """
+You are a senior SQL Server DBA writing an operational runbook.
+You receive structured data about a SQL Agent job: its steps, commands,
+schedules, notification operators, and 30-day execution history.
+
+Write a runbook in Markdown with EXACTLY these sections:
+1. Purpose — one paragraph: what this job does and why it exists.
+2. Schedule &amp; Dependencies — when it runs, what must complete first.
+3. Step-by-Step Procedure — each step explained in plain language. For T-SQL
+   steps, summarize what the command accomplishes; do NOT paste the full
+   command unless it is under 5 lines. For CmdExec/PowerShell steps, describe
+   the external action and its expected side effects.
+4. Normal Behavior — typical duration and success pattern from the history data.
+5. Failure Playbook — for each step, what its on-fail action does, the most
+   likely failure causes given the step type, and the first three diagnostic
+   checks (with specific DMV or msdb queries where applicable).
+6. Escalation — who is notified automatically and when to page a human.
+
+Rules:
+- Ground every claim in the provided data. Never invent server names,
+  schedules, or contacts.
+- If the job has failed runs in the history window, call them out explicitly
+  with dates and reference the failure playbook section.
+- Keep it under 600 words. On-call engineers read these at 3 AM.
+"""
+
+def generate_runbook(job_name: str, job_rows: list[dict], llm: OpenAI) -&gt; str:
+    """Generate a Markdown runbook for one SQL Agent job."""
+    resp = llm.chat.completions.create(
+        model="gpt-4o",
+        temperature=0.2,  # low but nonzero: structured prose, not rigid templates
+        messages=[
+            {"role": "system", "content": RUNBOOK_SYSTEM_PROMPT},
+            {"role": "user", "content": json.dumps(
+                {"job_name": job_name, "job_data": job_rows}, indent=2, default=str)},
+        ],
+        max_tokens=3000,
+    )
+    return resp.choices[0].message.content
+
+
+def regenerate_all_runbooks(conn_str: str, llm: OpenAI, output_dir: str):
+    """Extract every enabled job and regenerate its runbook Markdown file."""
+    conn = pyodbc.connect(conn_str)
+    # ... run the extraction query from the previous section ...
+    jobs: dict[str, list[dict]] = {}
+    # (group rows by job_name)
+    for job_name, rows in jobs.items():
+        markdown = generate_runbook(job_name, rows, llm)
+        safe_name = "".join(c if c.isalnum() else "_" for c in job_name)
+        path = f"{output_dir}/{safe_name}.md"
+        header = (
+            f"&lt;!-- AUTO-GENERATED {datetime.utcnow().isoformat()}Z — "
+            f"do not edit by hand; regenerate via regenerate_all_runbooks --&gt;\n\n"
+        )
+        with open(path, "w") as f:
+            f.write(header + markdown)
+        print(f"wrote {path}")</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The auto-generated header comment is load-bearing process, not decoration. It tells every reader — and every future LLM that ingests these docs — that the file is a projection of live configuration, and that hand edits will be overwritten. Runbook repositories without this discipline accumulate the worst of both worlds: generated docs that someone "fixed" by hand, which then silently diverge again.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Inline Documentation with Extended Properties</h3>
+
+<p class="text-gray-300 leading-relaxed">Job-level runbooks cover scheduled operations. For the database objects themselves — stored procedures, views, tables with non-obvious semantics — the documentation should live <em>with</em> the object, in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">MS_Description</code> extended properties. Here the LLM's job is narrower and higher-value: read a stored procedure body and write the three-line summary a human would write after studying it for twenty minutes.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import re
+
+DOCSTRING_PROMPT = """
+You are documenting a SQL Server stored procedure for a DBA team.
+Read the procedure definition and write a concise MS_Description value:
+- Line 1: what the procedure does (one sentence).
+- Line 2: key inputs/outputs and side effects.
+- Line 3: warnings (locks held, long runtime, destructive operations).
+Max 400 characters total. Plain text, no markdown.
+"""
+
+def document_undocumented_procs(conn_str: str, llm: OpenAI, apply: bool = False):
+    """Generate MS_Description values for procedures that lack them."""
+    conn = pyodbc.connect(conn_str)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT s.name AS schema_name, p.name AS proc_name,
+               OBJECT_DEFINITION(p.object_id) AS definition
+        FROM sys.procedures p
+        JOIN sys.schemas s ON s.schema_id = p.schema_id
+        WHERE NOT EXISTS (
+            SELECT 1 FROM sys.extended_properties ep
+            WHERE ep.major_id = p.object_id AND ep.minor_id = 0
+              AND ep.name = 'MS_Description'
+        )
+          AND p.is_ms_shipped = 0;
+    """)
+    for schema, proc, definition in cur.fetchall():
+        if not definition or len(definition) &gt; 20000:
+            continue  # skip encrypted or pathological bodies
+        resp = llm.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0.2,
+            messages=[
+                {"role": "system", "content": DOCSTRING_PROMPT},
+                {"role": "user", "content": definition[:12000]},
+            ],
+            max_tokens=300,
+        )
+        description = resp.choices[0].message.content.strip()
+        print(f"[{schema}].[{proc}]: {description[:80]}...")
+        if apply:
+            # Parameterize identifiers; description goes through sp_addextendedproperty
+            cur.execute(
+                "EXEC sys.sp_addextendedproperty @name=N'MS_Description', "
+                "@value=?, @level0type=N'SCHEMA', @level0name=?, "
+                "@level1type=N'PROCEDURE', @level1name=?;",
+                (description, schema, proc),
+            )
+    if apply:
+        conn.commit()
+    conn.close()</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Run this in dry-run mode first (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">apply=False</code>), review the generated descriptions in bulk, then apply. The review pass is fast — a DBA can scan a hundred generated descriptions in twenty minutes — and it catches the cases where the model misunderstood an ambiguous procedure. Over time, make extended-property documentation part of your deployment checklist: a migration that creates a procedure without <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">MS_Description</code> fails the pipeline check, and the generator fills the gap for legacy objects.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Drift Detection: When the Runbook and Reality Diverge</h3>
+
+<p class="text-gray-300 leading-relaxed">Generation solves staleness only if regeneration actually happens. The backstop is drift detection: a scheduled comparison between the last generated runbook inputs and the current live configuration. If a job's steps, schedule, or notification operators changed since the runbook was generated, the runbook is flagged as stale and regeneration is triggered automatically.</p>
+
+<p class="text-gray-300 leading-relaxed">The cheapest robust implementation hashes the canonical job definition and stores the hash alongside the generated document:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Canonical job fingerprint: changes when anything operationally meaningful changes
+SELECT
+    j.name AS job_name,
+    CHECKSUM_AGG(
+        CHECKSUM(
+            js.step_id, js.step_name, js.subsystem,
+            js.command, js.on_success_action, js.on_fail_action,
+            js.retry_attempts
+        )
+    ) AS steps_checksum,
+    CHECKSUM_AGG(
+        CHECKSUM(sch.name, sch.freq_type, sch.freq_interval,
+                 sch.active_start_time, sch.active_end_time)
+    ) AS schedules_checksum,
+    CHECKSUM_AGG(
+        CHECKSUM(op.name, j.notify_level_email)
+    ) AS notify_checksum
+FROM msdb.dbo.sysjobs j
+JOIN msdb.dbo.sysjobsteps js ON js.job_id = j.job_id
+LEFT JOIN msdb.dbo.sysjobschedules jsch ON jsch.job_id = j.job_id
+LEFT JOIN msdb.dbo.sysschedules sch ON sch.schedule_id = jsch.schedule_id
+LEFT JOIN msdb.dbo.sysoperators op ON op.id = j.notify_email_operator_id
+WHERE j.enabled = 1
+GROUP BY j.name;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Store these checksums in a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dba.runbook_fingerprints</code> table each time you generate. A SQL Agent job that recomputes the fingerprints hourly and compares them to the stored values detects drift within the hour — and the alert it raises names the exact job and which aspect changed (steps, schedule, or notifications), so the on-call engineer knows whether to regenerate immediately or at the next scheduled run.</p>
+
+<p class="text-gray-300 leading-relaxed">This same fingerprinting pattern extends beyond Agent jobs. Fingerprint maintenance plan definitions, linked server configurations, and database mail profiles. Any operational configuration that a runbook describes should have a fingerprint that a runbook's freshness can be checked against. Drift detection turns "keep docs current" from a cultural aspiration into a monitored property with an alert.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Incident-Driven Runbooks: Learning from the Ticket Queue</h3>
+
+<p class="text-gray-300 leading-relaxed">Configuration-derived runbooks cover the <em>known</em> operations. The second source of runbook material is incident history: the tickets, postmortems, and war-room notes that capture what actually went wrong and what actually fixed it. Most organizations have this knowledge scattered across a ticketing system, a chat archive, and three senior engineers' memories.</p>
+
+<p class="text-gray-300 leading-relaxed">The practical pattern is a quarterly "runbook mining" pass. Export resolved database incidents from the last quarter — title, timeline, root cause, resolution steps — and ask the LLM to do two things: first, cluster incidents into recurring failure modes (blocking chains from the same ETL job, tempdb pressure during month-end, AG failover flapping on the same replica); second, draft or update a troubleshooting runbook per cluster, grounded strictly in the resolution steps that appear across multiple tickets.</p>
+
+<p class="text-gray-300 leading-relaxed">Grounding matters enormously here. An LLM summarizing one ticket will happily generalize a one-off workaround into recommended practice. Require that every recommended step cite at least two independent incidents where it was the actual resolution. Steps that appear once go into an "observed once" appendix, not the main procedure. This is the same evidence bar you would apply to a human writing the runbook from memory — the model just does the clustering across hundreds of tickets that no human has time to read.</p>
+
+<p class="text-gray-300 leading-relaxed">Pair each incident-derived runbook with the diagnostic queries it references. When the runbook says "check for blocking chains," it should link to the specific blocking query from your monitoring toolkit — the one from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_requests</code> joining to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_sql_text</code> that your team actually uses — not a generic description. Generated runbooks earn trust when every diagnostic step is copy-paste executable.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">The Review Workflow: Trust but Verify</h3>
+
+<p class="text-gray-300 leading-relaxed">Generated documentation still needs human review — but review of <em>drafts</em>, which is an order of magnitude cheaper than writing from scratch. The workflow that works in practice:</p>
+
+<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Generate into a pull request, not into production docs.</strong> The pipeline writes Markdown files to a docs repository branch and opens a PR. A DBA reviews the diff — which, for unchanged jobs, is empty — and merges. Review effort concentrates exactly where the system changed.</p>
+
+<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Require review only on material changes.</strong> Fingerprint comparison tells you whether the underlying job changed. If only the history rollup changed (durations drifted, a failure occurred), auto-merge and note it in the PR description. Reserve human eyes for new jobs, changed steps, and changed failure behavior.</p>
+
+<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Track a documentation coverage metric.</strong> The fraction of enabled jobs with a current (fingerprint-matching) runbook, and the fraction of stored procedures with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">MS_Description</code>. Report it alongside your other operational metrics. What gets measured gets generated.</p>
+
+<p class="text-gray-300 leading-relaxed">4. <strong class="text-white">Expire aggressively.</strong> Any runbook whose fingerprint has not been re-verified in 30 days is marked "unverified" in its header, even if nothing changed. Verification is cheap (recompute checksums); the mark keeps the team honest about what they have actually confirmed versus what they assume.</p>
+
+<p class="text-gray-300 leading-relaxed">Teams that adopt this workflow typically reach 90%+ runbook coverage within a quarter, starting from near zero — not because anyone worked harder at documentation, but because the marginal cost of documenting the next job fell to a PR review. That is the real promise of LLM-powered documentation: not better prose, but documentation economics that finally work.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Generate runbooks from msdb, don't write them from memory.** Job definitions, step commands, schedules, operators, and 30-day execution history from msdb.dbo.sysjobs and sysjobhistory give the LLM evidence-based raw material, so the document is a projection of live configuration rather than someone's recollection.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Include recent execution behavior in every runbook.** Average duration, failure counts, and last outcome over the trailing 30 days tell the on-call engineer what "normal" looks like — the context they need most at 3 AM.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Detect drift with job fingerprints, not good intentions.** CHECKSUM_AGG over steps, schedules, and notifications, recomputed hourly and compared against the values stored at generation time, turns "docs are current" into a monitored property with an alert.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Mine incident history for troubleshooting runbooks, with an evidence bar.** Cluster resolved tickets into recurring failure modes and require every recommended step to cite at least two independent incidents; one-off workarounds go in an appendix, not the procedure.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Review drafts in pull requests, auto-merge the routine.** Fingerprint comparison focuses human review exactly where jobs changed; coverage metrics and 30-day verification expiry keep the system honest over time.</li>
+    </div>
+    <div class="mt-14 bg-violet-950/40 border border-violet-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · SQL Server</p>
+      </div>
+      <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
+         class="shrink-0 px-6 py-3 bg-violet-600 hover:bg-violet-500 text-white font-semibold rounded-xl text-sm transition">
+        Download Free
+      </a>
+    </div>
+        <div class="mt-10 rounded-2xl border border-blue-900/40 bg-blue-950/20 p-5 flex flex-col sm:flex-row items-center justify-between gap-4">
+      <div>
+        <p class="font-semibold text-white text-sm">Test yourself on this chapter</p>
+        <p class="text-gray-400 text-xs mt-1">5 questions &middot; instant scoring &middot; explanations included</p>
+      </div>
+      <a href="../quiz.html?book=book2&ch=22"
+         class="shrink-0 px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white font-bold rounded-xl text-sm transition">Take the Quiz &rarr;</a>
+    </div>
+<div class="mt-8 flex justify-between text-xs">
+      <a href="b2-ch21-nlq-self-service.html" class="text-gray-500 hover:text-gray-300 transition">← Previous Chapter</a>
+      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a>
+      <a href="b2-ch23-ai-ha-dr.html" class="text-violet-400 hover:text-violet-300 transition">Next Chapter →</a>
+    </div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · The AI-Powered DBA</div>
+  </footer>
+</body>
+</html>

@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 25: AI-Driven Security Hardening — The AI-Powered DBA</title>
+  <meta name="description" content="The AI-Powered DBA Chapter 25: AI-Driven Security Hardening. AI and AIOps for SQL Server, by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script></head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-violet-500 to-violet-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-violet-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 2 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-violet-600 hover:bg-violet-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6">
+      <a href="index.html" class="text-xs text-violet-400 hover:text-violet-300 transition">← All Chapters</a>
+    </div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-violet-900/40 border border-violet-800/40 text-violet-300 text-xs rounded-full font-medium">Chapter 25 of 40</span>
+    </div>
+    <div class="space-y-4 text-sm">
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 25: AI-Driven Security Hardening</h2>
+
+<p class="text-gray-300 leading-relaxed">Security hardening checklists are static. Attackers are not. The gap between "we ran the hardening checklist last quarter" and "we would notice a compromised service account tonight" is where breaches live — and it is a detection problem, not a configuration problem. This chapter does not re-teach the hardening baseline (disable <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">xp_cmdshell</code>, rename <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sa</code>, least privilege — you know these). It covers what AI changes: continuously scoring your attack surface from live catalog data, detecting anomalous access patterns that no static rule anticipates, measuring privilege creep as a time series instead of discovering it during the annual audit, and generating remediation plans that a human approves rather than scripts that run blind. The theme is the same as every chapter in this book: the model watches continuously, reasons about context, and the human keeps the authority.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Scoring the Attack Surface Continuously</h3>
+
+<p class="text-gray-300 leading-relaxed">A hardening score computed once per quarter is a photograph. The same score recomputed daily from catalog views is a vital sign. The inputs are all queryable: server-level configuration flags, privileged role membership, and the effective permissions graph. The query below assembles the raw signals into a single assessment row per instance:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Attack surface signals: one row per instance, snapshot daily into dba.security_score_history
+SELECT
+    SYSUTCDATETIME() AS snapshot_time,
+    -- Dangerous surface area: risky features currently enabled
+    (SELECT COUNT(*) FROM sys.configurations
+      WHERE name IN ('xp_cmdshell', 'Ole Automation Procedures',
+                     'clr enabled', 'Database Mail XPs', 'Ad Hoc Distributed Queries')
+        AND value_in_use = 1) AS risky_features_enabled,
+    -- Privilege concentration: who can do anything
+    (SELECT COUNT(DISTINCT sp.name)
+     FROM sys.server_principals sp
+     JOIN sys.server_role_members rm ON rm.member_principal_id = sp.principal_id
+     JOIN sys.server_principals r ON r.principal_id = rm.role_principal_id
+     WHERE r.name = 'sysadmin' AND sp.name NOT LIKE 'NT SERVICE\%') AS human_sysadmins,
+    -- Stale privileged accounts: sysadmin logins that have not connected in 90 days
+    (SELECT COUNT(*)
+     FROM sys.server_principals sp
+     JOIN sys.server_role_members rm ON rm.member_principal_id = sp.principal_id
+     JOIN sys.server_principals r ON r.principal_id = rm.role_principal_id
+     WHERE r.name = 'sysadmin'
+       AND sp.name NOT IN (SELECT DISTINCT login_name FROM dba.login_activity_90d)
+    ) AS stale_sysadmins,
+    -- sa account state: 0 = disabled+renamed (good), higher = worse
+    (SELECT CASE WHEN sp.is_disabled = 1 THEN 0 ELSE 50 END
+       + CASE WHEN sp.name = 'sa' THEN 50 ELSE 0 END
+     FROM sys.server_principals sp WHERE sp.sid = 0x01) AS sa_risk_points,
+    -- Contained-database and guest access exposure across user databases
+    (SELECT COUNT(*) FROM sys.databases
+      WHERE containment &gt; 0 AND database_id &gt; 4) AS contained_dbs,
+    (SELECT COUNT(*) FROM sys.databases d
+      WHERE EXISTS (SELECT 1 FROM sys.database_principals p
+                    WHERE p.name = 'guest' AND p.type = 'S'
+                      AND HAS_PERMS_BY_NAME(DB_NAME(d.database_id), 'DATABASE',
+                                            'CONNECT') IS NOT NULL)
+        AND d.database_id &gt; 4) AS guest_enabled_dbs;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The score itself is a weighted sum, but the weights are less important than the trend. Store every snapshot and alert on <em>change</em>: a new sysadmin granted at 2 AM, a risky feature re-enabled by a deployment, a stale account suddenly connecting. Static audits catch misconfiguration eventually; a daily score with change detection catches it within 24 hours and names exactly what moved. The LLM layer (later in this chapter) turns "score dropped 18 points" into "the deployment at 01:40 re-enabled xp_cmdshell on PROD-SQL-03; here is the remediation."</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Detecting Anomalous Access with Behavioral Models</h3>
+
+<p class="text-gray-300 leading-relaxed">Static rules catch known-bad patterns: logins at 3 AM, connections from unexpected subnets. They miss the compromised service account behaving <em>almost</em> normally — same login, same application, but querying tables it has never touched, at volumes it has never produced. Behavioral anomaly detection catches what rules cannot, because it models each principal's normal behavior and flags deviations.</p>
+
+<p class="text-gray-300 leading-relaxed">The feature set per login per day: distinct databases touched, distinct tables read, rows returned, queries executed, first/last activity hour, client hostnames used, and failed-login count. Collect it from SQL Audit or Extended Events session data aggregated into a daily table. Then score each login-day against that login's own 60-day baseline with an Isolation Forest — the same unsupervised approach from Chapter 10, now pointed at access behavior:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import pandas as pd
+import numpy as np
+import pyodbc
+from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import RobustScaler
+
+def score_login_anomalies(conn_str: str, target_date: str,
+                          contamination: float = 0.02) -&gt; pd.DataFrame:
+    """
+    Score each login's activity on target_date against its own 60-day baseline.
+    Returns logins ranked by anomaly score with contributing features.
+    """
+    conn = pyodbc.connect(conn_str)
+    df = pd.read_sql("""
+        SELECT login_name, activity_date,
+               databases_touched, tables_read, tables_written,
+               queries_executed, rows_returned,
+               first_activity_hour, last_activity_hour,
+               distinct_hosts, failed_logins
+        FROM dba.login_daily_features
+        WHERE activity_date BETWEEN DATEADD(DAY, -60, ?) AND ?
+    """, conn, params=(target_date, target_date))
+    conn.close()
+
+    feature_cols = ['databases_touched', 'tables_read', 'tables_written',
+                    'queries_executed', 'rows_returned',
+                    'first_activity_hour', 'last_activity_hour',
+                    'distinct_hosts', 'failed_logins']
+    results = []
+    for login, group in df.groupby('login_name'):
+        if len(group) &lt; 14:
+            continue  # insufficient baseline; skip rather than guess
+        baseline = group[group['activity_date'] &lt; target_date][feature_cols]
+        today = group[group['activity_date'] == target_date][feature_cols]
+        if today.empty or baseline.empty:
+            continue
+        scaler = RobustScaler()
+        X_base = scaler.fit_transform(baseline.fillna(0))
+        model = IsolationForest(n_estimators=200, contamination=contamination,
+                                random_state=42)
+        model.fit(X_base)
+        X_today = scaler.transform(today.fillna(0))
+        score = float(model.decision_function(X_today)[0])
+        is_anomaly = bool(model.predict(X_today)[0] == -1)
+        # Feature contribution: which dimensions deviated most (z-distance)
+        z = np.abs(X_today[0])
+        top_dims = [feature_cols[i] for i in np.argsort(z)[-3:][::-1]]
+        results.append({'login_name': login, 'anomaly_score': score,
+                        'is_anomaly': is_anomaly,
+                        'top_deviating_features': ", ".join(top_dims)})
+    out = pd.DataFrame(results).sort_values('anomaly_score')
+    return out[out['is_anomaly']]</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Per-login baselines are the critical design choice. A global model learns that "service accounts behave differently from humans" and flags every service account daily. A per-login model learns that <em>this specific</em> ETL account touches three databases between 01:00 and 03:00 — and flags the day it touches eleven databases at noon. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">top_deviating_features</code> column is what makes the alert actionable: "svc_etl flagged — tables_read and distinct_hosts deviated" tells the responder where to look in seconds, instead of dumping a raw score.</p>
+
+<p class="text-gray-300 leading-relaxed">Expect false positives during legitimate change: a new release that changes a service account's query pattern will trip the model. That is correct behavior — the model noticed a real change. The responder confirms it maps to a known deployment, and the baseline absorbs the new pattern within days. Tune <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">contamination</code> so the daily alert volume matches your team's investigation capacity; an anomaly system that pages ten times a day gets muted, and a muted system protects nothing.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Privilege Creep as a Time Series</h3>
+
+<p class="text-gray-300 leading-relaxed">Permissions only ever grow. Every incident, every "just give me access so I can debug this," every contractor onboarding adds grants that are never revoked. The annual access review finds the accumulation; by then it is a spreadsheet of three thousand rows that nobody has the context to adjudicate. The AI-era alternative: track effective permissions as a time series and flag grants that deviate from the principal's role pattern.</p>
+
+<p class="text-gray-300 leading-relaxed">Snapshot effective database permissions nightly — resolving role membership so you capture what each login can <em>actually</em> do, not just its direct grants:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Effective permissions per database principal, snapshot nightly.
+-- Run in each user database via sp_MSforeachdb or a registered-servers job.
+SELECT
+    CAST(SYSUTCDATETIME() AS DATE) AS snapshot_date,
+    DB_NAME() AS database_name,
+    dp.name AS principal_name,
+    dp.type_desc AS principal_type,
+    STRING_AGG(
+        CONCAT(pe.permission_name, ' ON ', pe.class_desc,
+               ISNULL(OBJECT_NAME(pe.major_id), '')),
+        '; '
+    ) AS effective_permissions,
+    COUNT(*) AS permission_count,
+    -- Risk-weighted: CONTROL/ALTER/TAKE OWNERSHIP count far more than SELECT
+    SUM(CASE WHEN pe.permission_name IN
+                  ('CONTROL', 'ALTER', 'TAKE OWNERSHIP', 'IMPERSONATE')
+             THEN 10
+             WHEN pe.permission_name IN ('INSERT', 'UPDATE', 'DELETE', 'EXECUTE')
+             THEN 3
+             ELSE 1 END) AS privilege_score
+FROM sys.database_principals dp
+JOIN sys.database_permissions pe
+    ON pe.grantee_principal_id = dp.principal_id
+WHERE dp.type IN ('S', 'U', 'G')          -- sql login, windows user/group
+  AND dp.name NOT IN ('dbo', 'guest', 'INFORMATION_SCHEMA', 'sys')
+GROUP BY dp.name, dp.type_desc;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Two analyses run against this history. First, <strong class="text-white">growth detection</strong>: principals whose privilege score grows faster than their peer group (same department role, same application tier). A developer whose score triples in a month while peers stay flat is either mid-incident-response or accumulating permanent grants for temporary needs — either way, worth a conversation within days, not at the annual review.</p>
+
+<p class="text-gray-300 leading-relaxed">Second, <strong class="text-white">unused privilege identification</strong>: join the permission snapshots against actual usage from SQL Audit or Query Store. A principal holding CONTROL on a database it has not touched in 180 days is a revocation candidate with near-zero risk. This is where automation earns its keep — generating the monthly "safe to revoke" list with evidence (last-used dates, peer comparisons) turns access reviews from a dreaded manual exercise into a fifteen-minute approval of pre-computed recommendations.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">LLM-Generated Remediation Plans with Human Approval</h3>
+
+<p class="text-gray-300 leading-relaxed">Detection without remediation is just expensive worrying. But autonomous <em>security</em> remediation is the one domain where full autonomy is almost never appropriate: revoking the wrong permission breaks production, and disabling the wrong login pages the CEO. The pattern from Chapter 10's gated remediation applies here with stricter gates — the LLM drafts the plan, a human approves every step, and the executor only runs approved, parameterized actions.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import json
+from openai import OpenAI
+
+REMEDIATION_PROMPT = """
+You are a SQL Server security advisor. You receive a detected security finding:
+a hardening-score regression, an anomalous login, or a privilege-creep alert.
+
+Produce a remediation plan as JSON:
+{
+  "finding_summary": "&lt;one sentence&gt;",
+  "severity": "CRITICAL" | "HIGH" | "MEDIUM" | "LOW",
+  "plan_steps": [
+    {"step": &lt;n&gt;, "action": "&lt;REVOKE|DISABLE_LOGIN|DENY|AUDIT_ONLY&gt;",
+     "target": "&lt;principal or object&gt;",
+     "tsql": "&lt;exact parameterized T-SQL&gt;",
+     "blast_radius": "&lt;what breaks if this is wrong&gt;",
+     "rollback": "&lt;exact T-SQL to undo&gt;"}
+  ],
+  "verification": "&lt;query to confirm the fix&gt;",
+  "requires_change_ticket": &lt;boolean&gt;
+}
+
+Rules:
+- Every destructive step MUST include blast_radius and rollback.
+- Prefer AUDIT_ONLY (enable auditing, no permission change) for MEDIUM/LOW.
+- Never recommend dropping a login; recommend DISABLE LOGIN (reversible).
+- Ground targets in the provided finding data. No invented principals.
+"""
+
+ALLOWED_REMEDIATION_ACTIONS = {'REVOKE', 'DENY', 'DISABLE_LOGIN', 'AUDIT_ONLY'}
+
+def draft_remediation(finding: dict, llm: OpenAI) -&gt; dict:
+    resp = llm.chat.completions.create(
+        model="gpt-4o",
+        temperature=0.1,
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": REMEDIATION_PROMPT},
+            {"role": "user", "content": json.dumps(finding, indent=2, default=str)},
+        ],
+    )
+    plan = json.loads(resp.choices[0].message.content)
+    # Validate: every step's action in the allowlist, every target exists
+    for step in plan['plan_steps']:
+        if step['action'] not in ALLOWED_REMEDIATION_ACTIONS:
+            raise ValueError(f"Action not permitted: {step['action']}")
+        if not step.get('rollback'):
+            raise ValueError(f"Step {step['step']} missing rollback")
+    return plan</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The plan goes to the DBA as an approval request — the Slack-token pattern from Chapter 10 works unchanged — with the blast radius and rollback attached to every step. Approval executes the steps in order, verifies with the plan's verification query, and writes the whole sequence to the audit log. The properties that make this safe are all in the constraints: reversible actions preferred (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DISABLE LOGIN</code>, never <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DROP LOGIN</code>), mandatory rollback for every step, allowlisted action verbs, and a human in the approval seat for anything above AUDIT_ONLY.</p>
+
+<p class="text-gray-300 leading-relaxed">Over time, the approved-plan history becomes a second training signal: which findings the team actually remediates versus dismisses. Findings dismissed repeatedly with "expected — contractor onboarding" are tuning feedback for the detection thresholds, not noise to ignore. Feed that back, and the system converges on alerting only about the deviations your team considers worth acting on — which is the definition of a security monitoring system that survives contact with reality.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Score the attack surface daily from catalog views, and alert on change.** Risky features, sysadmin membership, stale privileged accounts, and sa state snapshotted into a history table turn quarterly audit findings into 24-hour detection with the exact change named.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Detect anomalous access with per-login behavioral baselines.** An Isolation Forest per principal over daily activity features (databases touched, tables read, hosts used, failed logins) catches the compromised account behaving almost-normally — the case static rules structurally miss.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Track privilege creep as a time series, not an annual spreadsheet.** Nightly effective-permission snapshots with risk-weighted scores surface fast-growing principals within days, and joining grants against actual usage produces a low-risk monthly "safe to revoke" list.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Let the LLM draft remediation plans; keep humans on approval.** Every step needs an allowlisted action verb, a blast-radius statement, and a rollback — with reversible actions preferred (DISABLE LOGIN, never DROP LOGIN) and AUDIT_ONLY as the default for medium and low severity.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Feed approval history back into detection tuning.** Findings the team repeatedly dismisses are threshold-tuning signal; the system should converge on alerting only about deviations worth acting on, or it will be muted into irrelevance.</li>
+    </div>
+    <div class="mt-14 bg-violet-950/40 border border-violet-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · SQL Server</p>
+      </div>
+      <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
+         class="shrink-0 px-6 py-3 bg-violet-600 hover:bg-violet-500 text-white font-semibold rounded-xl text-sm transition">
+        Download Free
+      </a>
+    </div>
+        <div class="mt-10 rounded-2xl border border-blue-900/40 bg-blue-950/20 p-5 flex flex-col sm:flex-row items-center justify-between gap-4">
+      <div>
+        <p class="font-semibold text-white text-sm">Test yourself on this chapter</p>
+        <p class="text-gray-400 text-xs mt-1">5 questions &middot; instant scoring &middot; explanations included</p>
+      </div>
+      <a href="../quiz.html?book=book2&ch=25"
+         class="shrink-0 px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white font-bold rounded-xl text-sm transition">Take the Quiz &rarr;</a>
+    </div>
+<div class="mt-8 flex justify-between text-xs">
+      <a href="b2-ch24-intelligent-routing.html" class="text-gray-500 hover:text-gray-300 transition">← Previous Chapter</a>
+      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a>
+      <a href="b2-ch26-dba-copilot.html" class="text-violet-400 hover:text-violet-300 transition">Next Chapter →</a>
+    </div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · The AI-Powered DBA</div>
+  </footer>
+</body>
+</html>

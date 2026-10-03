@@ -27,26 +27,23 @@
 
 <p class="text-gray-300 leading-relaxed">The critical design decision is that layers two and three are the <em>same database</em>. Splitting retrieval and system-of-record across two systems forces you to solve distributed transactions for operations as simple as "store the answer and charge the user." Keeping them together means one transaction, one backup, one security model.</p>
 
-<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TB
-    Client[Client app] --> API[API tier - FastAPI / ASP.NET]
-    API --> LLM[Reasoning layer - Azure OpenAI / LLM API]
-    API --> SQL[(SQL Server 2025)]
-    subgraph SQL [Single SQL Server database]
-        V[VECTOR columns + vector indexes]
-        R[Relational tables - users, tenants, billing]
-        J[JSON columns - flexible AI outputs]
-        F[Full-text indexes - hybrid search]
-        Q[Service Broker - internal events]
-    end
-    LLM -.->|embeddings| V
-    API --> V
-    API --> R</pre></div>
+<figure class="my-8">
+  <img src="../images/arch-b6-ch02-single-db-ai.webp" alt="AI application architecture with client app, API tier, and reasoning layer on top of a single SQL Server 2025 database" class="w-full rounded-2xl border border-gray-700" loading="lazy">
+  <figcaption class="text-sm text-gray-400 mt-3 text-center">Figure 2.2 — One SQL Server Database for AI Apps.</figcaption>
+</figure>
+<p class="text-gray-300 leading-relaxed mt-4">The picture is the chapter's core argument: three thin layers on top — client app, API tier, reasoning — and one database underneath doing five jobs. Client requests flow through the API tier to the reasoning layer (Azure OpenAI); the embeddings come back down the dashed arrow into VECTOR columns, while relational tables, JSON columns, full-text indexes, and Service Broker handle everything else. No separate vector database, no extra operational surface — the operational meaning is that your backup, HA, and security story stays exactly the one you already have.</p>
 
 <p class="text-gray-300 leading-relaxed">Notice what is missing from the diagram: no standalone vector database, no separate cache tier for correctness-critical data, no message broker for internal events. Each of those can be added later for scale, but none is required to ship.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">2.2 The Lifecycle of a Single Chat Turn</h3>
+
+<figure class="my-8">
+  <img src="../images/arch-chat-turn.webp" alt="Horizontal swimlane sequence diagram of one chat turn across six layers &mdash; API, Identity, Embeddings, SQL Search, LLM, Response &mdash; with per-step latency labels and a dashed token-logging loop back to the API layer." class="w-full rounded-2xl border border-gray-700" />
+  <figcaption class="mt-3 text-sm text-gray-400 leading-relaxed"><strong class="text-gray-200">Figure 2.1 &mdash; Lifecycle of a single chat turn.</strong> Every hop is timed; the LLM call dominates latency, and token usage loops back for accounting.</figcaption>
+</figure>
+<p class="text-gray-300 leading-relaxed">Read the lanes left to right: the API layer runs the quota check, Identity stamps the JWT so downstream layers know the tenant, the embedding hop vectorizes the question, SQL Search runs the hybrid retrieval, the LLM reasons over the top-k chunks, and the Response lane formats the answer. The millisecond captions show where time actually goes &mdash; the LLM call dwarfs everything else, which is why retrieval quality (fewer, better chunks) beats model size for latency. The dashed Token Log loop-back is the accounting path: every turn records its token spend against the tenant, which is what makes per-customer billing possible.</p>
 
 <p class="text-gray-300 leading-relaxed">Tracing one request through the stack makes the layering concrete. A user sends "What is our refund policy for enterprise customers?" Here is what happens, in order, with timings from a typical production deployment:</p>
 

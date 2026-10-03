@@ -1,0 +1,407 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 21: Natural Language to SQL for Self-Service Analytics — The AI-Powered DBA</title>
+  <meta name="description" content="The AI-Powered DBA Chapter 21: Natural Language to SQL for Self-Service Analytics. AI and AIOps for SQL Server, by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script></head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-violet-500 to-violet-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-violet-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 2 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-violet-600 hover:bg-violet-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6">
+      <a href="index.html" class="text-xs text-violet-400 hover:text-violet-300 transition">← All Chapters</a>
+    </div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-violet-900/40 border border-violet-800/40 text-violet-300 text-xs rounded-full font-medium">Chapter 21 of 40</span>
+    </div>
+    <div class="space-y-4 text-sm">
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 21: Natural Language to SQL for Self-Service Analytics</h2>
+
+<p class="text-gray-300 leading-relaxed">Every DBA knows the pattern: a product manager needs "revenue by region last quarter," files a ticket, and waits three days while a DBA acts as a human query compiler. Multiply that by dozens of weekly ad-hoc requests and you have one of the largest hidden costs in data operations. Natural language to SQL (NLQ) promises to break this bottleneck — but the gap between a five-table demo and a production system the business trusts is enormous, and most of that gap is database engineering, not model capability. This chapter builds an NLQ layer on SQL Server that is safe, accurate, and governable: a metadata contract from your catalog views, a semantic layer of curated views, read-only execution, and an evaluation harness that keeps the system honest as your schema evolves.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Why Naive Text-to-SQL Fails on Real Schemas</h3>
+
+<p class="text-gray-300 leading-relaxed">Point a general-purpose LLM at your production database with a raw schema dump and ask a business question. What comes back is usually syntactically valid, confidently formatted — and wrong in ways that are expensive to catch. The failure modes are remarkably consistent across organizations.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Ambiguous naming.</strong> Your schema has <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">customer_id</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">cust_id</code>, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">bill_to_customer_id</code> across different tables. The model guesses which one the user means. It guesses wrong roughly as often as a coin flip when three plausible candidates exist.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Business logic lives in people's heads.</strong> "Active customers" might mean <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">status = 'A'</code> on one table, or a customer with an order in the last 90 days, or a customer not flagged in the churn table. No schema dump contains this definition. The model invents one.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Join path explosion.</strong> A 400-table schema has thousands of plausible join paths between any two entities. Foreign keys narrow it, but the model still picks the wrong bridge table with depressing regularity when multiple paths exist.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Performance blindness.</strong> Generated SQL is logically correct but physically catastrophic: unfiltered scans of billion-row tables, accidental cross joins through missing predicates, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SELECT *</code> against wide tables with LOB columns. One bad generated query can saturate tempdb during business hours.</p>
+
+<p class="text-gray-300 leading-relaxed">The lesson from every failed NLQ pilot is the same: accuracy does not come from a better model prompt. It comes from constraining the problem — curating what the model can see, what it can touch, and what vocabulary it is allowed to use. The DBA owns all three constraints, which is why NLQ is a DBA project wearing an AI costume.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">The Metadata Contract: Teaching the Model Your Schema</h3>
+
+<p class="text-gray-300 leading-relaxed">The single highest-leverage input to any NLQ system is a curated schema document. Not a raw dump of <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">INFORMATION_SCHEMA</code> — a document you generate, filter, and annotate. SQL Server's catalog views give you everything needed to build it programmatically.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Step 1: extract the curated table and column inventory.</strong> Exclude system objects, staging tables, and audit tables the model should never know about. Include data types and nullability so the model writes correct predicates:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Curated schema inventory for the NLQ metadata contract
+-- Maintain the exclusion list in a config table: nlq.nql_excluded_objects
+SELECT
+    s.name AS schema_name,
+    t.name AS table_name,
+    c.name AS column_name,
+    ty.name AS data_type,
+    CASE WHEN c.max_length = -1 THEN 'MAX'
+         ELSE CAST(c.max_length AS VARCHAR(10)) END AS max_length,
+    c.is_nullable,
+    c.is_identity,
+    ep.value AS business_description
+FROM sys.tables t
+JOIN sys.schemas s ON s.schema_id = t.schema_id
+JOIN sys.columns c ON c.object_id = t.object_id
+JOIN sys.types ty ON ty.user_type_id = c.user_type_id
+LEFT JOIN sys.extended_properties ep
+    ON ep.major_id = t.object_id
+   AND ep.minor_id = c.column_id
+   AND ep.class = 1
+   AND ep.name = 'MS_Description'
+WHERE t.is_ms_shipped = 0
+  AND s.name NOT IN ('stg', 'audit', 'etl', 'tmp')
+  AND NOT EXISTS (
+        SELECT 1 FROM nlq.excluded_objects x
+        WHERE x.schema_name = s.name AND x.object_name = t.name
+  )
+ORDER BY s.name, t.name, c.column_id;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Step 2: extract join paths from foreign keys.</strong> This is what stops the model from inventing joins. Every relationship the model is allowed to use should be declared here:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Declared join paths: the only relationships the NLQ model may use
+SELECT
+    fk.name AS relationship_name,
+    OBJECT_SCHEMA_NAME(fk.parent_object_id) AS child_schema,
+    OBJECT_NAME(fk.parent_object_id) AS child_table,
+    STRING_AGG(pc.name, ', ') WITHIN GROUP (ORDER BY fkc.constraint_column_id) AS child_columns,
+    OBJECT_SCHEMA_NAME(fk.referenced_object_id) AS parent_schema,
+    OBJECT_NAME(fk.referenced_object_id) AS parent_table,
+    STRING_AGG(rc.name, ', ') WITHIN GROUP (ORDER BY fkc.constraint_column_id) AS parent_columns
+FROM sys.foreign_keys fk
+JOIN sys.foreign_key_columns fkc ON fkc.constraint_object_id = fk.object_id
+JOIN sys.columns pc ON pc.object_id = fkc.parent_object_id
+                    AND pc.column_id = fkc.parent_column_id
+JOIN sys.columns rc ON rc.object_id = fkc.referenced_object_id
+                    AND rc.column_id = fkc.referenced_column_id
+GROUP BY fk.name, fk.parent_object_id, fk.referenced_object_id
+ORDER BY child_schema, child_table;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Step 3: annotate with business definitions using extended properties.</strong> This is where "active customer" stops being a guess. Your data stewards (or you, in a first pass) attach <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">MS_Description</code> values to the columns and views that carry business meaning:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Attach business definitions the NLQ model will read verbatim
+EXEC sys.sp_addextendedproperty
+    @name = N'MS_Description',
+    @value = N'Net revenue in USD after refunds, chargebacks, and tax. One row per order line.',
+    @level0type = N'SCHEMA', @level0name = N'reporting',
+    @level1type = N'VIEW',   @level1name = N'vw_order_revenue';
+
+EXEC sys.sp_addextendedproperty
+    @name = N'MS_Description',
+    @value = N'Customer is active if they placed an order in the trailing 90 days. Use vw_active_customers instead of filtering this column directly.',
+    @level0type = N'SCHEMA', @level0name = N'sales',
+    @level1type = N'TABLE',  @level1name = N'customers',
+    @level2type = N'COLUMN', @level2name = N'status';</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Regenerate this contract nightly and version it — when the NLQ system gives a wrong answer, the versioned contract tells you exactly what the model saw.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">The Semantic Layer: Views as the Query Contract</h3>
+
+<p class="text-gray-300 leading-relaxed">The metadata contract tells the model what exists. The semantic layer tells it what to use. The rule is simple: <strong class="text-white">the NLQ system never queries base tables directly.</strong> It queries a curated set of views in a dedicated schema (conventionally <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">reporting</code>), each one encoding the joins, filters, and business definitions for one analytical subject area.</p>
+
+<p class="text-gray-300 leading-relaxed">This single constraint eliminates three of the four failure modes from the previous section. Ambiguous naming disappears because the view exposes one canonical column name. Business logic is baked into the view definition instead of guessed. Join paths are pre-resolved by whoever wrote the view. What remains is the translation of "last quarter by region" into <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">GROUP BY</code> and date predicates — the part LLMs are genuinely good at.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Semantic layer view: the NLQ system's unit of truth for revenue questions
+CREATE OR ALTER VIEW reporting.vw_order_revenue AS
+SELECT
+    o.order_id,
+    o.order_date,
+    DATEPART(QUARTER, o.order_date) AS order_quarter,
+    YEAR(o.order_date) AS order_year,
+    r.region_name,
+    c.customer_name,
+    c.customer_segment,
+    ol.line_net_amount_usd AS net_revenue_usd,
+    p.product_category
+FROM sales.orders o
+JOIN sales.order_lines ol
+    ON ol.order_id = o.order_id
+JOIN sales.customers c
+    ON c.customer_id = o.customer_id
+JOIN geo.regions r
+    ON r.region_id = c.region_id
+JOIN catalog.products p
+    ON p.product_id = ol.product_id
+WHERE o.order_status NOT IN ('CANCELLED', 'FRAUD_HOLD')
+  AND ol.is_refund = 0;
+GO
+
+-- The NLQ contract only lists views in the reporting schema
+SELECT
+    s.name AS schema_name,
+    v.name AS view_name,
+    ep.value AS business_description,
+    (SELECT COUNT(*) FROM sys.columns c
+      WHERE c.object_id = v.object_id) AS column_count
+FROM sys.views v
+JOIN sys.schemas s ON s.schema_id = v.schema_id
+LEFT JOIN sys.extended_properties ep
+    ON ep.major_id = v.object_id AND ep.minor_id = 0
+   AND ep.class = 1 AND ep.name = 'MS_Description'
+WHERE s.name = 'reporting'
+ORDER BY v.name;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">A healthy semantic layer for a mid-size business is 15 to 40 views. Each view gets an owner, a refresh SLA if it is materialized or indexed, and a description. When a user asks a question no view can answer, that is a signal to extend the semantic layer — not a signal to let the model improvise against base tables. Track unanswerable questions in a log; they are your semantic-layer backlog, prioritized by frequency.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Safety Architecture: Read-Only by Construction</h3>
+
+<p class="text-gray-300 leading-relaxed">An LLM generating SQL against production is a privileged-code-execution system, and it must be engineered like one. Defense in depth, four layers:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Layer 1 — Least-privilege execution login.</strong> The NLQ service connects with a dedicated login that has <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db_datareader</code> on the reporting schema only, and explicit <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DENY</code> on everything else. Even if every other layer fails, this login physically cannot modify data.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Provision the NLQ execution principal: read-only, reporting schema only
+USE analytics;
+GO
+CREATE LOGIN nlq_service WITH PASSWORD = '/* from vault, rotated quarterly */';
+CREATE USER nlq_service FOR LOGIN nlq_service;
+
+-- Grant read on the semantic layer only
+GRANT SELECT ON SCHEMA::reporting TO nlq_service;
+
+-- Belt and suspenders: deny everything else explicitly
+DENY SELECT ON SCHEMA::sales TO nlq_service;
+DENY SELECT ON SCHEMA::hr TO nlq_service;
+DENY SELECT ON SCHEMA::finance_raw TO nlq_service;
+DENY EXECUTE ON SCHEMA::dbo TO nlq_service;
+GO
+
+-- Cap runaway generated queries at the engine level for this login
+-- (Query Governor cost limit in seconds of estimated cost)
+-- Applied via a logon trigger or Resource Governor workload group instead:
+-- CREATE WORKLOAD GROUP nlq_group WITH (REQUEST_MAX_CPU_TIME_SEC = 120)
+-- and classify the nlq_service login into it (see Chapter 24).</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Layer 2 — Statement validation before execution.</strong> Never execute model output directly. Parse it first: it must be a single <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SELECT</code> (or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WITH...SELECT</code>) statement, reference only allowlisted views, and contain no forbidden keywords. The Python validator below runs in the service tier, before anything reaches SQL Server:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import re
+
+FORBIDDEN_KEYWORDS = {
+    'INSERT', 'UPDATE', 'DELETE', 'MERGE', 'DROP', 'ALTER', 'CREATE',
+    'TRUNCATE', 'GRANT', 'DENY', 'REVOKE', 'EXEC', 'EXECUTE',
+    'XP_', 'SP_', 'OPENROWSET', 'OPENDATASOURCE', 'BULK',
+}
+
+ALLOWED_SCHEMAS = {'reporting'}  # NLQ may only touch the semantic layer
+
+def validate_generated_sql(sql: str, allowed_views: set[str]) -&gt; str:
+    """Validate LLM-generated SQL. Returns cleaned SQL or raises ValueError."""
+    cleaned = sql.strip().rstrip(';')
+
+    # Single statement only: reject stacked queries outright
+    if re.search(r';\s*\S', cleaned):
+        raise ValueError("Multiple statements detected; refusing to execute.")
+
+    upper = cleaned.upper()
+    first_word = re.match(r'\s*(WITH|SELECT)\b', upper)
+    if not first_word:
+        raise ValueError("Only SELECT / WITH...SELECT statements are permitted.")
+
+    for kw in FORBIDDEN_KEYWORDS:
+        if re.search(rf'\b{kw}\b', upper):
+            raise ValueError(f"Forbidden keyword detected: {kw}")
+
+    # Every referenced object must be an allowlisted reporting view
+    refs = set(re.findall(r'FROM\s+(?:\[?(\w+)\]?\. )?\[?(\w+)\]?', upper))
+    for schema, obj in refs:
+        schema = schema or 'DBO'
+        if schema != 'REPORTING' or obj not in {v.upper() for v in allowed_views}:
+            raise ValueError(f"Reference not in NLQ allowlist: {schema}.{obj}")
+
+    # Enforce a row cap: inject TOP if the query has no TOP clause
+    if not re.search(r'SELECT\s+TOP\s*\(', upper):
+        cleaned = re.sub(r'(?i)^\s*SELECT\s+', 'SELECT TOP (10000) ', cleaned, count=1)
+
+    return cleaned</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Layer 3 — Execution guardrails.</strong> Run validated SQL through <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sp_executesql</code> under the read-only login with a client-side timeout (60 seconds is generous for analytics questions), and classify the login into a Resource Governor workload group with CPU and memory caps so a bad generated query degrades gracefully instead of taking down the instance.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Layer 4 — Transparency.</strong> Always show the user the generated SQL alongside the answer. This is both a trust feature and a safety feature: a finance analyst who sees <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WHERE order_year = 2025</code> when she asked about 2026 will catch the error the validator cannot.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">The NLQ Pipeline: Putting It Together</h3>
+<figure class="my-8">
+  <img src="../images/arch-nlq-pipeline.webp" alt="End-to-end natural-language-to-SQL pipeline: a user question flows through the NLQ service, semantic layer, and LLM into green, amber, and red guardrail gates, then to SQL Server execution and a rendered answer, with dashed red retry arrows looping back from the gates to the LLM." class="w-full rounded-2xl border border-gray-700" />
+  <figcaption class="mt-3 text-sm text-gray-400 leading-relaxed"><strong class="text-gray-200">Figure 21.1 — The end-to-end NLQ pipeline.</strong> Every generated statement passes the guardrail gates before it touches SQL Server.</figcaption>
+</figure>
+<p class="text-gray-300 leading-relaxed">Read it left to right. The blue User zone is the only place free text enters the system. The purple NLQ Service parses intent and builds context from the semantic layer's governed views and metadata — the LLM never sees raw table names it shouldn't. The amber Guardrails zone is the heart of the design: the green Read Only gate rejects anything that isn't a SELECT, the amber Allowlist gate checks tables and columns against the metadata contract, and the red Risk Score gate scores the statement's blast radius. Only statements that clear all three reach SQL Server. The dashed red retry arrows are the feedback path — a rejected statement goes back to the LLM with the rejection reason, so the next attempt is smarter instead of just louder. The key insight: safety isn't a filter bolted on at the end; it's a series of gates the query must earn its way through.</p>
+
+<p class="text-gray-300 leading-relaxed">With the contract, semantic layer, and safety architecture in place, the runtime pipeline is straightforward. The service retrieves the relevant slice of the metadata contract for the question (keyword matching over view descriptions is sufficient for most deployments; embedding search helps past ~50 views), asks the LLM to write SQL against that contract, validates, executes, and returns results with the SQL attached.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import json
+import pyodbc
+from openai import OpenAI
+
+NLQ_SYSTEM_PROMPT = """
+You are a T-SQL generator for SQL Server. You receive a user question and a
+metadata contract describing the ONLY views you may query (schema: reporting).
+
+Rules:
+- Output a single SELECT or WITH...SELECT statement. Nothing else.
+- Reference only views listed in the contract. Never invent tables or columns.
+- Use only columns that exist in the contract. Check data types before comparing.
+- Prefer the view whose business_description best matches the question.
+- Date predicates: use DATEADD/DATEDIFF against GETDATE(); never hardcode year
+  boundaries unless the user names a specific year.
+- Return ONLY the SQL. No explanation, no markdown fences.
+"""
+
+def answer_question(question: str, contract: dict, allowed_views: set,
+                    llm: OpenAI, read_conn_str: str) -&gt; dict:
+    # 1. Retrieve the relevant contract slice (keyword match over descriptions)
+    q_lower = question.lower()
+    relevant = [v for v in contract['views']
+                if any(w in (v['business_description'] + v['view_name']).lower()
+                       for w in q_lower.split() if len(w) &gt; 3)]
+    relevant = relevant or contract['views'][:5]  # fallback: most-used views
+
+    # 2. Generate SQL
+    resp = llm.chat.completions.create(
+        model="gpt-4o",
+        temperature=0.0,  # deterministic generation for analytics
+        messages=[
+            {"role": "system", "content": NLQ_SYSTEM_PROMPT},
+            {"role": "user", "content": json.dumps(
+                {"question": question, "contract": relevant}, indent=2)},
+        ],
+    )
+    generated = resp.choices[0].message.content.strip()
+
+    # 3. Validate (raises on any violation)
+    safe_sql = validate_generated_sql(generated, allowed_views)
+
+    # 4. Execute as the read-only service login with a hard timeout
+    conn = pyodbc.connect(read_conn_str, timeout=60)
+    try:
+        cursor = conn.cursor()
+        cursor.execute(safe_sql)
+        columns = [c[0] for c in cursor.description]
+        rows = cursor.fetchmany(1000)
+    finally:
+        conn.close()
+
+    # 5. Log for the golden-set feedback loop (see next section)
+    log_nlq_request(question, generated, safe_sql, len(rows or []))
+
+    return {"question": question, "sql": safe_sql,
+            "columns": columns, "rows": rows}</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Two design decisions in this pipeline deserve emphasis. First, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">temperature=0.0</code>: analytics SQL generation must be deterministic. The same question asked twice should produce the same query; non-determinism here destroys user trust and makes the golden-set evaluation meaningless. Second, the contract slice keeps the prompt small and focused. Sending all 40 views on every request wastes tokens and measurably increases the rate at which the model picks the wrong view.</p>
+
+
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Keeping It Honest: The Golden Question Set</h3>
+
+<p class="text-gray-300 leading-relaxed">An NLQ system without evaluation is a demo. The evaluation harness is a table of 20 to 30 representative business questions with verified expected results, run on a schedule — weekly, and after every schema deployment. Score on <strong class="text-white">execution match</strong> (do the result sets agree?) rather than SQL string match, because many different queries can be correct.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Golden question set: the NLQ regression suite
+CREATE TABLE nlq.golden_questions (
+    question_id      INT IDENTITY PRIMARY KEY,
+    question_text    NVARCHAR(1000) NOT NULL,
+    expected_sql     NVARCHAR(MAX)  NOT NULL,  -- verified by a DBA, the oracle
+    category         NVARCHAR(50)   NOT NULL,  -- 'aggregation','trend','ranking','filter'
+    is_active        BIT NOT NULL DEFAULT 1
+);
+
+CREATE TABLE nlq.golden_runs (
+    run_id           INT IDENTITY PRIMARY KEY,
+    run_time         DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+    contract_version INT NOT NULL,
+    questions_run    INT NOT NULL,
+    questions_passed INT NOT NULL,
+    pass_rate AS CAST(questions_passed AS FLOAT) / NULLIF(questions_run, 0) PERSISTED
+);
+
+-- A question passes when the generated SQL returns the same rows as the oracle.
+-- Compare with EXCEPT in both directions; NULL-safe and order-independent.
+-- EXEC nlq.usp_run_golden_set compares answer_question() output vs expected_sql
+-- output and writes one row per question into nlq.golden_results.</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Set an alert when the pass rate drops below your threshold (90% is a reasonable bar). A drop almost always traces to one of three causes: a schema change that invalidated part of the contract, a new view added without a description (so retrieval never surfaces it), or prompt drift from a model version change. The versioned contract and per-question results make the diagnosis fast.</p>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">log_nlq_request</code> table from the pipeline feeds the other direction of the loop: questions users actually ask, clustered by similarity, tell you which semantic-layer views to build next and which golden questions to add. The questions your users ask and the system cannot answer are the most valuable product feedback your data platform will ever produce — treat them accordingly.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Accuracy comes from constraining the problem, not from a cleverer prompt.** A curated metadata contract, a semantic layer of views, and an allowlist of queryable objects eliminate the ambiguity, business-logic gaps, and join-path explosions that sink naive text-to-SQL pilots.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Generate the metadata contract from SQL Server catalog views and version it.** sys.tables, sys.columns, sys.foreign_keys, and MS_Description extended properties give you a machine-readable schema document; regenerating it on every deployment makes NLQ failures diagnosable instead of mysterious.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The NLQ system queries curated reporting views, never base tables.** Pre-resolved joins and baked-in business definitions in the semantic layer are what turn "revenue by region last quarter" from a guessing game into a deterministic GROUP BY.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Read-only by construction, in four layers.** A dedicated db_datareader login on the reporting schema, pre-execution statement validation (single SELECT, allowlisted views, forbidden keywords, injected TOP cap), Resource Governor limits with client timeouts, and always showing the user the generated SQL.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Evaluate with a golden question set scored on execution match.** Twenty to thirty verified business questions, re-run weekly and after every schema change, with alerts on pass-rate drops — plus logging of real user questions to drive semantic-layer expansion.</li>
+    </div>
+    <div class="mt-14 bg-violet-950/40 border border-violet-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · SQL Server</p>
+      </div>
+      <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
+         class="shrink-0 px-6 py-3 bg-violet-600 hover:bg-violet-500 text-white font-semibold rounded-xl text-sm transition">
+        Download Free
+      </a>
+    </div>
+        <div class="mt-10 rounded-2xl border border-blue-900/40 bg-blue-950/20 p-5 flex flex-col sm:flex-row items-center justify-between gap-4">
+      <div>
+        <p class="font-semibold text-white text-sm">Test yourself on this chapter</p>
+        <p class="text-gray-400 text-xs mt-1">5 questions &middot; instant scoring &middot; explanations included</p>
+      </div>
+      <a href="../quiz.html?book=book2&ch=21"
+         class="shrink-0 px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white font-bold rounded-xl text-sm transition">Take the Quiz &rarr;</a>
+    </div>
+<div class="mt-8 flex justify-between text-xs">
+      <a href="b2-ch20-autonomous-dba.html" class="text-gray-500 hover:text-gray-300 transition">← Previous Chapter</a>
+      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a>
+      <a href="b2-ch22-llm-runbooks.html" class="text-violet-400 hover:text-violet-300 transition">Next Chapter →</a>
+    </div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · The AI-Powered DBA</div>
+  </footer>
+</body>
+</html>
