@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Blocking chains in SQL Server: finding the real head blocker in 60 seconds — Rajesh Guntupalli</title>
+  <meta name="description" content="When every session is waiting and the app is down, don't kill sessions at random. Use the blocking DMVs to find the head blocker and decide what to do next." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-blue-500 to-blue-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-blue-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"    class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"     class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Book</a>
+        <a href="index.html"       class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Blog</a>
+        <a href="../about.html"    class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
+           class="ml-2 px-4 py-1.5 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded-lg transition">Get Free Tools</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="flex gap-2 mb-5"><span class="px-2 py-0.5 bg-blue-900/40 border border-blue-800/40 text-blue-300 text-xs rounded-full">SQL Server</span><span class="px-2 py-0.5 bg-blue-900/40 border border-blue-800/40 text-blue-300 text-xs rounded-full">Troubleshooting</span></div>
+    <h1 class="text-4xl font-extrabold mb-4 leading-tight">Blocking chains in SQL Server: finding the real head blocker in 60 seconds</h1>
+    <div class="flex items-center gap-3 text-xs text-gray-500 mb-10 pb-8 border-b border-gray-800/60">
+      <span>Rajesh Guntupalli</span><span>·</span><span>October 2026</span><span>·</span><span>6 min read</span>
+    </div>
+    <div class="space-y-4 text-sm">
+<p class="text-gray-300 leading-relaxed"># Blocking Chains in SQL Server: Finding the Real Head Blocker in 60 Seconds</p>
+
+<p class="text-gray-300 leading-relaxed">*By Rajesh Guntupalli*</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<p class="text-gray-300 leading-relaxed">It's 2 AM and your phone is vibrating itself off the nightstand. The app is timing out. You log in, see 200 sessions all showing <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">LCK_M_X</code> waits, and panic starts to set in. The worst thing you can do right now is kill sessions at random. One of those 200 sessions is the head blocker — everything else is just collateral damage. Find that one session and the whole chain resolves itself.</p>
+
+<p class="text-gray-300 leading-relaxed">Here's the method I use every single time.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">1. See the whole chain with one query</h2>
+
+<p class="text-gray-300 leading-relaxed">Don't look at sessions one by one. One query against <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_requests</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_sessions</code> shows you every waiting session, who it's blocked by, and how long it's been waiting:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Show every blocked session and its blocker
+SELECT
+    r.session_id,
+    r.blocking_session_id,
+    r.wait_type,
+    r.wait_time / 1000 AS wait_seconds,
+    s.login_name,
+    s.host_name,
+    s.program_name,
+    DB_NAME(r.database_id) AS database_name
+FROM sys.dm_exec_requests r
+JOIN sys.dm_exec_sessions s
+    ON s.session_id = r.session_id
+WHERE r.blocking_session_id &lt;&gt; 0
+   OR r.session_id IN (
+       SELECT DISTINCT blocking_session_id
+       FROM sys.dm_exec_requests
+       WHERE blocking_session_id &lt;&gt; 0
+   )
+ORDER BY r.blocking_session_id, r.session_id;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The head blocker is the session whose <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">blocking_session_id</code> is 0 (it appears in the result because it IS blocking others) but which is itself not waiting on anyone. That's the single session holding the lock everyone else wants. Everything downstream of it is just a symptom.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">2. Find out what the head blocker is actually doing</h2>
+
+<p class="text-gray-300 leading-relaxed">Knowing the session ID is only half the answer. You need its SQL text, and critically, whether it's idle in a transaction — a session doing nothing can still hold locks if the app never issued a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">COMMIT</code>:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- What is session 87 (the head blocker) running, and how long has the
+-- transaction been open?
+DECLARE @spid INT = 87;
+
+SELECT
+    r.session_id,
+    r.status,
+    r.command,
+    r.cpu_time,
+    r.total_elapsed_time / 1000 AS elapsed_seconds,
+    t.text AS current_sql,
+    DATEDIFF(SECOND, dt.transaction_begin_time, GETDATE()) AS tran_open_seconds
+FROM sys.dm_exec_requests r
+LEFT JOIN sys.dm_tran_session_transactions st
+    ON st.session_id = r.session_id
+LEFT JOIN sys.dm_tran_active_transactions dt
+    ON dt.transaction_id = st.transaction_id
+OUTER APPLY sys.dm_exec_sql_text(r.sql_handle) t
+WHERE r.session_id = @spid;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The pattern I see most often: an app opens a transaction, runs an <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">UPDATE</code>, then waits on some downstream API call before committing. The transaction stays open for minutes holding locks, and the whole database queues up behind it. The fix is rarely on the SQL side — it's in the app code.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">3. Check the kill cost before you kill anything</h2>
+
+<p class="text-gray-300 leading-relaxed">If the head blocker is a legit transaction that's almost done, killing it triggers a rollback — and rollbacks are single-threaded, can't be interrupted, and can take longer than just letting the transaction finish. Check how much work it has done first:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Estimate rollback cost for a transaction's database work
+SELECT
+    dt.database_id,
+    DB_NAME(dt.database_id) AS database_name,
+    dt.database_transaction_log_bytes_used / 1024 / 1024 AS log_mb_used,
+    dt.database_transaction_log_bytes_reserved / 1024 / 1024 AS log_mb_reserved
+FROM sys.dm_tran_database_transactions dt
+JOIN sys.dm_tran_session_transactions st
+    ON st.transaction_id = dt.transaction_id
+WHERE st.session_id = 87;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">If the blocker has written hundreds of megabytes to the log, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">KILL</code> will start a rollback that undoes all of it — potentially making the outage longer, not shorter. My rule: if the transaction is actively running and close to finishing, let it finish. If it's an idle session holding locks with no work happening, kill it without hesitation — there's nothing to roll back.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">4. NOLOCK is not the fix</h2>
+
+<p class="text-gray-300 leading-relaxed">The most common reaction to a blocking incident is sprinkling <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WITH (NOLOCK)</code> on everything. It hides the blocking by letting reads ignore locks, but you're trading correctness for speed — dirty reads, duplicated rows from page splits, even reading rows that get rolled back. I've seen financial reports built on NOLOCK return wrong totals. You don't want that on call at 3 AM.</p>
+
+<p class="text-gray-300 leading-relaxed">The real fixes, in order of preference:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Enable READ_COMMITTED_SNAPSHOT.</strong> One <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALTER DATABASE</code> and readers stop blocking writers entirely — they read the last committed version from the version store instead. This single change ends most chronic blocking chains in OLTP workloads:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Check if it's already on (1 = enabled)
+SELECT name, is_read_committed_snapshot_on
+FROM sys.databases
+WHERE name = 'YourDB';
+
+-- Enable it (needs a quiet moment: takes a schema modification lock)
+ALTER DATABASE YourDB SET READ_COMMITTED_SNAPSHOT ON;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Shorten transactions.</strong> The blocker is usually an app that opens a transaction, does work, then calls a web service before committing. Transactions should never span network calls. Commit before you leave the database layer.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Fix the missing index.</strong> An <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">UPDATE</code> that should touch 10 rows but scans 10 million takes exclusive locks on everything it scans. Proper indexing turns a table-wide lock storm into a few key locks held for milliseconds.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">5. Build the habit: catch it before your users do</h2>
+
+<p class="text-gray-300 leading-relaxed">The best blocking incidents are the ones you find in your inbox, not from your users. Set up a lightweight agent job that runs every 5 minutes, logs chains lasting longer than 30 seconds into a history table, and alerts you when the same blocker repeats. Trending data tells you whether this was a one-off or a recurring pattern that needs the real fix.</p>
+
+<p class="text-gray-300 leading-relaxed">Keep the head-blocker query from section 1 saved as a snippet in SSMS. When the alert fires at 2 AM, you want muscle memory, not a Google search. The whole diagnosis — find the chain, find the head blocker, see what it's doing, decide whether to kill — should take under 60 seconds.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Closing Thoughts</h2>
+
+<p class="text-gray-300 leading-relaxed">Blocking incidents feel chaotic because the symptoms are everywhere — hundreds of waiting sessions, cascading timeouts, dashboards on fire. But the root cause is always one session holding a lock it shouldn't hold. Find the head blocker, understand why it's holding that lock, and act on that one session. Everything else resolves itself.</p>
+
+<p class="text-gray-300 leading-relaxed">And resist the urge to NOLOCK your way out of the 2 AM incident. Your future self, debugging a wrong totals report at 3 AM, will thank you.</p>
+
+<p class="text-gray-300 leading-relaxed">Go deeper: The DBA Handbook, Chapter 14.</p>
+    </div>
+    <div class="mt-14 bg-blue-950/40 border border-blue-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">Execution plan visualizer · Index advisor · Slow query dashboard · SQL Server</p>
+      </div>
+      <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
+         class="shrink-0 px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded-xl text-sm transition">
+        Download Free
+      </a>
+    </div>
+    <div class="mt-8"><a href="index.html" class="text-xs text-gray-500 hover:text-gray-300 transition">← Back to all articles</a></div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli</div>
+  </footer>
+</body>
+</html>
