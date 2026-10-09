@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Tempdb under pressure: diagnosing allocation contention and spills — Rajesh Guntupalli</title>
+  <meta name="description" content="Queries slow down, nothing is blocked, CPUs look fine — and tempdb is the quiet culprit. How to tell whether it's allocation contention or spills, and what to fix first." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-blue-500 to-blue-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-blue-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"    class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"     class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Book</a>
+        <a href="index.html"       class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Blog</a>
+        <a href="../about.html"    class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
+           class="ml-2 px-4 py-1.5 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded-lg transition">Get Free Tools</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="flex gap-2 mb-5"><span class="px-2 py-0.5 bg-blue-900/40 border border-blue-800/40 text-blue-300 text-xs rounded-full">SQL Server</span><span class="px-2 py-0.5 bg-blue-900/40 border border-blue-800/40 text-blue-300 text-xs rounded-full">Troubleshooting</span></div>
+    <h1 class="text-4xl font-extrabold mb-4 leading-tight">Tempdb under pressure: diagnosing allocation contention and spills</h1>
+    <div class="flex items-center gap-3 text-xs text-gray-500 mb-10 pb-8 border-b border-gray-800/60">
+      <span>Rajesh Guntupalli</span><span>·</span><span>October 2026</span><span>·</span><span>6 min read</span>
+    </div>
+    <div class="space-y-4 text-sm">
+<p class="text-gray-300 leading-relaxed"># Tempdb Under Pressure: Diagnosing Allocation Contention and Spills</p>
+<p class="text-gray-300 leading-relaxed">*By Rajesh Guntupalli*</p>
+<p class="text-gray-300 leading-relaxed">---</p>
+<p class="text-gray-300 leading-relaxed">Tempdb is the one database on your instance that you never backed up, never tuned, and never thought about — until it becomes the bottleneck for everything. Every query that sorts, hashes, spools, or builds a temp table leans on tempdb. When it slows down, symptoms look like everything else: queries get slower, waits climb, and nothing obvious is blocked. I've walked into more than one "the server is slow" incident where tempdb was the whole story.</p>
+<p class="text-gray-300 leading-relaxed">Tempdb pain comes from three directions: file-level allocation contention, sort and hash spills, and version store growth. They have different signatures and different fixes. Here's how I diagnose each.</p>
+<p class="text-gray-300 leading-relaxed">---</p>
+<h2 class="text-xl font-bold text-white mt-10 mb-4">1. Start with the basics: space, latency, and version store</h2>
+<p class="text-gray-300 leading-relaxed">Before chasing exotic causes, rule out the obvious. Is tempdb full, is it slow, and is the version store ballooning? One script answers all three:</p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Tempdb health snapshot: free space, file latency, version store size
+SELECT
+    DB_NAME(f.database_id) AS database_name,
+    f.name AS file_name,
+    f.type_desc,
+    f.size * 8.0 / 1024 AS size_mb,
+    (f.size - FILEPROPERTY(f.name, 'SpaceUsed')) * 8.0 / 1024 AS free_mb,
+    fs.num_of_reads,
+    fs.num_of_writes,
+    CASE WHEN fs.num_of_reads + fs.num_of_writes &gt; 0
+         THEN (fs.io_stall_read_ms + fs.io_stall_write_ms) / (fs.num_of_reads + fs.num_of_writes)
+         ELSE 0 END AS avg_io_stall_ms
+FROM tempdb.sys.database_files f
+LEFT JOIN sys.dm_io_virtual_file_stats(2, NULL) fs
+    ON fs.file_id = f.file_id;
+
+-- Version store size in tempdb (should stay small; watch it grow with SNAPSHOT isolation)
+SELECT
+    SUM(version_store_reserved_page_count) * 8.0 / 1024 AS version_store_mb
+FROM sys.dm_db_file_space_usage;</code></pre>
+<p class="text-gray-300 leading-relaxed">If <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">avg_io_stall_ms</code> is consistently above 20–30ms on tempdb files, your tempdb is waiting on storage. That's the simplest possible finding and it happens more than people admit — tempdb on the same slow volume as everything else, or a virtual disk that someone provisioned thin.</p>
+<p class="text-gray-300 leading-relaxed">---</p>
+<h2 class="text-xl font-bold text-white mt-10 mb-4">2. Check for allocation page contention (the classic 2:1:1 problem)</h2>
+<p class="text-gray-300 leading-relaxed">This is the famous one. Tempdb has shared allocation pages — GAM, SGAM, and PFS — and on a busy server hundreds of threads can pile up waiting on the same handful of pages. The signature is heavy <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">PAGELATCH_EX</code> or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">PAGELATCH_SH</code> waits with page IDs pointing at tempdb (database_id 2). This query finds it directly:</p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Find which pages latch waits are waiting on right now
+SELECT
+    d.name AS database_name,
+    wt.wait_type,
+    wt.waiting_task_address,
+    PAGE_ADDRESS = wt.resource_description,
+    s.session_id,
+    s.login_name,
+    s.program_name
+FROM sys.dm_os_waiting_tasks wt
+JOIN sys.dm_exec_sessions s
+    ON s.session_id = wt.session_id
+JOIN sys.databases d
+    ON d.database_id = CASE
+        WHEN wt.resource_description LIKE '2:%' THEN 2
+        ELSE wt.database_id END
+WHERE wt.wait_type LIKE 'PAGELATCH%'
+ORDER BY wt.wait_duration_ms DESC;</code></pre>
+<p class="text-gray-300 leading-relaxed">If you see a wall of <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">PAGELATCH_EX</code> waits on resources like <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">2:1:1</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">2:1:3</code> — PFS pages — that's allocation contention. The classic fix, still valid: add more tempdb data files, one per logical CPU up to 8, all sized identically with identical autogrowth. Also make sure you don't have one file at 10 GB and seven at 100 MB — the proportional-fill algorithm will hammer the empty ones.</p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- How many tempdb data files do you have, and are they evenly sized?
+SELECT name, size * 8.0 / 1024 AS size_mb, growth * 8.0 / 1024 AS growth_mb
+FROM tempdb.sys.database_files
+WHERE type = 0;
+
+-- Add files so you have 8 equally sized data files (run during a maintenance window)
+ALTER DATABASE tempdb
+ADD FILE (NAME = tempdev2, FILENAME = 'D:\Data\tempdev2.ndf', SIZE = 4096MB, FILEGROWTH = 512MB);</code></pre>
+<p class="text-gray-300 leading-relaxed">On modern SQL Server versions, enabling trace flags 1117 and 1118 via the configuration option for uniform autogrowth also helps — the fix is structural, not per-query.</p>
+<p class="text-gray-300 leading-relaxed">---</p>
+<h2 class="text-xl font-bold text-white mt-10 mb-4">3. Hunt down spills: sorts and hashes that overflow to disk</h2>
+<p class="text-gray-300 leading-relaxed">The second flavor of tempdb pain is query plans that expected a small sort or hash table, got a big one, and spilled to tempdb. Spills are 10–100x slower than the in-memory operation the plan was built for. The giveaway is the "Sort Warnings" or "Hash Warning" event, and in modern plans you can see spill sizes directly. This finds the worst spillers in your plan cache:</p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Top queries by estimated spills to tempdb (SQL Server 2019+)
+SELECT TOP 20
+    qs.total_spills / NULLIF(qs.execution_count, 0) AS avg_spills_per_exec,
+    qs.total_spills,
+    qs.execution_count,
+    SUBSTRING(t.text, 1, 200) AS query_snippet
+FROM sys.dm_exec_query_stats qs
+CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) t
+WHERE qs.total_spills &gt; 0
+ORDER BY qs.total_spills DESC;</code></pre>
+<p class="text-gray-300 leading-relaxed">Spills almost always mean the optimizer guessed wrong about row counts. The root cause is stale or missing statistics, or parameter sniffing that built a plan for one value and ran it for another. Fix order: update statistics on the involved tables, look at the actual vs. estimated rows in the plan, and consider <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">OPTION (RECOMPILE)</code> for queries with volatile parameters. In SQL Server 2022+, memory grant feedback can automatically correct recurring spills — check <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_query_stats</code> for <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">last_dop</code> and memory grant adjustments before rewriting the query.</p>
+<p class="text-gray-300 leading-relaxed">---</p>
+<h2 class="text-xl font-bold text-white mt-10 mb-4">4. Find what's bloating the version store</h2>
+<p class="text-gray-300 leading-relaxed">If you're running <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">READ_COMMITTED_SNAPSHOT</code> or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SNAPSHOT</code> isolation — and you should be — tempdb hosts the version store: old row versions kept alive so readers see a consistent picture. It stays small as long as transactions finish quickly. The moment one session leaves a transaction open for an hour, the version store grows and every new version chains onto it. This finds the culprit:</p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Sessions holding the version store open with long transactions
+SELECT
+    s.session_id,
+    s.login_name,
+    s.host_name,
+    s.program_name,
+    DATEDIFF(MINUTE, dt.transaction_begin_time, GETDATE()) AS tran_open_minutes,
+    dt.transaction_id
+FROM sys.dm_tran_active_snapshot_database_transactions st
+JOIN sys.dm_tran_active_transactions dt
+    ON dt.transaction_id = st.transaction_id
+JOIN sys.dm_tran_session_transactions sst
+    ON sst.transaction_id = dt.transaction_id
+JOIN sys.dm_exec_sessions s
+    ON s.session_id = sst.session_id
+ORDER BY dt.transaction_begin_time;</code></pre>
+<p class="text-gray-300 leading-relaxed">In practice it's usually a report or an ETL step that opens a transaction and then sits on it. The fix is the same as in every blocking story: keep transactions short and never let them span network calls or user think-time.</p>
+<p class="text-gray-300 leading-relaxed">---</p>
+<h2 class="text-xl font-bold text-white mt-10 mb-4">5. Make it boring: baseline tempdb before the incident</h2>
+<p class="text-gray-300 leading-relaxed">Everything above is reactive. The move that pays off long-term is a lightweight baseline: every 10 minutes, log tempdb file space usage, version store size, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">PAGELATCH</code> wait counts into a history table. Ten rows an hour, nothing. When a slowdown hits, you can immediately answer "was tempdb different an hour ago?" instead of guessing.</p>
+<p class="text-gray-300 leading-relaxed">I keep one alert on top of it: version store above 20% of tempdb, or a data file with less than 10% free space. Those two thresholds have caught nearly every tempdb incident I've seen before users noticed.</p>
+<p class="text-gray-300 leading-relaxed">---</p>
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Closing Thoughts</h2>
+<p class="text-gray-300 leading-relaxed">Tempdb incidents are confusing because the symptoms are generic — everything gets a little slower, waits climb across the board, and no single query looks guilty. The diagnosis is simple once you know the three flavors: latch waits on 2:x pages mean allocation contention, spill warnings mean the optimizer misestimated, and a growing version store means someone left a transaction open.</p>
+<p class="text-gray-300 leading-relaxed">Check tempdb first, not last. It's the one database every query shares, and it's usually the one nobody tuned.</p>
+<p class="text-gray-300 leading-relaxed">Go deeper: The DBA Handbook, Chapter 9.</p>
+    </div>
+    <div class="mt-14 bg-blue-950/40 border border-blue-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">Execution plan visualizer · Index advisor · Slow query dashboard · SQL Server</p>
+      </div>
+      <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
+         class="shrink-0 px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded-xl text-sm transition">
+        Download Free
+      </a>
+    </div>
+    <div class="mt-8"><a href="index.html" class="text-xs text-gray-500 hover:text-gray-300 transition">← Back to all articles</a></div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli</div>
+  </footer>
+</body>
+</html>
