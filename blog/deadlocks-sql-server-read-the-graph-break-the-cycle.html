@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Deadlocks in SQL Server: read the graph, break the cycle — Rajesh Guntupalli</title>
+  <meta name="description" content="How to read a SQL Server deadlock graph, capture graphs with the system_health extended event, and the three fixes that actually stop deadlocks." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-blue-500 to-blue-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-blue-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"    class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"     class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Book</a>
+        <a href="index.html"       class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Blog</a>
+        <a href="../about.html"    class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
+           class="ml-2 px-4 py-1.5 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded-lg transition">Get Free Tools</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="flex gap-2 mb-5"><span class="px-2 py-0.5 bg-blue-900/40 border border-blue-800/40 text-blue-300 text-xs rounded-full">SQL Server</span><span class="px-2 py-0.5 bg-blue-900/40 border border-blue-800/40 text-blue-300 text-xs rounded-full">Troubleshooting</span></div>
+    <h1 class="text-4xl font-extrabold mb-4 leading-tight">Deadlocks in SQL Server: read the graph, break the cycle</h1>
+    <div class="flex items-center gap-3 text-xs text-gray-500 mb-10 pb-8 border-b border-gray-800/60">
+      <span>Rajesh Guntupalli</span><span>·</span><span>October 2026</span><span>·</span><span>6 min read</span>
+    </div>
+    <div class="space-y-4 text-sm">
+<p class="text-gray-300 leading-relaxed"># Deadlocks in SQL Server: Read the Graph, Break the Cycle</p>
+
+<p class="text-gray-300 leading-relaxed">*By Rajesh Guntupalli*</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<p class="text-gray-300 leading-relaxed">Every SQL Server DBA has a deadlock story. Mine involves a 3 AM alert, a payment processing job, and an error 1205 that kept reappearing no matter how many times the job retried. The app team wanted a retry loop. I wanted the actual cause. The retry loop lost — temporarily — and the deadlock graph told me exactly why.</p>
+
+<p class="text-gray-300 leading-relaxed">Deadlocks aren't random. They're a deterministic cycle of lock requests, and the deadlock graph shows you every step of it. Here's how to read one and how to break the cycle for good.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">1. What a deadlock actually is (and how SQL Server picks a victim)</h2>
+
+<p class="text-gray-300 leading-relaxed">A deadlock is a circle of waiting: process A holds a lock on row 1 and wants row 2, while process B holds a lock on row 2 and wants row 1. Neither can proceed. SQL Server's lock monitor detects the cycle and picks a victim to roll back.</p>
+
+<p class="text-gray-300 leading-relaxed">Victim selection isn't random either. SQL Server first honors <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DEADLOCK_PRIORITY</code> — higher values survive, lower ones die. If priorities tie, it kills the session with the lowest estimated rollback cost, which is usually the transaction that has done the least work. The survivor gets the locks and finishes; the victim gets error 1205.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Which session is running with an unusual deadlock priority?
+SELECT session_id, deadlock_priority
+FROM sys.dm_exec_sessions
+WHERE deadlock_priority &lt;&gt; 0
+  AND is_user_process = 1;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">If you've ever set <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DEADLOCK_PRIORITY HIGH</code> to "fix" a deadlock, all you did was move the error 1205 to somebody else. Priorities manage consequences, not causes.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">2. Capturing deadlock graphs without a trace flag</h2>
+
+<p class="text-gray-300 leading-relaxed">The good news: you don't need trace flag 1222. The built-in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">system_health</code> extended event session captures every deadlock graph by default on SQL Server 2012 and later. No setup, no restart.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Pull the most recent deadlock graphs from the system_health ring buffer
+WITH events AS (
+    SELECT CAST(t.target_data AS xml) AS target_xml
+    FROM sys.dm_xe_sessions s
+    JOIN sys.dm_xe_session_targets t
+        ON t.event_session_address = s.address
+    WHERE s.name = N'system_health'
+      AND t.target_name = N'ring_buffer'
+)
+SELECT
+    event_xml.value('(event/@timestamp)[1]', 'datetime2') AS deadlock_time,
+    event_xml.query('(event/data/value/deadlock)[1]')     AS deadlock_graph
+FROM events
+CROSS APPLY target_xml.nodes('RingBufferTarget/event') AS x(event_xml)
+WHERE event_xml.value('(event/@name)[1]', 'varchar(50)') = 'xml_deadlock_report'
+ORDER BY deadlock_time DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Run that right after a deadlock alert and you get the full XML graph. On a busy server, the ring buffer recycles — if you need history, set up your own XE session writing to a file target. One recurring deadlock a week is worth a permanent capture.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">3. Reading the graph: process-list, resource-list, and the one line that matters</h2>
+
+<p class="text-gray-300 leading-relaxed">A deadlock graph XML has two lists that matter: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">process-list</code> (who was involved) and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">resource-list</code> (what they were fighting over). In SSMS, the graphical deadlock graph view shows the same thing — the classic "process 1 → resource → process 2 → resource → process 1" circle.</p>
+
+<p class="text-gray-300 leading-relaxed">Each process entry includes the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">inputbuf</code> — the actual batch the session was running. That's the shortcut: in almost every graph I've analyzed, reading the two input buffers tells you the story before you decode a single lock mode.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- BAD: two procedures touch the same two tables in opposite order
+-- proc_payments updates orders, then payments
+UPDATE dbo.orders   SET status = 'Paid' WHERE order_id = @id;
+UPDATE dbo.payments  SET status = 'Done' WHERE order_id = @id;
+
+-- proc_refunds updates payments, then orders  -- deadlock magnet
+UPDATE dbo.payments  SET status = 'Reversed' WHERE order_id = @id;
+UPDATE dbo.orders    SET status = 'Refunded' WHERE order_id = @id;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">That was my 3 AM story: payments touched <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">orders</code> then <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">payments</code>; refunds touched <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">payments</code> then <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">orders</code>. Two X locks acquired in opposite order. The graph's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">owner-list</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">waiter-list</code> confirmed it in under a minute.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">4. Fix #1: touch tables in the same order, everywhere</h2>
+
+<p class="text-gray-300 leading-relaxed">The single highest-value deadlock fix I know: establish a canonical access order and enforce it in every procedure. If everything updates <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">orders</code> before <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">payments</code>, the circle can never form.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- GOOD: both procedures use the same canonical order (orders, then payments)
+CREATE PROCEDURE dbo.ApplyRefund (@id int)
+AS
+BEGIN
+    SET NOCOUNT ON;
+    UPDATE dbo.orders   SET status = 'Refunded' WHERE order_id = @id;
+    UPDATE dbo.payments  SET status = 'Reversed' WHERE order_id = @id;
+END;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">This is a code-review discipline, not a server setting. I keep a one-page "lock order" note in the runbook for each database — <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">orders</code> → <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">payments</code> → <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">audit</code> — and any procedure that violates it gets flagged. Sounds boring. It eliminated 90% of our deadlocks in one sprint.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">5. Fix #2: shorten transactions and use the right isolation level</h2>
+
+<p class="text-gray-300 leading-relaxed">Long transactions hold locks long. Locks held long overlap with other transactions. Overlap is where deadlocks live. The second fix is shrinking the window: do your reads, business logic, and validation <em>outside</em> the transaction, then open it only for the writes.</p>
+
+<p class="text-gray-300 leading-relaxed">Where readers fight writers, enable read committed snapshot isolation (RCSI). Readers take no shared locks, so read/write cycles — the most common deadlock shape — disappear.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- BAD: transaction spans slow app work; locks held the whole time
+BEGIN TRAN;
+    EXEC dbo.CallPaymentGateway @id;   -- seconds of blocking
+    UPDATE dbo.orders SET status = 'Paid' WHERE order_id = @id;
+COMMIT;
+
+-- GOOD: transaction covers only the writes
+EXEC dbo.CallPaymentGateway @id;       -- outside the transaction
+BEGIN TRAN;
+    UPDATE dbo.orders SET status = 'Paid' WHERE order_id = @id;
+COMMIT;
+
+-- Enable RCSI once per database (test in staging first — row versions add tempdb load)
+ALTER DATABASE Sales SET READ_COMMITTED_SNAPSHOT ON;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">RCSI is not free: version store writes go to tempdb, so monitor tempdb after enabling. But trading reader-writer deadlocks for a tempdb load you can plan for is almost always a good deal.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">6. Fix #3: add the covering index that stops lock escalation</h2>
+
+<p class="text-gray-300 leading-relaxed">Some deadlocks come from missing indexes. A lookup on an unindexed foreign key scans rows, taking shared locks on everything it touches — and a concurrent writer then needs exclusive locks on those same rows. A covering index turns that scan into a narrow seek, taking far fewer locks for a far shorter time.</p>
+
+<p class="text-gray-300 leading-relaxed">The deadlock graph tells you exactly which columns are involved: the resource-list shows the key or page each process was waiting on. When I see deadlocks on the same two keys from lookup-heavy procedures, a targeted index usually ends it.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- The graph showed waits on payments(order_id) via scan; a seek takes one key lock
+CREATE INDEX IX_payments_order_id
+    ON dbo.payments (order_id)
+    INCLUDE (status, updated_at);</code></pre>
+
+<p class="text-gray-300 leading-relaxed">This is also where the missing-index DMVs earn their keep — <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_db_missing_index_details</code> often points at the same columns the deadlock graph does. Two independent signals agreeing is the strongest evidence you'll get.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Closing takeaway</h2>
+
+<p class="text-gray-300 leading-relaxed">Stop treating deadlocks as random flakiness and stop papering over them with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DEADLOCK_PRIORITY</code> or blind retries. Pull the graph from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">system_health</code>, read the two input buffers, and you'll almost always find one of three things: opposite table access order, a transaction that's too fat, or a missing index turning seeks into scans. Fix the cause and the 1205s stop.</p>
+
+<p class="text-gray-300 leading-relaxed">Go deeper: The DBA Handbook, Chapter 3 — locking, isolation levels, and deadlock mechanics.</p>
+    </div>
+    <div class="mt-14 bg-blue-950/40 border border-blue-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">Execution plan visualizer · Index advisor · Slow query dashboard · SQL Server</p>
+      </div>
+      <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
+         class="shrink-0 px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded-xl text-sm transition">
+        Download Free
+      </a>
+    </div>
+    <div class="mt-8"><a href="index.html" class="text-xs text-gray-500 hover:text-gray-300 transition">← Back to all articles</a></div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli</div>
+  </footer>
+</body>
+</html>
