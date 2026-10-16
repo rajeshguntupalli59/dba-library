@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SQL Server backup failures: 6 ways they break and how to catch each one — Rajesh Guntupalli</title>
+  <meta name="description" content="The six backup failure patterns DBAs keep hitting — unreachable shares, full drives, broken log chains, overlapping jobs, checksum errors, and unverified backups." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-blue-500 to-blue-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-blue-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"    class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"     class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Book</a>
+        <a href="index.html"       class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Blog</a>
+        <a href="../about.html"    class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
+           class="ml-2 px-4 py-1.5 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded-lg transition">Get Free Tools</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="flex gap-2 mb-5"><span class="px-2 py-0.5 bg-blue-900/40 border border-blue-800/40 text-blue-300 text-xs rounded-full">SQL Server</span><span class="px-2 py-0.5 bg-blue-900/40 border border-blue-800/40 text-blue-300 text-xs rounded-full">Troubleshooting</span></div>
+    <h1 class="text-4xl font-extrabold mb-4 leading-tight">SQL Server backup failures: 6 ways they break and how to catch each one</h1>
+    <div class="flex items-center gap-3 text-xs text-gray-500 mb-10 pb-8 border-b border-gray-800/60">
+      <span>Rajesh Guntupalli</span><span>·</span><span>October 2026</span><span>·</span><span>6 min read</span>
+    </div>
+    <div class="space-y-4 text-sm">
+<p class="text-gray-300 leading-relaxed">A backup that fails is almost worse than no backup at all — it gives you confidence you don't deserve. I've seen teams discover their backups were broken only when they needed to restore. That's the worst possible time to learn.</p>
+
+<p class="text-gray-300 leading-relaxed">Here are the six failure patterns I keep seeing, and the T-SQL to catch each one before disaster does.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">1. The backup share is unreachable</h2>
+
+<p class="text-gray-300 leading-relaxed">The classic: your job writes to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">\\nas\backups\</code>, someone renames the share or the service account password expires, and every job fails with operating system error 53 or 1326. The SQL Server service account — not you — needs write access to that path.</p>
+
+<p class="text-gray-300 leading-relaxed">Check what's actually failing before you blame the network:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Which databases never got a successful backup, and why the last one failed
+SELECT
+    d.name AS database_name,
+    MAX(b.backup_finish_date) AS last_successful_backup,
+    DATEDIFF(DAY, MAX(b.backup_finish_date), GETDATE()) AS days_since_backup
+FROM sys.databases d
+LEFT JOIN msdb.dbo.backupset b
+    ON b.database_name = d.name
+    AND b.type = 'D'
+    AND b.is_copy_only = 0
+WHERE d.database_id &gt; 4
+  AND d.state_desc = 'ONLINE'
+GROUP BY d.name
+HAVING MAX(b.backup_finish_date) IS NULL
+    OR MAX(b.backup_finish_date) &lt; DATEADD(DAY, -2, GETDATE());</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Then read the real error in the SQL Server error log — the job history message alone is usually truncated. If you see error 3201 ("Cannot open backup device"), fix the share and the service account permissions first, and back the share path itself: test it with a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">COPY_ONLY</code> backup to the NUL device so the real job never discovers the problem for you.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">2. The drive fills up mid-backup</h2>
+
+<p class="text-gray-300 leading-relaxed">A full backup of a 400 GB database with no compression and no retention cleanup will happily fill a 1 TB drive — and then fail with error 3257 ("There is insufficient free space on disk"). The backup dies, the old files stay, and the next night's job fails faster.</p>
+
+<p class="text-gray-300 leading-relaxed">Two fixes. Turn on compression — it usually cuts backup size by 60–80% with barely any CPU cost on modern servers — and check free space before the job runs:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- GOOD: compressed backup with checksum verification
+BACKUP DATABASE MyDb
+TO DISK = '\\nas\backups\MyDb_full.bak'
+WITH COMPRESSION, CHECKSUM, STATS = 10;
+
+-- Free space on every drive SQL Server can see
+SELECT DISTINCT
+    volume_mount_point,
+    CAST(total_bytes / 1024.0 / 1024 / 1024 AS DECIMAL(10,2)) AS total_gb,
+    CAST(available_bytes / 1024.0 / 1024 / 1024 AS DECIMAL(10,2)) AS free_gb
+FROM sys.master_files
+CROSS APPLY sys.dm_os_volume_stats(database_id, file_id);</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Add the free-space check to your backup job's first step. If a drive is under, say, 20% free, fail the step with a clear message instead of letting the backup die halfway through at 3 AM.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">3. BACKUP LOG in SIMPLE recovery model</h2>
+
+<p class="text-gray-300 leading-relaxed">Error 4208: "The statement BACKUP LOG is not allowed while the recovery model is SIMPLE." Someone changed the recovery model to SIMPLE during a migration, the log backup job kept running, and now you have a nightly error that's been ignored for six months.</p>
+
+<p class="text-gray-300 leading-relaxed">If the database is supposed to be in FULL recovery, switch it back and take a full backup immediately — the log chain is broken, and until you take a full backup, point-in-time recovery is not possible:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- GOOD: repair the log chain after a recovery-model mix-up
+ALTER DATABASE MyDb SET RECOVERY FULL;
+
+BACKUP DATABASE MyDb
+TO DISK = '\\nas\backups\MyDb_full.bak'
+WITH COMPRESSION, CHECKSUM;
+
+BACKUP LOG MyDb
+TO DISK = '\\nas\backups\MyDb_log.trn'
+WITH COMPRESSION, CHECKSUM;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">And add a guard to your log-backup job so it skips SIMPLE-recovery databases instead of failing noisily — alert fatigue is how real failures get ignored.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">4. Overlapping backup jobs stepping on each other</h2>
+
+<p class="text-gray-300 leading-relaxed">Error 3023: "Backup, file manipulation operations... are not allowed on a database that is in use when any... operation is in progress." Your full backup starts at 1 AM, the differential starts at 1:05 AM on the same database, and one of them dies every night.</p>
+
+<p class="text-gray-300 leading-relaxed">SQL Server can't run two backup operations on the same database at the same time. Look for overlaps in your Agent job schedules — this often happens after someone adds a new job or a maintenance plan runs longer than expected and cascades into the next window.</p>
+
+<p class="text-gray-300 leading-relaxed">The fix is schedule hygiene, not retry logic: stagger jobs, keep a single backup window per instance, and make long-running jobs fail loudly instead of quietly spilling into the next slot.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">5. Checksum errors — the backup that was already corrupt</h2>
+
+<p class="text-gray-300 leading-relaxed">This is the scary one. Error 3041: the backup hit a page with a checksum mismatch. The data was already corrupt on disk — the backup just told you about it. If your backups don't use <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WITH CHECKSUM</code>, and the database doesn't have <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">PAGE_VERIFY CHECKSUM</code> enabled, corruption can sit there silently for years.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- GOOD: enable page checksums so corruption is caught on write, not at restore
+ALTER DATABASE MyDb SET PAGE_VERIFY CHECKSUM;
+
+-- Find databases that are still on the old detection method
+SELECT name, page_verify_option_desc
+FROM sys.databases
+WHERE page_verify_option_desc &lt;&gt; 'CHECKSUM'
+  AND database_id &gt; 4;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Run a weekly <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DBCC CHECKDB</code> on every production database and treat checksum errors as a severity-1 incident. A backup of a corrupt database is just a corrupt database with extra steps.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">6. Nobody ever verified the backup</h2>
+
+<p class="text-gray-300 leading-relaxed">The most common failure of all: the backup job succeeds every night, nobody checks whether the file is actually restorable, and during an outage you discover the media set is incomplete or the header is unreadable. A green job history is not a restore plan.</p>
+
+<p class="text-gray-300 leading-relaxed">At minimum, verify the media header after every backup. Better: automate a monthly restore test to a scratch server and confirm the database comes online.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- GOOD: quick media verification — catches incomplete or damaged backup files
+RESTORE VERIFYONLY
+FROM DISK = '\\nas\backups\MyDb_full.bak'
+WITH CHECKSUM;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Closing takeaway</h2>
+
+<p class="text-gray-300 leading-relaxed">Backups fail in boring, repeatable ways — and that's good news, because boring problems can be monitored. Build yourself a daily check: every database with a recent successful full, free space on every target drive, no SIMPLE-recovery databases running log jobs, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">PAGE_VERIFY</code> set to CHECKSUM everywhere, and a restore test you actually run. The five minutes you spend each morning beats the five hours you'll spend explaining a gap in the backup chain.</p>
+
+<p class="text-gray-300 leading-relaxed">Go deeper: The DBA Handbook, Chapter 10.</p>
+    </div>
+    <div class="mt-14 bg-blue-950/40 border border-blue-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">Execution plan visualizer · Index advisor · Slow query dashboard · SQL Server</p>
+      </div>
+      <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
+         class="shrink-0 px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded-xl text-sm transition">
+        Download Free
+      </a>
+    </div>
+    <div class="mt-8"><a href="index.html" class="text-xs text-gray-500 hover:text-gray-300 transition">← Back to all articles</a></div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli</div>
+  </footer>
+</body>
+</html>
