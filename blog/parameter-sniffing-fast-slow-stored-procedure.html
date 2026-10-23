@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Parameter sniffing in SQL Server: why the same stored procedure runs fast and slow — Rajesh Guntupalli</title>
+  <meta name="description" content="The first call compiles the plan, the rest inherit it. How to diagnose parameter sniffing with T-SQL and fix it without guesswork." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-blue-500 to-blue-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-blue-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"    class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"     class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Book</a>
+        <a href="index.html"       class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Blog</a>
+        <a href="../about.html"    class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="https://rajeshguntupalli59.github.io/querylab/"
+           class="ml-2 px-4 py-1.5 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded-lg transition">Get Free Tools</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="flex gap-2 mb-5"><span class="px-2 py-0.5 bg-blue-900/40 border border-blue-800/40 text-blue-300 text-xs rounded-full">SQL Server</span><span class="px-2 py-0.5 bg-blue-900/40 border border-blue-800/40 text-blue-300 text-xs rounded-full">Troubleshooting</span><span class="px-2 py-0.5 bg-blue-900/40 border border-blue-800/40 text-blue-300 text-xs rounded-full">Performance</span></div>
+    <h1 class="text-4xl font-extrabold mb-4 leading-tight">Parameter sniffing in SQL Server: why the same stored procedure runs fast and slow</h1>
+    <div class="flex items-center gap-3 text-xs text-gray-500 mb-10 pb-8 border-b border-gray-800/60">
+      <span>Rajesh Guntupalli</span><span>·</span><span>October 2026</span><span>·</span><span>7 min read</span>
+    </div>
+    <div class="space-y-4 text-sm">
+<p class="text-gray-300 leading-relaxed">Few production mysteries are as frustrating as this one: a stored procedure runs in 200 milliseconds for one customer and takes 90 seconds for another. Same procedure, same code, same indexes. The developers swear nothing changed. The execution plans look like two completely different queries. And sometimes they are — in spirit, if not in text.</p>
+
+<p class="text-gray-300 leading-relaxed">This is parameter sniffing, and it is one of the most common root causes I find behind "intermittent" slowdowns in SQL Server environments. Here is what is actually happening, how to prove it in about five minutes, and the fixes that actually hold up.</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">1. The first call compiles the plan; everyone else inherits it</h2>
+
+<p class="text-gray-300 leading-relaxed">When SQL Server executes a stored procedure for the first time (or after a plan cache flush), it compiles an execution plan based on the <em>actual parameter values passed in that first call</em>. That compiled plan is then cached and reused for every subsequent call — regardless of how different the new parameter values are.</p>
+
+<p class="text-gray-300 leading-relaxed">The optimizer does its job perfectly for the value it saw. The problem is skewed data. Imagine a procedure that looks up orders by <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">customer_id</code>. One customer has 12 orders; another has 400,000. If the first call compiles for the 12-order customer, the cached plan might choose nested loops with a key lookup — elegant for 12 rows, catastrophic for 400,000. Flip it around and the 12-order customer gets a hash join over a giant scan.</p>
+
+<p class="text-gray-300 leading-relaxed">So the plan is not "wrong" — it was optimized for a reality that no longer applies. This is why the slowness comes and goes: whoever calls first after a recompile wins, and everyone else pays.</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">2. Prove it before you touch anything</h2>
+
+<p class="text-gray-300 leading-relaxed">Do not start with fixes. Start with evidence. The cheapest proof is to run the procedure with the bad parameter right after evicting its cached plan, and watch whether it suddenly gets fast:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Find the plan handle for your procedure
+SELECT qs.plan_handle, st.text
+FROM sys.dm_exec_query_stats qs
+CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) st
+WHERE st.text LIKE '%dbo.GetCustomerOrders%';
+
+-- Evict ONLY that plan (never run DBCC FREEPROCCACHE on a whole server in prod)
+DBCC FREEPROCCACHE (0x06000...);  -- paste the real plan_handle here
+
+-- Re-run with the "bad" parameter and compare duration
+EXEC dbo.GetCustomerOrders @customer_id = 42;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">If the slow call becomes fast after the cache eviction, you have your diagnosis. For ongoing confirmation, Query Store is even better — it keeps the history of which plans ran, with which runtime stats, so you can watch the fast and slow plans take turns:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Plans and their average durations for one procedure, from Query Store
+SELECT p.plan_id,
+       AVG(rs.avg_duration) / 1000.0 AS avg_ms,
+       COUNT(*) AS executions
+FROM sys.query_store_plan p
+JOIN sys.query_store_query q ON q.query_id = p.query_id
+JOIN sys.query_store_query_text qt ON qt.query_text_id = q.query_text_id
+JOIN sys.query_store_runtime_stats rs ON rs.plan_id = p.plan_id
+WHERE qt.query_sql_text LIKE '%dbo.GetCustomerOrders%'
+GROUP BY p.plan_id
+ORDER BY avg_ms DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Two plans for the same query with wildly different average durations is the classic signature. Also compare estimated vs. actual row counts in the plan — a sniffed plan shows an estimate matching the first call's selectivity, not the current one.</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">3. Fix it the cheap way first: OPTION (RECOMPILE)</h2>
+
+<p class="text-gray-300 leading-relaxed">If the procedure executes dozens or hundreds of times per minute, recompile cost is trivial compared to running the wrong plan for 90 seconds:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- GOOD: each call gets a plan built for ITS parameter values
+CREATE OR ALTER PROCEDURE dbo.GetCustomerOrders
+    @customer_id INT
+AS
+SELECT o.order_id, o.order_date, o.total
+FROM dbo.orders o
+WHERE o.customer_id = @customer_id
+OPTION (RECOMPILE);</code></pre>
+
+<p class="text-gray-300 leading-relaxed">I reach for this first whenever the procedure is not called hundreds of times per second and the plan is sensitive to the parameter. It is also the safest to test in a crisis because it changes nothing structural. The tradeoff: compilation cost on every execution. On a hot loop of 2,000 calls per second, that cost matters — but that is the rare case, not the default one.</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">4. Fix it the targeted way: OPTIMIZE FOR the reality of your data</h2>
+
+<p class="text-gray-300 leading-relaxed">Sometimes you know your workload's shape: 95% of calls pass a small customer ID, 5% pass the whales. Instead of letting a random first call decide, you tell the optimizer which reality to optimize for:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- BAD: plan flips based on whoever called first after a recompile
+SELECT o.order_id, o.order_date, o.total
+FROM dbo.orders o
+WHERE o.customer_id = @customer_id;
+
+-- GOOD: compile for the value that represents your dominant workload
+SELECT o.order_id, o.order_date, o.total
+FROM dbo.orders o
+WHERE o.customer_id = @customer_id
+OPTION (OPTIMIZE FOR (@customer_id = 11842));  -- your typical customer
+
+-- GOOD: or admit you cannot know and ask for an average-statistics plan
+SELECT o.order_id, o.order_date, o.total
+FROM dbo.orders o
+WHERE o.customer_id = @customer_id
+OPTION (OPTIMIZE FOR UNKNOWN);</code></pre>
+
+<p class="text-gray-300 leading-relaxed">There is a related trick worth knowing: copying the parameter into a local variable inside the procedure defeats sniffing (the optimizer uses density statistics instead of the specific value). It is less explicit than <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">OPTIMIZE FOR UNKNOWN</code> but achieves a similar averaging effect, and it requires no hints on the statement.</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">5. Fix it the durable way: Query Store plan forcing</h2>
+
+<p class="text-gray-300 leading-relaxed">Hints change the code, and code changes need deployments. When you already have a known-good plan recorded in Query Store and you just need to stop the flip-flopping today, force the good plan:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Pin the good plan so the bad one never gets picked again
+EXEC sys.sp_query_store_force_plan
+     @query_id = 1284,
+     @plan_id  = 9051;
+
+-- Remove the pin later, after you've fixed the underlying sensitivity
+EXEC sys.sp_query_store_unforce_plan @query_id = 1284;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">I treat plan forcing as a stabilizer, not a cure. It locks you to today's good plan while you apply one of the structural fixes above. Revisit forced plans after data growth or schema changes — a forced plan that quietly becomes the wrong plan is parameter sniffing wearing a different mask.</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Closing takeaway</h2>
+
+<p class="text-gray-300 leading-relaxed">Parameter sniffing is the optimizer doing exactly what it was asked to do — optimize for the values it saw. The instability is a feature of the cache, not a bug in your query. So the diagnosis is always the same sequence: confirm with a cache eviction, watch the plans fight in Query Store, then pick the fix that matches your call rate and data skew — recompile for low-frequency sensitivity, optimize-for for skewed-but-predictable workloads, and plan forcing to stabilize while you fix the structure.</p>
+
+<p class="text-gray-300 leading-relaxed">The next time someone tells you "the stored procedure is slow for some users," resist the urge to tune indexes first. Ask which parameter they passed.</p>
+
+<p class="text-gray-300 leading-relaxed">Go deeper: The DBA Handbook, Chapter 7.</p>
+    </div>
+    <div class="mt-14 bg-blue-950/40 border border-blue-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryLab — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">Execution plan visualizer · Index advisor · Slow query dashboard · SQL Server</p>
+      </div>
+      <a href="https://rajeshguntupalli59.github.io/querylab/"
+         class="shrink-0 px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded-xl text-sm transition">
+        Download Free
+      </a>
+    </div>
+    <div class="mt-8"><a href="index.html" class="text-xs text-gray-500 hover:text-gray-300 transition">← Back to all articles</a></div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli</div>
+  </footer>
+</body>
+</html>
