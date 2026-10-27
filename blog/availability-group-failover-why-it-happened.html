@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Your Availability Group failed over at 2 AM: how to find out why — Rajesh Guntupalli</title>
+  <meta name="description" content="An unplanned AG failover is a mystery with three witnesses: the cluster log, the SQL Server error log, and the AG DMVs. How to ask each one the right question." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-blue-500 to-blue-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-blue-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"    class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"     class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Book</a>
+        <a href="index.html"       class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Blog</a>
+        <a href="../about.html"    class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="https://rajeshguntupalli59.github.io/querylab/"
+           class="ml-2 px-4 py-1.5 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded-lg transition">Get Free Tools</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="flex gap-2 mb-5"><span class="px-2 py-0.5 bg-blue-900/40 border border-blue-800/40 text-blue-300 text-xs rounded-full">SQL Server</span><span class="px-2 py-0.5 bg-blue-900/40 border border-blue-800/40 text-blue-300 text-xs rounded-full">Troubleshooting</span></div>
+    <h1 class="text-4xl font-extrabold mb-4 leading-tight">Your Availability Group failed over at 2 AM: how to find out why</h1>
+    <div class="flex items-center gap-3 text-xs text-gray-500 mb-10 pb-8 border-b border-gray-800/60">
+      <span>Rajesh Guntupalli</span><span>·</span><span>October 2026</span><span>·</span><span>7 min read</span>
+    </div>
+    <div class="space-y-4 text-sm">
+<p class="text-gray-300 leading-relaxed">The alert wakes you up: the Availability Group failed over. The application reconnected, the databases are online on the new primary, and everyone is asking the same question — why did it fail over? "The AG failed over" is not a root cause. It is the start of the investigation, and if you do not nail down the cause now, it will happen again next week, probably at 2 AM again.</p>
+
+<p class="text-gray-300 leading-relaxed">Here is the order I work through, every time. It takes about twenty minutes, and it ends with an answer you can defend in the incident review.</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">1. First, establish what actually happened</h2>
+
+<p class="text-gray-300 leading-relaxed">Before touching any log, answer three questions: which replica is primary now, when exactly did the role change, and was the failover planned or automatic? A planned manual failover during a patching window and an automatic failover caused by a lease timeout are two completely different incidents, and confusing them wastes the whole investigation.</p>
+
+<p class="text-gray-300 leading-relaxed">This query gives you the current state of every replica and database in the group:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>SELECT
+    ag.name AS ag_name,
+    ar.replica_server_name,
+    ars.role_desc,
+    ars.operational_state_desc,
+    ars.connected_state_desc,
+    ars.synchronization_health_desc,
+    drs.database_name,
+    drs.synchronization_state_desc,
+    drs.is_suspended
+FROM sys.dm_hadr_availability_replica_states ars
+JOIN sys.availability_replicas ar
+    ON ar.replica_id = ars.replica_id
+JOIN sys.availability_groups ag
+    ON ag.group_id = ar.group_id
+LEFT JOIN sys.dm_hadr_database_replica_states drs
+    ON drs.replica_id = ars.replica_id
+ORDER BY ag.name, ars.role_desc;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Run it on the new primary. If any database shows <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">NOT SYNCHRONIZING</code> or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SUSPENDED</code>, you have a second problem hiding behind the first one — deal with the failover cause first, then fix synchronization before anyone calls the incident closed.</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">2. Ask the wrong witness last: do not start with the application logs</h2>
+
+<p class="text-gray-300 leading-relaxed">The instinct is to start with whatever paged you — the application errors, the connection timeouts, the monitoring alert. Those tell you the failover hurt, not why it happened. The failover has exactly three reliable witnesses, and you should question them in this order: the Windows cluster log, the SQL Server error log, and the AG DMVs.</p>
+
+<p class="text-gray-300 leading-relaxed">The mistake I see most often looks like this:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- BAD: Only proves the failover happened, not why
+SELECT * FROM sys.dm_hadr_availability_replica_states;
+-- "The secondary is primary now." Yes. Why?
+
+-- GOOD: Start from the failover event and work backwards
+-- 1. Cluster log: what did the cluster decide, and when?
+-- 2. SQL Server error log: what did the instance see?
+-- 3. DMVs: what is the state right now?</code></pre>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">3. Read the cluster log — the cluster made the decision</h2>
+
+<p class="text-gray-300 leading-relaxed">For an automatic failover, the Windows Server Failover Cluster is the thing that actually decided to move the group. Its log is the only place that records the decision and the reason. Generate it from any cluster node:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Run in PowerShell on any cluster node
+Get-ClusterLog -Destination C:\Temp -TimeSpan 60
+# Then search the log for the AG resource name and the failover time window</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Search around the failover timestamp for phrases like <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">lost lease</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">health check timeout</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">quorum was lost</code>, or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">resource failed</code>. One of these is almost always there. The cluster log is noisy — thousands of lines per hour — so filter hard on the time window and the AG resource name, or you will drown in it.</p>
+
+<p class="text-gray-300 leading-relaxed">If the log shows a manual failover command, your investigation is nearly over: find out who ran it and whether it was the planned maintenance you already knew about. Check the change log before you declare a mystery.</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">4. Match the cluster's story against the SQL Server error log</h2>
+
+<p class="text-gray-300 leading-relaxed">Now open the SQL Server error log on the old primary for the same time window. You are looking for what the instance experienced: lease timeouts, I/O stalls, or the instance going unresponsive. A lease timeout means the cluster could not reach the instance — the instance may have been perfectly healthy but starved of CPU, or the host may have been frozen by a backup, a snapshot, or a runaway process.</p>
+
+<p class="text-gray-300 leading-relaxed">Cross-check with the system event log on the old primary's host for the same minutes: disk errors, network adapter resets, or a host-level freeze all show up there and explain a lease timeout that SQL Server alone cannot. I once chased a "SQL Server problem" for two days before the host event log showed a storage path flapping every night during the backup window. The database was the victim, not the cause.</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">5. Learn the five usual suspects by heart</h2>
+
+<p class="text-gray-300 leading-relaxed">Almost every unplanned AG failover I have investigated comes down to one of these five. Run through them in order and most investigations end at step two:</p>
+
+<p class="text-gray-300 leading-relaxed"><code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Lease timeout</code> — the instance was too busy or frozen to renew its cluster lease. Look for CPU pressure, memory pressure, or a host freeze. <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Health check timeout</code> — the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sp_server_diagnostics</code> check did not complete in time, usually because the instance was under severe resource pressure. <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Quorum loss</code> — the cluster lost too many votes, often after a network partition or a second node going down for maintenance at the same time. <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Manual failover</code> — someone, or some automation, moved the group on purpose. <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Resource failure</code> — the AG resource itself failed, which usually means the instance crashed or was stopped.</p>
+
+<p class="text-gray-300 leading-relaxed">If none of the five fits, widen the window: check whether a patching or backup job overlapped the failover time, and whether the same failover has happened before at the same hour. Recurring failovers on a schedule are almost always a job, not a fault.</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">6. Before you close the incident, prove the new primary is actually healthy</h2>
+
+<p class="text-gray-300 leading-relaxed">A failover is not over when the role moves. Check synchronization health on every database, confirm the redo queue on the new secondary is draining rather than growing, and verify the listener is pointing clients at the right replica. This is also the moment to check failover readiness for next time:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Failover readiness: every database synchronized, no suspended replicas?
+SELECT
+    drs.database_name,
+    drs.synchronization_state_desc,
+    drs.synchronization_health_desc,
+    drs.redo_queue_size,
+    drs.redo_rate,
+    drs.log_send_queue_size
+FROM sys.dm_hadr_database_replica_states drs
+JOIN sys.availability_replicas ar
+    ON ar.replica_id = drs.replica_id
+WHERE drs.is_local = 0
+  AND drs.synchronization_state_desc &lt;&gt; 'SYNCHRONIZED';</code></pre>
+
+<p class="text-gray-300 leading-relaxed">An empty result here means every remote database is synchronized and ready to take over. Anything in the result is a failover that will hurt — fix it now, while nobody is paging you.</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Closing takeaway</h2>
+
+<p class="text-gray-300 leading-relaxed">Write the cause down the same night, while the logs are fresh. "AG failed over, cause unknown, monitoring" is how teams end up explaining the same incident three times. The cluster log tells you what was decided, the error log tells you what the instance felt, and the DMVs tell you where you stand now. Twenty minutes with all three, and the 2 AM mystery becomes a one-line entry in the incident log — and a fix you can actually schedule.</p>
+
+<p class="text-gray-300 leading-relaxed">Go deeper: The DBA Handbook, Chapter 11 — High Availability.</p>
+    </div>
+    <div class="mt-14 bg-blue-950/40 border border-blue-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryLab — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">Execution plan visualizer · Index advisor · Slow query dashboard · SQL Server</p>
+      </div>
+      <a href="https://rajeshguntupalli59.github.io/querylab/"
+         class="shrink-0 px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded-xl text-sm transition">
+        Download Free
+      </a>
+    </div>
+    <div class="mt-8"><a href="index.html" class="text-xs text-gray-500 hover:text-gray-300 transition">← Back to all articles</a></div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli</div>
+  </footer>
+</body>
+</html>
