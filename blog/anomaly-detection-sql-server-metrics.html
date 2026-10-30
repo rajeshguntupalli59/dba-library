@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Anomaly detection for SQL Server metrics: baselines that catch real problems — Rajesh Guntupalli</title>
+  <meta name="description" content="Fixed thresholds cry wolf at month-end and stay silent during real incidents. Build a baseline from wait stats and Query Store, score deviations, and alert only when two signals agree." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-blue-500 to-blue-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-blue-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"    class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"     class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Book</a>
+        <a href="index.html"       class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Blog</a>
+        <a href="../about.html"    class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="https://rajeshguntupalli59.github.io/querylab/"
+           class="ml-2 px-4 py-1.5 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded-lg transition">Get Free Tools</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="flex gap-2 mb-5"><span class="px-2 py-0.5 bg-blue-900/40 border border-blue-800/40 text-blue-300 text-xs rounded-full">SQL Server</span><span class="px-2 py-0.5 bg-blue-900/40 border border-blue-800/40 text-blue-300 text-xs rounded-full">AI + Databases</span></div>
+    <h1 class="text-4xl font-extrabold mb-4 leading-tight">Anomaly detection for SQL Server metrics: baselines that catch real problems</h1>
+    <div class="flex items-center gap-3 text-xs text-gray-500 mb-10 pb-8 border-b border-gray-800/60">
+      <span>Rajesh Guntupalli</span><span>·</span><span>October 2026</span><span>·</span><span>7 min read</span>
+    </div>
+    <div class="space-y-4 text-sm">
+<p class="text-gray-300 leading-relaxed">Every DBA has lived this: an alert fires at 9 AM on the first of the month, you drop everything, and it turns out to be the normal month-end reporting load. Then, on a quiet Tuesday, nothing alerts at all — while a bad plan quietly doubles response times for one important query. Fixed thresholds fail in both directions, because "normal" on a SQL Server instance is not a single number. It changes by hour, by day of the week, and by workload.</p>
+<p class="text-gray-300 leading-relaxed">Anomaly detection is simply the fix for that: compare today against what this server usually does at this time, and alert on the deviation, not the raw value. You do not need a machine-learning platform to start. SQL Server already keeps the raw material — wait statistics and Query Store — and a few tables plus one scheduled query get you most of the value.</p>
+<p class="text-gray-300 leading-relaxed">Start small on purpose. One metric, one baseline, one alert. Teams that try to baseline everything at once end up with a monitoring project instead of a monitoring result. Pick the wait type that has hurt you most in the last six months, baseline it, and let the first alert prove the approach before you expand it.</p>
+<h2 class="text-xl font-bold text-white mt-10 mb-4">1. Why fixed thresholds lie to you</h2>
+<p class="text-gray-300 leading-relaxed">A threshold like "alert if CPU is over 80%" assumes 80% means the same thing at 3 AM and at 10 AM. It does not. Batch jobs, backups, index maintenance, and reporting windows all push counters up legitimately. Worse, a threshold set high enough to survive the busy window is too high to catch a real problem during a quiet one: a query that normally takes 50 ms taking 800 ms at midnight is a genuine incident, and it will never trip an 80% CPU alert.</p>
+<p class="text-gray-300 leading-relaxed">The rule I use now: never alert on a raw counter alone. Alert on a counter that is unusual <em>for this server, at this hour, on this kind of day</em>. That one change killed most of my alert fatigue, because the alerts that survived were the ones worth waking up for.</p>
+<p class="text-gray-300 leading-relaxed">There is a second, quieter failure mode worth naming: thresholds set so high that they never fire become decoration. If an alert has not fired in six months, it is not proof the server is healthy — it is proof the alert is untested. Review silent alerts quarterly and ask what incident they would actually catch.</p>
+<h2 class="text-xl font-bold text-white mt-10 mb-4">2. Capture a baseline before you need one</h2>
+<p class="text-gray-300 leading-relaxed">Wait statistics are cumulative counters, so a single snapshot tells you nothing — you need the delta between two snapshots. Create a small baseline table in a DBA utility database and snapshot it every 15 minutes with a SQL Server Agent job. Keep 30 days; that is enough to cover month-end cycles without growing forever.</p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- GOOD: a baseline table you own, in a DBA database, not in user databases
+CREATE TABLE dbo.WaitStatsBaseline (
+    snapshot_time DATETIME2 NOT NULL,
+    wait_type NVARCHAR(60) NOT NULL,
+    wait_time_ms BIGINT NOT NULL,
+    waiting_tasks_count BIGINT NOT NULL
+);
+
+-- Run every 15 minutes from a SQL Server Agent job
+INSERT INTO dbo.WaitStatsBaseline (snapshot_time, wait_type, wait_time_ms, waiting_tasks_count)
+SELECT SYSUTCDATETIME(), wait_type, wait_time_ms, waiting_tasks_count
+FROM sys.dm_os_wait_stats
+WHERE wait_type NOT IN ('SLEEP_TASK', 'LAZYWRITER_SLEEP', 'SQLTRACE_BUFFER_FLUSH',
+    'REQUEST_FOR_DEADLOCK_SEARCH', 'XE_TIMER_EVENT', 'BROKER_TO_FLUSH');</code></pre>
+<p class="text-gray-300 leading-relaxed">Filter out the benign waits up front, or they will dominate every chart and hide the waits that matter, like <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CXPACKET</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">PAGEIOLATCH_SH</code>, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">LCK_M_X</code>. The same snapshot habit works for Query Store: record average duration and execution count per query, so a single regressed query cannot hide inside a server-wide average.</p>
+<p class="text-gray-300 leading-relaxed">A baseline that grows forever is a future incident of its own, so prune it in the same job. Thirty days of 15-minute snapshots is plenty for weekly patterns, and a nightly delete keeps the table small and the queries fast.</p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- GOOD: keep 30 days, prune nightly, or the baseline table becomes the problem
+DELETE FROM dbo.WaitStatsBaseline
+WHERE snapshot_time &lt; DATEADD(DAY, -30, SYSUTCDATETIME());
+
+-- Also snapshot the top waits per window, not just the raw counters,
+-- so a single bad 15 minutes is easy to find later without re-aggregating
+-- the whole table.</code></pre>
+<p class="text-gray-300 leading-relaxed">One more habit that pays off: snapshot on the same server clock, in UTC, and record the job's own runtime. If the Agent job ever slips or stops, you want the gap in the baseline to be obvious, not silently filled with stale-looking data.</p>
+<h2 class="text-xl font-bold text-white mt-10 mb-4">3. Compare like with like, or the baseline lies too</h2>
+<p class="text-gray-300 leading-relaxed">The most common baseline mistake is averaging all of history together. A server that runs payroll on Fridays and backups on Sundays has no single "average Friday." Compare each snapshot against the same hour on the same weekday over the last four weeks. Four samples is a thin baseline, but it is honest — and it already separates a genuine spike from a scheduled job.</p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- BAD: one global average, blind to time of day and day of week
+SELECT AVG(wait_time_ms) FROM dbo.WaitStatsBaseline WHERE wait_type = 'CXPACKET';
+
+-- GOOD: same weekday, same hour, last four weeks — the comparison that means something
+SELECT wait_type,
+       PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY wait_time_ms)
+           OVER (PARTITION BY wait_type) AS p95_ms
+FROM dbo.WaitStatsBaseline
+WHERE wait_type = 'CXPACKET'
+  AND DATEPART(WEEKDAY, snapshot_time) = DATEPART(WEEKDAY, SYSUTCDATETIME())
+  AND DATEPART(HOUR, snapshot_time) = DATEPART(HOUR, SYSUTCDATETIME())
+  AND snapshot_time &gt;= DATEADD(WEEK, -4, SYSUTCDATETIME());</code></pre>
+<p class="text-gray-300 leading-relaxed">If your workload has a monthly cycle, keep a second, longer baseline for month-end and quarter-end windows and check those dates against it. Two baselines beat one clever one.</p>
+<p class="text-gray-300 leading-relaxed">Public holidays are the other trap. A holiday Monday looks nothing like a normal Monday, and it will either page you or poison the baseline for the next four Mondays. Tag known exception days in a small calendar table and exclude them from the baseline — or, at minimum, note them when you review a flagged anomaly, so you are not chasing a calendar effect.</p>
+<p class="text-gray-300 leading-relaxed">When you are unsure whether a pattern is weekly or daily, plot it before you automate it. One look at wait time by hour, split by weekday, usually answers the question faster than any statistical test, and it shows the team exactly why the new alert behaves differently from the old threshold.</p>
+<h2 class="text-xl font-bold text-white mt-10 mb-4">4. Score the deviation, do not just eyeball it</h2>
+<p class="text-gray-300 leading-relaxed">A spike to 3x the baseline sounds alarming until you learn the baseline was near zero. Score deviations with a percentile or a simple ratio, and require both a relative jump and a minimum absolute size before anything pages you. That pair of conditions is what separates "interesting chart" from "wake somebody up."</p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Flag a wait only if it is BOTH 3x its p95 baseline AND above 1,000 ms in the window
+WITH Deltas AS (
+    SELECT wait_type,
+           MAX(wait_time_ms) - MIN(wait_time_ms) AS delta_ms
+    FROM dbo.WaitStatsBaseline
+    WHERE snapshot_time &gt;= DATEADD(MINUTE, -15, SYSUTCDATETIME())
+    GROUP BY wait_type
+)
+SELECT d.wait_type, d.delta_ms
+FROM Deltas d
+WHERE d.delta_ms &gt; 1000
+  AND d.delta_ms &gt; 3 * (SELECT PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY wait_time_ms)
+                        FROM dbo.WaitStatsBaseline b
+                        WHERE b.wait_type = d.wait_type);</code></pre>
+<p class="text-gray-300 leading-relaxed">Start with these two thresholds and tune them from your own false positives, not from a blog post — including this one. If a threshold pages you twice for a scheduled job, exclude that job's window or raise the floor. Every false page you tolerate trains the team to ignore the next real one.</p>
+<p class="text-gray-300 leading-relaxed">Keep a log of every alert and what it turned out to be, even for a month. That log is your tuning data: it tells you which wait types are noisy, which hours are fragile, and where the absolute floor is too low. Without it, you are tuning on memory, and memory always remembers the last incident best.</p>
+<p class="text-gray-300 leading-relaxed">Resist the urge to add a third or fourth condition to fix one noisy alert. Complexity hides behaviour. Change one threshold at a time, watch it for a week, and only then decide whether the next change is needed.</p>
+<h2 class="text-xl font-bold text-white mt-10 mb-4">5. Alert only when two signals agree</h2>
+<p class="text-gray-300 leading-relaxed">One signal is a hint; two independent signals are an incident. Pair a wait-stats anomaly with a Query Store regression, or a blocking spike with a jump in batch requests per second. When I get a wait anomaly alone, I log it and watch. When Query Store shows the same window's top query doubling in average duration, I act. This corroboration rule is the single biggest reason my on-call nights got quieter without missing real incidents.</p>
+<p class="text-gray-300 leading-relaxed">Logging the single-signal cases matters too: they are your candidate list for the next alert. If the same lone signal appears three times before a real incident, promote it to a corroborating signal for that scenario.</p>
+<p class="text-gray-300 leading-relaxed">Query Store makes the second signal easy, because it already tracks per-query history. A query whose recent average duration is far above its own baseline, while its execution count is unchanged, is almost always a plan regression — and that is a much more actionable alert than "CPU is high."</p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Second signal: queries whose recent average duration is 3x their own history
+SELECT q.query_id, AVG(rs.avg_duration) AS recent_avg_duration_us
+FROM sys.query_store_query q
+JOIN sys.query_store_plan p ON p.query_id = q.query_id
+JOIN sys.query_store_runtime_stats rs ON rs.plan_id = p.plan_id
+WHERE rs.last_execution_time &gt;= DATEADD(HOUR, -1, SYSUTCDATETIME())
+GROUP BY q.query_id
+HAVING AVG(rs.avg_duration) &gt; 3 * (
+    SELECT AVG(rs2.avg_duration) FROM sys.query_store_runtime_stats rs2
+    JOIN sys.query_store_plan p2 ON p2.plan_id = rs2.plan_id
+    WHERE p2.query_id = q.query_id
+      AND rs2.last_execution_time &lt; DATEADD(HOUR, -1, SYSUTCDATETIME()));</code></pre>
+<h2 class="text-xl font-bold text-white mt-10 mb-4">6. When an anomaly fires, run the same triage every time</h2>
+<p class="text-gray-300 leading-relaxed">Detection is only half the job; the other half is not wasting the first ten minutes. My checklist is short and always in the same order: confirm the anomaly is still happening, find the head blocker or the top wait, identify the query behind it in Query Store, and check what changed — a deployment, a statistics update, a new plan. Only then do I touch anything, and the first action is almost always the reversible one: force a known-good plan in Query Store or kill the single offending session, not a server-wide change at 2 AM.</p>
+<p class="text-gray-300 leading-relaxed">Keep the checklist to one screen. A triage document nobody reads under pressure is worse than no document, because it gives false confidence. If a step does not change your next action, cut it.</p>
+<p class="text-gray-300 leading-relaxed">Write the checklist down, keep it next to the alert, and review it after every incident. The anomalies you catch will teach you more about your real workload in a month than a year of staring at dashboards.</p>
+<p class="text-gray-300 leading-relaxed">After the incident, feed the outcome back into the baseline. If the anomaly was a legitimate new pattern — a new reporting job, a new application release — update the baseline notes so the next occurrence is expected, not alarming. If it was a real regression, record which fix worked, so the next DBA on call is not rediscovering it at 2 AM.</p>
+<p class="text-gray-300 leading-relaxed">Finally, share the wins. When the baseline catches a plan regression before users report it, tell the team. Trust in alerting is earned one quiet, accurate page at a time, and a team that trusts its alerts acts on them faster.</p>
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Closing takeaway</h2>
+<p class="text-gray-300 leading-relaxed">You do not need a fancy platform to do anomaly detection well. You need a baseline you trust, a comparison that respects time of day, a score with both a relative and an absolute floor, and a second signal before you page anyone. Build the snapshot job this week, let it collect for a fortnight, and then turn on one alert. That single alert, tuned until it only fires when it matters, is worth more than fifty thresholds you have learned to ignore.</p>
+<p class="text-gray-300 leading-relaxed">If you take one thing from this post, make it the snapshot job. Everything else — percentiles, corroboration, triage — is easy once the data exists, and impossible until it does. Two weeks from now, your future self, woken at 2 AM by a real anomaly instead of a scheduled job, will be grateful.</p>
+<p class="text-gray-300 leading-relaxed">And when that first accurate alert arrives, do not just fix the incident. Write down what the baseline caught, how early it caught it, and what the old threshold would have done. That note is the case for expanding the approach to the next metric — and the next server.</p>
+<p class="text-gray-300 leading-relaxed">Go deeper: The AI-Powered DBA, Chapter 9.</p>
+    </div>
+    <div class="mt-14 bg-blue-950/40 border border-blue-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryLab — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">Execution plan visualizer · Index advisor · Slow query dashboard · SQL Server</p>
+      </div>
+      <a href="https://rajeshguntupalli59.github.io/querylab/"
+         class="shrink-0 px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded-xl text-sm transition">
+        Download Free
+      </a>
+    </div>
+    <div class="mt-8"><a href="index.html" class="text-xs text-gray-500 hover:text-gray-300 transition">← Back to all articles</a></div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli</div>
+  </footer>
+</body>
+</html>
