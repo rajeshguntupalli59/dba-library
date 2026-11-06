@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Transaction log full: why SQL Server stopped accepting writes — and the 5-minute triage — Rajesh Guntupalli</title>
+  <meta name="description" content="Error 9002 means the transaction log cannot grow or reuse space. Ask log_reuse_wait_desc why, clear the real blocker, and size the log so it never happens again." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-blue-500 to-blue-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-blue-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"    class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"     class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Book</a>
+        <a href="index.html"       class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Blog</a>
+        <a href="../about.html"    class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="https://rajeshguntupalli59.github.io/querylab/"
+           class="ml-2 px-4 py-1.5 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded-lg transition">Get Free Tools</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="flex gap-2 mb-5"><span class="px-2 py-0.5 bg-blue-900/40 border border-blue-800/40 text-blue-300 text-xs rounded-full">SQL Server</span><span class="px-2 py-0.5 bg-blue-900/40 border border-blue-800/40 text-blue-300 text-xs rounded-full">Troubleshooting</span></div>
+    <h1 class="text-4xl font-extrabold mb-4 leading-tight">Transaction log full: why SQL Server stopped accepting writes — and the 5-minute triage</h1>
+    <div class="flex items-center gap-3 text-xs text-gray-500 mb-10 pb-8 border-b border-gray-800/60">
+      <span>Rajesh Guntupalli</span><span>·</span><span>November 2026</span><span>·</span><span>6 min read</span>
+    </div>
+    <div class="space-y-4 text-sm">
+<p class="text-gray-300 leading-relaxed">Error 9002 is one of the few SQL Server errors that stops the business cold: "The transaction log for database 'X' is full due to 'LOG_BACKUP'." Inserts fail, updates fail, and every write-heavy application starts throwing errors at the same time. It feels like a disk problem. It usually isn't.</p>
+
+<p class="text-gray-300 leading-relaxed">The transaction log is not a trash can that fills up and gets emptied. It is a circular file: SQL Server reuses space once the transactions recorded in it are no longer needed. A "full" log almost never means the log file is too small. It means something is preventing reuse — and SQL Server will tell you exactly what, if you ask the right DMV first. That is the whole triage: find the blocker, clear it, then fix the setup so it does not come back.</p>
+
+<p class="text-gray-300 leading-relaxed">Here is the order I run it in, during an incident.</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">1. Ask SQL Server why the log cannot reuse space</h2>
+
+<p class="text-gray-300 leading-relaxed">Before touching anything, run two checks. The first tells you how full the log really is; the second tells you the reason reuse is blocked. That reason — <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">log_reuse_wait_desc</code> — decides the entire fix, so read it before you act.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- How full is every log, and what is blocking reuse?
+SELECT
+    d.name AS database_name,
+    d.log_reuse_wait_desc,
+    d.recovery_model_desc
+FROM sys.databases d
+WHERE d.database_id &gt; 4;
+
+-- Log size and percent used, per database
+DBCC SQLPERF(LOGSPACE);</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The value in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">log_reuse_wait_desc</code> is the diagnosis. <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">LOG_BACKUP</code> means no log backup has run since the last checkpoint. <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ACTIVE_TRANSACTION</code> means an open transaction is holding the log hostage. <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">REPLICATION</code> or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">AVAILABILITY_REPLICA</code> means a downstream consumer has not read the log yet. <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">NOTHING</code> with a full log usually means the file hit its max size or the disk is genuinely out of space. Each one has a different fix — and the wrong fix wastes the incident.</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">2. The usual suspect: a long-running transaction</h2>
+
+<p class="text-gray-300 leading-relaxed">In my experience, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ACTIVE_TRANSACTION</code> is the most common cause, and it is the sneakiest. A single transaction that started hours ago — a bulk load in a test window, a forgotten <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">BEGIN TRAN</code> in an SSMS window, a job that errored out before its <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">COMMIT</code> — pins the log at the point where it started. Everything written since then cannot be reused, no matter how many log backups you take. The log grows until it hits its ceiling, and then writes stop.</p>
+
+<p class="text-gray-300 leading-relaxed">Find the oldest open transaction in the affected database:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Oldest open transactions, with who started them and when
+SELECT
+    t.session_id,
+    s.login_name,
+    s.host_name,
+    s.program_name,
+    t.transaction_begin_time,
+    DATEDIFF(MINUTE, t.transaction_begin_time, GETDATE())
+        AS open_minutes,
+    t.transaction_state
+FROM sys.dm_tran_active_transactions t
+JOIN sys.dm_exec_sessions s
+    ON s.session_id = t.transaction_id
+WHERE t.transaction_state = 2  -- active
+ORDER BY t.transaction_begin_time;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Once you know the session, decide deliberately. If it is a forgotten SSMS window or a runaway ad-hoc load, kill it — <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">KILL &lt;session_id&gt;</code> — and watch the log start reusing space within seconds. If it is a real business transaction, talk to the application owner before killing anything: rolling back a six-hour load is also a business decision. But either way, you now know the cause instead of guessing.</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">3. Clear it the right way — and the two "fixes" that make it worse</h2>
+
+<p class="text-gray-300 leading-relaxed">If the blocker is <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">LOG_BACKUP</code>, the fix is a transaction log backup. In the FULL recovery model, the log is only reusable after a log backup marks those virtual log files as inactive. No backup, no reuse — the file grows forever. That is by design: the FULL model exists so you can restore to a point in time, and that promise costs log backups.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- BAD: switching to SIMPLE to "fix" a full log in production
+-- You just broke the log chain and lost point-in-time recovery.
+ALTER DATABASE SalesDB SET RECOVERY SIMPLE;
+DBCC SHRINKFILE (SalesDB_log, 100);
+
+-- GOOD: back up the log, then let reuse happen on its own
+BACKUP LOG SalesDB
+    TO DISK = 'D:\Backups\SalesDB_log.trn'
+    WITH COMPRESSION;
+DBCC SQLPERF(LOGSPACE);  -- confirm the used % dropped</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Two traps to avoid during the incident. First, flipping to SIMPLE recovery mid-incident breaks the log chain: your next full backup becomes the new base, and everything between the last full backup and the switch is unrecoverable. If the database genuinely does not need point-in-time recovery, SIMPLE is a legitimate choice — but make it a planned decision, not a panic move at 2 AM. Second, do not shrink the log file first. Shrinking while the blocker is still active does nothing, and shrinking after the fact just guarantees the file has to grow again — slowly, one autogrowth event at a time — during the next busy period.</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">4. When the blocker is downstream: replication and Availability Groups</h2>
+
+<p class="text-gray-300 leading-relaxed">If <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">log_reuse_wait_desc</code> says <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">REPLICATION</code>, the Log Reader Agent has not delivered the transactions yet — usually because the distributor is down, the agent job failed, or a subscriber is offline. Fix the agent, not the log. If it says <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">AVAILABILITY_REPLICA</code>, a secondary replica has not hardened the log records yet. Check the replica's synchronization state and its network path before you touch the primary.</p>
+
+<p class="text-gray-300 leading-relaxed">In both cases the log on the primary is doing exactly what it should: holding records until every consumer has them. Growing the log file buys you time while you fix the real problem. Deleting or shrinking it does not — and if you force the issue, you can break replication or the AG instead. When a replica is permanently gone, remove it from the Availability Group or drop the publication cleanly; do not leave a dead consumer pinning your log forever.</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">5. Stop it coming back: size, growth, and an alert</h2>
+
+<p class="text-gray-300 leading-relaxed">Once writes are flowing again, fix the setup. Most log-full incidents I see are really three configuration problems: no scheduled log backups, a log file sized for a quiet day, and nobody watching the used percentage. All three are cheap to fix.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- GOOD: log backups every 15 minutes, sized log, fixed growth
+-- 1. Schedule this in a SQL Agent job, every 15 minutes:
+BACKUP LOG SalesDB
+    TO DISK = 'D:\Backups\SalesDB_log.trn'
+    WITH COMPRESSION;
+
+-- 2. Pre-size the log to a realistic working size (e.g. 8 GB)
+--    instead of letting it grow 10% at a time under load:
+ALTER DATABASE SalesDB
+MODIFY FILE (NAME = N'SalesDB_log', SIZE = 8192MB);
+
+-- 3. Fixed growth in MB, not percent — 10% of 50 GB is a
+--    5 GB growth event that freezes writes while it happens:
+ALTER DATABASE SalesDB
+MODIFY FILE (NAME = N'SalesDB_log', FILEGROWTH = 512MB);
+
+-- 4. Alert when log use passes 70% — the warning you want
+--    at 10 AM, not the error you get at 2 AM:
+SELECT name, log_reuse_wait_desc
+FROM sys.databases
+WHERE database_id &gt; 4;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">A word on size: do not just make the log enormous and walk away. An oversized log with hundreds of tiny virtual log files slows down startup, restore, and replication. Size it to the largest transaction your workload actually runs, plus headroom — then let the 15-minute backups keep it recycling. And set the alert. The alert is the difference between a five-minute fix during business hours and a 2 AM page.</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Closing Thoughts</h2>
+
+<p class="text-gray-300 leading-relaxed">A full transaction log is rarely a storage problem. It is a reuse problem, and SQL Server names the blocker in one column: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">log_reuse_wait_desc</code>. Read it first, clear the real cause — a stale transaction, a missing log backup, a stalled replica — and only then think about file size. The five-minute version of this triage is worth memorizing, because error 9002 always arrives at the worst possible moment.</p>
+
+<p class="text-gray-300 leading-relaxed">Go deeper: The DBA Handbook, Chapter 10 — Backup Strategies.</p>
+    </div>
+    <div class="mt-14 bg-blue-950/40 border border-blue-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryLab — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">Execution plan visualizer · Index advisor · Slow query dashboard · SQL Server</p>
+      </div>
+      <a href="https://rajeshguntupalli59.github.io/querylab/"
+         class="shrink-0 px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded-xl text-sm transition">
+        Download Free
+      </a>
+    </div>
+    <div class="mt-8"><a href="index.html" class="text-xs text-gray-500 hover:text-gray-300 transition">← Back to all articles</a></div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli</div>
+  </footer>
+</body>
+</html>
