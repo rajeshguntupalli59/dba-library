@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Query Store in SQL Server: catching the query that quietly got slow — Rajesh Guntupalli</title>
+  <meta name="description" content="The query did not change, the data did not change — but it went from 200ms to 20 seconds. Query Store remembers every plan, so you can prove the regression and force the good plan back." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-blue-500 to-blue-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-blue-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"    class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"     class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Book</a>
+        <a href="index.html"       class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Blog</a>
+        <a href="../about.html"    class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="https://rajeshguntupalli59.github.io/querylab/"
+           class="ml-2 px-4 py-1.5 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded-xl text-sm transition">Get Free Tools</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="flex gap-2 mb-5"><span class="px-2 py-0.5 bg-blue-900/40 border border-blue-800/40 text-blue-300 text-xs rounded-full">SQL Server</span><span class="px-2 py-0.5 bg-blue-900/40 border border-blue-800/40 text-blue-300 text-xs rounded-full">Performance</span></div>
+    <h1 class="text-4xl font-extrabold mb-4 leading-tight">Query Store in SQL Server: catching the query that quietly got slow</h1>
+    <div class="flex items-center gap-3 text-xs text-gray-500 mb-10 pb-8 border-b border-gray-800/60">
+      <span>Rajesh Guntupalli</span><span>·</span><span>November 2026</span><span>·</span><span>6 min read</span>
+    </div>
+    <div class="space-y-4 text-sm">
+<p class="text-gray-300 leading-relaxed">The worst performance problems are not the ones that blow up on deploy day. They are the ones that creep in on a Tuesday: a report that took 200 milliseconds last month now takes 20 seconds, nobody changed the query, nobody changed the code, and the application team is convinced the database is "just slow now." I have had this conversation more times than I can count, and every time the answer was the same — the query did not get slower, its plan changed.</p>
+
+<p class="text-gray-300 leading-relaxed">SQL Server has a built-in flight recorder for exactly this situation: Query Store. It remembers every query, every plan it used, and how long each plan took. When something regresses, you do not have to guess what changed. You can open the history, point at the moment the plan flipped, and prove it. Here is how I use it, in the order I actually run it during an incident.</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">1. Turn Query Store on — and check it is still on</h2>
+
+<p class="text-gray-300 leading-relaxed">Query Store has been on by default for new databases since SQL Server 2016, but plenty of production databases predate that, or had it switched off during a migration and never switched back on. The first step is always the same: confirm it is actually capturing data, because a Query Store that is off is just an empty set of views.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Is Query Store on, and is it actually capturing?
+SELECT
+    name,
+    is_query_store_on,
+    query_store_capture_mode_desc
+FROM sys.databases
+WHERE database_id &gt; 4;
+
+-- GOOD: enable it with sane retention and size limits
+ALTER DATABASE SalesDB
+SET QUERY_STORE = ON (
+    OPERATION_MODE = READ_WRITE,
+    CLEANUP_POLICY = (STALE_QUERY_THRESHOLD_DAYS = 30),
+    DATA_FLUSH_INTERVAL_SECONDS = 900,
+    MAX_STORAGE_SIZE_MB = 1000,
+    QUERY_CAPTURE_MODE = AUTO
+);</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Two settings matter more than the rest. <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">QUERY_CAPTURE_MODE = AUTO</code> skips queries that run once and never come back, so the store does not fill up with ad-hoc noise. And <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">MAX_STORAGE_SIZE_MB</code> is the ceiling: when Query Store hits it, it silently flips to read-only mode and stops recording — which is exactly when you need it most. Set the size generously and put an alert on the read-only state. I will come back to that in section 5.</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">2. Find the queries that regressed</h2>
+
+<p class="text-gray-300 leading-relaxed">When someone reports "the app is slow," do not start with the slowest query right now. Start with the queries whose performance changed. A query that has always taken 10 seconds is a tuning problem; a query that took 200 milliseconds yesterday and takes 20 seconds today is a regression, and regressions have a cause you can find.</p>
+
+<p class="text-gray-300 leading-relaxed">This query compares each query's recent average duration against its best historical average, and surfaces the ones that got dramatically worse:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Queries whose recent average is far worse than their best
+SELECT TOP 20
+    q.query_id,
+    OBJECT_NAME(q.object_id) AS object_name,
+    SUBSTRING(qt.query_sql_text, 1, 120) AS query_text,
+    rs_recent.avg_duration / 1000.0 AS recent_avg_ms,
+    rs_best.avg_duration / 1000.0 AS best_avg_ms,
+    rs_recent.avg_duration * 1.0 / NULLIF(rs_best.avg_duration, 0)
+        AS regression_factor
+FROM sys.query_store_query q
+JOIN sys.query_store_query_text qt
+    ON qt.query_text_id = q.query_text_id
+CROSS APPLY (
+    SELECT AVG(rs.avg_duration) AS avg_duration
+    FROM sys.query_store_plan p
+    JOIN sys.query_store_runtime_stats rs
+        ON rs.plan_id = p.plan_id
+    WHERE p.query_id = q.query_id
+      AND rs.last_execution_time &gt; DATEADD(HOUR, -24, GETUTCDATE())
+) rs_recent
+CROSS APPLY (
+    SELECT MIN(rs.avg_duration) AS avg_duration
+    FROM sys.query_store_plan p
+    JOIN sys.query_store_runtime_stats rs
+        ON rs.plan_id = p.plan_id
+    WHERE p.query_id = q.query_id
+) rs_best
+WHERE rs_recent.avg_duration &gt; rs_best.avg_duration * 5
+  AND rs_recent.avg_duration &gt; 100000  -- slower than 100ms
+ORDER BY regression_factor DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Read the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">regression_factor</code> column first. A factor of 100 means the query is running a hundred times slower than its best recorded plan — that is not a gradual drift, that is a plan flip, and it is the first thing to investigate. Note the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">query_id</code> at the top of the list: everything after this uses it.</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">3. Read the plan change — what actually flipped?</h2>
+
+<p class="text-gray-300 leading-relaxed">Once you have the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">query_id</code>, look at every plan that query has used and when each one was active. This is the part the plan cache can never give you, because the plan cache only holds the current plan — the old, fast one is already gone from memory. Query Store kept it.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- All plans for one regressed query, with their history
+-- Replace @QueryId with the query_id from the previous step
+SELECT
+    p.plan_id,
+    p.last_compile_start_time,
+    rs.first_execution_time,
+    rs.last_execution_time,
+    rs.count_executions,
+    rs.avg_duration / 1000.0 AS avg_duration_ms,
+    rs.avg_logical_io_reads,
+    rs.avg_rowcount
+FROM sys.query_store_plan p
+JOIN sys.query_store_runtime_stats rs
+    ON rs.plan_id = p.plan_id
+WHERE p.query_id = 42  -- &lt;-- your query_id here
+ORDER BY rs.last_execution_time;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">What you are looking for is the boundary: the old plan with a low average duration, and the new plan that started at a specific time with a much higher one. That timestamp is gold — it tells you what else happened at that moment. In my experience the usual suspects are: statistics updated after a big data load, which changed the row estimates; a plan recompiled with an atypical parameter value (parameter sniffing again); or an index that was dropped, disabled, or rebuilt during maintenance. The plan change is the symptom; the timestamp tells you where to look for the cause.</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">4. Force the good plan back — and know when to let go</h2>
+
+<p class="text-gray-300 leading-relaxed">Here is the part that makes Query Store more than a diagnostic tool: you can pin the query to the plan that used to be fast, right now, without changing a line of application code. This is a stabilizer, not a cure — it buys you a calm production system while you fix the real cause. But on a bad day, a calm production system is exactly what you need.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- GOOD: pin the query to the plan that was fast
+EXEC sp_query_store_force_plan
+    @query_id = 42,
+    @plan_id = 7;   -- the old plan with the low avg_duration
+
+-- Check what is currently forced
+SELECT
+    q.query_id,
+    p.plan_id,
+    p.is_forced_plan
+FROM sys.query_store_query q
+JOIN sys.query_store_plan p
+    ON p.query_id = q.query_id
+WHERE p.is_forced_plan = 1;
+
+-- BAD: forcing a plan and forgetting about it forever
+-- The data will keep changing, and a forced plan that was
+-- perfect in November can be the wrong plan by March.
+
+-- When the root cause is fixed, release the plan:
+EXEC sp_query_store_unforce_plan
+    @query_id = 42,
+    @plan_id = 7;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Treat every forced plan like a bandage with an expiry date. I keep a short list of forced plans and review it monthly: if the statistics are fresh, the missing index is in place, or the bad parameter value is gone, unforce the plan and let the optimizer do its job. A forced plan that outlives its reason is how you end up with a query that is slow for a completely new reason six months later — and this time Query Store cannot help you, because you told it not to choose.</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">5. The maintenance nobody does — until Query Store goes silent</h2>
+
+<p class="text-gray-300 leading-relaxed">Query Store fails in the quietest way possible: it fills up, flips itself to read-only, and stops recording. Nothing errors. No alert fires. You only discover it three weeks later, when a query regresses and the history you needed was never captured. Check the state as part of your regular health checks, not after the incident.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Health check: state, size, and how much history you have
+SELECT
+    d.name AS database_name,
+    q.actual_state_desc,
+    q.current_storage_size_mb,
+    q.max_storage_size_mb,
+    q.readonly_reason
+FROM sys.database_query_store_options q
+JOIN sys.databases d
+    ON d.database_id = q.database_id;
+
+-- If it went read-only because it filled up, clear it and
+-- raise the ceiling — then find out why it filled up:
+-- (usually QUERY_CAPTURE_MODE = ALL on a busy ad-hoc workload)
+ALTER DATABASE SalesDB
+SET QUERY_STORE CLEAR;
+ALTER DATABASE SalesDB
+SET QUERY_STORE (MAX_STORAGE_SIZE_MB = 2000);</code></pre>
+
+<p class="text-gray-300 leading-relaxed">If you see <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">readonly_reason</code> showing size, the fix is not just clearing it — it is finding out why it filled. The usual culprit is <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">QUERY_CAPTURE_MODE = ALL</code> on a database full of one-off ad-hoc queries, or a retention window far longer than the workload justifies. Switch to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">AUTO</code>, keep 30 days, and size the store for your busiest day, not your quietest. A flight recorder that stops recording is worse than no flight recorder at all — at least then you know you have no data.</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Closing Thoughts</h2>
+
+<p class="text-gray-300 leading-relaxed">"The database got slow" is almost never the whole story. Most of the time one query changed plans, and everything downstream — the timeouts, the blocking, the angry tickets — is just that one regression echoing through the system. Query Store turns that from a guessing game into a five-minute investigation: find the regressed query, find the moment the plan flipped, force the good plan back, then fix the cause. The next time a report quietly goes from 200 milliseconds to 20 seconds, you will not be asking what changed. You will already know.</p>
+
+<p class="text-gray-300 leading-relaxed">Go deeper: The DBA Handbook — Performance Troubleshooting.</p>
+    </div>
+    <div class="mt-14 bg-blue-950/40 border border-blue-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryLab — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">Execution plan visualizer · Index advisor · Slow query dashboard · SQL Server</p>
+      </div>
+      <a href="https://rajeshguntupalli59.github.io/querylab/"
+         class="shrink-0 px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded-xl text-sm transition">
+        Download Free
+      </a>
+    </div>
+    <div class="mt-8"><a href="index.html" class="text-xs text-gray-500 hover:text-gray-300 transition">← Back to all articles</a></div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli</div>
+  </footer>
+</body>
+</html>
