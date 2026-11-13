@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Index maintenance in SQL Server: when to rebuild, when to reorganize, and when to stop — Rajesh Guntupalli</title>
+  <meta name="description" content="Fragmentation is not the emergency your maintenance plan thinks it is. A practical guide to rebuild vs reorganize, the thresholds that actually matter, and the indexes you should stop touching." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-blue-500 to-blue-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-blue-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"    class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"     class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Book</a>
+        <a href="index.html"       class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Blog</a>
+        <a href="../about.html"    class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="https://rajeshguntupalli59.github.io/querylab/"
+           class="ml-2 px-4 py-1.5 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded-lg transition">Get Free Tools</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="flex gap-2 mb-5"><span class="px-2 py-0.5 bg-blue-900/40 border border-blue-800/40 text-blue-300 text-xs rounded-full">SQL Server</span><span class="px-2 py-0.5 bg-blue-900/40 border border-blue-800/40 text-blue-300 text-xs rounded-full">Maintenance</span></div>
+    <h1 class="text-4xl font-extrabold mb-4 leading-tight">Index maintenance in SQL Server: when to rebuild, when to reorganize, and when to stop</h1>
+    <div class="flex items-center gap-3 text-xs text-gray-500 mb-10 pb-8 border-b border-gray-800/60">
+      <span>Rajesh Guntupalli</span><span>·</span><span>November 2026</span><span>·</span><span>6 min read</span>
+    </div>
+    <div class="space-y-4 text-sm">
+<p class="text-gray-300 leading-relaxed">Almost every SQL Server I inherit has the same maintenance plan: rebuild every index, every night, no exceptions. It is the most common waste of I/O, log space, and maintenance-window time in the DBA world — and in most cases it buys nothing.</p>
+
+<p class="text-gray-300 leading-relaxed">Fragmentation is real, but it is not the emergency the default maintenance plan thinks it is. On modern storage, a fragmented index rarely hurts a query that seeks a handful of rows. What hurts is a nightly rebuild of a 200 GB index that was barely fragmented, blocking writes, filling the transaction log, and generating a mountain of log backups — for a 2% improvement nobody will ever feel.</p>
+
+<p class="text-gray-300 leading-relaxed">Here is how I decide what to maintain, and what to leave alone.</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">1. Measure fragmentation before you touch anything</h2>
+
+<p class="text-gray-300 leading-relaxed">Never maintain an index you have not measured. <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_db_index_physical_stats</code> tells you the truth in one query — logical fragmentation, page count, and page density — for every index in the database.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>SELECT
+    OBJECT_NAME(ips.object_id) AS table_name,
+    i.name AS index_name,
+    ips.avg_fragmentation_in_percent,
+    ips.page_count,
+    ips.avg_page_space_used_in_percent
+FROM sys.dm_db_index_physical_stats(DB_ID(), NULL, NULL, NULL, 'SAMPLED') ips
+JOIN sys.indexes i
+    ON i.object_id = ips.object_id
+    AND i.index_id = ips.index_id
+WHERE ips.page_count &gt; 1000          -- ignore tiny indexes
+  AND ips.index_level = 0
+  AND ips.avg_fragmentation_in_percent &gt; 10
+ORDER BY ips.page_count DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">page_count &gt; 1000</code> filter matters. A 12-page index at 90% fragmentation is irrelevant — the whole thing fits in a handful of reads. Small indexes are noise; only maintain indexes big enough for fragmentation to cost real I/O.</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">2. Reorganize below 30%, rebuild above it</h2>
+
+<p class="text-gray-300 leading-relaxed">The old rule still holds, and it is worth keeping because it matches what each operation actually does. <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">REORGANIZE</code> compacts pages in place, is always online, and is gentle on the log. <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">REBUILD</code> creates a fresh copy of the index — faster to fix heavy fragmentation, but far more expensive.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- 10-30% fragmented: reorganize, always online, light on the log
+ALTER INDEX IX_Orders_CustomerId ON dbo.Orders REORGANIZE;
+
+-- Over 30% fragmented: rebuild, online where the edition allows
+ALTER INDEX IX_Orders_CustomerId ON dbo.Orders
+REBUILD WITH (ONLINE = ON, MAXDOP = 4);
+
+-- Under 10%: do nothing. Seriously. Leave it alone.</code></pre>
+
+<p class="text-gray-300 leading-relaxed">One more thing a rebuild gives you that reorganize does not: it updates statistics on that index with a full scan. If a query got slow right after a big data load, a rebuild can fix the plan as a side effect — but if that is all you need, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">UPDATE STATISTICS ... WITH FULLSCAN</code> is far cheaper than rebuilding the index to get it.</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">3. Stop rebuilding indexes that re-fragment by morning</h2>
+
+<p class="text-gray-300 leading-relaxed">Some indexes are fragmentation factories. A nonclustered index on a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">uniqueidentifier</code> column fed by <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">NEWID()</code>, or an index on a random hash key, will be 60% fragmented again within hours of a rebuild. Rebuilding it nightly is mopping the floor while the tap is running.</p>
+
+<p class="text-gray-300 leading-relaxed">For these, the fix is not maintenance — it is design. A sequential key such as <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">NEWSEQUENTIALID()</code> or an identity column inserts at the end of the index instead of in the middle, and fragmentation mostly stops happening. If you cannot change the key, accept the fragmentation: a seek on a fragmented index still finds its rows, and the rebuild was buying you nothing a seek could feel.</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">4. Rebuilds have a hidden cost: the transaction log</h2>
+
+<p class="text-gray-300 leading-relaxed">This is the one that bites people. An offline rebuild of a large index is fully logged, and even an online rebuild generates substantial log traffic. I have seen a nightly rebuild job fill a transaction log, stall log backups, and delay an availability group replica — all to defragment indexes that were barely fragmented.</p>
+
+<p class="text-gray-300 leading-relaxed">Before you schedule a rebuild, check two things: that the log has room for roughly the size of the index being rebuilt, and that the job runs when log backups can keep up. If the maintenance window is tight, reorganize instead, or split the rebuild across nights by index size. A rebuild that cannot finish inside its window is worse than no rebuild at all.</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">5. The indexes you should stop maintaining entirely</h2>
+
+<p class="text-gray-300 leading-relaxed">Not every index deserves maintenance, because not every index deserves to exist. Heaps with no clustered index, duplicate indexes left over from a migration, and indexes on tables that are truncated and reloaded every night do not need a maintenance plan — they need a decision.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Find indexes that are never used for seeks or scans
+SELECT
+    OBJECT_NAME(s.object_id) AS table_name,
+    i.name AS index_name,
+    s.user_seeks, s.user_scans, s.user_lookups,
+    s.user_updates
+FROM sys.dm_db_index_usage_stats s
+JOIN sys.indexes i
+    ON i.object_id = s.object_id
+    AND i.index_id = s.index_id
+WHERE s.database_id = DB_ID()
+  AND s.user_seeks = 0
+  AND s.user_scans = 0
+  AND s.user_lookups = 0
+ORDER BY s.user_updates DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">An index with zero reads and thousands of writes is pure overhead: every insert and update pays to maintain it, and no query ever benefits. Drop it — after checking it is not a unique constraint or supporting a foreign key — and you have removed both the index and its maintenance cost in one move.</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">6. Automate by threshold, not by calendar</h2>
+
+<p class="text-gray-300 leading-relaxed">The maintenance job that works is one that reads the measurements and acts only where the thresholds say so. A simple cursor over the fragmentation query, reorganizing below 30% and rebuilding above it, replaces the blanket rebuild job entirely — and it finishes in minutes instead of hours because most nights there is almost nothing to do.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>DECLARE @sql NVARCHAR(MAX);
+
+DECLARE cur CURSOR LOCAL FAST_FORWARD FOR
+SELECT
+    CASE
+        WHEN ips.avg_fragmentation_in_percent &gt;= 30
+        THEN 'ALTER INDEX ' + QUOTENAME(i.name)
+             + ' ON ' + QUOTENAME(OBJECT_SCHEMA_NAME(ips.object_id))
+             + '.' + QUOTENAME(OBJECT_NAME(ips.object_id))
+             + ' REBUILD WITH (ONLINE = ON);'
+        ELSE 'ALTER INDEX ' + QUOTENAME(i.name)
+             + ' ON ' + QUOTENAME(OBJECT_SCHEMA_NAME(ips.object_id))
+             + '.' + QUOTENAME(OBJECT_NAME(ips.object_id))
+             + ' REORGANIZE;'
+    END
+FROM sys.dm_db_index_physical_stats(DB_ID(), NULL, NULL, NULL, 'SAMPLED') ips
+JOIN sys.indexes i
+    ON i.object_id = ips.object_id
+    AND i.index_id = ips.index_id
+WHERE ips.page_count &gt; 1000
+  AND ips.index_level = 0
+  AND ips.avg_fragmentation_in_percent &gt; 10;
+
+OPEN cur;
+FETCH NEXT FROM cur INTO @sql;
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    EXEC sp_executesql @sql;
+    FETCH NEXT FROM cur INTO @sql;
+END
+CLOSE cur;
+DEALLOCATE cur;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Run this weekly, not nightly — fragmentation builds slowly on most workloads, and a weekly run keeps the job small enough to finish inside any maintenance window. Log the indexes it touches so you can spot the ones it rebuilds every single week; those are the fragmentation factories from section 3, and they need a design fix, not more maintenance.</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Closing Thoughts</h2>
+
+<p class="text-gray-300 leading-relaxed">Good index maintenance is boring on purpose: measure first, reorganize the mildly fragmented, rebuild only the badly fragmented and large, and stop maintaining indexes that re-fragment by morning or never get read. The goal is not zero fragmentation. The goal is queries that stay fast without the maintenance job becoming the biggest workload on the server.</p>
+
+<p class="text-gray-300 leading-relaxed">If you are still running a blanket rebuild-everything job, replace it with the measurement query above and a threshold-based job this week. Your transaction log will thank you.</p>
+
+<p class="text-gray-300 leading-relaxed">Go deeper: The DBA Handbook, Chapter 12.</p>
+    </div>
+    <div class="mt-14 bg-blue-950/40 border border-blue-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryLab — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">Execution plan visualizer · Index advisor · Slow query dashboard · SQL Server</p>
+      </div>
+      <a href="https://rajeshguntupalli59.github.io/querylab/"
+         class="shrink-0 px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded-xl text-sm transition">
+        Download Free
+      </a>
+    </div>
+    <div class="mt-8"><a href="index.html" class="text-xs text-gray-500 hover:text-gray-300 transition">← Back to all articles</a></div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli</div>
+  </footer>
+</body>
+</html>
