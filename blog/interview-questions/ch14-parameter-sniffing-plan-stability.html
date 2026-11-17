@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 14: Parameter Sniffing &amp; Plan Stability — 200 SQL Server Interview Questions</title>
+  <meta name="description" content="SQL Server interview questions Q145–Q156: Parameter Sniffing &amp; Plan Stability. Answers, T-SQL examples, and key learnings by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script></head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-blue-500 to-blue-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-blue-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../../index.html"    class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../../products.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../../book.html"     class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Book</a>
+        <a href="../index.html"       class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Blog</a>
+        <a href="../../about.html"    class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="https://rajeshguntupalli59.github.io/querylab/"
+           class="ml-2 px-4 py-1.5 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded-lg transition">Get Free Tools</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6">
+      <a href="index.html" class="text-xs text-blue-400 hover:text-blue-300 transition">← All Chapters</a>
+    </div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-blue-900/40 border border-blue-800/40 text-blue-300 text-xs rounded-full font-medium">Chapter 14 of 18</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/60 text-gray-300 text-xs rounded-full font-medium">Part 3 · Advanced · Q145–Q156</span>
+    </div>
+    <div class="space-y-4 text-sm">
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 14: Parameter Sniffing &amp; Plan Stability</h2>
+
+<p class="text-gray-300 leading-relaxed">Parameter sniffing is one of the most common causes of a query that is fast for one value and slow for another. This chapter explains how SQL Server builds one plan from the first parameter value it sees, how to prove sniffing with a simple test, and how to choose a fix that fits the workload. It also covers plan stability tools in Query Store, plan guides, and SQL Server 2022 Parameter Sensitive Plan optimization.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">In this chapter:</strong></p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span><span>What parameter sniffing is and how it produces a plan that fits one value badly for others</span></li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span><span>How to test for sniffing by comparing plans and using OPTION (RECOMPILE)</span></li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span><span>The fix ladder from RECOMPILE and OPTIMIZE FOR to local variables and branching</span></li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span><span>Parameter Sensitive Plan optimization in SQL Server 2022</span></li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span><span>Plan guides, Query Store plan forcing, and Automatic Plan Correction</span></li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span><span>How to verify a forced plan and diagnose fast in SSMS and slow from the app</span></li>
+
+<div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> A good fix starts with proof, not a hint, so test with different values and OPTION (RECOMPILE) before changing code. Choose the least invasive fix that stays stable when data and statistics change, and verify the result with runtime statistics after forcing or tuning. Plan stability is ongoing work, because a plan that is good today can go bad after a statistics update or a workload shift.</p></div>
+
+<h3 id="q145" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q145. What is parameter sniffing, and how does it cause bad execution plans?</h3>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Answer:</strong> Parameter sniffing is the behavior where SQL Server looks at the actual parameter values supplied on first compile and builds an execution plan optimized for those values. That plan is then cached and reused for later executions with different values. When data distribution is uneven, a plan that is ideal for one value can be very poor for another value.</p>
+
+<p class="text-gray-300 leading-relaxed">For example, a selective customer with only a few orders is best served by an index seek, while a common customer with many orders may be best served by a scan. If the procedure is first compiled for the selective customer, later calls for the common customer reuse the seek plan and perform many inefficient lookups. If it is first compiled for the common customer, later calls for the selective customer reuse the scan plan and read far more data than needed.</p>
+
+<p class="text-gray-300 leading-relaxed">The problem is not sniffing itself, because sniffing often produces good plans. The problem is plan reuse across values with very different selectivity, especially when statistics are stale, data is skewed, or the first compiled value is an outlier. That is why the same procedure can be fast in testing and slow in production, or fast at one time of day and slow at another.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE OR ALTER PROCEDURE dbo.GetOrdersByCustomer
+    @CustomerID INT
+AS
+BEGIN
+    SELECT OrderID, CustomerID, OrderDate, Status, TotalAmount
+    FROM dbo.Orders
+    WHERE CustomerID = @CustomerID
+    ORDER BY OrderDate DESC;
+END;
+
+EXEC dbo.GetOrdersByCustomer @CustomerID = 101;
+EXEC dbo.GetOrdersByCustomer @CustomerID = 207;</code></pre>
+
+<div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> Parameter sniffing happens when one compiled plan built for one value is reused for very different values that need a different plan.</p></div>
+
+<h3 id="q146" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q146. How do you test whether a slow query is caused by parameter sniffing?</h3>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Answer:</strong> Run the query with two very different parameter values and compare the actual execution plans, logical reads, and duration. Use a selective value that returns few rows, such as customer 101, and a common value that returns many rows, such as customer 207. If the plans differ in shape or one value is fast while the other is slow with the same cached plan, sniffing is a strong suspect. Enable statistics for IO and time so the comparison is based on reads and duration, not only on elapsed time.</p>
+
+<p class="text-gray-300 leading-relaxed">The settling test is OPTION (RECOMPILE). Run the slow value with OPTION (RECOMPILE) so SQL Server builds a fresh plan for that exact value using current statistics. If the slow value becomes fast with RECOMPILE and slow again without it, parameter sniffing is the likely cause. Also check the plan cache to confirm that one plan is being reused across values, and check whether the problem follows the first compiled value after a recompile.</p>
+
+<p class="text-gray-300 leading-relaxed">Do not clear the whole plan cache in production to test. Test in a non-production copy or use a targeted recompile for the single statement or procedure, and capture plans before and after so the evidence is repeatable. A test that only shows one slow run without a RECOMPILE comparison does not prove sniffing.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>SET STATISTICS IO, TIME ON;
+
+SELECT OrderID, CustomerID, OrderDate, Status, TotalAmount
+FROM dbo.Orders
+WHERE CustomerID = 101;
+
+SELECT OrderID, CustomerID, OrderDate, Status, TotalAmount
+FROM dbo.Orders
+WHERE CustomerID = 207;
+
+SELECT OrderID, CustomerID, OrderDate, Status, TotalAmount
+FROM dbo.Orders
+WHERE CustomerID = 207
+OPTION (RECOMPILE);
+
+SET STATISTICS IO, TIME OFF;</code></pre>
+
+<div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> If two values produce very different plans and RECOMPILE fixes the slow value, parameter sniffing is the likely cause.</p></div>
+
+<h3 id="q147" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q147. How does OPTION (RECOMPILE) fix parameter sniffing, and when should you use it?</h3>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Answer:</strong> OPTION (RECOMPILE) forces SQL Server to compile a fresh plan for every execution using the actual runtime parameter values and current statistics. The plan is not reused from cache for that statement, so each value gets a plan built for its own selectivity. This removes the stale-plan reuse that causes sniffing problems and is the most direct fix when values differ greatly.</p>
+
+<p class="text-gray-300 leading-relaxed">Use RECOMPILE when the query runs infrequently, when compile cost is small compared with execution savings, or when correctness and stable performance across values matter more than CPU spent on compilation. It is a good fit for reports, ad hoc queries with skewed parameters, and procedures where a bad plan is very expensive. Statement-level RECOMPILE affects only that statement, while procedure-level RECOMPILE affects the whole procedure, so prefer statement level to limit the cost.</p>
+
+<p class="text-gray-300 leading-relaxed">Do not use RECOMPILE blindly on high-frequency OLTP queries. Frequent recompilation adds CPU overhead, can increase compile contention, and can hurt throughput when the query runs hundreds of times per second. Measure compile CPU and execution savings, and consider a more targeted fix such as OPTIMIZE FOR, branching, or Parameter Sensitive Plan optimization when the query is hot.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE OR ALTER PROCEDURE dbo.GetOrdersByCustomer
+    @CustomerID INT
+AS
+BEGIN
+    SELECT OrderID, CustomerID, OrderDate, Status, TotalAmount
+    FROM dbo.Orders
+    WHERE CustomerID = @CustomerID
+    ORDER BY OrderDate DESC
+    OPTION (RECOMPILE);
+END;</code></pre>
+
+<div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> RECOMPILE trades compile cost for a plan built for the current values, so use it where correctness matters more than compile overhead.</p></div>
+
+<h3 id="q148" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q148. How do OPTIMIZE FOR and OPTIMIZE FOR UNKNOWN work, and when should you use each one?</h3>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Answer:</strong> OPTIMIZE FOR tells the optimizer to build the plan as if a specific parameter value had been supplied, regardless of the runtime value. For example, OPTIMIZE FOR with customer 101 builds a plan suited to a selective value, and that plan is reused for all values. Use it when one value dominates the workload, when you know the typical value that must perform well, or when you need a stable plan and can accept poorer performance for outlier values.</p>
+
+<p class="text-gray-300 leading-relaxed">OPTIMIZE FOR UNKNOWN tells the optimizer to ignore the runtime value and use average distribution statistics instead of sniffing a specific value. The result is a middle-ground plan that is stable across values but rarely optimal for extreme values. Use it when no single value dominates, when values vary widely, and when stability matters more than peak performance for any one value.</p>
+
+<p class="text-gray-300 leading-relaxed">Both hints freeze the optimization choice at compile time and do not adapt when data distribution changes. Revisit the choice after major data changes, statistics updates, or workload shifts, and verify with runtime statistics that the chosen plan still performs well for the values that matter most.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>DECLARE @CustomerID INT = 207;
+
+SELECT OrderID, CustomerID, OrderDate, Status, TotalAmount
+FROM dbo.Orders
+WHERE CustomerID = @CustomerID
+OPTION (OPTIMIZE FOR (@CustomerID = 101));
+
+SELECT OrderID, CustomerID, OrderDate, Status, TotalAmount
+FROM dbo.Orders
+WHERE CustomerID = @CustomerID
+OPTION (OPTIMIZE FOR UNKNOWN);</code></pre>
+
+<div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> OPTIMIZE FOR pins the plan to a chosen value while OPTIMIZE FOR UNKNOWN pins it to average distribution, and neither adapts when data changes.</p></div>
+
+<h3 id="q149" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q149. How can local variables defeat parameter sniffing, and what is the trade-off?</h3>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Answer:</strong> Copying a parameter into a local variable hides the runtime value from the optimizer at compile time. The optimizer does not know the local variable value when it builds the plan, so it uses average density statistics to estimate rows, similar to OPTIMIZE FOR UNKNOWN. The result is a single stable plan that does not change based on the first compiled value.</p>
+
+<p class="text-gray-300 leading-relaxed">This is simple to implement and requires no query hint, which makes it attractive for legacy code. It works best when values are moderately skewed and a stable average plan performs acceptably for most executions. It is also useful when you cannot easily add hints or when you need a quick stabilization while a better fix is tested.</p>
+
+<p class="text-gray-300 leading-relaxed">The trade-off is that the average plan is rarely optimal for extreme values. A selective value that should use a seek may get a scan, and a common value that should use a scan may get a seek with many lookups. For highly skewed data, local variables can stabilize performance at a mediocre level rather than fixing the slow case, so measure reads and duration for both selective and common values before keeping this fix.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE OR ALTER PROCEDURE dbo.GetOrdersByCustomer
+    @CustomerID INT
+AS
+BEGIN
+    DECLARE @LocalCustomerID INT = @CustomerID;
+
+    SELECT OrderID, CustomerID, OrderDate, Status, TotalAmount
+    FROM dbo.Orders
+    WHERE CustomerID = @LocalCustomerID
+    ORDER BY OrderDate DESC;
+END;</code></pre>
+
+<div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> Local variables hide the runtime value from the optimizer and produce an average plan that is stable but rarely optimal for extreme values.</p></div>
+
+<h3 id="q150" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q150. When should you use IF/ELSE branching or separate procedures to handle parameter sniffing?</h3>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Answer:</strong> Use branching when different parameter values genuinely need different plans and the split between them is clear, stable, and easy to maintain. An IF/ELSE block lets each branch compile its own plan for its own value range, so a common customer can use one plan shape while other customers use another. This is effective when the skew is driven by a small number of known values or by a clear threshold, such as a status, region, or high-volume customer.</p>
+
+<p class="text-gray-300 leading-relaxed">Separate procedures go one step further by giving each path its own cached plan and its own tuning surface. A wrapper procedure can route to a procedure for common values and a procedure for selective values, which keeps each plan independent and easier to test. This is cleaner when the logic differs beyond a single predicate or when each path needs different hints, indexes, or maintenance.</p>
+
+<p class="text-gray-300 leading-relaxed">The cost is duplication and maintenance risk. Logic must be kept in sync across branches, and a new skewed value can fall through the wrong branch if the split is hard-coded. Use branching only after proving sniffing with the RECOMPILE test, keep the branch condition simple and documented, and recheck the split when data distribution changes.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE OR ALTER PROCEDURE dbo.GetOrdersByCustomer
+    @CustomerID INT
+AS
+BEGIN
+    IF @CustomerID = 207
+    BEGIN
+        SELECT OrderID, CustomerID, OrderDate, Status, TotalAmount
+        FROM dbo.Orders
+        WHERE CustomerID = @CustomerID
+        ORDER BY OrderDate DESC
+        OPTION (OPTIMIZE FOR (@CustomerID = 207));
+    END
+    ELSE
+    BEGIN
+        SELECT OrderID, CustomerID, OrderDate, Status, TotalAmount
+        FROM dbo.Orders
+        WHERE CustomerID = @CustomerID
+        ORDER BY OrderDate DESC
+        OPTION (RECOMPILE);
+    END
+END;</code></pre>
+
+<div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> Branching is the right fix when different parameter values genuinely need different plans and the split is stable and easy to maintain.</p></div>
+
+<h3 id="q151" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q151. How does Parameter Sensitive Plan optimization in SQL Server 2022 work, and what are its requirements?</h3>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Answer:</strong> Parameter Sensitive Plan optimization allows SQL Server to store multiple execution plans for a single parameterized query and choose among them at runtime based on the parameter values. The optimizer detects that different values need different plans, builds a dispatcher plan that routes each execution to the right variant, and caches the variants together. This addresses sniffing without hints, recompilation on every run, or manual branching.</p>
+
+<p class="text-gray-300 leading-relaxed">Requirements include SQL Server 2022 and database compatibility level 160, with the database scoped configuration for Parameter Sensitive Plan optimization enabled. It applies to parameterized queries where the optimizer can identify sensitivity, typically equality predicates on skewed columns in stored procedures and parameterized batches. It does not apply to every query shape, and it still depends on statistics that reflect the skew.</p>
+
+<p class="text-gray-300 leading-relaxed">Monitor the result through Query Store and plan cache inspection, and verify that different values are actually using different variants with better reads and duration. If the feature does not trigger, the query may not meet the sensitivity criteria, statistics may not show the skew, or compatibility settings may be wrong. Treat it as a strong first option on SQL Server 2022, but still verify with runtime data.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>USE SalesDB;
+
+SELECT name, compatibility_level
+FROM sys.databases
+WHERE name = N'SalesDB';
+
+SELECT name, value, value_for_secondary
+FROM sys.database_scoped_configurations
+WHERE name = N'PARAMETER_SENSITIVE_PLAN_OPTIMIZATION';
+
+ALTER DATABASE SCOPED CONFIGURATION
+SET PARAMETER_SENSITIVE_PLAN_OPTIMIZATION = ON;</code></pre>
+
+<div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> Parameter Sensitive Plan optimization in SQL Server 2022 keeps separate plans for different parameter sensitivities when the database meets the compatibility and configuration requirements.</p></div>
+
+<h3 id="q152" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q152. What are plan guides, when should you use them, and what are the risks?</h3>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Answer:</strong> A plan guide attaches a query hint to a query without changing the query text or the application code. SQL Server matches the incoming query text to the guide and applies the hint at compile time. Plan guides come in SQL, OBJECT, and TEMPLATE forms, covering standalone batches, objects such as procedures, and parameterized query templates. They are useful when you cannot change vendor code, third-party application queries, or a query that is generated by a framework.</p>
+
+<p class="text-gray-300 leading-relaxed">Use plan guides as a targeted, last-resort fix after proving the problem and testing the hint. A common use is to apply OPTIMIZE FOR UNKNOWN or another hint to a vendor query that suffers from sniffing. Document why the guide exists, which query it matches, and when it should be reviewed, because the behavior is invisible to anyone reading the application code.</p>
+
+<p class="text-gray-300 leading-relaxed">The risks are fragility and hidden behavior. A guide stops matching if the query text changes by even whitespace or formatting, if the schema changes, or if the plan shape no longer applies after statistics or data changes. A forced hint can also become harmful over time while appearing to work, so monitor guide usage, validate the plan after every relevant change, and prefer Query Store plan forcing when you can manage the query directly.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>EXEC sys.sp_create_plan_guide
+    @name = N'Guide_GetOrdersByCustomer',
+    @stmt = N'SELECT OrderID, CustomerID, OrderDate, Status, TotalAmount FROM dbo.Orders WHERE CustomerID = @CustomerID',
+    @type = N'SQL',
+    @module_or_batch = NULL,
+    @params = N'@CustomerID INT',
+    @hints = N'OPTION (OPTIMIZE FOR UNKNOWN)';
+
+SELECT plan_guide_id, name, scope_type_desc, is_disabled
+FROM sys.plan_guides
+WHERE name = N'Guide_GetOrdersByCustomer';</code></pre>
+
+<div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> Plan guides can fix a query you cannot change, but they are fragile because they break when the query text or plan shape changes.</p></div>
+
+<h3 id="q153" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q153. How do you force a plan with Query Store, and what safeguards and verification steps apply?</h3>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Answer:</strong> Query Store plan forcing pins a specific execution plan for a query so the optimizer reuses it instead of choosing a new plan. Identify the query and the good plan in Query Store, verify the plan with runtime statistics, then force it with the Query Store procedure. Keep the query identifier and plan identifier from the Query Store views so the force operation targets the exact plan you tested.</p>
+
+<p class="text-gray-300 leading-relaxed">Safeguards start with testing and reversibility. Test the forced plan in a non-production environment with representative data and workload, document the reason for forcing and the expected improvement, and set a review date to recheck the force. Forcing can fail if the schema changes, if the plan is no longer valid, or if statistics change the plan shape, so check force status and failure reasons after forcing and after deployments.</p>
+
+<p class="text-gray-300 leading-relaxed">Verification is mandatory, not optional. Compare duration, CPU, logical reads, and execution count before and after forcing, and confirm the forced plan is actually being used. Unforce the plan promptly if performance gets worse or if a better plan emerges, and keep Query Store enabled so you can see regressions and forcing history over time.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>USE SalesDB;
+
+SELECT
+    q.query_id,
+    p.plan_id,
+    p.is_forced_plan,
+    q.last_execution_time
+FROM sys.query_store_query AS q
+JOIN sys.query_store_plan AS p
+    ON p.query_id = q.query_id
+WHERE q.object_id = OBJECT_ID(N'dbo.GetOrdersByCustomer')
+ORDER BY q.last_execution_time DESC;
+
+EXEC sys.sp_query_store_force_plan @query_id = 12, @plan_id = 34;
+EXEC sys.sp_query_store_unforce_plan @query_id = 12, @plan_id = 34;</code></pre>
+
+<div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> Force only a plan you have verified with runtime statistics, keep the forcing reversible, and recheck it after data and workload changes.</p></div>
+
+<h3 id="q154" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q154. How does Automatic Plan Correction work, and what are its limits?</h3>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Answer:</strong> Automatic Plan Correction uses Query Store history to detect plan regressions and force the last good plan automatically. When Query Store is enabled and automatic tuning for FORCE_LAST_GOOD_PLAN is on, SQL Server compares recent performance with earlier baseline performance for the same query. If it finds a regression with enough confidence, it creates a tuning recommendation and forces the last good plan, then verifies the improvement.</p>
+
+<p class="text-gray-300 leading-relaxed">The feature helps with regressions caused by plan changes, such as a new plan after a statistics update or recompilation that performs worse than the previous plan. It is valuable because it can respond faster than manual review and because it keeps a record of recommendations, actions, and verification results. It still requires Query Store to be enabled and in read-write mode, with enough history to compare.</p>
+
+<p class="text-gray-300 leading-relaxed">Limits are important. Automatic Plan Correction only addresses regressions it can detect and verify from Query Store data, and it does not fix missing indexes, bad statistics, parameter sniffing root causes, or resource pressure. It can only force a previous good plan that still exists and is still valid, and it will not help if no good plan was ever captured. Monitor recommendations and forced plans, and treat automatic correction as a safety net, not a replacement for tuning.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>USE SalesDB;
+
+SELECT
+    name,
+    desired_state_desc,
+    actual_state_desc,
+    reason_desc
+FROM sys.database_automatic_tuning_options
+WHERE name = N'FORCE_LAST_GOOD_PLAN';
+
+SELECT
+    name,
+    type,
+    state_desc
+FROM sys.dm_db_tuning_recommendations;</code></pre>
+
+<div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> Automatic Plan Correction can force the last good plan for a regression, but it only helps Query Store regressions it can verify with confidence.</p></div>
+
+<h3 id="q155" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q155. Why is a forced plan not necessarily a recovered query, and how do you verify the fix?</h3>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Answer:</strong> A forced plan only tells the optimizer which plan shape to use, and it does not guarantee that the query is fast again. Data distribution, parameter values, statistics, indexes, and resource pressure can all make a previously good plan perform poorly today. Forcing can also fail silently in effect if the plan is not used, if the force is ignored due to a schema change, or if the workload has shifted to values the forced plan does not suit.</p>
+
+<p class="text-gray-300 leading-relaxed">Verify with runtime statistics after forcing, not only with the force status. Check duration, CPU, logical reads, physical reads, and execution count for the forced plan in Query Store, and compare with the period before forcing under similar workload. Confirm the plan in use is the forced plan, check for force failures, and test the selective and common parameter values separately so a single average does not hide a slow case.</p>
+
+<p class="text-gray-300 leading-relaxed">Re-check after statistics updates and workload shifts, because a forced plan that is good today can go bad tomorrow. Set a review date, re-measure after major data loads, index changes, or statistics updates, and unforce if the query regresses or if a new plan performs better. A fix is only proven when the query stays fast under real workload over time, not when the force command succeeds.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>USE SalesDB;
+
+SELECT
+    p.plan_id,
+    p.is_forced_plan,
+    rs.count_executions,
+    rs.avg_duration,
+    rs.avg_logical_io_reads,
+    rs.last_execution_time
+FROM sys.query_store_plan AS p
+JOIN sys.query_store_runtime_stats AS rs
+    ON rs.plan_id = p.plan_id
+WHERE p.query_id = 12
+ORDER BY rs.last_execution_time DESC;</code></pre>
+
+<div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> A forced plan is only a fix when runtime statistics after forcing show the query is actually fast again under real workload.</p></div>
+
+<h3 id="q156" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q156. Scenario: A report runs fast in SSMS but slow from the application. How do you diagnose it?</h3>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Answer:</strong> First, compare SET options and execution plans for the SSMS session and the application session. SSMS and application drivers often use different default SET options, and different options can produce different cached plans for the same query text. Check ARITHABORT in particular, because SSMS sets it ON by default while many application connections leave it OFF, and that difference alone can lead to a different plan. Capture the actual plan and session options from both sides before changing code.</p>
+
+<p class="text-gray-300 leading-relaxed">Next, check for parameter sniffing and different parameter values. The report may be fast in SSMS because it was tested with a selective value and slow from the app because it runs with a common value, or vice versa. Compare the query hash in the plan cache to see whether multiple plans exist for the same query, and test the slow value with OPTION (RECOMPILE) to see whether a fresh plan fixes it. Also confirm the database, user, connection settings, and data are the same, because a different database or stale statistics in one environment can mimic a plan problem.</p>
+
+<p class="text-gray-300 leading-relaxed">Fix the root cause, not the symptom. Align SET options where the application allows it, fix sniffing with the appropriate ladder step, and verify the application plan after the change with runtime statistics. Do not conclude the application is at fault until you have compared options, values, and plans side by side with evidence from both sessions.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>DBCC USEROPTIONS;
+
+SELECT session_id, login_name, program_name, arithabort, ansi_nulls, quoted_identifier
+FROM sys.dm_exec_sessions
+WHERE is_user_process = 1;
+
+SELECT
+    query_hash,
+    COUNT(DISTINCT plan_handle) AS plan_count,
+    SUM(execution_count) AS total_executions
+FROM sys.dm_exec_query_stats
+GROUP BY query_hash
+HAVING COUNT(DISTINCT plan_handle) &gt; 1
+ORDER BY total_executions DESC;</code></pre>
+
+<div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> Different SET options or different parameter values can produce different plans, so compare options and plans before assuming the application is at fault.</p></div>
+    </div>
+    <div class="mt-14 bg-blue-950/40 border border-blue-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryLab — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · SQL Server</p>
+      </div>
+      <a href="https://rajeshguntupalli59.github.io/querylab/"
+         class="shrink-0 px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded-xl text-sm transition">
+        Download Free
+      </a>
+    </div>
+<div class="mt-8 flex justify-between text-xs">
+      <a href="ch13-wait-stats-storage-io-troubleshooting.html" class="text-blue-400 hover:text-blue-300 transition">← Previous Chapter</a>
+      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a>
+      <a href="ch15-memory-cpu-performance-pressure.html" class="text-blue-400 hover:text-blue-300 transition">Next Chapter →</a>
+    </div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · SQL Server Interview Questions</div>
+  </footer>
+</body>
+</html>
