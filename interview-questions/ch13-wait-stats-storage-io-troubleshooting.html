@@ -1,0 +1,474 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 13: Wait Stats &amp; Storage IO Troubleshooting — 200 SQL Server Interview Questions</title>
+  <meta name="description" content="SQL Server interview questions Q131–Q144: Wait Stats &amp; Storage IO Troubleshooting. Answers, T-SQL examples, and key learnings by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script></head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-blue-500 to-blue-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-blue-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"    class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"        class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"    class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6">
+      <a href="index.html" class="text-xs text-blue-400 hover:text-blue-300 transition">← All Chapters</a>
+    </div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-blue-900/40 border border-blue-800/40 text-blue-300 text-xs rounded-full font-medium">Chapter 13 of 18</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/60 text-gray-300 text-xs rounded-full font-medium">Part 3 · Advanced · Q131–Q144</span>
+    </div>
+    <div class="space-y-4 text-sm">
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 13: Wait Stats &amp; Storage IO Troubleshooting</h2>
+
+<p class="text-gray-300 leading-relaxed">Storage and IO problems often show up as slow queries, but the wait type alone does not tell you whether SQL Server, the query, or the disk is at fault. This chapter builds a repeatable method for reading wait statistics, measuring file latency, and separating query problems from storage problems. It also covers file placement, tempdb, and parallelism waits that are often misread alongside IO waits.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">In this chapter:</strong></p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span><span>How to read wait statistics with baselines and why single wait types mislead</span></li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span><span>PAGEIOLATCH, WRITELOG, and IO_COMPLETION waits and what each one points to</span></li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span><span>Disk latency metrics from file statistics and PerfMon</span></li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span><span>How to prove a storage problem versus a query problem with data</span></li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span><span>File placement, instant file initialization, RAID, sector size, and alignment</span></li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span><span>Tempdb IO troubleshooting and parallelism waits CXPACKET and CXCONSUMER</span></li>
+
+<div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> Wait statistics show where time went, not why it went there, so every IO conclusion needs latency data and read counts together. Low latency with huge reads points to the query and its plan, while high latency with modest reads points to storage or throughput. Baselines, file-level metrics, and repeat measurements turn an IO argument into evidence.</p></div>
+
+<h3 id="q131" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q131. What is the correct methodology for using wait statistics, and why can CXPACKET alone mislead you?</h3>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Answer:</strong> Wait statistics are cumulative since startup or since the last clear, so a single snapshot is not a diagnosis. Take two snapshots over a matching workload interval, subtract the earlier values from the later values, and rank waits by total wait time in that interval. Filter out benign idle waits, then focus on the top waits that also correlate with slow queries, high CPU, blocking, or IO latency.</p>
+
+<p class="text-gray-300 leading-relaxed">A baseline matters because normal for one system is a problem for another. Capture top waits during a healthy period with similar workload, and compare the same interval length, time of day, and workload type. Also check average wait time and waiting task count, not only total time, because a wait with many short waits is different from a wait with a few very long waits.</p>
+
+<p class="text-gray-300 leading-relaxed">CXPACKET alone misleads because it is normal in parallel plans. Parallel threads must wait for each other to finish, so a busy parallel workload can show large CXPACKET totals while queries are healthy. Act on parallelism waits only when they track with slow queries, skewed parallel work, or excessive parallelism, and check CXCONSUMER, degree of parallelism settings, and plan shape before changing configuration.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>SELECT TOP 10
+    wait_type,
+    wait_time_ms,
+    waiting_tasks_count,
+    wait_time_ms / NULLIF(waiting_tasks_count, 0) AS avg_wait_ms,
+    signal_wait_time_ms,
+    wait_time_ms - signal_wait_time_ms AS resource_wait_ms
+FROM sys.dm_os_wait_stats
+WHERE wait_type NOT IN (
+    N'BROKER_EVENTHANDLER', N'BROKER_RECEIVE_WAITFOR',
+    N'BROKER_TASK_STOP', N'BROKER_TO_FLUSH',
+    N'CHECKPOINT_QUEUE', N'CLR_AUTO_EVENT',
+    N'DIRTY_PAGE_POLL', N'DISPATCHER_QUEUE_SEMAPHORE',
+    N'HADR_FILESTREAM_IOMGR_IOCOMPLETION', N'LAZYWRITER_SLEEP',
+    N'LOGMGR_QUEUE', N'ONDEMAND_TASK_QUEUE',
+    N'PARALLEL_REDO_WORKER_WAIT_WORK', N'PREEMPTIVE_OS_GENERICOPS',
+    N'QDS_PERSIST_TASK_MAIN_LOOP_SLEEP', N'QDS_CLEANUP_STALE_QUERIES_TASK_MAIN_LOOP_SLEEP',
+    N'REQUEST_FOR_DEADLOCK_SEARCH', N'RESOURCE_QUEUE',
+    N'SLEEP_TASK', N'SLEEP_SYSTEMTASK',
+    N'SQLTRACE_BUFFER_FLUSH', N'WAITFOR',
+    N'XE_DISPATCHER_WAIT', N'XE_TIMER_EVENT'
+)
+ORDER BY wait_time_ms DESC;</code></pre>
+
+<div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> Wait statistics are useful only against a baseline taken over a matching interval, and a single wait type never proves a root cause on its own.</p></div>
+
+<h3 id="q132" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q132. What does PAGEIOLATCH_SH mean, and what is the first diagnostic step when it is the top wait?</h3>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Answer:</strong> PAGEIOLATCH_SH means a session is waiting for a data page to be read from disk into the buffer pool and latched in shared mode for a read. SH stands for shared, and the latch is held while the page is read and made available. High PAGEIOLATCH_SH means SQL Server is doing many physical reads, but it does not by itself prove that storage is slow.</p>
+
+<p class="text-gray-300 leading-relaxed">The first diagnostic step is to ask whether the reads are necessary. Check the top queries by physical reads and inspect their execution plans for scans, missing indexes, stale statistics, or large result sets that force disk reads. If a query is reading millions of pages that should have been a small seek, the fix is the query or the index, not the disk.</p>
+
+<p class="text-gray-300 leading-relaxed">Then check read latency in sys.dm_io_virtual_file_stats at file level. Low latency with huge reads points to a query problem, because the disk is responding quickly and the workload is simply asking for too much data. High latency with modest reads points to a storage problem, because even a reasonable number of reads is waiting too long for disk.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>SELECT TOP 10
+    qs.total_physical_reads,
+    qs.execution_count,
+    qs.total_physical_reads / NULLIF(qs.execution_count, 0) AS avg_physical_reads,
+    qs.total_logical_reads,
+    st.text
+FROM sys.dm_exec_query_stats AS qs
+CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) AS st
+ORDER BY qs.total_physical_reads DESC;
+
+SELECT
+    DB_NAME(vfs.database_id) AS database_name,
+    mf.physical_name,
+    vfs.num_of_reads,
+    vfs.num_of_bytes_read,
+    vfs.io_stall_read_ms / NULLIF(vfs.num_of_reads, 0) AS avg_read_stall_ms,
+    vfs.io_stall_write_ms / NULLIF(vfs.num_of_writes, 0) AS avg_write_stall_ms
+FROM sys.dm_io_virtual_file_stats(NULL, NULL) AS vfs
+JOIN sys.master_files AS mf
+    ON mf.database_id = vfs.database_id
+    AND mf.file_id = vfs.file_id
+ORDER BY avg_read_stall_ms DESC;</code></pre>
+
+<div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> The first step is to ask whether the reads are necessary, because low latency with huge reads means a query problem and high latency means a storage problem.</p></div>
+
+<figure id="figure-9" class="my-8 scroll-mt-20">
+  <img src="diagrams/09_buffer_pool_io_path.png" alt="Figure 9: Buffer pool and the storage IO path: logical reads vs physical reads and PAGEIOLATCH_SH waits." class="w-full rounded-2xl border border-gray-700" />
+  <figcaption class="mt-3 text-sm text-gray-400 leading-relaxed"><strong class="text-gray-200">Figure 9.</strong> Buffer pool and the storage IO path: logical reads vs physical reads and PAGEIOLATCH_SH waits.</figcaption>
+</figure>
+
+<h3 id="q133" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q133. What is the difference between PAGEIOLATCH_SH, PAGEIOLATCH_EX, and PAGEIOLATCH_UP, and how does a latch differ from a lock?</h3>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Answer:</strong> All three waits mean a session is waiting for a page that must be read from disk, and the suffix describes the latch mode requested. SH is shared mode for a read, EX is exclusive mode for a change to the page, and UP is update mode where the session intends to change the page but has not yet taken an exclusive latch. PAGEIOLATCH_SH is the most common in reporting and scan-heavy workloads, while EX and UP appear more with writes and page modifications.</p>
+
+<p class="text-gray-300 leading-relaxed">A latch is different from a lock in scope and lifetime. A latch protects a physical page in memory for a very short time while it is read, changed, or written, and it is released as soon as the physical operation finishes. A lock protects logical data such as a row, key, page, or table for the duration needed by a transaction, and it supports blocking, deadlock detection, and isolation semantics.</p>
+
+<p class="text-gray-300 leading-relaxed">Do not confuse PAGEIOLATCH with PAGELATCH. PAGEIOLATCH includes disk IO to bring the page into memory, while PAGELATCH is contention for a page already in memory, often on allocation pages in tempdb or on hot pages under heavy inserts. The fix for PAGELATCH is usually contention reduction, while the fix for PAGEIOLATCH starts with read necessity and latency.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>SELECT
+    wait_type,
+    wait_time_ms,
+    waiting_tasks_count
+FROM sys.dm_os_wait_stats
+WHERE wait_type IN (N'PAGEIOLATCH_SH', N'PAGEIOLATCH_EX', N'PAGEIOLATCH_UP', N'PAGELATCH_SH', N'PAGELATCH_EX', N'PAGELATCH_UP')
+ORDER BY wait_time_ms DESC;</code></pre>
+
+<div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> A latch protects a memory page for a very short time while a lock protects logical data for the length of a transaction.</p></div>
+
+<h3 id="q134" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q134. What causes WRITELOG waits, and how do you investigate them?</h3>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Answer:</strong> WRITELOG means a session is waiting for log records to be written to durable storage during a commit or checkpoint. Common causes are slow log disk latency, low log throughput, very frequent commits, large transactions, log file growth, and synchronous mirroring or Availability Group commit waits where the local commit must wait for a remote log harden. It is a log throughput wait, not a data page wait, so data file latency alone does not explain it.</p>
+
+<p class="text-gray-300 leading-relaxed">Investigate in order: confirm WRITELOG is a top wait over a timed interval, check log file write latency at file level, and check whether log flushes correlate with slow commits. Check for synchronous replicas, mirroring state, long-running transactions holding the log, and log file growth events. Also check transaction patterns, because many small commits or chatty application loops can saturate even healthy log storage.</p>
+
+<p class="text-gray-300 leading-relaxed">Fixes depend on the cause. Separate the log onto fast dedicated storage, size the log to avoid frequent growth, tune commit frequency and batch size, and address replica or network delay if a synchronous secondary is the bottleneck. Do not move the log or change replica mode without evidence, because the wrong change can trade durability for speed.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>SELECT
+    wait_type,
+    wait_time_ms,
+    waiting_tasks_count
+FROM sys.dm_os_wait_stats
+WHERE wait_type = N'WRITELOG';
+
+SELECT
+    DB_NAME(vfs.database_id) AS database_name,
+    mf.name AS logical_name,
+    mf.physical_name,
+    vfs.num_of_writes,
+    vfs.io_stall_write_ms / NULLIF(vfs.num_of_writes, 0) AS avg_write_stall_ms
+FROM sys.dm_io_virtual_file_stats(NULL, NULL) AS vfs
+JOIN sys.master_files AS mf
+    ON mf.database_id = vfs.database_id
+    AND mf.file_id = vfs.file_id
+WHERE mf.type_desc = N'LOG'
+ORDER BY avg_write_stall_ms DESC;</code></pre>
+
+<div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> WRITELOG means the session is waiting for log records to reach durable storage, so check log throughput and disk latency before blaming the query.</p></div>
+
+<h3 id="q135" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q135. What causes IO_COMPLETION waits, and how do you investigate them?</h3>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Answer:</strong> IO_COMPLETION means a session is waiting for an IO operation to finish that is not a normal data page read. Common causes are backup and restore, checkpoint, DBCC checks, file growth and shrink, lazy writer activity, and other background IO that must complete before work can continue. It often appears during maintenance windows or alongside large bulk operations rather than during steady query traffic.</p>
+
+<p class="text-gray-300 leading-relaxed">Investigate by correlating the wait with running work. Check currently executing requests for backup, restore, DBCC, checkpoint, and bulk commands, and compare the wait timeline with job history and maintenance schedules. Check file-level latency for the affected files, and check whether the wait is concentrated on one database, one file, or one time window.</p>
+
+<p class="text-gray-300 leading-relaxed">If the wait tracks with a backup or checkpoint, the fix is usually scheduling, throughput, or backup tuning rather than query tuning. If it appears without an obvious background job, check for file growth events, storage latency spikes, and large scans that spill or force heavy IO. Always confirm with timed samples, because a cumulative total can hide a short maintenance spike.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>SELECT
+    wait_type,
+    wait_time_ms,
+    waiting_tasks_count
+FROM sys.dm_os_wait_stats
+WHERE wait_type = N'IO_COMPLETION';
+
+SELECT
+    session_id,
+    command,
+    status,
+    wait_type,
+    wait_time,
+    total_elapsed_time
+FROM sys.dm_exec_requests
+WHERE command LIKE N'%BACKUP%'
+   OR command LIKE N'%RESTORE%'
+   OR command LIKE N'%DBCC%';</code></pre>
+
+<div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> IO_COMPLETION usually points to a background IO operation such as backup or checkpoint rather than a normal data page read.</p></div>
+
+<h3 id="q136" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q136. Which disk latency metrics should you check, and how do you read sys.dm_io_virtual_file_stats and PerfMon counters?</h3>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Answer:</strong> The core metrics are average read stall and average write stall per file, calculated as total stall time divided by number of reads or writes. Also check number of reads and writes, bytes read and written, and total stall time, because latency without volume can mislead. sys.dm_io_virtual_file_stats returns cumulative values since startup, so take two samples over a known interval and calculate the delta to get latency for that period.</p>
+
+<p class="text-gray-300 leading-relaxed">PerfMon adds the operating system and storage view. Check Avg Disk sec per Read and Avg Disk sec per Write for latency, Disk Reads per sec and Disk Writes per sec for throughput, and queue length for saturation. Correlate the disk instance with the SQL Server file path, because one slow volume can hide behind healthy averages for other volumes.</p>
+
+<p class="text-gray-300 leading-relaxed">Use thresholds as guidance, not as hard rules. For OLTP workloads, sustained read or write latency under 10 ms is generally healthy, 10 to 20 ms deserves attention, and sustained latency above 20 ms deserves investigation, but fast flash storage should be much lower and busy reporting storage can be higher without a fault. The baseline for the same volume under similar load is more reliable than any generic threshold.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>SELECT
+    DB_NAME(vfs.database_id) AS database_name,
+    mf.physical_name,
+    vfs.num_of_reads,
+    vfs.num_of_writes,
+    vfs.io_stall_read_ms / NULLIF(vfs.num_of_reads, 0) AS avg_read_stall_ms,
+    vfs.io_stall_write_ms / NULLIF(vfs.num_of_writes, 0) AS avg_write_stall_ms,
+    vfs.io_stall / NULLIF(vfs.num_of_reads + vfs.num_of_writes, 0) AS avg_total_stall_ms
+FROM sys.dm_io_virtual_file_stats(NULL, NULL) AS vfs
+JOIN sys.master_files AS mf
+    ON mf.database_id = vfs.database_id
+    AND mf.file_id = vfs.file_id
+ORDER BY avg_total_stall_ms DESC;</code></pre>
+
+<div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> Average stall per read and per write at file level is the evidence that separates a slow disk from a busy disk.</p></div>
+
+<h3 id="q137" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q137. How do you tell a storage problem from a query problem?</h3>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Answer:</strong> Use latency and read counts together, never one alone. Low latency with huge physical and logical reads points to a query problem, because storage is responding quickly and the query is asking for too much data. High latency with modest reads points to a storage problem, because even reasonable work is waiting too long for disk. High latency with huge reads can mean both problems are present, and the query fix usually comes first because it reduces load on storage.</p>
+
+<p class="text-gray-300 leading-relaxed">Check the plan and the data access path next. Look for table scans, index scans over large ranges, missing indexes, implicit conversions, stale statistics, and large sorts or hashes that spill. Compare logical reads, physical reads, duration, and CPU for the same query over time, and check whether a plan change or statistics update lines up with the slowdown.</p>
+
+<p class="text-gray-300 leading-relaxed">Then confirm at file level. Identify which files and volumes show high stall, whether the problem is read or write, and whether it correlates with wait statistics in the same interval. A storage conclusion needs file latency, volume latency, and wait data for the same time window, while a query conclusion needs the plan, read counts, and a repeatable test showing fewer reads after the fix.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>SELECT TOP 5
+    wait_type,
+    wait_time_ms,
+    waiting_tasks_count
+FROM sys.dm_os_wait_stats
+WHERE wait_type LIKE N'PAGEIOLATCH%'
+ORDER BY wait_time_ms DESC;
+
+SELECT TOP 10
+    qs.total_physical_reads,
+    qs.total_logical_reads,
+    qs.execution_count,
+    st.text
+FROM sys.dm_exec_query_stats AS qs
+CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) AS st
+ORDER BY qs.total_physical_reads DESC;</code></pre>
+
+<div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> Latency decides whether storage is slow, while read counts decide whether the query is asking for too much data.</p></div>
+
+<h3 id="q138" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q138. What are the best practices for file placement for data, log, and tempdb files, and what is instant file initialization?</h3>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Answer:</strong> Place data files, transaction log files, and tempdb files on separate volumes where possible, so that heavy reads, log writes, and tempdb activity do not compete for the same disks. Keep the log on fast, low-latency storage with good write performance, because every commit depends on log writes. Size data and log files up front to expected size, and use fixed-size autogrowth in megabytes rather than percentage growth to avoid many small growth events.</p>
+
+<p class="text-gray-300 leading-relaxed">Tempdb deserves its own volume and multiple equally sized data files to reduce allocation contention, with the same autogrowth settings on each file. Keep tempdb files the same size so SQL Server can use proportional fill evenly. Avoid placing tempdb on the same volume as user data or logs on a busy system, and monitor tempdb usage before adding files blindly.</p>
+
+<p class="text-gray-300 leading-relaxed">Instant file initialization allows SQL Server to allocate data file space without zeroing the new pages, which makes file creation and growth much faster. It applies to data files only, not to log files, and it requires the Perform Volume Maintenance Tasks permission for the SQL Server service account. There is a small security trade-off because old disk content is not zeroed, so confirm the setting with the security policy for the environment.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>SELECT
+    DB_NAME(database_id) AS database_name,
+    name AS logical_name,
+    physical_name,
+    type_desc
+FROM sys.master_files
+WHERE database_id IN (DB_ID(N'SalesDB'), DB_ID(N'tempdb'))
+ORDER BY database_name, type_desc;
+
+SELECT servicename, instant_file_initialization_enabled
+FROM sys.dm_server_services
+WHERE servicename LIKE N'SQL Server%';
+
+ALTER DATABASE SalesDB
+ADD FILE (
+    NAME = N'SalesDB_Data2',
+    FILENAME = N'D:\SQLData\SalesDB_Data2.ndf',
+    SIZE = 1024MB,
+    FILEGROWTH = 256MB
+) TO FILEGROUP [PRIMARY];</code></pre>
+
+<div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> Separate data, log, and tempdb files onto different paths, size files up front, and enable instant file initialization so growth does not stall work.</p></div>
+
+<h3 id="q139" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q139. What storage best practices should a DBA know about RAID levels, sector size, and partition alignment?</h3>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Answer:</strong> RAID choice is a trade-off between redundancy, write performance, and capacity. RAID 1 and RAID 10 are common for transaction logs, tempdb, and write-heavy data because they mirror without a large write penalty. RAID 5 and RAID 6 can suit read-heavy data, but they carry a write penalty for parity calculation, and RAID 0 has no redundancy and should not hold data that must survive a disk loss. Confirm the RAID level and cache settings with the storage team, because SQL Server sees only the presented volume.</p>
+
+<p class="text-gray-300 leading-relaxed">Sector size and partition alignment affect how efficiently IO is issued to disk. SQL Server works with 512-byte sector emulation, and modern storage may present 512-byte emulation over 4 KB physical sectors, so confirm the sector presentation and formatting choices with the storage and Windows teams. Partitions should be aligned, commonly at a 1024 KB offset, so that IO boundaries line up with storage boundaries and do not cause extra read-modify-write work.</p>
+
+<p class="text-gray-300 leading-relaxed">Keep this area brief in an interview and focus on validation. A DBA does not need to design the array, but should know what to ask for, what to check after a change, and how to validate with latency and throughput tests under realistic load. If latency is high after a storage change, compare file-level stall before and after the change for the same workload.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>SELECT
+    DB_NAME(database_id) AS database_name,
+    name AS logical_name,
+    physical_name,
+    size * 8 / 1024 AS size_mb,
+    growth,
+    is_percent_growth
+FROM sys.master_files
+ORDER BY database_name, name;</code></pre>
+
+<div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> Choose RAID and disk settings for the workload, keep partition alignment and sector size correct, and validate with latency and throughput tests.</p></div>
+
+<h3 id="q140" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q140. How do you troubleshoot tempdb IO problems?</h3>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Answer:</strong> Start by identifying whether the problem is allocation contention, space pressure, version store growth, or file-level IO latency. Check tempdb file space usage for free space, version store, user objects, and internal objects, and check which sessions are allocating the most tempdb pages. High version store use points to long-running transactions under snapshot isolation or heavy trigger and online index activity, while high internal object use points to sorts, hashes, and spills.</p>
+
+<p class="text-gray-300 leading-relaxed">Check for PAGELATCH contention on allocation pages, which shows up as waits on pages such as 2:1:1, 2:1:2, and 2:1:3 in tempdb. This is a sign that many sessions are competing to allocate pages at the same time. The usual response is multiple equally sized tempdb data files, consistent autogrowth, and reducing tempdb-heavy patterns where possible, such as unnecessary temp tables, large sorts, and repeated spills.</p>
+
+<p class="text-gray-300 leading-relaxed">Then check file-level IO latency for tempdb files and correlate it with wait statistics. If latency is high, check the tempdb volume, separation from other files, and whether autogrowth events line up with slowdowns. Size tempdb up front, monitor growth, and fix the queries that spill or hold long transactions rather than only adding files.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>USE tempdb;
+
+SELECT
+    SUM(unallocated_extent_page_count) * 8 / 1024 AS free_space_mb,
+    SUM(version_store_reserved_page_count) * 8 / 1024 AS version_store_mb,
+    SUM(user_object_reserved_page_count) * 8 / 1024 AS user_objects_mb,
+    SUM(internal_object_reserved_page_count) * 8 / 1024 AS internal_objects_mb
+FROM sys.dm_db_file_space_usage;
+
+SELECT TOP 10
+    session_id,
+    user_objects_alloc_page_count * 8 / 1024 AS user_alloc_mb,
+    internal_objects_alloc_page_count * 8 / 1024 AS internal_alloc_mb
+FROM sys.dm_db_session_space_usage
+ORDER BY user_objects_alloc_page_count + internal_objects_alloc_page_count DESC;
+
+SELECT name, physical_name, size * 8 / 1024 AS size_mb
+FROM tempdb.sys.database_files;</code></pre>
+
+<div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> Tempdb problems are usually allocation contention or heavy version store and spill use, so measure file usage and top allocators before adding files.</p></div>
+
+<h3 id="q141" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q141. Scenario: Queries suddenly slow down and the top wait is PAGEIOLATCH_SH. How do you troubleshoot it?</h3>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Answer:</strong> First, check whether the reads are necessary by finding the top queries by physical reads and inspecting their plans. Look for a query that suddenly started scanning, a missing or disabled index, a plan change, or a parameter value that now reads far more pages than before. If one or two queries account for most physical reads, the slowdown is likely a query or plan problem even though the wait type sounds like storage.</p>
+
+<p class="text-gray-300 leading-relaxed">Next, check read latency at file level over a timed interval. Low latency with huge reads confirms a query problem, so focus on the plan, indexes, statistics, and filters. High latency with modest reads points to storage, so check the affected volume, storage health, and whether other workloads or maintenance jobs are saturating the same disks. Also check buffer pool pressure, because memory pressure can force more physical reads when pages are evicted too quickly.</p>
+
+<p class="text-gray-300 leading-relaxed">Then walk the timeline: what changed just before the slowdown, such as a deployment, statistics update, index change, data load, or storage event. Test the fix on the worst query first, measure logical reads, physical reads, and duration before and after, and only escalate to storage with file-level latency, wait data, and query evidence for the same interval.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>SELECT TOP 10
+    qs.total_physical_reads,
+    qs.execution_count,
+    qs.total_logical_reads,
+    st.text
+FROM sys.dm_exec_query_stats AS qs
+CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) AS st
+ORDER BY qs.total_physical_reads DESC;
+
+SELECT
+    DB_NAME(vfs.database_id) AS database_name,
+    mf.physical_name,
+    vfs.io_stall_read_ms / NULLIF(vfs.num_of_reads, 0) AS avg_read_stall_ms
+FROM sys.dm_io_virtual_file_stats(NULL, NULL) AS vfs
+JOIN sys.master_files AS mf
+    ON mf.database_id = vfs.database_id
+    AND mf.file_id = vfs.file_id
+ORDER BY avg_read_stall_ms DESC;</code></pre>
+
+<div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> Start with the queries doing the physical reads, then use read latency to decide whether to fix the plan or escalate to storage.</p></div>
+
+<h3 id="q142" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q142. Scenario: WRITELOG waits spike after adding a synchronous Availability Group replica. How do you diagnose it?</h3>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Answer:</strong> First, check Availability Group replica health, log send queue size, redo queue size, and HADR_SYNC_COMMIT waits for the affected database. A synchronous replica makes every commit wait for the log to harden on the secondary, so a slow secondary, slow network, or slow secondary log disk can show up locally as WRITELOG. Confirm synchronization state and health before assuming local storage is at fault.</p>
+
+<p class="text-gray-300 leading-relaxed">Next, separate local log latency from replica delay. Check local log file write latency, then check secondary log latency, network latency and throughput between replicas, and whether the send queue is growing. A growing log send queue with healthy local latency points to network or secondary throughput, while high local latency points to local log storage. Also check for large transactions and frequent commits, because synchronous commit magnifies any log throughput problem.</p>
+
+<p class="text-gray-300 leading-relaxed">Decide the fix from the evidence. Options include fixing secondary storage or network, tuning transaction size and commit frequency, moving the secondary closer, or reviewing whether synchronous commit is required for that replica. Changing to asynchronous commit trades durability guarantees for speed, so it needs explicit approval and a clear understanding of possible data loss on failover.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>SELECT
+    DB_NAME(database_id) AS database_name,
+    replica_id,
+    synchronization_state_desc,
+    synchronization_health_desc,
+    log_send_queue_size,
+    redo_queue_size,
+    last_commit_time
+FROM sys.dm_hadr_database_replica_states
+WHERE database_id = DB_ID(N'SalesDB');
+
+SELECT
+    wait_type,
+    wait_time_ms,
+    waiting_tasks_count
+FROM sys.dm_os_wait_stats
+WHERE wait_type IN (N'WRITELOG', N'HADR_SYNC_COMMIT');</code></pre>
+
+<div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> A new synchronous replica can turn commit waits into network and remote log waits, so check replica health and queues before blaming local disks.</p></div>
+
+<h3 id="q143" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q143. Scenario: The storage team says the disks are fine, but waits point to IO. How do you prove the problem with data?</h3>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Answer:</strong> First, take two timed samples of file-level latency and wait statistics over the same interval when the problem is happening. Calculate the delta for each file, showing average read stall, average write stall, number of reads and writes, and bytes moved. A single cumulative snapshot proves little, while a timed delta tied to slow queries is hard to dismiss.</p>
+
+<p class="text-gray-300 leading-relaxed">Next, build a complete evidence pack for the same window. Include top waits with the increase in the interval, the affected database and file paths, PerfMon disk latency and throughput for the matching volumes, and the queries running at the time with their read counts and durations. Show that the slowdown lines up with high stall on specific files, and rule out the query side by showing read counts are reasonable or unchanged from baseline.</p>
+
+<p class="text-gray-300 leading-relaxed">Present the data by file and volume, not by server average. Name the database, file, volume, time window, latency, IOPS, and wait increase, and compare with a healthy baseline for the same volume and workload. Ask the storage team to check the same volumes and time window, including cache, queue depth, contention from other hosts, and any storage events, so both sides are looking at the same evidence.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>SELECT
+    DB_NAME(vfs.database_id) AS database_name,
+    mf.physical_name,
+    vfs.num_of_reads,
+    vfs.num_of_writes,
+    vfs.io_stall_read_ms,
+    vfs.io_stall_write_ms
+FROM sys.dm_io_virtual_file_stats(NULL, NULL) AS vfs
+JOIN sys.master_files AS mf
+    ON mf.database_id = vfs.database_id
+    AND mf.file_id = vfs.file_id
+WHERE mf.database_id = DB_ID(N'SalesDB');
+
+SELECT
+    object_name,
+    counter_name,
+    instance_name,
+    cntr_value
+FROM sys.dm_os_performance_counters
+WHERE counter_name IN (N'Avg. Disk sec/Read', N'Avg. Disk sec/Write', N'Disk Reads/sec', N'Disk Writes/sec')
+    AND instance_name LIKE N'%D:%';</code></pre>
+
+<div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> Timed before-and-after file latency and wait data prove an IO problem in a way that a single snapshot or an opinion cannot.</p></div>
+
+<h3 id="q144" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q144. What do CXPACKET and CXCONSUMER waits mean, and when should you act on them?</h3>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Answer:</strong> CXPACKET means parallel threads are waiting for each other to finish a parallel operation. In a parallel plan, work is split across threads, and fast threads wait for slow threads before the next step can complete. Some CXPACKET is normal and expected whenever parallelism is used, so a large total alone does not prove a problem.</p>
+
+<p class="text-gray-300 leading-relaxed">CXCONSUMER was separated from CXPACKET in later versions to identify consumer threads waiting for producer threads in parallel plans. It is generally benign and reflects normal parallel coordination, while true parallelism problems show up with skewed work distribution, excessive parallelism, or one thread doing far more work than the others. Check both waits together with query duration and plan shape, not in isolation.</p>
+
+<p class="text-gray-300 leading-relaxed">Act only when parallelism waits correlate with slow queries. Check max degree of parallelism and cost threshold for parallelism, look for parallel scans caused by missing indexes or stale statistics, and check for skewed data distribution across threads. Fix the plan or the data distribution first, and tune parallelism settings carefully with testing, because lowering parallelism too far can slow down large reporting queries that benefit from it.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>SELECT
+    wait_type,
+    wait_time_ms,
+    waiting_tasks_count,
+    wait_time_ms / NULLIF(waiting_tasks_count, 0) AS avg_wait_ms
+FROM sys.dm_os_wait_stats
+WHERE wait_type IN (N'CXPACKET', N'CXCONSUMER')
+ORDER BY wait_time_ms DESC;
+
+SELECT
+    name,
+    value_in_use,
+    description
+FROM sys.configurations
+WHERE name IN (N'max degree of parallelism', N'cost threshold for parallelism');</code></pre>
+
+<div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> CXPACKET is normal in parallel plans, so act only when parallelism waits track with slow queries and skewed or excessive parallel work.</p></div>
+    </div>
+    <div class="mt-14 bg-blue-950/40 border border-blue-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryLab — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · SQL Server</p>
+      </div>
+      <a href="https://rajeshguntupalli59.github.io/querylab/"
+         class="shrink-0 px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded-xl text-sm transition">
+        Download Free
+      </a>
+    </div>
+<div class="mt-8 flex justify-between text-xs">
+      <a href="ch12-security-agent-and-data-movement.html" class="text-blue-400 hover:text-blue-300 transition">← Previous Chapter</a>
+      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a>
+      <a href="ch14-parameter-sniffing-plan-stability.html" class="text-blue-400 hover:text-blue-300 transition">Next Chapter →</a>
+    </div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · SQL Server Interview Questions</div>
+  </footer>
+</body>
+</html>
