@@ -51,7 +51,7 @@
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span><span>Snapshot isolation, READ_COMMITTED_SNAPSHOT, and optimistic concurrency</span></li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span><span>NOLOCK, lock timeout, deadlock priority, and killing sessions safely</span></li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span><span>NOLOCK, delayed durability, and killing sessions safely</span></li>
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span><span>Effects of long-running transactions on the log and version store</span></li>
 
@@ -357,29 +357,28 @@ WHERE CustomerID = 12;</code></pre>
 
 <div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> NOLOCK trades correctness for speed by skipping shared locks, so it must never be used where the result has to be right.</p></div>
 
-<h3 id="q102" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q102. How do SET LOCK_TIMEOUT and DEADLOCK_PRIORITY work, and when would you use them?</h3>
+<h3 id="q102" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q102. What is delayed durability, and when is it safe to use?</h3>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Answer:</strong> SET LOCK_TIMEOUT controls how long a session waits for a lock before failing. The value is in milliseconds, the default is -1 which means wait forever, and 0 means fail immediately without waiting. When the timeout expires, the statement fails with error 1222 and the transaction is not automatically rolled back, so error handling must decide what to do next. The setting is session-scoped and affects lock waits only.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Answer:</strong> With normal, fully durable transactions, COMMIT returns only after the log records are flushed to disk, so a crash can never lose a committed transaction. With delayed durability, COMMIT returns before the log flush: the log records sit in a memory buffer and are flushed when the buffer fills to about 60KB, roughly every millisecond, when a fully durable transaction commits, or when sys.sp_flush_log is called. Skipping the flush per commit removes WRITELOG waits, which is why it helps high-throughput workloads where log write latency is the measured bottleneck.</p>
 
-<p class="text-gray-300 leading-relaxed">SET DEADLOCK_PRIORITY controls how likely a session is to be chosen as the deadlock victim. The values are LOW, NORMAL, HIGH, or a number from -10 to 10, and the default is NORMAL, which equals 0. When a deadlock occurs, the session with the lowest priority is rolled back first, and ties are broken by estimated rollback cost. The setting is also session-scoped.</p>
+<p class="text-gray-300 leading-relaxed">The price is durability: a crash, a failover, or an unexpected shutdown loses every committed-but-unflushed transaction, and the application was already told those transactions succeeded. Delayed durability is not supported with transactional replication or change data capture, and cross-database or distributed transactions are always fully durable regardless of the setting. It works with Availability Groups, but a delayed-durable transaction is not guaranteed to have reached a secondary either, even a synchronous one, so failover can lose it too.</p>
 
-<p class="text-gray-300 leading-relaxed">Use a short lock timeout for interactive or time-sensitive work that should fail fast rather than queue behind a long blocker, and use LOW deadlock priority for reporting or background jobs so a critical transaction survives when the two deadlock. A HIGH priority does not guarantee survival, because if all parties are HIGH the cheapest rollback still wins.</p>
+<p class="text-gray-300 leading-relaxed">Enable it at the database level with DELAYED_DURABILITY set to ALLOWED, which lets individual transactions opt in, or FORCED, which applies it to every transaction. Use it only where the data can be regenerated: staging tables, ETL scratch data, or telemetry that can be replayed. Never use it for orders, payments, or anything the application acknowledges to a user as complete.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>SET LOCK_TIMEOUT 5000;
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Allow individual transactions to opt in
+ALTER DATABASE StagingDB SET DELAYED_DURABILITY = ALLOWED;
 
-SELECT @@LOCK_TIMEOUT AS lock_timeout_ms;
-
-SET DEADLOCK_PRIORITY LOW;
-
+-- In the loader only: fast commits, then flush at the end of the step
 BEGIN TRANSACTION;
+INSERT INTO dbo.StagingOrders SELECT * FROM dbo.OrderFeed;
+COMMIT TRANSACTION WITH (DELAYED_DURABILITY = ON);
+EXEC sys.sp_flush_log;
 
-UPDATE dbo.Orders
-SET Status = 'Processing'
-WHERE OrderID = 101;
+SELECT name, delayed_durability_desc
+FROM sys.databases
+WHERE name = 'StagingDB';</code></pre>
 
-COMMIT TRANSACTION;</code></pre>
-
-<div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> LOCK_TIMEOUT limits how long a session waits for a lock, while DEADLOCK_PRIORITY influences which session is rolled back when a deadlock occurs.</p></div>
+<div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> Delayed durability returns from COMMIT before the log flush, which removes WRITELOG waits but can lose committed transactions on a crash, so use it only for regenerable data and never for money.</p></div>
 
 <h3 id="q103" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q103. How do you kill a blocking session safely, and what rollback considerations apply?</h3>
 

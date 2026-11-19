@@ -45,7 +45,7 @@
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span><span>Log shipping architecture, setup, failover, and monitoring</span></li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span><span>Extended investigation of time-based timeouts with no blocking</span></li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span><span>Migrating a large database to Azure with minimal downtime</span></li>
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span><span>Partitioning at scale, sliding windows, and partition-level operations</span></li>
 
@@ -94,24 +94,29 @@ SELECT * FROM msdb.dbo.log_shipping_secondary_databases;</code></pre>
 
 <div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> Log shipping is a simple manual disaster recovery method that copies and restores log backups on a schedule, so its recovery point depends on the backup and restore intervals and failover must be practiced.</p></div>
 
-<h3 id="q193" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q193. How do you investigate time-based timeouts when there is no blocking in sys.dm_exec_requests?</h3>
+<h3 id="q193" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q193. How do you migrate a large SQL Server database to Azure with minimal downtime?</h3>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Answer:</strong> First, capture what is waiting right now with sys.dm_os_waiting_tasks while the timeout is happening, because sys.dm_exec_requests only shows currently executing requests and misses waits between batches, waits during login, and waits that have already finished. Record the wait type, the wait duration, the blocking session if any, and the resource description, and repeat the capture several times during the bad window.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Answer:</strong> Start with an assessment, using Azure Migrate or the Data Migration Assistant, to find compatibility blockers: cross-database queries, CLR, Agent jobs, linked servers, unsupported features, and collation differences. The assessment also decides the target: SQL Managed Instance for near-complete compatibility with on-premises SQL Server, Azure SQL Database for new cloud-native work, or SQL Server on an Azure VM when you need full operating system control. Size the target from a real workload baseline, not from the current hardware spec.</p>
 
-<p class="text-gray-300 leading-relaxed">Next, check wait history and the pattern over time. Compare sys.dm_os_wait_stats before and after the window, check Query Store wait stats for the affected queries, and look for waits such as ASYNC_NETWORK_IO, RESOURCE_SEMAPHORE, THREADPOOL, SOS_SCHEDULER_YIELD, or PAGEIOLATCH that point to the client, memory grants, worker pressure, CPU, or storage. A timeout that happens at the same time each day usually points to scheduled work, so check Agent jobs, backups, CHECKDB, index maintenance, statistics updates, ETL loads, antivirus scans, and storage snapshots that run at that time.</p>
+<p class="text-gray-300 leading-relaxed">For minimal downtime, do an online migration, not a one-shot copy. Seed the target with a backup restored to Azure Blob storage, then keep it in sync with transactional replication, log shipping, or Azure Database Migration Service in online mode, so the target lags the source by seconds. Rehearse the whole path at least once on a copy, including the rollback plan, because the first run always finds something the assessment missed.</p>
 
-<p class="text-gray-300 leading-relaxed">Use Extended Events to catch what polling misses. Capture attention events for timeouts, sql_batch_completed and rpc_completed for slow completions, and login and logout events for connection pressure, filtered to the affected application and time window. Correlate the results with PerfMon or server metrics for CPU, memory, disk latency, and network, and check the application side for connection pool exhaustion, command timeouts set too low, and retries that amplify the load.</p>
+<p class="text-gray-300 leading-relaxed">The cutover is the only downtime: stop writes on the source, drain the remaining changes, run the final sync, point the application connection string or DNS at the new target, and verify logins, jobs, and a smoke-test workload before declaring success. Aim for a cutover window under 15 minutes. The post-cutover checks that most often catch people out are orphaned users, because logins do not travel with the database, Agent jobs that were never recreated, and performance differences on the new platform, so compare query performance against the pre-migration baseline in the first days.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>SELECT session_id, wait_type, wait_duration_ms, blocking_session_id, resource_description
-FROM sys.dm_os_waiting_tasks
-WHERE session_id &gt; 50;
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Seed the Azure target: back up to Blob storage, restore on the target
+BACKUP DATABASE SalesDB
+TO URL = 'https://mystorage.blob.core.windows.net/backups/SalesDB.bak'
+WITH COMPRESSION, INIT;
 
-SELECT wait_type, waiting_tasks_count, wait_time_ms
-FROM sys.dm_os_wait_stats
-WHERE wait_type NOT IN ('CLR_SEMAPHORE', 'LAZYWRITER_SLEEP')
-ORDER BY wait_time_ms DESC;</code></pre>
+-- On the target, after restore, fix logins that did not travel
+SELECT dp.name AS OrphanedUser
+FROM sys.database_principals AS dp
+LEFT JOIN sys.server_principals AS sp
+    ON sp.sid = dp.sid
+WHERE dp.type IN ('S', 'U')
+  AND dp.name NOT IN ('dbo', 'guest', 'INFORMATION_SCHEMA', 'sys')
+  AND sp.sid IS NULL;</code></pre>
 
-<div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> When timeouts follow a clock pattern with no blocking, look beyond current requests to waiting tasks, wait history, Extended Events, and scheduled work that runs at the same time.</p></div>
+<div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> Migrate online by seeding from a backup and syncing the tail with replication or DMS, cut over by draining writes and switching the connection string, and verify logins, jobs, and performance before calling it done.</p></div>
 
 <h3 id="q194" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q194. How does partitioning work at scale, including the sliding window pattern, partition-level operations, and common pitfalls?</h3>
 

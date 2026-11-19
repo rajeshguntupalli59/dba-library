@@ -87,13 +87,13 @@ FROM tempdb.sys.database_files;</code></pre>
 
 <div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> TempDB is shared scratch space for the whole instance, so pressure on it slows every database, not just one workload.</p></div>
 
-<h3 id="q106" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q106. What causes TempDB PFS, GAM, and SGAM contention, and how do multiple data files and trace flags 1118 and 1117 help?</h3>
+<h3 id="q106" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q106. What causes TempDB PFS, GAM, and SGAM contention, and how do you fix it on modern SQL Server?</h3>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Answer:</strong> PFS, GAM, and SGAM are allocation pages that track free space. PFS tracks how full each page is, GAM tracks which extents are free, and SGAM tracks mixed extents that still have free pages. In TempDB these pages sit at well-known locations in the first data file, so when many sessions create and drop temp tables at once, they all latch the same few pages and wait on PAGELATCH_UP or PAGELATCH_EX for pages such as 2:1:1, 2:1:2, and 2:1:3. This is latch contention on allocation metadata, not row locking.</p>
 
 <p class="text-gray-300 leading-relaxed">The main fix is to spread allocations across multiple equal-sized TempDB data files on the same fast storage, with the same initial size and the same autogrow settings so SQL Server uses proportional fill evenly. A common starting point is one file per logical processor up to eight files, then add files in groups if contention remains, while monitoring latch waits rather than adding files blindly.</p>
 
-<p class="text-gray-300 leading-relaxed">Trace flag 1118 forces uniform extent allocations, which reduces SGAM contention by avoiding mixed extents, and trace flag 1117 forces all files in a filegroup to grow together, which prevents one file from becoming a hot spot. In SQL Server 2016 and later, TempDB already uses uniform extents and grows all files together by default, so the flags are mostly relevant to older versions and to interview history, while the multiple-files guidance still applies.</p>
+<p class="text-gray-300 leading-relaxed">Older guidance named trace flags 1118 and 1117: 1118 forced uniform extent allocations to reduce SGAM contention, and 1117 forced all files in a filegroup to grow together. Since SQL Server 2016 both behaviors are the default for TempDB, so the flags are interview history, not something to enable on a modern instance. On a pre-2016 instance they still apply, but on current versions the fix is files, sizing, and autogrow, plus checking whether the workload is abusing temp tables in the first place.</p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>SELECT session_id, wait_type, wait_duration_ms, resource_description
 FROM sys.dm_os_waiting_tasks
@@ -108,8 +108,9 @@ ALTER DATABASE tempdb ADD FILE (
 );
 GO
 
-DBCC TRACEON (1118, -1);
-DBCC TRACEON (1117, -1);</code></pre>
+-- Check the current TempDB file layout: equal sizes, equal growth
+SELECT name, size * 8 / 1024 AS SizeMB, growth, is_percent_growth
+FROM tempdb.sys.database_files;</code></pre>
 
 <div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> Spreading TempDB allocations across equal-sized files removes the single-page latch bottleneck that PFS, GAM, and SGAM contention creates.</p></div>
 

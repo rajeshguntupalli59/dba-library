@@ -37,7 +37,7 @@
     <div class="space-y-4 text-sm">
 <h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 12: Security, Agent and Data Movement</h2>
 
-<p class="text-gray-300 leading-relaxed">Security controls who can connect and what they can do, Agent automates the work that must run on schedule, and data movement tools copy and transform data between systems. This chapter connects those three areas because interviewers often test them together. You need the principal model, the role model, and a working picture of Agent, SSIS, and ADF.</p>
+<p class="text-gray-300 leading-relaxed">Security controls who can connect and what they can do, Agent automates the work that must run on schedule, and data movement tools copy and transform data between systems. This chapter connects those three areas because interviewers often test them together. You need the principal model, the role model, and a working picture of Agent, SSIS, and encryption.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">In this chapter:</strong></p>
 
@@ -47,13 +47,13 @@
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span><span>GRANT, DENY, REVOKE, permission hierarchy, and ownership chaining</span></li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span><span>Schemas for organization and security</span></li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span><span>Orphaned users after a restore and how to fix them</span></li>
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span><span>SQL Server Agent jobs, steps, schedules, operators, and alerts</span></li>
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span><span>SSIS packages and the SSISDB catalog</span></li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span><span>Azure Data Factory and Azure SQL deployment options</span></li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span><span>TDE versus Always Encrypted, and Azure SQL deployment options</span></li>
 
 <div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> Use least privilege through roles and schemas, automate routine work with Agent jobs you can audit, and choose the data movement tool that fits where the data lives and who will maintain it. The Azure choice follows the same rule: pick the platform service that removes the most undifferentiated administration without breaking compatibility.</p></div>
 
@@ -108,25 +108,29 @@ GO</code></pre>
 
 <div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> DENY always beats GRANT, REVOKE simply removes a prior grant or deny, and ownership chaining skips checks only while every object in the chain has the same owner.</p></div>
 
-<h3 id="q126" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q126. What are schemas, and what security and organizational benefits do they provide?</h3>
+<h3 id="q126" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q126. After restoring a database on another server, logins cannot connect. What are orphaned users, and how do you fix them?</h3>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Answer:</strong> A schema is a namespace and container inside a database, and every object has a two-part name such as Sales.Orders. The default schema is dbo, but you can create schemas by business area, such as Sales, HR, or Reporting, to organize objects and avoid name collisions. A user has a default schema that SQL Server uses when a query omits the schema name, which is why fully qualifying names is a good habit.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Answer:</strong> A database user is mapped to a server login by SID, not by name. A backup carries the database users with their SIDs, but it does not carry the logins. After a restore on another server, the login either does not exist or exists with the same name but a different SID, so the user is orphaned: the name matches, the SID does not, and the login fails with "Login failed for user" even though the password is right. This is one of the first things to check after any restore or migration.</p>
 
-<p class="text-gray-300 leading-relaxed">Schemas are also a security boundary. You can grant permissions once at the schema level instead of object by object, so a new table in the schema inherits the intended access pattern. Ownership chaining works naturally within a schema, and separating schemas lets different teams own and manage different areas without sharing dbo permissions.</p>
+<p class="text-gray-300 leading-relaxed">Find orphans by comparing sys.database_principals against sys.server_principals on SID, or with the report mode of the older sp_change_users_login procedure. Fix each one by remapping the user to the correct login with ALTER USER ... WITH LOGIN, and create the login first if it does not exist on the new server. The cleanest prevention is contained database users, which store the authentication inside the database itself, so a restore to another server just works. Always verify logins as part of a restore drill, not only the data.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE SCHEMA Sales AUTHORIZATION dbo;
-GO
-CREATE TABLE Sales.Orders
-(
-    OrderID INT PRIMARY KEY,
-    OrderDate DATE NOT NULL,
-    Amount DECIMAL(10, 2) NOT NULL
-);
-GO
-GRANT SELECT ON SCHEMA::Sales TO AppUser;
-GO</code></pre>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Find orphaned users: database users with no matching login SID
+SELECT dp.name AS OrphanedUser, dp.sid
+FROM sys.database_principals AS dp
+LEFT JOIN sys.server_principals AS sp
+    ON sp.sid = dp.sid
+WHERE dp.type IN ('S', 'U')
+  AND dp.name NOT IN ('dbo', 'guest', 'INFORMATION_SCHEMA', 'sys')
+  AND sp.sid IS NULL;
 
-<div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> Schemas organize objects by business area and let you grant permissions once at the schema level instead of object by object.</p></div>
+-- Fix by remapping the user to the correct login
+ALTER USER AppUser WITH LOGIN = AppUser;
+
+-- Prevent it entirely with a contained database user
+CREATE USER AppUser WITH PASSWORD = 'UseA-Strong-Password-1';
+ALTER DATABASE SalesDB SET CONTAINMENT = PARTIAL;</code></pre>
+
+<div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> Users map to logins by SID, so a restore orphans them when the login is missing or has a different SID; remap with ALTER USER ... WITH LOGIN, or use contained users to avoid the problem.</p></div>
 
 <h3 id="q127" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q127. How does SQL Server Agent work, including jobs, steps, schedules, operators, and alerts?</h3>
 
@@ -156,13 +160,39 @@ ORDER BY e.start_time DESC;</code></pre>
 
 <div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> Control flow orchestrates the work, data flow moves and transforms the rows, and the SSISDB catalog stores, runs, and logs deployed projects.</p></div>
 
-<h3 id="q129" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q129. What is Azure Data Factory, and how does it compare with SSIS?</h3>
+<h3 id="q129" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q129. Transparent Data Encryption or Always Encrypted — how do you choose?</h3>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Answer:</strong> Azure Data Factory, or ADF, is a cloud-native data integration service for building pipelines that move and transform data. A pipeline is a workflow of activities, such as Copy, Stored Procedure, or Data Flow. A linked service is a connection to a data store or compute service, a dataset is a named view of the data in that store, and a trigger starts a pipeline on a schedule, on a tumbling window, or when an event such as a new file occurs. Pipelines run on an Integration Runtime, which can be Azure-hosted, self-hosted for on-premises data, or an SSIS runtime for existing packages.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Answer:</strong> Transparent Data Encryption, or TDE, encrypts the data files, log file, and backups at rest. A database encryption key protected by a certificate in master encrypts every page as it is written, and the application sees nothing different. TDE protects a stolen disk, a stolen backup, or a detached data file, but it does not protect data in memory or on the network: once a page is read into the buffer pool it is decrypted, and traffic still needs TLS. A TDE backup can only be restored on a server that has the certificate and private key, so back those up separately and test the restore.</p>
 
-<p class="text-gray-300 leading-relaxed">ADF differs from SSIS in where it runs and how it is managed. ADF needs no server to install or patch, scales on demand, is defined in JSON and managed through the Azure portal or code, and fits cloud and hybrid sources best. SSIS is mature, rich in transformations, built in Visual Studio, and often already in place on premises. For new cloud work, start with ADF. For an existing SSIS investment, keep SSIS or lift it into ADF through the SSIS Integration Runtime with minimal changes.</p>
+<p class="text-gray-300 leading-relaxed">Always Encrypted encrypts individual columns, and the keys never reach the engine: the column master key lives with the application or in a key vault, and the client driver encrypts values before sending them. That protects sensitive columns from DBAs, from cloud operators, and from memory dumps. The trade-offs are real: randomized encryption cannot be searched, joined, or range-filtered, deterministic encryption allows equality only, and some operations and data types are unsupported, so it needs application and driver support.</p>
 
-<div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> ADF builds cloud pipelines from linked services, datasets, and triggers, while SSIS remains the stronger choice for existing on-premises packages that you can lift into ADF through the SSIS runtime when needed.</p></div>
+<p class="text-gray-300 leading-relaxed">Choose TDE when the requirement is encryption at rest and compliance for files and backups. Choose Always Encrypted when specific columns must stay hidden from everyone who can touch the server, including administrators. The two can be combined: TDE for the files, Always Encrypted for the columns that must never be visible in plaintext on the server.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- TDE: master key, certificate, database encryption key, then switch on
+USE master;
+CREATE MASTER KEY ENCRYPTION BY PASSWORD = 'UseA-Strong-Password-1';
+CREATE CERTIFICATE TDECert WITH SUBJECT = 'TDE Certificate';
+GO
+USE SalesDB;
+CREATE DATABASE ENCRYPTION KEY
+WITH ALGORITHM = AES_256
+ENCRYPTION BY SERVER CERTIFICATE TDECert;
+ALTER DATABASE SalesDB SET ENCRYPTION ON;
+GO
+-- Always Encrypted: the column is encrypted by the client driver
+CREATE TABLE dbo.Customers
+(
+    CustomerID INT PRIMARY KEY,
+    NationalID NVARCHAR(11)
+        COLLATE Latin1_General_BIN2
+        ENCRYPTED WITH (
+            COLUMN_ENCRYPTION_KEY = CEK1,
+            ENCRYPTION_TYPE = DETERMINISTIC,
+            ALGORITHM = 'AEAD_AES_256_CBC_HMAC_SHA_256'
+        )
+);</code></pre>
+
+<div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> TDE encrypts files and backups at rest and is transparent to applications, while Always Encrypted encrypts columns with keys the engine never sees, so choose TDE for at-rest compliance and Always Encrypted when columns must stay hidden from administrators.</p></div>
 
 <h3 id="q130" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q130. How do Azure SQL Database, SQL Managed Instance, and SQL Server on an Azure VM differ, and how do you choose between them?</h3>
 

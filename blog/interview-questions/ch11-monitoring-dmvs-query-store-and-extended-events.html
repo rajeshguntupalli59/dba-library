@@ -49,7 +49,7 @@
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span><span>Extended Events sessions, events, actions, predicates, and targets</span></li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span><span>sp_WhoIsActive, wait statistics, and performance counters</span></li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span><span>sp_WhoIsActive, wait statistics, and finding a query that is no longer running</span></li>
 
 <div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> Good monitoring combines live DMV checks for what is happening now with Query Store and Extended Events for what changed over time. Learn the small set of DMVs and counters in this chapter, and you can triage most performance problems without Profiler or guesswork.</p></div>
 
@@ -225,18 +225,37 @@ DBCC SQLPERF ('sys.dm_os_wait_stats', CLEAR);</code></pre>
 
 <div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> Wait stats are cumulative, so capture snapshots and compare deltas over a fixed interval instead of reacting to totals since the last restart.</p></div>
 
-<h3 id="q122" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q122. What do Page Life Expectancy, buffer cache hit ratio, batch requests per second, and compilations per second tell you?</h3>
+<h3 id="q122" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q122. How do you find a long-running query that is no longer running?</h3>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Answer:</strong> These counters come from sys.dm_os_performance_counters and Performance Monitor, and they only mean something against a baseline for that server. Page Life Expectancy is how long, in seconds, a page stays in the buffer pool. A sharp drop from baseline suggests memory pressure, but the old 300 second rule is outdated for servers with large memory.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Answer:</strong> The live DMVs only show work that is running right now, so once the query finishes it disappears from sys.dm_exec_requests. Start with Query Store, which keeps runtime statistics in time windows: open the Top Resource Consuming Queries report or query sys.query_store_runtime_stats joined to the query text, filter by the time window when the slowness happened, and sort by total duration. That shows the query, its plans, and whether the plan changed at that time.</p>
 
-<p class="text-gray-300 leading-relaxed">Buffer cache hit ratio is the percentage of page reads served from memory instead of disk. It is usually above 99 percent on OLTP systems, but a low value alone does not prove memory pressure, since large scans can lower it. Batch Requests per second measures throughput and shows load. SQL Compilations per second measures plan compilations, and a high value relative to batch requests suggests poor plan reuse, ad hoc SQL, or excessive recompiles.</p>
+<p class="text-gray-300 leading-relaxed">If Query Store was off or the window has aged out, use an Extended Events session on sql_statement_completed with a duration filter, or the default system_health session for errors and deadlocks around the same time. As a standing habit, many DBAs log sp_WhoIsActive output to a table every few minutes, which gives a recent history of what ran and how long it took. The answer the interviewer wants is the habit, not the tool: for a past incident you need persisted history, and Query Store is the one that is already there.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>SELECT object_name, counter_name, instance_name, cntr_value
-FROM sys.dm_os_performance_counters
-WHERE counter_name IN (N'Page life expectancy', N'Buffer cache hit ratio', N'Batch Requests/sec', N'SQL Compilations/sec')
-ORDER BY object_name, counter_name;</code></pre>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Slowest queries in a past time window, from Query Store history
+SELECT TOP 10 qt.query_sql_text,
+       rs.avg_duration / 1000 AS AvgDurationMs,
+       rs.count_executions,
+       rs.last_execution_time
+FROM sys.query_store_query_text AS qt
+INNER JOIN sys.query_store_query AS q
+    ON q.query_text_id = qt.query_text_id
+INNER JOIN sys.query_store_plan AS p
+    ON p.query_id = q.query_id
+INNER JOIN sys.query_store_runtime_stats AS rs
+    ON rs.plan_id = p.plan_id
+WHERE rs.last_execution_time &gt;= DATEADD(HOUR, -4, SYSDATETIME())
+ORDER BY rs.avg_duration DESC;
 
-<div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> These four counters together separate memory pressure from throughput and plan reuse problems, but only when you compare them against a baseline for that server.</p></div>
+-- Capture statements over 5 seconds for next time
+CREATE EVENT SESSION LongStatements ON SERVER
+ADD EVENT sqlserver.sql_statement_completed
+(
+    WHERE duration &gt; 5000000
+)
+ADD TARGET package0.event_file
+(SET filename = N'C:\XE\LongStatements.xel');</code></pre>
+
+<div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> Live DMVs only show running work, so a finished slow query is found in persisted history: Query Store time windows first, then an Extended Events session or a logged sp_WhoIsActive history.</p></div>
     </div>
     <div class="mt-14 bg-blue-950/40 border border-blue-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">

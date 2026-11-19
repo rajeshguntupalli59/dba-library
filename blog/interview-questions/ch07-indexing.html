@@ -55,7 +55,7 @@
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span><span>Fragmentation, rebuild versus reorganize, and fill factor</span></li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span><span>Missing index DMVs, unused indexes, and maintenance strategy</span></li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span><span>Missing index DMVs, duplicate and unused indexes, and maintenance strategy</span></li>
 
 <div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> A good index matches the filter, join, and sort pattern of the query so SQL Server can seek to a small set of rows instead of scanning. Every extra index costs write time, storage, and maintenance, so index design is a trade-off between read speed and write cost.</p></div>
 
@@ -127,22 +127,30 @@ WHERE object_id = OBJECT_ID('dbo.OrderStaging');</code></pre>
 
 <div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> A heap is an unordered table with no clustered index, and it is acceptable mainly for staging and bulk load work rather than for large tables that need selective lookups.</p></div>
 
-<h3 id="q64" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q64. How many clustered indexes can a table have, and why?</h3>
+<h3 id="q64" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q64. How do you find duplicate and overlapping indexes, and what do you do about them?</h3>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Answer:</strong> A table can have exactly one clustered index, or none if it is a heap. The reason is physical: the clustered index is not a separate copy, it is the table itself stored in key order, with data rows at the leaf level. A set of rows can only be stored in one order at a time.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Answer:</strong> A duplicate index has the same key columns in the same order as another index on the same table, so it can never help a query the other index cannot already serve. An overlapping index is a weaker case: its leading columns are a leftmost subset of a wider index, so the wider index can usually serve the same seeks. Both kinds accumulate over time, from cautious adds, from missing-index suggestions applied without checking what already exists, and from migrations that recreate indexes.</p>
 
-<p class="text-gray-300 leading-relaxed">A second clustered index would need a second copy of all the data in a different order, which SQL Server does not maintain. If a query needs a different order, the answer is a nonclustered index, which keeps its own ordered key list and points back to the data rows.</p>
+<p class="text-gray-300 leading-relaxed">Duplicates cost real money: every insert, update, and delete must maintain every index, they consume storage and backup space, they slow down index maintenance, and they give the optimizer more plans to consider. Find candidates by grouping sys.indexes by table and key columns, or with a community script such as sp_BlitzIndex, which flags exact duplicates and near-duplicates. Before dropping anything, check sys.dm_db_index_usage_stats for seeks, scans, and lookups: an index with no reads and many writes is a removal candidate, but usage stats reset on restart, so collect them over a full workload cycle. The safe sequence is disable the index first, watch for regressions over a representative period, then drop it.</p>
 
-<p class="text-gray-300 leading-relaxed">A table can have one clustered index plus many nonclustered indexes, up to 999 nonclustered indexes per table. In real designs the practical limit is much lower because each index adds write, storage, and maintenance cost.</p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Usage per index: no reads plus many writes marks a removal candidate
+SELECT OBJECT_NAME(i.object_id) AS TableName,
+       i.name AS IndexName,
+       s.user_seeks, s.user_scans, s.user_lookups, s.user_updates
+FROM sys.indexes AS i
+LEFT JOIN sys.dm_db_index_usage_stats AS s
+    ON s.object_id = i.object_id
+    AND s.index_id = i.index_id
+    AND s.database_id = DB_ID()
+WHERE i.object_id = OBJECT_ID('dbo.Orders')
+ORDER BY s.user_seeks + s.user_scans DESC;
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE CLUSTERED INDEX IX_Orders_OrderDate
-ON dbo.OrderStaging (OrderDate);
+-- Safe removal: disable first, monitor, then drop
+ALTER INDEX IX_Orders_Duplicate ON dbo.Orders DISABLE;
+-- After a full workload cycle with no regression:
+DROP INDEX IX_Orders_Duplicate ON dbo.Orders;</code></pre>
 
-SELECT name, type_desc, is_primary_key
-FROM sys.indexes
-WHERE object_id = OBJECT_ID('dbo.OrderStaging');</code></pre>
-
-<div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> A table can have only one clustered index because the clustered index defines the single physical order in which the data rows are stored.</p></div>
+<div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> Duplicate indexes have identical key columns and overlapping indexes are leftmost subsets of wider ones; both waste writes and storage, so find them in sys.indexes, confirm with usage stats, disable first, then drop.</p></div>
 
 <h3 id="q65" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q65. What is the difference between an index seek, an index scan, and a table scan?</h3>
 
@@ -319,7 +327,7 @@ WHERE Email = @Email;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Internal fragmentation means pages are partly empty, so the index holds more pages than it needs and scans read more pages to return the same rows. It shows up as a low avg_page_space_used_in_percent. Both are usually caused by page splits from inserts and updates, and by deletes that leave empty space.</p>
 
-<p class="text-gray-300 leading-relaxed">Reorganize defragments the leaf level in place, is always online, uses few resources, and is suited to moderate fragmentation. Rebuild creates a fresh copy of the index, removes both kinds of fragmentation, and updates index statistics, but costs more and needs care on large tables. A common rule of thumb is reorganize from about 5 percent to 30 percent fragmentation, and rebuild above 30 percent, while also considering page count and workload.</p>
+<p class="text-gray-300 leading-relaxed">Reorganize defragments the leaf level in place, is always online, uses few resources, and is suited to moderate fragmentation. Rebuild creates a fresh copy of the index, removes both kinds of fragmentation, and updates index statistics, but costs more and needs care on large tables. The old rule of thumb, reorganize from 5 percent to 30 percent fragmentation and rebuild above 30 percent, is no longer the right answer: Microsoft's current guidance is measure-first, and on SSD and NVMe storage fragmentation matters far less than it did on spinning disks, because random reads are cheap and the real costs are page density and write amplification. Before rebuilding, try updating statistics first, check page_count and avg_page_space_used_in_percent, and confirm the index actually hurts a real query. Many DBAs now reorganize rarely, rebuild only when page density is low or a query measurably improves, and otherwise leave the index alone.</p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>SELECT index_id, avg_fragmentation_in_percent, avg_page_space_used_in_percent, page_count
 FROM sys.dm_db_index_physical_stats(DB_ID(), OBJECT_ID('dbo.Orders'), NULL, NULL, 'LIMITED');
@@ -328,7 +336,7 @@ ALTER INDEX IX_Orders_CustomerID ON dbo.Orders REORGANIZE;
 
 ALTER INDEX IX_Orders_CustomerID ON dbo.Orders REBUILD WITH (ONLINE = ON);</code></pre>
 
-<div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> External fragmentation is pages stored out of logical order and internal fragmentation is wasted space inside pages, with reorganize suited to moderate fragmentation and rebuild suited to heavy fragmentation.</p></div>
+<div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> External fragmentation is pages stored out of logical order and internal fragmentation is wasted space inside pages; decide rebuild versus reorganize from measured page density and query impact, not from a fixed percentage, and try a statistics update first.</p></div>
 
 <h3 id="q74" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q74. What is fill factor, and what are its purpose and trade-offs?</h3>
 

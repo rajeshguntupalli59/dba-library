@@ -47,9 +47,9 @@
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span><span>Disk latency metrics from file statistics and PerfMon</span></li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span><span>How to prove a storage problem versus a query problem with data</span></li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span><span>The transaction log full scenario and error 9002</span></li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span><span>File placement, instant file initialization, RAID, sector size, and alignment</span></li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span><span>File placement, instant file initialization, and virtual log files</span></li>
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span><span>Tempdb IO troubleshooting and parallelism waits CXPACKET and CXCONSUMER</span></li>
 
@@ -286,25 +286,26 @@ ADD FILE (
 
 <div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> Separate data, log, and tempdb files onto different paths, size files up front, and enable instant file initialization so growth does not stall work.</p></div>
 
-<h3 id="q139" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q139. What storage best practices should a DBA know about RAID levels, sector size, and partition alignment?</h3>
+<h3 id="q139" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q139. What are virtual log files (VLFs), and how do they affect transaction log performance?</h3>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Answer:</strong> RAID choice is a trade-off between redundancy, write performance, and capacity. RAID 1 and RAID 10 are common for transaction logs, tempdb, and write-heavy data because they mirror without a large write penalty. RAID 5 and RAID 6 can suit read-heavy data, but they carry a write penalty for parity calculation, and RAID 0 has no redundancy and should not hold data that must survive a disk loss. Confirm the RAID level and cache settings with the storage team, because SQL Server sees only the presented volume.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Answer:</strong> The transaction log is divided into virtual log files, or VLFs, and each VLF is the unit that gets truncated and reused. When the log grows, SQL Server creates new VLFs sized by the growth amount, so a log that grew in many small steps ends up with hundreds or thousands of tiny VLFs. That is the classic VLF problem: recovery, restores, log backups, and even instance startup all walk the VLF list, so a log with thousands of VLFs is slow at exactly the moments when speed matters most.</p>
 
-<p class="text-gray-300 leading-relaxed">Sector size and partition alignment affect how efficiently IO is issued to disk. SQL Server works with 512-byte sector emulation, and modern storage may present 512-byte emulation over 4 KB physical sectors, so confirm the sector presentation and formatting choices with the storage and Windows teams. Partitions should be aligned, commonly at a 1024 KB offset, so that IO boundaries line up with storage boundaries and do not cause extra read-modify-write work.</p>
+<p class="text-gray-300 leading-relaxed">Check the VLF count with sys.dm_db_log_info on SQL Server 2016 SP2 and later, or DBCC LOGINFO on older versions. A healthy log has tens of VLFs, not thousands. The fix is to grow the log to its target size in a few large steps, so each step creates a small number of large VLFs, and to set autogrowth to a fixed size in megabytes rather than a percentage. Shrinking and regrowing the log to fix VLFs is a maintenance-window operation, never a routine fix, because shrinking a log that is in use can fail and a wrong size just recreates the problem.</p>
 
-<p class="text-gray-300 leading-relaxed">Keep this area brief in an interview and focus on validation. A DBA does not need to design the array, but should know what to ask for, what to check after a change, and how to validate with latency and throughput tests under realistic load. If latency is high after a storage change, compare file-level stall before and after the change for the same workload.</p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Count VLFs and see their sizes
+SELECT COUNT(*) AS VLFCount,
+       SUM(vlf_size_mb) AS TotalLogSizeMB
+FROM sys.dm_db_log_info(DB_ID('SalesDB'));
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>SELECT
-    DB_NAME(database_id) AS database_name,
-    name AS logical_name,
-    physical_name,
-    size * 8 / 1024 AS size_mb,
-    growth,
-    is_percent_growth
-FROM sys.master_files
-ORDER BY database_name, name;</code></pre>
+SELECT vlf_begin_offset, vlf_size_mb, vlf_status, vlf_active
+FROM sys.dm_db_log_info(DB_ID('SalesDB'))
+ORDER BY vlf_begin_offset;
 
-<div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> Choose RAID and disk settings for the workload, keep partition alignment and sector size correct, and validate with latency and throughput tests.</p></div>
+-- Grow in large steps, and set fixed autogrowth instead of a percentage
+ALTER DATABASE SalesDB
+MODIFY FILE (NAME = N'SalesDB_log', SIZE = 8192MB, FILEGROWTH = 512MB);</code></pre>
+
+<div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> The log is made of virtual log files, and many small autogrowth steps create thousands of tiny VLFs that slow recovery and restores, so grow the log in large steps and use fixed-size autogrowth.</p></div>
 
 <h3 id="q140" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q140. How do you troubleshoot tempdb IO problems?</h3>
 
@@ -392,37 +393,33 @@ WHERE wait_type IN (N'WRITELOG', N'HADR_SYNC_COMMIT');</code></pre>
 
 <div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> A new synchronous replica can turn commit waits into network and remote log waits, so check replica health and queues before blaming local disks.</p></div>
 
-<h3 id="q143" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q143. Scenario: The storage team says the disks are fine, but waits point to IO. How do you prove the problem with data?</h3>
+<h3 id="q143" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q143. Scenario: The transaction log is full (error 9002). What do you do?</h3>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Answer:</strong> First, take two timed samples of file-level latency and wait statistics over the same interval when the problem is happening. Calculate the delta for each file, showing average read stall, average write stall, number of reads and writes, and bytes moved. A single cumulative snapshot proves little, while a timed delta tied to slow queries is hard to dismiss.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Answer:</strong> First, find out why the log cannot be reused: query log_reuse_wait_desc in sys.databases, because it names the exact blocker. LOG_BACKUP means the log has not been backed up, so take a transaction log backup. ACTIVE_TRANSACTION means a long-running transaction is holding the log, so find it in sys.dm_tran_database_transactions and deal with the session behind it. AVAILABILITY_REPLICA means a secondary has not received the log yet, so check replica lag. REPLICATION means the log reader has not processed the transactions. Each cause has a different fix, so guessing wastes the outage.</p>
 
-<p class="text-gray-300 leading-relaxed">Next, build a complete evidence pack for the same window. Include top waits with the increase in the interval, the affected database and file paths, PerfMon disk latency and throughput for the matching volumes, and the queries running at the time with their read counts and durations. Show that the slowdown lines up with high stall on specific files, and rule out the query side by showing read counts are reasonable or unchanged from baseline.</p>
+<p class="text-gray-300 leading-relaxed">Next, check the practical limits: free disk space on the log volume, the log file's maximum size, and its autogrowth setting. If the log must grow, give it room, either by freeing space or by growing the file in a large step. Two answers mark a weak candidate: shrinking the log to fix the error, which only frees space temporarily and recreates the problem, and switching the database to SIMPLE recovery in production, which breaks the log chain and kills point-in-time recovery. After the fix, take a log backup, confirm the log reuse wait clears, and set up an alert on log used percentage so the next one is caught before error 9002.</p>
 
-<p class="text-gray-300 leading-relaxed">Present the data by file and volume, not by server average. Name the database, file, volume, time window, latency, IOPS, and wait increase, and compare with a healthy baseline for the same volume and workload. Ask the storage team to check the same volumes and time window, including cache, queue depth, contention from other hosts, and any storage events, so both sides are looking at the same evidence.</p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- First diagnostic step: what is blocking log reuse?
+SELECT name, log_reuse_wait_desc,
+       log_reuse_wait_time
+FROM sys.databases
+WHERE name = 'SalesDB';
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>SELECT
-    DB_NAME(vfs.database_id) AS database_name,
-    mf.physical_name,
-    vfs.num_of_reads,
-    vfs.num_of_writes,
-    vfs.io_stall_read_ms,
-    vfs.io_stall_write_ms
-FROM sys.dm_io_virtual_file_stats(NULL, NULL) AS vfs
-JOIN sys.master_files AS mf
-    ON mf.database_id = vfs.database_id
-    AND mf.file_id = vfs.file_id
-WHERE mf.database_id = DB_ID(N'SalesDB');
+-- If ACTIVE_TRANSACTION, find the open transaction holding the log
+SELECT s.session_id, s.login_name, s.host_name,
+       t.database_transaction_begin_time,
+       DATEDIFF(MINUTE, t.database_transaction_begin_time, SYSDATETIME()) AS OpenMinutes
+FROM sys.dm_tran_database_transactions AS t
+INNER JOIN sys.dm_tran_session_transactions AS st
+    ON st.transaction_id = t.transaction_id
+INNER JOIN sys.dm_exec_sessions AS s
+    ON s.session_id = st.session_id
+WHERE t.database_id = DB_ID('SalesDB');
 
-SELECT
-    object_name,
-    counter_name,
-    instance_name,
-    cntr_value
-FROM sys.dm_os_performance_counters
-WHERE counter_name IN (N'Avg. Disk sec/Read', N'Avg. Disk sec/Write', N'Disk Reads/sec', N'Disk Writes/sec')
-    AND instance_name LIKE N'%D:%';</code></pre>
+-- After fixing the cause, back up the log to free it
+BACKUP LOG SalesDB TO DISK = 'E:\Backups\SalesDB_Log.trn';</code></pre>
 
-<div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> Timed before-and-after file latency and wait data prove an IO problem in a way that a single snapshot or an opinion cannot.</p></div>
+<div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> Error 9002 starts with log_reuse_wait_desc, which names the blocker; fix that cause, never shrink the log or switch to SIMPLE recovery as the answer.</p></div>
 
 <h3 id="q144" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q144. What do CXPACKET and CXCONSUMER waits mean, and when should you act on them?</h3>
 

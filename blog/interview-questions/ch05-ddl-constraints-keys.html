@@ -47,7 +47,7 @@
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span><span>UNIQUE, CHECK, and DEFAULT constraints</span></li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span><span>IDENTITY columns, SEQUENCE objects, and the different kinds of keys</span></li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span><span>IDENTITY columns, SEQUENCE objects, and collation mismatches</span></li>
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span><span>Normalization to 1NF, 2NF, and 3NF, when to denormalize, and DELETE vs TRUNCATE vs DROP</span></li>
 
@@ -137,24 +137,25 @@ SELECT NEXT VALUE FOR dbo.InvoiceSeq AS NextInvoiceNumber;</code></pre>
 
 <div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> IDENTITY auto-numbers one table column, while a SEQUENCE is an independent counter that any table or statement can draw numbers from.</p></div>
 
-<h3 id="q48" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q48. What are candidate, primary, surrogate, natural, and composite keys?</h3>
+<h3 id="q48" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q48. What is collation, and what problems do collation mismatches cause?</h3>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Answer:</strong> A candidate key is any minimal set of columns that could uniquely identify a row. A table can have several candidates, for example EmployeeID and Email in an Employees table. The primary key is the one candidate chosen as the main identifier, and the remaining candidates are usually enforced with UNIQUE constraints.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Answer:</strong> A collation is the set of rules SQL Server uses to sort and compare character data: which characters sort before others, and whether comparisons are case sensitive, accent sensitive, and width sensitive. Collation is set at three levels: the server, the database, and the column, with each level inheriting from the one above unless it is overridden. A typical name such as SQL_Latin1_General_CP1_CI_AS means case-insensitive (CI) and accent-sensitive (AS).</p>
 
-<p class="text-gray-300 leading-relaxed">A natural key uses a meaningful business value, such as an email address or a product code, while a surrogate key is an artificial value with no business meaning, such as an IDENTITY integer created only to identify the row. Surrogate keys are popular because they are narrow and stable, while natural keys can change or be reused. A composite key is a key made of two or more columns together, such as OrderID plus ProductID identifying one line in an order details table.</p>
+<p class="text-gray-300 leading-relaxed">Mismatches cause the error "Cannot resolve the collation conflict between ... in the equal to operation", usually when joining or comparing columns from databases with different collations, or when a temp table inherits tempdb's collation while the user database uses another. The quick fix in a query is the COLLATE clause, for example COLLATE DATABASE_DEFAULT, which makes the comparison use the current database collation. The durable fix is to align collations: set the column collation at creation time, or change a database collation with ALTER DATABASE ... COLLATE, which rebuilds affected indexes and needs a maintenance window. Always check collation before a migration or a restore to another server, because a mismatch only shows up when the first comparison runs.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE OrderDetails (
-    OrderID INT NOT NULL,
-    ProductID INT NOT NULL,
-    Quantity INT NOT NULL,
-    CONSTRAINT PK_OrderDetails PRIMARY KEY (OrderID, ProductID),
-    CONSTRAINT FK_OrderDetails_Orders FOREIGN KEY (OrderID)
-        REFERENCES Orders (OrderID),
-    CONSTRAINT FK_OrderDetails_Products FOREIGN KEY (ProductID)
-        REFERENCES Products (ProductID)
-);</code></pre>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Check the collation at each level
+SELECT SERVERPROPERTY('Collation') AS ServerCollation;
+SELECT name, collation_name FROM sys.databases WHERE name = 'SalesDB';
+SELECT name, collation_name FROM sys.columns
+WHERE object_id = OBJECT_ID('dbo.Customers') AND name = 'Email';
 
-<div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> Candidate keys are all possible unique identifiers, the primary key is the one chosen, and surrogate, natural, and composite describe where that key comes from and how many columns it uses.</p></div>
+-- Fix a comparison conflict in the query
+SELECT *
+FROM dbo.Customers AS c
+INNER JOIN dbo.Orders AS o
+    ON o.CustomerEmail COLLATE DATABASE_DEFAULT = c.Email COLLATE DATABASE_DEFAULT;</code></pre>
+
+<div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> Collation decides how strings sort and compare, and mismatches between databases or tempdb break joins until you align them with COLLATE or a collation change.</p></div>
 
 <h3 id="q49" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q49. What is normalization? Explain 1NF, 2NF, and 3NF, and when to denormalize.</h3>
 
@@ -184,7 +185,7 @@ CREATE TABLE Customers (
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Answer:</strong> DELETE is a DML statement that removes rows one by one, with an optional WHERE clause to choose which rows go. Every deleted row is logged, DELETE triggers fire, the identity seed is unchanged, and the statement can be rolled back. DELETE respects foreign keys, so a parent row cannot be deleted while child rows reference it unless a cascade action applies.</p>
 
-<p class="text-gray-300 leading-relaxed">TRUNCATE is a DDL statement that removes all rows from a table at once, with no WHERE clause. It deallocates data pages with minimal logging, so it is much faster for emptying a table, it resets the IDENTITY seed, and DELETE triggers do not fire. A table referenced by a foreign key cannot be truncated until the foreign key is dropped or disabled, and TRUNCATE requires ALTER permission. DROP is also DDL, but it removes the table itself: its definition, data, indexes, constraints, and triggers are all gone, and recovery requires a restore.</p>
+<p class="text-gray-300 leading-relaxed">TRUNCATE is a DDL statement that removes all rows from a table at once, with no WHERE clause. It deallocates data pages with minimal logging, so it is much faster for emptying a table, it resets the IDENTITY seed, and DELETE triggers do not fire. A table referenced by a foreign key cannot be truncated until the foreign key is dropped or disabled, and TRUNCATE requires ALTER permission. TRUNCATE is transactional, so inside an explicit transaction it can be rolled back like DELETE, which is a common interview trap: the minimal logging is about speed, not about losing the ability to roll back. DROP is also DDL, but it removes the table itself: its definition, data, indexes, constraints, and triggers are all gone, and recovery requires a restore.</p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>DELETE FROM Orders WHERE OrderDate &lt; '2020-01-01';
 

@@ -43,7 +43,7 @@
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span><span>Availability Group architecture with replicas, listeners, and database mirroring endpoints</span></li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span><span>Synchronous and asynchronous commit and automatic, manual, and forced failover</span></li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span><span>Synchronous and asynchronous commit, failover types, and contained Availability Groups</span></li>
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span><span>Diagnosing a secondary that is not syncing, including endpoints, seeding, and the redo queue</span></li>
 
@@ -179,22 +179,37 @@ WHERE mirroring_state IS NOT NULL;</code></pre>
 
 <div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> Availability Groups are the current high availability standard, and database mirroring is the deprecated feature that Availability Groups replaced.</p></div>
 
-<h3 id="q174" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q174. What are the types of Availability Group failover - planned manual, forced, and automatic - and what are the data loss implications?</h3>
+<h3 id="q174" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q174. What is a contained Availability Group, and what failover problems does it solve?</h3>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Answer:</strong> A planned manual failover is started by a DBA to move the primary role to a synchronous secondary, usually for patching or maintenance. The target must be in the SYNCHRONIZED state, the move is brief, clients reconnect through the listener, and there is no data loss when the target is fully synchronized. This is the safe, routine failover type.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Answer:</strong> A normal Availability Group replicates only user databases. Logins, SQL Server Agent jobs, and server-level configuration live outside the AG, so after a failover the application often cannot log in because the login does not exist on the new primary, or a critical job simply does not run because it was never created there. Those are the classic post-failover incidents, and they are caused by state that the AG never replicated.</p>
 
-<p class="text-gray-300 leading-relaxed">An automatic failover happens on its own when the primary fails, the secondary is synchronous with automatic failover mode, and the cluster keeps quorum. When the secondary was synchronized at failure time, automatic failover also aims for no data loss, though in-flight transactions still roll back and applications must reconnect and retry. Automatic failover never applies to asynchronous replicas.</p>
+<p class="text-gray-300 leading-relaxed">A contained Availability Group, available from SQL Server 2022, replicates that state too. It carries contained system databases with the AG, so logins, Agent jobs, and some server configuration travel with the databases to whichever replica becomes primary. Create it with WITH (CONTAINED) in the CREATE AVAILABILITY GROUP statement, and always create a listener, because the contained system databases are only reachable through it. In SQL Server 2022 the contained system databases use automatic seeding only, and large user databases are added afterwards with JOIN ONLY; SQL Server 2025 also supports contained AGs as part of a distributed Availability Group.</p>
 
-<p class="text-gray-300 leading-relaxed">A forced failover uses FORCE_FAILOVER_ALLOW_DATA_LOSS when the primary is gone and cannot be recovered, and it accepts that any log not yet sent or redone will be lost. Use it only when the primary is truly unrecoverable, check how far behind the target was, and plan for the old primary to be rebuilt and rejoined as a secondary after recovery. Forced failover on an asynchronous replica carries the highest loss risk.</p>
+<p class="text-gray-300 leading-relaxed">Contained AGs are not free of limits: replication of any type is not supported, SSIS packages and maintenance plans are not supported inside them, and the contained system databases are not copies of the instance system databases, they are created fresh for the AG. For a new AG where failover must just work, including logins and jobs, a contained AG removes a whole class of incidents that used to need manual sync scripts.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>ALTER AVAILABILITY GROUP AG1 FAILOVER;
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Create a contained AG: logins and Agent jobs travel with the databases
+CREATE AVAILABILITY GROUP AG1
+WITH (CONTAINED)
+FOR DATABASE SalesDB
+REPLICA ON
+    'SQL01' WITH (
+        ENDPOINT_URL = 'TCP://SQL01:5022',
+        AVAILABILITY_MODE = SYNCHRONOUS_COMMIT,
+        FAILOVER_MODE = AUTOMATIC,
+        SEEDING_MODE = AUTOMATIC
+    ),
+    'SQL02' WITH (
+        ENDPOINT_URL = 'TCP://SQL02:5022',
+        AVAILABILITY_MODE = SYNCHRONOUS_COMMIT,
+        FAILOVER_MODE = AUTOMATIC,
+        SEEDING_MODE = AUTOMATIC
+    );
 
-SELECT ag.name, ar.replica_server_name, rs.role_desc, rs.operational_state_desc
-FROM sys.availability_groups AS ag
-INNER JOIN sys.availability_replicas AS ar ON ar.group_id = ag.group_id
-INNER JOIN sys.dm_hadr_availability_replica_states AS rs ON rs.replica_id = ar.replica_id;</code></pre>
+-- Confirm which AGs are contained
+SELECT name, is_contained
+FROM sys.availability_groups;</code></pre>
 
-<div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> Planned and automatic failovers aim for no data loss from a synchronized replica, while a forced failover accepts possible data loss when the primary is gone.</p></div>
+<div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> A contained Availability Group replicates logins and Agent jobs with the databases, so failover no longer breaks logins or leaves jobs behind on the old primary.</p></div>
 
 <h3 id="q175" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q175. How do readable secondaries work, including read-only routing, replica lag, and the snapshot isolation requirement?</h3>
 
