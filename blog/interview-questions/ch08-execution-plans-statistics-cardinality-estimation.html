@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Chapter 8: Execution Plans, Statistics &amp; Cardinality Estimation — 200 SQL Server Interview Questions</title>
+  <title>Chapter 8: Execution Plans, Statistics &amp; Cardinality Estimation — 210 SQL Server Interview Questions</title>
   <meta name="description" content="SQL Server interview questions Q77–Q90: Execution Plans, Statistics &amp; Cardinality Estimation. Answers, T-SQL examples, and key learnings by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script></head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
@@ -31,7 +31,7 @@
       <a href="index.html" class="text-xs text-blue-400 hover:text-blue-300 transition">← All Chapters</a>
     </div>
     <div class="flex items-center gap-3 mb-4">
-      <span class="px-2.5 py-1 bg-blue-900/40 border border-blue-800/40 text-blue-300 text-xs rounded-full font-medium">Chapter 8 of 18</span>
+      <span class="px-2.5 py-1 bg-blue-900/40 border border-blue-800/40 text-blue-300 text-xs rounded-full font-medium">Chapter 8 of 19</span>
       <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/60 text-gray-300 text-xs rounded-full font-medium">Part 2 · Intermediate · Q77–Q90</span>
     </div>
     <div class="space-y-4 text-sm">
@@ -49,7 +49,7 @@
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span><span>Plan warnings for missing indexes, implicit conversion, spills, and missing join predicates</span></li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span><span>Statistics, histograms, and density vectors</span></li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span><span>Statistics, histograms, and incremental statistics</span></li>
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span><span>Auto-create and auto-update statistics and thresholds on large tables</span></li>
 
@@ -191,19 +191,27 @@ ORDER BY CustomerID;</code></pre>
   <figcaption class="mt-3 text-sm text-gray-400 leading-relaxed"><strong class="text-gray-200">Figure 4.</strong> Statistics histogram (DBCC SHOW_STATISTICS): RANGE_HI_KEY steps, EQ_ROWS, and range rows. Values shown are illustrative.</figcaption>
 </figure>
 
-<h3 id="q83" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q83. What is the density vector, and what role does it play in cardinality estimation?</h3>
+<h3 id="q83" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q83. What are incremental statistics, and when do they help on partitioned tables?</h3>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Answer:</strong> The density vector is the third result set from DBCC SHOW_STATISTICS, with one row per prefix of the statistics columns. Each row shows All density, Average Length, and the Columns covered. All density is the inverse of the number of distinct values for that column prefix: a density of 0.01 means about 100 distinct combinations, and a lower density means values are more unique and selective.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Answer:</strong> On a partitioned table, a normal statistics update scans the whole table, even when only the newest partition changed. Incremental statistics, available since SQL Server 2014 for partitioned tables, store one histogram per partition and let you update the statistics for a single partition instead. That matters on very large tables, where only the current partition receives new rows and a full scan for statistics would take too long to run often.</p>
 
-<p class="text-gray-300 leading-relaxed">The optimizer uses density when the histogram cannot answer the question directly, for example for equality on a non-leading column of a composite statistics object, for predicates on columns without a histogram step, or for estimating distinct combinations in joins and grouping. The basic estimate is density multiplied by the number of rows, which approximates how many rows share one value.</p>
+<p class="text-gray-300 leading-relaxed">To use them, create the statistics with STATISTICS_INCREMENTAL = ON, or enable it on an index. Then update one partition with UPDATE STATISTICS ... WITH RESAMPLE ON PARTITIONS(n). The per-partition histograms are merged into a combined view the optimizer uses. Check whether a statistics object is incremental with sys.stats.is_incremental. If the table is not partitioned, incremental statistics do nothing, and for small tables a full update is already cheap enough.</p>
 
-<p class="text-gray-300 leading-relaxed">Average Length is the average storage size in bytes of the columns in that prefix, which the optimizer uses for memory and row size estimates. Density is an average, so it works well for evenly spread values and poorly for skewed values where one value dominates, which is one reason histograms exist alongside it.</p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Create an index with incremental statistics on a partitioned table
+CREATE NONCLUSTERED INDEX IX_Orders_CustomerID
+    ON dbo.Orders (CustomerID)
+    WITH (STATISTICS_INCREMENTAL = ON);
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>DBCC SHOW_STATISTICS ('dbo.Orders', 'IX_Orders_CustomerID') WITH DENSITY_VECTOR;
+-- Update statistics for only the newest partition (partition 12)
+UPDATE STATISTICS dbo.Orders IX_Orders_CustomerID
+WITH RESAMPLE ON PARTITIONS(12);
 
-DBCC SHOW_STATISTICS ('dbo.Customers', 'IX_Customers_Name') WITH DENSITY_VECTOR;</code></pre>
+-- Check which statistics objects are incremental
+SELECT name, is_incremental
+FROM sys.stats
+WHERE object_id = OBJECT_ID('dbo.Orders');</code></pre>
 
-<div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> The density vector gives the inverse of distinct values for each column prefix, and the optimizer multiplies density by row count to estimate rows when the histogram has no direct answer.</p></div>
+<div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> Incremental statistics store one histogram per partition so you can refresh statistics for only the changed partition instead of scanning a very large table.</p></div>
 
 <h3 id="q84" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q84. How do auto-create and auto-update statistics work, and how do thresholds behave on large tables?</h3>
 

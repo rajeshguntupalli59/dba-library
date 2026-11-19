@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Chapter 6: Programmability &amp; Views — 200 SQL Server Interview Questions</title>
+  <title>Chapter 6: Programmability &amp; Views — 210 SQL Server Interview Questions</title>
   <meta name="description" content="SQL Server interview questions Q51–Q60: Programmability &amp; Views. Answers, T-SQL examples, and key learnings by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script></head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
@@ -31,7 +31,7 @@
       <a href="index.html" class="text-xs text-blue-400 hover:text-blue-300 transition">← All Chapters</a>
     </div>
     <div class="flex items-center gap-3 mb-4">
-      <span class="px-2.5 py-1 bg-blue-900/40 border border-blue-800/40 text-blue-300 text-xs rounded-full font-medium">Chapter 6 of 18</span>
+      <span class="px-2.5 py-1 bg-blue-900/40 border border-blue-800/40 text-blue-300 text-xs rounded-full font-medium">Chapter 6 of 19</span>
       <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/60 text-gray-300 text-xs rounded-full font-medium">Part 1 · Beginner · Q51–Q60</span>
     </div>
     <div class="space-y-4 text-sm">
@@ -53,7 +53,7 @@
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span><span>Variables, table variables, temp tables, error handling, and transactions</span></li>
 
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span><span>Backup types, recovery models, and INSERT, UPDATE, and DELETE with OUTPUT</span></li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span><span>Backup types, recovery models, and the MERGE statement</span></li>
 
 <div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> Programmability objects put reusable logic and rules inside the database, where they can be secured, shared, and kept consistent for every caller. Views simplify access, procedures and functions encapsulate work, triggers enforce row-level rules, and transactions, error handling, and backups protect correctness and recoverability.</p></div>
 
@@ -235,26 +235,40 @@ TO DISK = 'C:\Backups\SalesDB_Log.trn';</code></pre>
 
 <div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> Full backups capture the whole database, differential backups capture changes since the last full backup, and log backups enable point-in-time restore when the database uses the Full or Bulk-logged recovery model.</p></div>
 
-<h3 id="q60" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q60. What is the syntax for INSERT, UPDATE, and DELETE, and how does the OUTPUT clause work?</h3>
+<h3 id="q60" class="text-lg font-semibold text-white mt-8 mb-3 scroll-mt-20">Q60. What is the MERGE statement, and why do DBAs warn against it?</h3>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Answer:</strong> INSERT adds rows with VALUES, including several rows in one statement, or with INSERT...SELECT to copy rows from a query. UPDATE changes rows with SET, optionally joining other tables, and DELETE removes rows, both normally guarded by a WHERE clause. Without WHERE, UPDATE changes every row and DELETE removes every row, so always check the filter before running either statement outside a transaction.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Answer:</strong> MERGE does an INSERT, UPDATE, and DELETE in one statement, matching a source to a target on a key and taking a different action for matched, unmatched, and source-missing rows. It looks like the perfect upsert, but the SQL Server community warns against it for three reasons. First, it has a known race condition: without HOLDLOCK, two concurrent MERGE statements can both decide a row does not exist and both try to insert it, failing with a unique key violation. Second, a source with duplicate matches produces wrong results or an error, and the error is hard to trace. Third, the plans it generates are often worse than separate statements, and the statement is harder to read and debug.</p>
 
-<p class="text-gray-300 leading-relaxed">The OUTPUT clause returns the rows affected by an INSERT, UPDATE, DELETE, or MERGE statement, using the inserted and deleted pseudo-tables. For INSERT, inserted holds the new rows. For DELETE, deleted holds the removed rows. For UPDATE, deleted holds the before-image and inserted holds the after-image. OUTPUT can return the rows to the client or capture them with OUTPUT INTO a table variable or temp table for auditing.</p>
+<p class="text-gray-300 leading-relaxed">If you must use MERGE, add WITH (HOLDLOCK) on the target and end the statement with a semicolon, because MERGE requires one. The safer pattern most teams prefer is separate statements in one transaction: UPDATE the matched rows first, then INSERT the rows that do not exist, using WHERE NOT EXISTS. It is longer, but it has no race condition, no duplicate-match surprise, and a plan you can read. Many shops ban MERGE outright, and knowing that is itself a good interview answer.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>INSERT INTO dbo.Products (ProductID, ProductName, UnitPrice)
-OUTPUT inserted.ProductID, inserted.ProductName
-VALUES (101, 'Chai', 18.00);
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- MERGE with HOLDLOCK: the minimum safe form
+MERGE INTO dbo.Products AS Target
+USING dbo.StagingProducts AS Source
+    ON Target.ProductID = Source.ProductID
+WHEN MATCHED THEN
+    UPDATE SET Target.UnitPrice = Source.UnitPrice
+WHEN NOT MATCHED BY TARGET THEN
+    INSERT (ProductID, ProductName, UnitPrice)
+    VALUES (Source.ProductID, Source.ProductName, Source.UnitPrice)
+WHEN NOT MATCHED BY SOURCE THEN
+    DELETE;
 
-UPDATE dbo.Products
-SET UnitPrice = 20.00
-OUTPUT deleted.UnitPrice AS OldPrice, inserted.UnitPrice AS NewPrice
-WHERE ProductID = 101;
+-- Safer pattern: separate statements in one transaction
+BEGIN TRANSACTION;
+    UPDATE p
+    SET p.UnitPrice = s.UnitPrice
+    FROM dbo.Products p
+    JOIN dbo.StagingProducts s ON p.ProductID = s.ProductID;
 
-DELETE FROM dbo.Products
-OUTPUT deleted.ProductID, deleted.ProductName
-WHERE ProductID = 101;</code></pre>
+    INSERT INTO dbo.Products (ProductID, ProductName, UnitPrice)
+    SELECT s.ProductID, s.ProductName, s.UnitPrice
+    FROM dbo.StagingProducts s
+    WHERE NOT EXISTS (
+        SELECT 1 FROM dbo.Products p WHERE p.ProductID = s.ProductID
+    );
+COMMIT TRANSACTION;</code></pre>
 
-<div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> INSERT adds rows, UPDATE changes them, DELETE removes them, and OUTPUT exposes the before and after rows through the deleted and inserted tables.</p></div>
+<div class="my-5 rounded-xl border border-blue-900/40 bg-blue-950/20 px-5 py-4"><p class="text-sm text-gray-300 leading-relaxed"><strong class="text-blue-300">Key learning:</strong> MERGE combines insert, update, and delete in one statement but has a race condition without HOLDLOCK, so most teams use separate statements in a transaction instead.</p></div>
     </div>
     <div class="mt-14 bg-blue-950/40 border border-blue-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
