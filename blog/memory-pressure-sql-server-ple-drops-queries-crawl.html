@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Memory pressure in SQL Server: when PLE drops and your queries start crawling — Rajesh Guntupalli</title>
+  <meta name="description" content="Page Life Expectancy crashing, buffer pool churn, and memory grants eating your server — how to diagnose SQL Server memory pressure and fix the real cause." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-blue-500 to-blue-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-blue-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"    class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"     class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"       class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Blog</a>
+        <a href="../interview-questions.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Questions</a>
+        <a href="../about.html"    class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="https://rajeshguntupalli59.github.io/querylab/"
+           class="ml-2 px-4 py-1.5 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded-lg transition">Get Free Tools</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="flex gap-2 mb-5"><span class="px-2 py-0.5 bg-blue-900/40 border border-blue-800/40 text-blue-300 text-xs rounded-full">SQL Server</span><span class="px-2 py-0.5 bg-blue-900/40 border border-blue-800/40 text-blue-300 text-xs rounded-full">Troubleshooting</span></div>
+    <h1 class="text-4xl font-extrabold mb-4 leading-tight">Memory pressure in SQL Server: when PLE drops and your queries start crawling</h1>
+    <div class="flex items-center gap-3 text-xs text-gray-500 mb-10 pb-8 border-b border-gray-800/60">
+      <span>Rajesh Guntupalli</span><span>·</span><span>November 2026</span><span>·</span><span>6 min read</span>
+    </div>
+    <div class="space-y-4 text-sm">
+<p class="text-gray-300 leading-relaxed">Nothing changed. No new deploy, no new query, no spike in users. But suddenly every query is slow, the disk is hammering, and the monitoring dashboard is red. I have seen this exact morning more times than I can count, and nine times out of ten the culprit is the same: SQL Server ran out of useful memory, and the buffer pool started churning.</p>
+
+<p class="text-gray-300 leading-relaxed">Memory pressure is sneaky because it rarely announces itself as a memory problem. It shows up as slow queries, high disk I/O, and CPU that looks busy doing nothing useful. Here is how I diagnose it — and how I decide whether the fix is a setting, a query, or a bigger server.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">1. What Page Life Expectancy actually tells you (and what it doesn't)</h2>
+
+<p class="text-gray-300 leading-relaxed">Page Life Expectancy, or PLE, is the average number of seconds a data page stays in the buffer pool before being evicted. On a healthy server it is measured in thousands of seconds. When it craters to double digits, pages are being flushed almost as fast as they are read in — which means every query is going back to disk for data it read five minutes ago.</p>
+
+<p class="text-gray-300 leading-relaxed">The old rule of thumb — "PLE should be above 300" — is from the era of 4 GB servers and is mostly useless today. On a server with 256 GB of RAM, a PLE of 300 would be a disaster. The number that matters is the trend: a PLE that was 40,000 yesterday and 400 today is a real signal, whatever the absolute value. Check it like this:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Page Life Expectancy, per NUMA node
+SELECT
+    object_name,
+    counter_name,
+    instance_name AS numa_node,
+    cntr_value AS ple_seconds
+FROM sys.dm_os_performance_counters
+WHERE counter_name = 'Page life expectancy';
+
+-- How much memory SQL Server is actually using vs. its target
+SELECT
+    physical_memory_in_use_kb / 1024 AS sql_memory_mb,
+    large_page_allocations_kb / 1024 AS large_pages_mb,
+    locked_page_allocations_kb / 1024 AS locked_pages_mb,
+    total_virtual_address_space_kb / 1024 AS vas_mb,
+    virtual_address_space_reserved_kb / 1024 AS vas_reserved_mb,
+    virtual_address_space_committed_kb / 1024 AS vas_committed_mb
+FROM sys.dm_os_process_memory;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">One warning: PLE can be low for a legitimate reason. A single huge backup, a big index rebuild, or a one-off reporting scan can flush the buffer pool and tank PLE for an hour. That is not memory pressure — that is a workload doing exactly what it was asked to do. Always ask what changed before you declare a crisis.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">2. Find out who is eating the memory</h2>
+
+<p class="text-gray-300 leading-relaxed">SQL Server's memory is not one bucket. It is split across memory clerks: the buffer pool, the plan cache, memory grants for running queries, and a dozen smaller consumers. When memory is tight, you need to know which clerk is holding it — because the fix for a bloated plan cache is very different from the fix for a runaway sort.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Top memory consumers by clerk
+SELECT TOP 10
+    type AS clerk_type,
+    SUM(pages_kb) / 1024 AS memory_mb,
+    SUM(awe_allocated_kb) / 1024 AS awe_mb
+FROM sys.dm_os_memory_clerks
+GROUP BY type
+ORDER BY SUM(pages_kb) DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">On most servers, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">MEMORYCLERK_SQLBUFFERPOOL</code> dominates, and that is exactly what you want — data cached in memory is the whole point. The interesting cases are the exceptions: a plan cache holding gigabytes of single-use ad-hoc plans, or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">MEMORYCLERK_SQLQERESERVATIONS</code> (memory grants) ballooning because a few queries are asking for enormous workspaces. If the buffer pool is small relative to your data, the answer is usually more RAM or better indexes — not a clerk-level fix.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">3. The memory grant problem: one query, half the RAM</h2>
+
+<p class="text-gray-300 leading-relaxed">This is the memory-pressure case I see most often in production, and it hides in plain sight. A query with a big sort or hash join asks SQL Server for a memory grant before it runs. If the optimizer overestimates the row count — bad statistics, a skewed parameter — the grant can be enormous. A single query can reserve 25% of the server's memory, and while it holds that grant, every other query queues behind it waiting for its own grant.</p>
+
+<p class="text-gray-300 leading-relaxed">The symptom is distinctive: queries that normally run in milliseconds start timing out, but CPU is low and disk is quiet. The server is not busy — it is waiting on memory grants. Find the culprits live:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Queries currently holding (or waiting for) memory grants
+SELECT
+    r.session_id,
+    r.requested_memory_kb / 1024 AS requested_mb,
+    r.granted_memory_kb / 1024 AS granted_mb,
+    r.required_memory_kb / 1024 AS required_mb,
+    r.used_memory_kb / 1024 AS used_mb,
+    r.wait_time_ms,
+    r.queue_id,
+    SUBSTRING(t.text, r.statement_start_offset / 2 + 1,
+        (CASE WHEN r.statement_end_offset = -1
+              THEN LEN(t.text)
+              ELSE r.statement_end_offset END
+              - r.statement_start_offset) / 2 + 1) AS statement_text
+FROM sys.dm_exec_query_memory_grants r
+CROSS APPLY sys.dm_exec_sql_text(r.sql_handle) t
+ORDER BY r.requested_memory_kb DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The fixes, in order of preference: fix the statistics or the parameter sniffing that caused the overestimate, so the grant shrinks to what the query actually needs. If the query genuinely needs the memory, cap it with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">OPTION (MAX_GRANT_PERCENT = 5)</code> or set a per-workload cap with Resource Governor. And if the query is sorting millions of rows just to return ten, rewrite it — no amount of RAM fixes a query that asks for the wrong thing.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">4. Set max server memory — and leave the OS something</h2>
+
+<p class="text-gray-300 leading-relaxed">By default, SQL Server will happily consume nearly all the memory on the box. That sounds efficient until the operating system needs memory for its own work — or another process on the same server does — and Windows starts paging SQL Server's memory to disk. A SQL Server that is being paged by the OS is slower than a SQL Server with a smaller, stable allocation.</p>
+
+<p class="text-gray-300 leading-relaxed">The fix takes thirty seconds and should be on every server you own:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Cap SQL Server, leaving room for the OS and other services.
+-- Rule of thumb: reserve 4 GB, or 10% of total RAM, whichever is larger.
+-- Example: 64 GB server -> max server memory = 57344 MB (56 GB)
+EXEC sp_configure 'show advanced options', 1;
+RECONFIGURE;
+EXEC sp_configure 'max server memory (MB)', 57344;
+RECONFIGURE;
+
+-- Confirm the setting took effect
+SELECT name, value_in_use
+FROM sys.configurations
+WHERE name = 'max server memory (MB)';</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Two things people get wrong here. First, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max server memory</code> caps the buffer pool and most clerks, but not everything — thread stacks and some external components sit outside it, which is another reason to leave the OS a real margin. Second, never set <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">min server memory</code> equal to max on a shared box; you are telling SQL Server it may never give memory back, which is how a quiet overnight server starves the morning's other workloads.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">5. When the fix is more memory — and when it isn't</h2>
+
+<p class="text-gray-300 leading-relaxed">Adding RAM is the easiest fix in the world, and sometimes it is the right one. If your buffer pool is genuinely smaller than your working set — the hot data your queries touch all day — no amount of tuning changes the math. Pages will churn, PLE will stay low, and disk will stay busy. Buy the memory; it is cheaper than a week of your time.</p>
+
+<p class="text-gray-300 leading-relaxed">But memory pressure is often a symptom with a cheaper cure. Before you order RAM, check these: a missing index forcing a full scan that floods the buffer pool with cold pages; a query doing a hash join on a billion-row table when a nested loop on an indexed seek would do; a plan cache full of single-use plans (turn on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">optimize for ad hoc workloads</code>); an SSIS package or a linked-server query pulling entire tables into memory. Fix one of those and PLE recovers on its own — no purchase order required.</p>
+
+<p class="text-gray-300 leading-relaxed">My rule: if PLE recovers after you fix a query, it was a query problem. If PLE stays low on a quiet server with good plans, it is a capacity problem. Measure first, spend second.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Closing Thoughts</h2>
+
+<p class="text-gray-300 leading-relaxed">Memory pressure is one of those problems that looks like everything else — slow queries, busy disks, angry users — until you check the right counter. Start with PLE and the trend, not the absolute number. Find which clerk is holding the memory. Look for the grant hogs before you blame the hardware. And set max server memory on every server you touch, because the OS paging SQL Server to disk is a failure mode you never want to debug at 2 AM.</p>
+
+<p class="text-gray-300 leading-relaxed">Most of the time, the server is not dying. It is just out of room to think. Give it the room — or take away the query that stole it.</p>
+
+<p class="text-gray-300 leading-relaxed">Go deeper: The DBA Handbook, Chapter 7 — Performance Optimization.</p>
+    </div>
+    <div class="mt-14 bg-blue-950/40 border border-blue-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryLab — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">Execution plan visualizer · Index advisor · Slow query dashboard · SQL Server</p>
+      </div>
+      <a href="https://rajeshguntupalli59.github.io/querylab/"
+         class="shrink-0 px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded-xl text-sm transition">
+        Download Free
+      </a>
+    </div>
+    <div class="mt-8"><a href="index.html" class="text-xs text-gray-500 hover:text-gray-300 transition">← Back to all articles</a></div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli</div>
+  </footer>
+</body>
+</html>
