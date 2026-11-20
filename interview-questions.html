@@ -42,7 +42,19 @@
       <svg class="absolute left-3 top-1/2 -translate-y-1/2 text-gray-500" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
       <button id="clearSearch" class="hidden absolute right-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-white text-xs px-2 py-1">Clear ✕</button>
     </div>
-    <p class="text-xs text-gray-500 mb-8">Browse by part and chapter below, or search. Every question opens its full answer with T-SQL examples. Prefer the full list? <a href="blog/interview-questions/index.html" class="text-blue-400 hover:text-blue-300 transition">Open the chapter index →</a></p>
+    <div class="flex items-center gap-3 mb-6">
+      <div class="flex-1 min-w-0">
+        <div class="flex justify-between text-xs text-gray-400 mb-1.5">
+          <span id="progressLabel">0 of 210 learned</span>
+          <span id="progressPct">0%</span>
+        </div>
+        <div class="h-2 bg-gray-800 rounded-full overflow-hidden">
+          <div id="progressBar" class="h-full bg-green-500 rounded-full transition-all duration-300" style="width: 0%"></div>
+        </div>
+      </div>
+      <button id="resetProgress" type="button" class="shrink-0 px-3 py-1.5 text-xs font-medium text-gray-400 bg-gray-800/60 border border-gray-700/60 rounded-lg hover:text-white hover:bg-gray-800 transition">Reset</button>
+    </div>
+    <p class="text-xs text-gray-500 mb-8">Browse by part and chapter below, or search. Turn on <span class="text-gray-300 font-medium">Study mode</span> to quiz yourself one question at a time, and tap the <span class="text-green-400 font-medium">✓</span> on any question to mark it learned — progress is saved in your browser. Prefer the full list? <a href="blog/interview-questions/index.html" class="text-blue-400 hover:text-blue-300 transition">Open the chapter index →</a></p>
 
     <div id="tabs" class="sticky top-14 z-40 bg-gray-950 pt-2 pb-4 -mx-1 px-1">
       <div id="partTabs" class="flex flex-wrap gap-2 mb-3" role="tablist" aria-label="Parts"></div>
@@ -97,6 +109,60 @@
   var currentPart = 0;
   var currentChapter = 0;    // index into CHAPTERS
   var searchToken = 0;
+  var studyMode = false;     // study mode: one question open at a time
+  var currentItems = [];     // accordion wraps of the currently shown chapter
+
+  // --- Learned progress (localStorage, per browser) -------------------------
+  var LS_KEY = 'dba-interview-learned-v1';
+  var learned = (function () {
+    try { return JSON.parse(localStorage.getItem(LS_KEY)) || {}; } catch (e) { return {}; }
+  })();
+  function saveLearned() { try { localStorage.setItem(LS_KEY, JSON.stringify(learned)); } catch (e) {} }
+  function learnedCount() { var n = 0; for (var k in learned) if (learned[k]) n++; return n; }
+  function chapterRange(idx) {
+    var parts = CHAPTERS[idx].range.replace(/Q/g, '').split('–');
+    return { lo: parseInt(parts[0], 10), hi: parseInt(parts[1], 10) };
+  }
+  function chapterLearned(idx) {
+    var r = chapterRange(idx), n = 0;
+    for (var i = r.lo; i <= r.hi; i++) if (learned['q' + i]) n++;
+    return n;
+  }
+  function paintMark(mark, isL) {
+    mark.className = isL
+      ? 'shrink-0 w-7 h-7 rounded-full bg-green-600 border border-green-500 text-white text-sm font-bold flex items-center justify-center hover:bg-green-500 transition'
+      : 'shrink-0 w-7 h-7 rounded-full bg-transparent border border-gray-600 text-gray-500 text-sm font-bold flex items-center justify-center hover:border-green-500 hover:text-green-400 transition';
+    mark.setAttribute('aria-pressed', isL ? 'true' : 'false');
+    mark.title = isL ? 'Learned — click to unmark' : 'Mark as learned';
+    mark.textContent = '✓';
+  }
+  function toggleLearned(qid, mark) {
+    if (learned[qid]) { delete learned[qid]; } else { learned[qid] = true; }
+    saveLearned();
+    paintMark(mark, !!learned[qid]);
+    updateProgressUI();
+  }
+  function closeOthers(except) {
+    if (!studyMode) return;
+    currentItems.forEach(function (it) { if (it !== except) it._toggle(false); });
+  }
+  function updateProgressUI() {
+    var total = learnedCount();
+    var pct = Math.round(total / 210 * 100);
+    document.getElementById('progressLabel').textContent = total + ' of 210 learned';
+    document.getElementById('progressPct').textContent = pct + '%';
+    document.getElementById('progressBar').style.width = pct + '%';
+    var cpL = document.getElementById('chapterProgressLabel');
+    if (cpL && cache[currentChapter]) {
+      var done = chapterLearned(currentChapter);
+      var n = cache[currentChapter].questions.length;
+      var cpct = Math.round(done / n * 100);
+      cpL.textContent = done + ' of ' + n + ' learned in this chapter';
+      document.getElementById('chapterProgressPct').textContent = cpct + '%';
+      document.getElementById('chapterProgressBar').style.width = cpct + '%';
+    }
+    renderTabs();
+  }
 
   var panel = document.getElementById('panel');
   var searchResults = document.getElementById('searchResults');
@@ -162,9 +228,11 @@
     wrap.className = 'border border-gray-800 rounded-xl bg-gray-900/40 overflow-hidden';
     wrap.dataset.qid = q.id;
 
+    var header = document.createElement('div');
+    header.className = 'flex items-center gap-2 px-4 py-3 hover:bg-gray-800/50 transition';
     var btn = document.createElement('button');
     btn.type = 'button';
-    btn.className = 'w-full flex items-center justify-between gap-4 px-4 py-3 text-left hover:bg-gray-800/50 transition';
+    btn.className = 'flex-1 flex items-center justify-between gap-4 text-left';
     btn.setAttribute('aria-expanded', 'false');
     var label = document.createElement('span');
     label.className = 'text-sm font-semibold text-white';
@@ -174,6 +242,15 @@
     chev.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="m6 9 6 6 6-6"/></svg>';
     btn.appendChild(label);
     btn.appendChild(chev);
+    var mark = document.createElement('button');
+    mark.type = 'button';
+    paintMark(mark, !!learned[q.id]);
+    mark.addEventListener('click', function (e) {
+      e.stopPropagation();
+      toggleLearned(q.id, mark);
+    });
+    header.appendChild(btn);
+    header.appendChild(mark);
 
     var body = document.createElement('div');
     body.className = 'hidden border-t border-gray-800 px-4 py-4 space-y-4 text-sm';
@@ -183,14 +260,16 @@
       var open = body.classList.toggle('hidden') === false;
       btn.setAttribute('aria-expanded', open ? 'true' : 'false');
       chev.style.transform = open ? 'rotate(180deg)' : '';
+      if (open) closeOthers(wrap);
       if (open && onToggle) onToggle(q.id);
     });
 
-    wrap.appendChild(btn);
+    wrap.appendChild(header);
     wrap.appendChild(body);
     wrap._toggle = function (open) {
       var isOpen = !body.classList.contains('hidden');
       if (open === isOpen) return;
+      if (open) closeOthers(wrap);
       body.classList.toggle('hidden', !open);
       btn.setAttribute('aria-expanded', open ? 'true' : 'false');
       chev.style.transform = open ? 'rotate(180deg)' : '';
@@ -221,7 +300,29 @@
       introWrap.appendChild(cloneNodes(parsed.intro));
       panel.appendChild(introWrap);
 
-      // Expand all / Collapse all
+      // Chapter progress (this chapter's learned count + bar)
+      var chProg = document.createElement('div');
+      chProg.className = 'mb-4';
+      var chProgRow = document.createElement('div');
+      chProgRow.className = 'flex justify-between text-xs text-gray-400 mb-1.5';
+      var chProgLabel = document.createElement('span');
+      chProgLabel.id = 'chapterProgressLabel';
+      var chProgPct = document.createElement('span');
+      chProgPct.id = 'chapterProgressPct';
+      chProgRow.appendChild(chProgLabel);
+      chProgRow.appendChild(chProgPct);
+      var chProgTrack = document.createElement('div');
+      chProgTrack.className = 'h-1.5 bg-gray-800 rounded-full overflow-hidden';
+      var chProgBar = document.createElement('div');
+      chProgBar.id = 'chapterProgressBar';
+      chProgBar.className = 'h-full bg-green-500 rounded-full transition-all duration-300';
+      chProgBar.style.width = '0%';
+      chProgTrack.appendChild(chProgBar);
+      chProg.appendChild(chProgRow);
+      chProg.appendChild(chProgTrack);
+      panel.appendChild(chProg);
+
+      // Expand all / Collapse all / Study mode
       var controls = document.createElement('div');
       controls.className = 'flex items-center gap-2 mb-4';
       var expandAll = document.createElement('button');
@@ -232,11 +333,22 @@
       collapseAll.type = 'button';
       collapseAll.className = 'px-3 py-1.5 text-xs font-medium text-gray-300 bg-gray-800/60 border border-gray-700/60 rounded-lg hover:bg-gray-800 transition';
       collapseAll.textContent = 'Collapse all';
+      var studyBtn = document.createElement('button');
+      studyBtn.type = 'button';
+      function paintStudyBtn() {
+        studyBtn.className = studyMode
+          ? 'px-3 py-1.5 text-xs font-medium text-white bg-blue-600 border border-blue-600 rounded-lg hover:bg-blue-500 transition'
+          : 'px-3 py-1.5 text-xs font-medium text-gray-300 bg-gray-800/60 border border-gray-700/60 rounded-lg hover:bg-gray-800 transition';
+        studyBtn.textContent = studyMode ? 'Study mode: on' : 'Study mode';
+      }
+      paintStudyBtn();
       var count = document.createElement('span');
       count.className = 'ml-auto text-xs text-gray-500';
-      count.textContent = parsed.questions.length + ' questions · ' + ch.range;
+      var defaultCountText = parsed.questions.length + ' questions · ' + ch.range;
+      count.textContent = studyMode ? 'Study mode — click a question to reveal its answer' : defaultCountText;
       controls.appendChild(expandAll);
       controls.appendChild(collapseAll);
+      controls.appendChild(studyBtn);
       controls.appendChild(count);
       panel.appendChild(controls);
 
@@ -248,9 +360,23 @@
         return item;
       });
       panel.appendChild(list);
+      currentItems = items;
 
-      expandAll.addEventListener('click', function () { items.forEach(function (it) { it._toggle(true); }); });
+      expandAll.addEventListener('click', function () {
+        if (studyMode) { studyMode = false; paintStudyBtn(); count.textContent = defaultCountText; }
+        items.forEach(function (it) { it._toggle(true); });
+      });
       collapseAll.addEventListener('click', function () { items.forEach(function (it) { it._toggle(false); }); });
+      studyBtn.addEventListener('click', function () {
+        studyMode = !studyMode;
+        paintStudyBtn();
+        if (studyMode) {
+          items.forEach(function (it) { it._toggle(false); });
+          count.textContent = 'Study mode — click a question to reveal its answer';
+        } else {
+          count.textContent = defaultCountText;
+        }
+      });
 
       if (expandQid) {
         var target = list.querySelector('[data-qid="' + expandQid + '"]');
@@ -265,8 +391,14 @@
         // Chapter selected: show the whole chapter on one page — every
         // question and answer open, no need to open them one by one.
         // (Deep links and search results still expand just the one question.)
-        items.forEach(function (it) { it._toggle(true); });
+        // In study mode, keep everything closed instead: one question at a time.
+        if (studyMode) {
+          items.forEach(function (it) { it._toggle(false); });
+        } else {
+          items.forEach(function (it) { it._toggle(true); });
+        }
       }
+      updateProgressUI();
     }).catch(function () {
       panel.innerHTML = '';
       var err = document.createElement('div');
@@ -303,9 +435,12 @@
     chapterTabsEl.innerHTML = '';
     CHAPTERS.forEach(function (ch, idx) {
       if (ch.part !== currentPart) return;
-      chapterTabsEl.appendChild(pill(ch.num + ' · ' + ch.short + ' · ' + ch.range, idx === currentChapter, function () {
+      var r = chapterRange(idx);
+      var done = chapterLearned(idx);
+      var total = r.hi - r.lo + 1;
+      chapterTabsEl.appendChild(pill(ch.num + ' · ' + ch.short + ' · ' + ch.range + ' · ' + done + '/' + total, idx === currentChapter, function () {
         selectChapter(idx);
-      }, 'Chapter ' + ch.num + ' — ' + ch.range));
+      }, 'Chapter ' + ch.num + ' — ' + ch.range + ' · ' + done + ' of ' + total + ' learned'));
     });
   }
 
@@ -441,6 +576,15 @@
   });
   clearBtn.addEventListener('click', clearSearchUI);
 
+  document.getElementById('resetProgress').addEventListener('click', function () {
+    if (!learnedCount()) return;
+    if (!confirm('Clear all learned progress? This cannot be undone.')) return;
+    learned = {};
+    saveLearned();
+    updateProgressUI();
+    renderChapter(currentChapter);
+  });
+
   // --- Init: deep-link #qNNN, else first chapter -------------------------------
   renderTabs();
   var hash = (location.hash || '').replace('#', '');
@@ -454,6 +598,7 @@
   } else {
     renderChapter(currentChapter);
   }
+  updateProgressUI();
 })();
 </script>
 </body>
